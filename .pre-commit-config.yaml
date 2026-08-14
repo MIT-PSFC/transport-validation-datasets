@@ -21,6 +21,19 @@ repos:
         types: [python]
         files: "^transport_validation_datasets/"
         exclude: "^transport_validation_datasets/tests/"
+      # ruff's D/DOC rules cover docstring layout, but not whether the names under
+      # Args: match the signature. pylint's docparams extension does.
+      - id: docparams
+        name: docparams
+        entry: >-
+          uv run pylint --load-plugins=pylint.extensions.docparams
+          --disable=all
+          --enable=missing-param-doc,differing-param-doc,useless-param-doc
+          --accept-no-param-doc=n --default-docstring-type=google
+        language: system
+        types: [python]
+        files: "^transport_validation_datasets/"
+        exclude: "^transport_validation_datasets/tests/"
       - id: isort
         name: isort
         entry: uv run isort

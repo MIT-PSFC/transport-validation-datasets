@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "disruption-py>=0.14.0",
+    "freeqdsk>=0.5.2",
     "mkgp>=3.1.4",
     "pre-commit>=4.6.2",
 ]
@@ -25,6 +26,33 @@ dev = [
 
 [tool.isort]
 profile = "black"
+
+[tool.ruff.lint]
+# preview is required for the DOC (pydoclint) rules. It also widens ruff's default
+# rule set, so select is pinned explicitly: the E/F entries are ruff's own defaults.
+preview = true
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "D",   # pydocstyle: docstring layout
+    "DOC", # pydoclint: docstring content matches the code
+]
+ignore = [
+    "D100", # missing docstring in public module
+    "D104", # missing docstring in public package
+    "D105", # missing docstring in magic method
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"transport_validation_datasets/tests/*" = ["D", "DOC"]
+
+[tool.pytest.ini_options]
+testpaths = ["transport_validation_datasets/tests"]
 
 [tool.hatch.build.targets.sdist]
 include = ["transport_validation_datasets"]
