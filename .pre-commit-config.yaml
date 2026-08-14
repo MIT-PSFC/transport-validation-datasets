@@ -1,0 +1,29 @@
+repos:
+  - repo: local
+    hooks:
+      # https://zhauniarovich.com/post/2020/2020-06-clearing-jupyter-output/
+      - id: jupyter-nb-clear-output
+        name: jupyter-nb-clear-output
+        files: \.ipynb$
+        stages: [pre-commit]
+        language: system
+        entry: jupyter nbconvert --ClearOutputPreprocessor.enabled=True --inplace
+      - id: ruff_format
+        name: ruff_format 
+        entry: uv run ruff format
+        language: system
+        types: [python]
+        files: "^transport_validation_datasets/"
+      - id: ruff_check
+        name: ruff_check
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+        files: "^transport_validation_datasets/"
+        exclude: "^transport_validation_datasets/tests/"
+      - id: isort
+        name: isort
+        entry: uv run isort
+        language: system
+        types: [python]
+        files: "^transport_validation_datasets/"

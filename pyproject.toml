@@ -1,0 +1,37 @@
+[project]
+name = "transport-validation-datasets"
+version = "0.1.0"
+description = "Methods for generating datasets to validate transport codes and train hybrid physics models"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "disruption-py>=0.14.0",
+    "mkgp>=3.1.4",
+    "pre-commit>=4.6.2",
+]
+
+[dependency-groups]
+dev = [
+    "black>=26.5.1",
+    "isort>=8.0.1",
+    "mypy>=2.3.0",
+    "pylint>=4.0.7",
+    "pytest>=9.1.1",
+    "ruff>=0.16.3",
+    "shellcheck-py>=0.11.0.1",
+    "tomllint>=0.3.6",
+    "yamllint>=1.38.0",
+]
+
+[tool.isort]
+profile = "black"
+
+[tool.hatch.build.targets.sdist]
+include = ["transport_validation_datasets"]
+
+[tool.hatch.build.targets.wheel]
+include = ["transport_validation_datasets"]
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
