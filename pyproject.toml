@@ -7,6 +7,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "disruption-py>=0.14.0",
     "freeqdsk>=0.5.2",
+    "matplotlib>=3.11.1",
     "mkgp>=3.1.4",
     "pre-commit>=4.6.2",
 ]
@@ -53,6 +54,12 @@ convention = "google"
 
 [tool.pytest.ini_options]
 testpaths = ["transport_validation_datasets/tests"]
+filterwarnings = [
+    "ignore::RuntimeWarning:disruption_py.*",
+    "ignore::FutureWarning:disruption_py.*",
+    # fork() in a multi-threaded process, from disruption_py spawning workers
+    "ignore:This process:DeprecationWarning:multiprocessing.*",
+]
 
 [tool.hatch.build.targets.sdist]
 include = ["transport_validation_datasets"]

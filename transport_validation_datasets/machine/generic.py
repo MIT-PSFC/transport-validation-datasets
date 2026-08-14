@@ -1,9 +1,7 @@
-from pathlib import Path
-
 import numpy as np
 import xarray as xr
-from freeqdsk import aeqdsk, geqdsk
 from loguru import logger
+
 
 def make_uniform_1kHz_timebase(max_time: float) -> np.ndarray:
     """Create a uniform timebase at 1 kHz up to the specified maximum time.
@@ -47,9 +45,12 @@ def make_geqdsk_dataset(
     rlim=None,
     zlim=None,
 ):
-    """
-    Build an Xarray dataset holding every signal needed to recreate a GEQDSK
-    file. FreeQDSK canonical names, COCOS 1.
+    """Build an Xarray dataset holding every signal needed to recreate a GEQDSK file.
+
+    FreeQDSK canonical names, COCOS 1.
+
+    Returns:
+        Dataset with all GEQDSK signals on dim 'idx', with 'time'/'shot' coords.
     """
     rcentr = r_grid[len(r_grid) // 2]
     rleft = r_grid[0]
@@ -118,13 +119,21 @@ def make_geqdsk_dataset(
 
 def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     """Snap an EFIT reconstruction (dim 'idx', 'time'/'shot' coords) onto grid_times.
-    Essentially a forward-fill but with a little tolerance and respecting NaNs.
+
+    Nearest-neighbor snap with tie-break toward later grid points. No interpolation, no fill.
 
     Each EFIT slice goes to its nearest grid time, with no interpolation of the
     reconstruction. The snap only absorbs sub-step machine jitter in the EFIT clock,
     so ties break toward the later grid point: an EFIT at 9.5 ms on a 1 ms grid lands
     at 10 ms, never feeding the 9 ms slice a future reconstruction. Grid times with no
     EFIT slice (e.g. before the first reconstruction) come back as NaN
+
+    Args:
+        ds: EFIT reconstruction with dim 'idx' and 'time'/'shot' coords.
+        grid_times: Uniform timebase to snap onto [s].
+
+    Returns:
+        The reconstruction on grid_times, NaN at grid times with no EFIT slice.
     """
     grid_times = np.asarray(grid_times)
     efit_times = ds["time"].values
@@ -154,7 +163,13 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
 
 
 def efit_cocos_from_signs(current, bcentr, logger_override=None) -> int:
-    # EFIT COCOS from sign of median Ip and B0: https://efit-ai.gitlab.io/efit/files.html
+    """Identify the EFIT COCOS from the signs of median Ip and B0.
+
+    See https://efit-ai.gitlab.io/efit/files.html
+
+    Returns:
+        COCOS number (1, 3, 5, or 7). Falls back to 1 for unexpected sign combinations.
+    """
     if logger_override is None:
         logger_override = logger
     sign_ip = np.sign(np.nanmedian(current))
@@ -174,20 +189,26 @@ def efit_cocos_from_signs(current, bcentr, logger_override=None) -> int:
 
 
 def orient_signal(geqdsk_data, efit_time):
-    """
-    Orient every retrieved signal time-first and transpose psirz to (T, r, z).
+    """Orient every retrieved signal time-first and transpose psirz to (T, r, z).
 
     No interpolation: each signal is kept on its native per-timeslice EFIT grid.
     Quality flags and reconstructions are not meaningful when interpolated, so
     callers must use time_setting="efit" to keep the tree's own timebase.
     Mutates and returns the dict.
+
+    Returns:
+        The mutated geqdsk_data dict.
     """
 
     def _time_first(data, n_time):
-        """
-        Move the axis whose length equals n_time to axis 0. Leaves 1D arrays and
-        arrays already time-first unchanged. Used to normalise the per-machine MDS
-        layouts (some store profiles/boundary as (spatial, T)).
+        """Move the axis whose length equals n_time to axis 0.
+
+        Leaves 1D arrays and arrays already time-first unchanged. Used to
+        normalise the per-machine MDS layouts (some store profiles/boundary as
+        (spatial, T)).
+
+        Returns:
+            The array with time on axis 0.
         """
         if data is None or data.ndim < 2:
             return data

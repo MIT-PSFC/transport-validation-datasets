@@ -1,9 +1,12 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+import numpy as np
+import xarray as xr
 from loguru import logger
 
 from transport_validation_datasets.gp_fitting.dispatcher import ClusterFitConfig
+from transport_validation_datasets.machine.plots import plot_unprocessed_data
 
 
 class DataWorkflow(ABC):
@@ -47,6 +50,24 @@ class DataWorkflow(ABC):
 
         Returns:
             Margin in seconds.
+        """
+
+    @property
+    @abstractmethod
+    def min_pulse_length(self) -> float:
+        """Minimum time between the first and last valid ip after filtering.
+
+        Returns:
+            Minimum pulse length in seconds.
+        """
+
+    @property
+    @abstractmethod
+    def min_usable_time(self) -> float:
+        """Minimum summed duration of the valid ip segments after filtering.
+
+        Returns:
+            Minimum usable time in seconds.
         """
 
     @property
@@ -147,3 +168,103 @@ class DataWorkflow(ABC):
         Also makes plots for each shot to visualize the data and any issues
         encountered.
         """
+
+    def filter_and_plot(self, ds_input: xr.Dataset) -> xr.Dataset | None:
+        """Take datasets with standardized names, run filtering on them, and plot results.
+
+        Rejected shots are plotted unfiltered to rejected_shots_dir. Accepted shots
+        are plotted unfiltered to accepted_shots_dir, with the kept segments shaded
+        green. Both plots mark the end margin cutoff and (if one was found) the
+        transient cutoff.
+
+        Args:
+            ds_input: Dataset with standardized signal names for one shot.
+
+        Returns:
+            The filtered dataset, or None if the shot should be rejected.
+        """
+        shot = ds_input.shot.values[0]
+
+        # 0: Cut all data end_margin seconds before ip is NaN to avoid including obviously disruptive data at the end of the shot
+        ip_valid = ds_input["ip"].notnull().any(dim="shot")
+        last_valid_time = float(ip_valid[::-1].idxmax(dim="time"))
+        end_margin_time = last_valid_time - self.end_margin
+        valid_mask = ds_input["time"] < end_margin_time
+
+        # 1: Apply valid_filter
+        for signal, bounds in self.valid_filter.items():
+            if "min" in bounds:
+                valid_mask = valid_mask & (ds_input[signal] >= bounds["min"])
+            if "max" in bounds:
+                valid_mask = valid_mask & (ds_input[signal] <= bounds["max"])
+            if "min_abs" in bounds:
+                valid_mask = valid_mask & (
+                    np.abs(ds_input[signal]) >= bounds["min_abs"]
+                )
+            if "max_abs" in bounds:
+                valid_mask = valid_mask & (
+                    np.abs(ds_input[signal]) <= bounds["max_abs"]
+                )
+
+        # 2: Apply transient_filter: cut everything from the first time a signal exceeds its threshold
+        transient_margin_time = None
+        for signal, threshold in self.transient_filter.items():
+            exceeded = valid_mask & (ds_input[signal] > threshold)
+            if exceeded.any():
+                first_time = float(
+                    ds_input["time"].where(exceeded.any(dim="shot")).min()
+                )
+                if transient_margin_time is None or first_time < transient_margin_time:
+                    transient_margin_time = first_time
+        if transient_margin_time is not None:
+            valid_mask = valid_mask & (ds_input["time"] < transient_margin_time)
+
+        ds_filtered = ds_input.where(valid_mask, drop=True)
+
+        # If there is not sufficient data after filtering, return None to indicate that this shot should be rejected:
+        # the first and last non-nan ip must be at least min_pulse_length apart, and the
+        # non-nan segments within must sum to at least min_usable_time
+        ip_valid_filtered = ds_filtered["ip"].notnull().any(dim="shot")
+        ip_times = ds_filtered["time"].values[ip_valid_filtered.values]
+        if ip_times.size < 2:
+            pulse_length = 0.0
+            usable_time = 0.0
+        else:
+            pulse_length = float(ip_times[-1] - ip_times[0])
+            # Timebase is uniform 1 kHz, so any gap beyond 1.5 ms separates two segments
+            gaps = np.diff(ip_times)
+            usable_time = float(gaps[gaps < 1.5e-3].sum())
+
+        if pulse_length < self.min_pulse_length or usable_time < self.min_usable_time:
+            logger.warning(
+                f"Shot {shot} rejected: pulse length {pulse_length:.3f} s "
+                f"(min {self.min_pulse_length}) or usable time {usable_time:.3f} s "
+                f"(min {self.min_usable_time}) insufficient after filtering"
+            )
+            plot_unprocessed_data(
+                ds_input,
+                self.rejected_shots_dir / f"shot_{shot}.png",
+                title=f"Shot {shot} (REJECTED)",
+                valid_filter=self.valid_filter,
+                transient_filter=self.transient_filter,
+                end_margin_time=end_margin_time,
+                transient_margin_time=transient_margin_time,
+            )
+            return None
+        else:
+            # Plot the entire shot, with the kept segments shaded green
+            kept_times = ds_filtered["time"].values
+            breaks = np.flatnonzero(np.diff(kept_times) > 1.5e-3)
+            span_starts = np.insert(kept_times[breaks + 1], 0, kept_times[0])
+            span_ends = np.append(kept_times[breaks], kept_times[-1])
+            plot_unprocessed_data(
+                ds_input,
+                self.accepted_shots_dir / f"shot_{shot}.png",
+                title=f"Shot {shot}",
+                valid_filter=self.valid_filter,
+                transient_filter=self.transient_filter,
+                end_margin_time=end_margin_time,
+                transient_margin_time=transient_margin_time,
+                kept_spans=list(zip(span_starts.tolist(), span_ends.tolist())),
+            )
+            return ds_filtered

@@ -43,6 +43,46 @@ class PartitionSpec:
     constraint: str | None = None
 
 
+def parse_partition_specs(value) -> list["PartitionSpec"]:
+    """Parse a partition spec string into PartitionSpecs.
+
+    Args:
+        value: Comma-separated entries of name@time_limit or
+            name@time_limit@constraint, e.g.
+            "sched_psfc_mit_r8@8:00:00,mit_preemptable@8:00:00@rocky8".
+            Also accepts a tuple/list of entry strings (Python Fire may
+            pre-split comma-separated arguments).
+
+    Returns:
+        One PartitionSpec per entry.
+
+    Raises:
+        ValueError: If an entry does not match the format, or the spec is empty.
+    """
+    if isinstance(value, str):
+        entries = value.split(",")
+    else:
+        entries = list(value)
+    specs = []
+    for entry in entries:
+        fields = entry.strip().split("@")
+        if len(fields) == 2:
+            specs.append(PartitionSpec(name=fields[0], time_limit=fields[1]))
+        elif len(fields) == 3:
+            specs.append(
+                PartitionSpec(
+                    name=fields[0], time_limit=fields[1], constraint=fields[2]
+                )
+            )
+        else:
+            raise ValueError(
+                f"Bad partition spec '{entry}': expected name@time_limit or name@time_limit@constraint"
+            )
+    if not specs:
+        raise ValueError("Empty partition spec")
+    return specs
+
+
 @dataclass
 class ClusterFitConfig:
     """Launch options for cluster-based GP fitting.

@@ -1,8 +1,4 @@
-import numpy as np
 import xarray as xr
-from disruption_py.core.physics_method.decorator import physics_method
-from disruption_py.core.physics_method.params import PhysicsMethodParams
-from disruption_py.inout.mds import mdsExceptions
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.settings.output_setting import DatasetOutputSetting
@@ -10,23 +6,33 @@ from disruption_py.workflow import get_shots_data
 from loguru import logger
 
 from transport_validation_datasets.dispy_utils import passive_log_settings, summary
+from transport_validation_datasets.machine.cmod.dispy_methods import (
+    CmodEfitMethods,
+    CmodGeometryMethods,
+    CmodThomsonMethods,
+    UniformTimeSetting,
+)
+from transport_validation_datasets.machine.generic import (
+    make_uniform_1kHz_timebase,
+    snap_to_grid,
+)
 from transport_validation_datasets.workflow import DataWorkflow
-from transport_validation_datasets.machine.cmod.dispy_methods import CmodGeometryMethods, CmodEfitMethods, CmodThomsonMethods, UniformTimeSetting
 
 
 class CModDataWorkflow(DataWorkflow):
     """C-Mod specific data workflow for creating and processing datasets."""
 
     min_pulse_length = 0.5
+    min_usable_time = 0.2
     valid_filter = {
-        "ip": {"min": 100e3},
+        "ip": {"min_abs": 100e3},  # Only care about magnitude of ip
         "n_e_line_average": {"min": 1e18, "max": 4e20},
-        "energy_mhd": {"min": 3e3, "max": 2e6},
+        "energy_mhd": {"min": 3e3},
         "beta_tor_norm": {"min": 0.0, "max": 2.0},
     }
     transient_filter = {
-        "p_oh": 5.0,
-        "p_rad": 2.5,
+        "power_ohm": 5.0e6,
+        "power_radiated": 2.5e6,
     }
     end_margin = 0.02
     shot_blacklist = []
@@ -39,7 +45,7 @@ class CModDataWorkflow(DataWorkflow):
         """
         data = summary(
             summary_table="summary",
-            ipmax=self.valid_filter["ip"]["min"],
+            ipmax=self.valid_filter["ip"]["min_abs"],
             pulse_length=self.min_pulse_length,
             min_shot=1160500000,
             max_shot=1160932000,
@@ -100,7 +106,7 @@ class CModDataWorkflow(DataWorkflow):
                 continue
 
             # Get data for this shot using disruption-py
-            # Two datasets created separately due to timebase differences
+            # Three datasets created separately due to timebase differences
             # One for fast 0D signals (Ip, B0, shaping, density, power, all native 1 kHz)
             # One for the EFIT dataset (native 1 kHz on C-Mod)
             # And one for Thomson scattering (native 20 Hz)
@@ -108,16 +114,80 @@ class CModDataWorkflow(DataWorkflow):
             ds_efit = _get_efit_dataset(shot)
             ds_thomson = _get_thomson_dataset(shot)
 
+            # TODO(ZanderKeith): Here is where we would optionally modify the TS data according to density calibrations
+
+            ds_merged = xr.merge(
+                [ds_fast, ds_efit, ds_thomson], compat="no_conflicts", join="outer"
+            )
+
+            ds_standardized = self.standardize_signal_names(ds_merged)
+            if ds_standardized is None:
+                logger.warning(
+                    f"Shot {shot} is missing critical signals. Skipping unprocessed data file creation."
+                )
+                continue
+
+            ds_unprocessed = self.filter_and_plot(ds_standardized)
+            if ds_unprocessed is None:
+                logger.warning(
+                    f"Shot {shot} did not pass filtering. Skipping unprocessed data file creation."
+                )
+                continue
+
+            ds_unprocessed.to_netcdf(unprocessed_ds_path)
+            logger.info(f"Created unprocessed data file for shot {shot}.")
             unprocessed_shots += 1
 
+    def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset:
+        """Rename signals to IMAS-like names, keeping freeqdsk names for EFIT signals.
 
-    def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
-        """Rename signals in dataset to typical names.
-        
+        All signals stay in SI units. Plasma current and toroidal field are stored
+        as magnitudes, sign conventions live in the geqdsk signals.
+
+        Args:
+            ds: Merged dataset with disruption-py signal names.
+
         Returns:
-            Dataset with standardized signal names, or None if critical signals are missing
+            Dataset with standardized signal names.
         """
-        return None
+        # disruption-py signal name -> IMAS-like name
+        imas_rename = {
+            # summary/global_quantities
+            "bt": "b0",
+            "wmhd": "energy_mhd",
+            "beta_n": "beta_tor_norm",
+            "p_oh": "power_ohm",
+            "p_rad": "power_radiated",
+            # summary/heating_current_drive
+            "p_icrf": "power_ic",
+            "p_lh": "power_lh",
+            # summary/line_average
+            "n_e": "n_e_line_average",
+            # equilibrium/time_slice/boundary
+            "a_minor": "minor_radius",
+            "kappa": "elongation",
+            "tritop": "triangularity_upper",
+            "tribot": "triangularity_lower",
+            "rout": "geometric_axis_r",
+            # thomson_scattering/channel
+            "ts_channel_ne": "ts_channel_n_e",
+            "ts_channel_ne_error": "ts_channel_n_e_error",
+            "ts_channel_te": "ts_channel_t_e",
+            "ts_channel_te_error": "ts_channel_t_e_error",
+        }
+
+        ds = ds.rename({k: v for k, v in imas_rename.items() if k in ds})
+
+        # C-Mod has no NBI, zero where ip is valid
+        if "ip" in ds:
+            ds["power_nbi"] = ds["ip"] * 0.0
+            ds["power_nbi"].attrs = {
+                "description": "Neutral beam heating power (none on C-Mod)",
+                "units": "W",
+                "ref": "/summary/heating_current_drive/power_nbi",
+            }
+
+        return ds
 
 
 def _get_fast_dataset(shot: int) -> xr.Dataset:
@@ -168,6 +238,9 @@ def _get_efit_dataset(shot: int) -> xr.Dataset:
 
     Args:
         shot: Shot number to retrieve data for.
+
+    Returns:
+        Dataset with GEQDSK signals for the given shot.
     """
     settings = RetrievalSettings(
         run_methods=["get_geqdsk_parameters"],
@@ -186,13 +259,16 @@ def _get_efit_dataset(shot: int) -> xr.Dataset:
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
+
 def _get_thomson_dataset(shot: int) -> xr.Dataset:
     """Retrieve Thomson scattering data for the given shot.
 
     Args:
         shot: Shot number to retrieve data for.
-    """
 
+    Returns:
+        Dataset with Thomson channel signals snapped to the uniform 1 kHz grid.
+    """
     retrieval_settings = RetrievalSettings(
         run_methods=["get_thomson_channels"],
         efit_nickname_setting="EFIT21",
@@ -207,6 +283,9 @@ def _get_thomson_dataset(shot: int) -> xr.Dataset:
         log_settings=passive_log_settings(),
         num_processes=1,
     )
+    # Snap native ~20 Hz TS slices onto the uniform 1 kHz grid, no interpolation.
+    # Grid times with no TS slice come back as NaN.
+    timebase = make_uniform_1kHz_timebase(float(result["time"].values.max()))
+    result = snap_to_grid(result, timebase)
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
-

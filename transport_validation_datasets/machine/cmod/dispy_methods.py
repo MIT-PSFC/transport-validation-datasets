@@ -1,45 +1,39 @@
 """Custom disruption-py physics methods for C-Mod."""
 
 import numpy as np
+import xarray as xr
 from disruption_py.core.physics_method.decorator import physics_method
 from disruption_py.core.physics_method.params import PhysicsMethodParams
+from disruption_py.core.utils.math import interp1
 from disruption_py.inout.mds import mdsExceptions
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.core.utils.math import interp1
-from transport_validation_datasets.machine.generic import (
-    efit_cocos_from_signs,
-    make_geqdsk_dataset,
-    orient_signal,
-    snap_to_grid,
-    make_uniform_1kHz_timebase
-)
-
-import numpy as np
-import pandas as pd
-import xarray as xr
 from disruption_py.settings import TimeSetting, TimeSettingParams
 from disruption_py.settings.time_setting import _postprocess
 
+from transport_validation_datasets.machine.generic import (
+    efit_cocos_from_signs,
+    make_geqdsk_dataset,
+    make_uniform_1kHz_timebase,
+    orient_signal,
+    snap_to_grid,
+)
+
+
 class UniformTimeSetting(TimeSetting):
-    """
-    1 kHz uniform timebase up to the maximum time in the EFIT tree
-    """
+    """1 kHz uniform timebase up to the maximum time in the EFIT tree."""
 
     def __init__(self):
-        """
-        Initialize with tokamak overrides.
-        """
+        """Initialize with tokamak overrides."""
 
     def _get_times(self, params: TimeSettingParams) -> np.ndarray:
-        """
-        Retrieve the EFIT timebase for the tested tokamaks.
+        """Retrieve the EFIT timebase for the tested tokamaks.
 
         Parameters
         ----------
         params : TimeSettingParams
             Parameters needed to retrieve the timebase.
 
-        Returns
+        Returns:
         -------
         np.ndarray
             Array of times in the timebase.
@@ -60,6 +54,7 @@ class UniformTimeSetting(TimeSetting):
         timebase = make_uniform_1kHz_timebase(max_time)
         return timebase
 
+
 class CmodGeometryMethods:
     """Geometry signals from the C-Mod aeqdsk that stock disruption-py skips."""
 
@@ -70,6 +65,9 @@ class CmodGeometryMethods:
 
         disruption-py exposes rmagx (magnetic axis) but not aeqdsk rout, which
         is the boundary geometric center and the radius that pairs with a_minor.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
 
         Returns:
             Dict with rout [m] on the requested timebase.
@@ -118,7 +116,15 @@ class CmodEfitMethods:
     @staticmethod
     @physics_method(columns=[*geqdsk_cols.keys()], tokamak=Tokamak.CMOD)
     def get_geqdsk_parameters(params: PhysicsMethodParams):
-        """Retrieve the full GEQDSK reconstruction for C-Mod (COCOS-normalised)."""
+        """Retrieve the full GEQDSK reconstruction for C-Mod (COCOS-normalised).
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dataset with all geqdsk_cols signals plus grids and limiter, snapped
+            onto the requested timebase without interpolation.
+        """
         efit_time = params.mds_conn.get_data(
             r"\efit_a_eqdsk:atime", tree_name="_efit_tree"
         )
@@ -187,6 +193,7 @@ class CmodEfitMethods:
         ds_geqdsk = snap_to_grid(ds_geqdsk, params.times)
         return ds_geqdsk
 
+
 class CmodThomsonMethods:
     """Raw Thomson scattering channel retrievals for C-Mod."""
 
@@ -246,6 +253,10 @@ class CmodThomsonMethods:
         Returns:
             Dict with z (channel,), time (T,), and ne/ne_error/te/te_error as
             (T, channel) arrays with invalid (zero) points set to nan.
+
+        Raises:
+            ValueError: If the channel count does not match the z positions, or
+                the te and ne timebases disagree.
         """
         region = {"z": params.mds_conn.get_data(nodes["z"], tree_name="electrons")}
         time = None
@@ -299,9 +310,16 @@ class CmodThomsonMethods:
         beam radius for every channel. Data stays on the native TS timebase
         (~20 Hz), not params.times.
 
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
         Returns:
             Dataset with ne [m^-3] and te [eV] plus errors on (idx, ts_channel),
             channel positions ts_channel_r and ts_channel_z [m] on (ts_channel,).
+
+        Raises:
+            ValueError: If the core TS channels are inconsistent (propagated from
+                _get_region_channels). Edge TS failures are logged and skipped.
         """
         core = CmodThomsonMethods._get_region_channels(
             params, CmodThomsonMethods.core_nodes
@@ -330,9 +348,7 @@ class CmodThomsonMethods:
         # Radius of the vertical laser beam, shared by all channels
         r_beam = float(
             np.atleast_1d(
-                params.mds_conn.get_data(
-                    r".yag.results.param:r", tree_name="electrons"
-                )
+                params.mds_conn.get_data(r".yag.results.param:r", tree_name="electrons")
             )[0]
         )
 
@@ -350,9 +366,7 @@ class CmodThomsonMethods:
             "ts_channel_z": ("ts_channel", z_pos.astype(np.float32)),
         }
         for quant in ["ne", "ne_error", "te", "te_error"]:
-            combined = np.concatenate(
-                [r[quant] for r in regions.values()], axis=1
-            )
+            combined = np.concatenate([r[quant] for r in regions.values()], axis=1)
             data_vars[f"ts_channel_{quant}"] = (
                 ("idx", "ts_channel"),
                 combined.astype(np.float32),
