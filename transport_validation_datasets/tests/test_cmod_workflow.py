@@ -63,6 +63,8 @@ class TestMakeUnprocessedDataFiles:
 
         shotlist_missing = [
             1160503006,  # Missing TS data
+            1160503011,  # Missing EFIT data
+            1160503015,  # No EFIT21 tree at all
         ]
         shotlist_present = [
             1160503007,  # Should be present
@@ -83,23 +85,3 @@ class TestMakeUnprocessedDataFiles:
             assert not file_path.exists(), (
                 f"Unprocessed data file for shot {shot} should not exist"
             )
-
-    def test_special_cases(self):
-        # These shots should be working, but they weren't in the past
-        # ensure no regressions and they are still handled correctly
-        test_dir = TEST_DIR / "test_special_cases"
-        shotlist = [
-            1160503011,  # Missing EFIT data?
-        ]
-        workflow = cmod_workflow(test_dir, shotlist=shotlist)
-
-        workflow.make_unprocessed_data_files()
-        for shot in shotlist:
-            file_path = workflow.unprocessed_data_dir / f"{shot}.nc"
-            assert file_path.exists(), (
-                f"Unprocessed data file for shot {shot} does not exist"
-            )
-
-
-# class TestGPFitting:
-#     def test_

@@ -105,20 +105,31 @@ class CModDataWorkflow(DataWorkflow):
                 unprocessed_shots += 1
                 continue
 
-            # Get data for this shot using disruption-py
-            # Three datasets created separately due to timebase differences
-            # One for fast 0D signals (Ip, B0, shaping, density, power, all native 1 kHz)
-            # One for the EFIT dataset (native 1 kHz on C-Mod)
-            # And one for Thomson scattering (native 20 Hz)
-            ds_fast = _get_fast_dataset(shot)
-            ds_efit = _get_efit_dataset(shot)
-            ds_thomson = _get_thomson_dataset(shot)
+            # Get data for this shot using disruption-py.
+            # Three datasets created separately due to timebase differences:
+            # fast 0D signals (Ip, B0, shaping, density, power, all native 1 kHz),
+            # the EFIT dataset (native 1 kHz on C-Mod),
+            # and Thomson scattering (native 20 Hz).
+            datasets = []
+            missing = False
+            for name, getter in (
+                ("fast", _get_fast_dataset),
+                ("efit", _get_efit_dataset),
+                ("thomson", _get_thomson_dataset),
+            ):
+                ds = getter(shot)
+                if ds is None:
+                    logger.warning(
+                        f"Shot {shot} is missing retrievable {name} data. "
+                        "Skipping unprocessed data file creation."
+                    )
+                    missing = True
+                    break
+                datasets.append(ds)
+            if missing:
+                continue
 
-            # TODO(ZanderKeith): Here is where we would optionally modify the TS data according to density calibrations
-
-            ds_merged = xr.merge(
-                [ds_fast, ds_efit, ds_thomson], compat="no_conflicts", join="outer"
-            )
+            ds_merged = xr.merge(datasets, compat="no_conflicts", join="outer")
 
             ds_standardized = self.standardize_signal_names(ds_merged)
             if ds_standardized is None:
@@ -198,11 +209,25 @@ class CModDataWorkflow(DataWorkflow):
         return ds
 
 
-def _get_fast_dataset(shot: int) -> xr.Dataset:
+def _is_empty_result(result: xr.Dataset) -> bool:
+    """Check whether get_shots_data returned no usable data for a shot.
+
+    When retrieval fails (e.g. a missing MDSplus tree), get_shots_data logs the
+    error and returns an empty dataset with no shot/time index variables. Reshaping
+    that with set_index would raise, so callers use this to skip the shot instead.
+
+    Returns:
+        True if the result has no usable shot/time data, False otherwise.
+    """
+    return "shot" not in result or "time" not in result or result["time"].size == 0
+
+
+def _get_fast_dataset(shot: int) -> xr.Dataset | None:
     """Retrieve fast 0D signals and EFIT dataset.
 
     Returns:
-        Dataset with EFIT signals for the given shot.
+        Dataset with EFIT signals for the given shot, or None if retrieval
+        returned no data.
     """
     cmod_dataset_signals = [
         "ip",  # Plasma current
@@ -237,18 +262,21 @@ def _get_fast_dataset(shot: int) -> xr.Dataset:
         log_settings=passive_log_settings(),
         num_processes=1,
     )
+    if _is_empty_result(result):
+        return None
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
 
-def _get_efit_dataset(shot: int) -> xr.Dataset:
+def _get_efit_dataset(shot: int) -> xr.Dataset | None:
     """Retrieve EFIT dataset for the given shot.
 
     Args:
         shot: Shot number to retrieve data for.
 
     Returns:
-        Dataset with GEQDSK signals for the given shot.
+        Dataset with GEQDSK signals for the given shot, or None if retrieval
+        returned no data.
     """
     settings = RetrievalSettings(
         run_methods=["get_geqdsk_parameters"],
@@ -264,18 +292,21 @@ def _get_efit_dataset(shot: int) -> xr.Dataset:
         log_settings=passive_log_settings(),
         num_processes=1,
     )
+    if _is_empty_result(result):
+        return None
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
 
-def _get_thomson_dataset(shot: int) -> xr.Dataset:
+def _get_thomson_dataset(shot: int) -> xr.Dataset | None:
     """Retrieve Thomson scattering data for the given shot.
 
     Args:
         shot: Shot number to retrieve data for.
 
     Returns:
-        Dataset with Thomson channel signals snapped to the uniform 1 kHz grid.
+        Dataset with Thomson channel signals snapped to the uniform 1 kHz grid,
+        or None if retrieval returned no data.
     """
     retrieval_settings = RetrievalSettings(
         run_methods=["get_thomson_channels"],
@@ -291,6 +322,8 @@ def _get_thomson_dataset(shot: int) -> xr.Dataset:
         log_settings=passive_log_settings(),
         num_processes=1,
     )
+    if _is_empty_result(result):
+        return None
     # Snap native ~20 Hz TS slices onto the uniform 1 kHz grid, no interpolation.
     # Grid times with no TS slice come back as NaN.
     timebase = make_uniform_1kHz_timebase(float(result["time"].values.max()))
