@@ -8,6 +8,9 @@ from loguru import logger
 from transport_validation_datasets.gp_fitting.dispatcher import ClusterFitConfig
 from transport_validation_datasets.machine.plots import plot_unprocessed_data
 
+# Width of the centered boxcar applied before the transient thresholds are checked [s].
+TRANSIENT_SMOOTHING_WINDOW = 5e-3
+
 
 class DataWorkflow(ABC):
     """Class that handles organization of data processing steps.
@@ -38,6 +41,9 @@ class DataWorkflow(ABC):
     @abstractmethod
     def transient_filter(self) -> dict[str, float]:
         """Dictionary of thresholds for signals, used to filter out transient events.
+
+        Thresholds are compared against the signal smoothed by a centered boxcar
+        TRANSIENT_SMOOTHING_WINDOW wide, NOT the raw signal.
 
         Returns:
             Thresholds for signals, e.g. {"signal_name": 1.0}.
@@ -206,10 +212,24 @@ class DataWorkflow(ABC):
                     np.abs(ds_input[signal]) <= bounds["max_abs"]
                 )
 
-        # 2: Apply transient_filter: cut everything from the first time a signal exceeds its threshold
+        # 2: Apply transient_filter: cut everything from the first time a signal exceeds
+        # its threshold. The comparison uses each signal smoothed by a centered boxcar
+        # (TRANSIENT_SMOOTHING_WINDOW wide) so that sporadic noise spikes on their own do
+        # not trip the filter.
+        dt = float(np.median(np.diff(ds_input["time"].values)))
+        smoothing_samples = max(1, round(TRANSIENT_SMOOTHING_WINDOW / dt))
+        if smoothing_samples % 2 == 0:
+            # Boxcar must be odd so it stays centered on the present timestep
+            smoothing_samples += 1
+
         transient_margin_time = None
         for signal, threshold in self.transient_filter.items():
-            exceeded = valid_mask & (ds_input[signal] > threshold)
+            smoothed = (
+                ds_input[signal]
+                .rolling(time=smoothing_samples, center=True, min_periods=1)
+                .mean()
+            )
+            exceeded = valid_mask & (smoothed > threshold)
             if exceeded.any():
                 first_time = float(
                     ds_input["time"].where(exceeded.any(dim="shot")).min()
