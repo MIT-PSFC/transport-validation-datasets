@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -134,9 +135,18 @@ class DataWorkflow(ABC):
         self.unprocessed_data_dir = data_assembly_dir / "01_unprocessed"
         self.rejected_shots_dir = self.unprocessed_data_dir / "rejected_shots"
         self.accepted_shots_dir = self.unprocessed_data_dir / "accepted_shots"
+        self.failed_shots_dir = self.unprocessed_data_dir / "failed_shots"
         self.fit_staging_dir = data_assembly_dir / "02_fit_staging"
         self.fit_results_dir = data_assembly_dir / "03_fit_results"
         self.fit_plots_dir = self.fit_results_dir / "ts_fits"
+
+        # Log the run to a timestamped file named for when it was launched.
+        self.logs_dir = data_assembly_dir / "logs"
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        launch_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.log_file = self.logs_dir / f"{ds_name}_{launch_time}.log"
+        logger.add(self.log_file)
+        logger.info(f"Logging this run to {self.log_file}")
 
         if shotlist_file is None:
             logger.info(
@@ -151,6 +161,30 @@ class DataWorkflow(ABC):
                     int(line.strip()) for line in lines if line.strip().isdigit()
                 ]
             logger.info(f"Loaded {len(self.shotlist)} shots from {shotlist_file}")
+
+    def record_failed_shot(self, shot: int, reason: str):
+        """Record that a shot failed to produce an unprocessed file.
+
+        Writes failed_shots_dir/<shot>.txt with the reason so later runs skip the
+        shot via shot_already_failed instead of retrying it.
+
+        Args:
+            shot: Shot number that failed.
+            reason: Human-readable reason the shot was skipped.
+        """
+        self.failed_shots_dir.mkdir(parents=True, exist_ok=True)
+        (self.failed_shots_dir / f"{shot}.txt").write_text(reason)
+
+    def shot_already_failed(self, shot: int) -> bool:
+        """Check whether a shot was recorded as failed on a previous run.
+
+        Args:
+            shot: Shot number to check.
+
+        Returns:
+            True if a failure record exists for the shot, False otherwise.
+        """
+        return (self.failed_shots_dir / f"{shot}.txt").exists()
 
     @abstractmethod
     def _get_shotlist_from_source(self) -> list[int]:
@@ -263,7 +297,7 @@ class DataWorkflow(ABC):
             )
             plot_unprocessed_data(
                 ds_input,
-                self.rejected_shots_dir / f"shot_{shot}.png",
+                self.rejected_shots_dir / f"{shot}.png",
                 title=f"Shot {shot} (REJECTED)",
                 valid_filter=self.valid_filter,
                 transient_filter=self.transient_filter,
@@ -279,7 +313,7 @@ class DataWorkflow(ABC):
             span_ends = np.append(kept_times[breaks], kept_times[-1])
             plot_unprocessed_data(
                 ds_input,
-                self.accepted_shots_dir / f"shot_{shot}.png",
+                self.accepted_shots_dir / f"{shot}.png",
                 title=f"Shot {shot}",
                 valid_filter=self.valid_filter,
                 transient_filter=self.transient_filter,

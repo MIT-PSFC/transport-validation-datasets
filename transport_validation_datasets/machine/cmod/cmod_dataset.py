@@ -105,6 +105,10 @@ class CModDataWorkflow(DataWorkflow):
                 unprocessed_shots += 1
                 continue
 
+            if self.shot_already_failed(shot):
+                logger.info(f"Shot {shot} failed on a previous run. Skipping.")
+                continue
+
             # Get data for this shot using disruption-py.
             # Three datasets created separately due to timebase differences:
             # fast 0D signals (Ip, B0, shaping, density, power, all native 1 kHz),
@@ -119,10 +123,12 @@ class CModDataWorkflow(DataWorkflow):
             ):
                 ds = getter(shot)
                 if ds is None:
+                    reason = f"Missing retrievable {name} data."
                     logger.warning(
                         f"Shot {shot} is missing retrievable {name} data. "
                         "Skipping unprocessed data file creation."
                     )
+                    self.record_failed_shot(shot, reason)
                     missing = True
                     break
                 datasets.append(ds)
@@ -136,6 +142,7 @@ class CModDataWorkflow(DataWorkflow):
                 logger.warning(
                     f"Shot {shot} is missing critical signals. Skipping unprocessed data file creation."
                 )
+                self.record_failed_shot(shot, "Missing critical signals.")
                 continue
 
             ds_unprocessed = self.filter_and_plot(ds_standardized)
@@ -143,6 +150,7 @@ class CModDataWorkflow(DataWorkflow):
                 logger.warning(
                     f"Shot {shot} did not pass filtering. Skipping unprocessed data file creation."
                 )
+                self.record_failed_shot(shot, "Did not pass filtering.")
                 continue
 
             ds_unprocessed.to_netcdf(unprocessed_ds_path)
