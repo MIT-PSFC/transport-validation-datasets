@@ -221,3 +221,4 @@ __marimo__/
 ref/
 scratch/
 .vscode/
+transport_validation_datasets/tests/test_outputs

@@ -161,7 +161,8 @@ def plot_unprocessed_data(
     ax_ne.set_ylim(_signal_ylim(ne_signals))
 
     # Dots at 0 for time indices where the TS profiles have data
-    if "ts_channel_n_e" in ds:
+    # No ts_channel dim means the TS retrieval failed and the column is all NaN
+    if "ts_channel_n_e" in ds and "ts_channel" in ds["ts_channel_n_e"].dims:
         fresh_profiles = ds["ts_channel_n_e"].notnull().any(dim="ts_channel")
         ax_ne.plot(
             time,

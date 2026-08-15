@@ -87,7 +87,7 @@ class CModDataWorkflow(DataWorkflow):
         """
         unprocessed_shots = 0
         for shot in self.shotlist:
-            if unprocessed_shots >= self.max_num_shots:
+            if self.max_num_shots and (unprocessed_shots >= self.max_num_shots):
                 logger.info(
                     f"Reached maximum number of unprocessed shots ({self.max_num_shots}). Stopping."
                 )
@@ -138,7 +138,7 @@ class CModDataWorkflow(DataWorkflow):
             logger.info(f"Created unprocessed data file for shot {shot}.")
             unprocessed_shots += 1
 
-    def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset:
+    def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
         """Rename signals to IMAS-like names, keeping freeqdsk names for EFIT signals.
 
         All signals stay in SI units. Plasma current and toroidal field are stored
@@ -148,7 +148,8 @@ class CModDataWorkflow(DataWorkflow):
             ds: Merged dataset with disruption-py signal names.
 
         Returns:
-            Dataset with standardized signal names.
+            Dataset with standardized signal names, or None if the shot is missing
+            critical signals.
         """
         # disruption-py signal name -> IMAS-like name
         imas_rename = {
@@ -177,6 +178,13 @@ class CModDataWorkflow(DataWorkflow):
         }
 
         ds = ds.rename({k: v for k, v in imas_rename.items() if k in ds})
+
+        # TS profiles are the point of the dataset. When get_thomson_channels fails,
+        # disruption-py still fills its declared columns, but with NaN on the 0D
+        # timebase, so there is no ts_channel dim to plot or fit
+        if "ts_channel_n_e" not in ds or "ts_channel" not in ds["ts_channel_n_e"].dims:
+            logger.warning("No Thomson scattering channels retrieved for this shot.")
+            return None
 
         # C-Mod has no NBI, zero where ip is valid
         if "ip" in ds:
