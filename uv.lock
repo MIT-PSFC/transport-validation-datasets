@@ -2007,7 +2007,9 @@ dependencies = [
     { name = "freeqdsk" },
     { name = "matplotlib" },
     { name = "mkgp" },
+    { name = "numpy" },
     { name = "pre-commit" },
+    { name = "scipy" },
 ]
 
 [package.dev-dependencies]
@@ -2028,8 +2030,10 @@ requires-dist = [
     { name = "disruption-py", specifier = ">=0.14.0" },
     { name = "freeqdsk", specifier = ">=0.5.2" },
     { name = "matplotlib", specifier = ">=3.11.1" },
-    { name = "mkgp", specifier = ">=3.1.4" },
+    { name = "mkgp", specifier = "==3.1.4" },
+    { name = "numpy", specifier = ">=1.26" },
     { name = "pre-commit", specifier = ">=4.6.2" },
+    { name = "scipy", specifier = ">=1.14" },
 ]
 
 [package.metadata.requires-dev]

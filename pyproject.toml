@@ -8,8 +8,10 @@ dependencies = [
     "disruption-py>=0.14.0",
     "freeqdsk>=0.5.2",
     "matplotlib>=3.11.1",
-    "mkgp>=3.1.4",
+    "mkgp==3.1.4",
+    "numpy>=1.26",
     "pre-commit>=4.6.2",
+    "scipy>=1.14",
 ]
 
 [dependency-groups]
@@ -54,6 +56,10 @@ convention = "google"
 
 [tool.pytest.ini_options]
 testpaths = ["transport_validation_datasets/tests"]
+markers = [
+    "slow: deselected by default, run with -m slow",
+]
+addopts = "-m 'not slow'"
 filterwarnings = [
     "ignore::RuntimeWarning:disruption_py.*",
     "ignore::FutureWarning:disruption_py.*",

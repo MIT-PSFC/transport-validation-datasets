@@ -275,3 +275,209 @@ def plot_unprocessed_data(
     fig_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(fig_path)
     plt.close(fig)
+
+
+def _fit_mean_ylim(fit_mean: np.ndarray, fallback: float, pad: float = 1.05) -> float:
+    """Compute the top y-limit for a TS fit panel.
+
+    A little over the largest GP fit mean, computed across the whole shot so
+    every page shares the same axis.
+
+    Args:
+        fit_mean: (n_t, n_x) fitted profiles of the shot.
+        fallback: Limit to use when the fit is all-NaN or non-positive.
+        pad: Multiplicative headroom above the largest fit value.
+
+    Returns:
+        The top y-limit.
+    """
+    hi = float(np.nanmax(fit_mean)) if np.isfinite(fit_mean).any() else np.nan
+    if not np.isfinite(hi) or hi <= 0:
+        return fallback
+    return hi * pad
+
+
+# Panel labels for the TS fit diagnostic, keyed by the fit_output variable
+# prefix: (prefix, profile label, gradient label, fallback y-limit).
+_TS_FIT_PANELS = (
+    ("te", "Te [keV]", "dTe/drho [keV]", 5.0),
+    ("ne", "ne [1e20 m^-3]", "dne/drho [1e20 m^-3]", 1.8),
+)
+
+
+def _plot_fit_band(ax, x: np.ndarray, y: np.ndarray, err: np.ndarray, label: str):
+    """Plot a fit mean plus its +-1 sigma band over the finite part of the grid.
+
+    Args:
+        ax: Axes to plot on.
+        x: rho grid.
+        y: Fit mean.
+        err: 1-sigma band half-width.
+        label: Legend label of the mean line.
+    """
+    valid = np.isfinite(y)
+    if not valid.any():
+        return
+    ax.plot(x[valid], y[valid], color="black", label=label)
+    ax.fill_between(
+        x[valid],
+        (y - err)[valid],
+        (y + err)[valid],
+        color="black",
+        alpha=0.2,
+        label="GP +-1 sigma",
+    )
+
+
+def _style_ts_panel(ax, ylabel: str, title: str):
+    """Apply the shared TS fit panel styling.
+
+    Args:
+        ax: Axes to style.
+        ylabel: Y-axis label.
+        title: Panel title.
+    """
+    ax.set_xlabel("rho")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8)
+
+
+def plot_ts_fits(
+    pdf_path: Path | str,
+    shot: int,
+    ts_time: np.ndarray,
+    rho_ch: np.ndarray,
+    channel_data: dict[str, tuple[np.ndarray, np.ndarray]],
+    fit_output,
+    rho_fit: np.ndarray,
+    channel_groups: list[tuple[np.ndarray, str, str]] | None = None,
+    max_pages: int = 20,
+) -> int:
+    """Save a PDF comparing the GP fits to the raw TS measurements of one shot.
+
+    One page per sampled measurement time, 2x2 panels: Te (top left) and ne
+    (top right) with the channel data, GP fit mean and +-1 sigma predictive
+    band, then the GP gradients d/drho with their +-1 sigma bands below.
+    Fitted hyperparameters are annotated on the profile panels when the
+    method provides them.
+
+    Args:
+        pdf_path: Destination PDF path.
+        shot: Shot number, for the page titles.
+        ts_time: (n_t,) measurement times [s].
+        rho_ch: (n_t, n_ch) channel rho locations, NaN where invalid.
+        channel_data: {"te": (y, err), "ne": (y, err)}, each (n_t, n_ch), in
+            the same units the fit consumed (Te [keV], ne [1e20 m^-3]).
+        fit_output: ShotFitOutput whose rows align with ts_time.
+        rho_fit: (n_x,) rho grid the fits were predicted on.
+        channel_groups: Optional (mask, color, label) triples to split the
+            channels by diagnostic; one blue "raw TS" group when None. A mask
+            is (n_ch,) for a fixed split (C-Mod core vs edge Thomson) or
+            (n_t, n_ch) when the split varies per slice.
+        max_pages: Sample the fitted slices down to at most this many pages.
+
+    Returns:
+        The number of pages written; a shot with no fitted slice writes an
+        empty PDF.
+    """
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    pdf_path = Path(pdf_path)
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Only page over slices where the fit produced a real profile. Times with
+    # too few channels (or culled fits) are all-NaN and the panels would come
+    # out blank.
+    has_fit = np.isfinite(fit_output.te_fit).any(axis=-1) | np.isfinite(
+        fit_output.ne_fit
+    ).any(axis=-1)
+    live = np.flatnonzero(has_fit)[:: max(1, np.count_nonzero(has_fit) // max_pages)]
+
+    n_ch = rho_ch.shape[1]
+    groups = (
+        channel_groups
+        if channel_groups is not None
+        else [(np.ones(n_ch, dtype=bool), "tab:blue", "raw TS")]
+    )
+    ylims = {
+        var: _fit_mean_ylim(getattr(fit_output, f"{var}_fit"), fallback=fallback)
+        for var, _, _, fallback in _TS_FIT_PANELS
+    }
+
+    with PdfPages(pdf_path) as pdf:
+        for i_time in live:
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            title = f"shot {shot}  t={ts_time[i_time]:.3f} s"
+            for i_var, (var, label, grad_label, _) in enumerate(_TS_FIT_PANELS):
+                data_y, err_y = (arr[i_time, :] for arr in channel_data[var])
+                rho_at_t = rho_ch[i_time, :]
+
+                ax = axes[0, i_var]
+                for mask, color, name in groups:
+                    mask_at_t = mask[i_time, :] if mask.ndim == 2 else mask
+                    valid = (
+                        mask_at_t
+                        & np.isfinite(rho_at_t)
+                        & np.isfinite(data_y)
+                        & np.isfinite(err_y)
+                    )
+                    if valid.any():
+                        ax.errorbar(
+                            rho_at_t[valid],
+                            data_y[valid],
+                            yerr=err_y[valid],
+                            fmt="o",
+                            ms=4,
+                            color=color,
+                            label=name,
+                            zorder=3,
+                        )
+                _plot_fit_band(
+                    ax,
+                    rho_fit,
+                    getattr(fit_output, f"{var}_fit")[i_time, :],
+                    getattr(fit_output, f"{var}_std")[i_time, :],
+                    "GP fit",
+                )
+                ax.set_ylim(bottom=0, top=ylims[var])
+                _style_ts_panel(ax, label, title)
+                # The annotation layout is mkgp-specific (5 hyperparameters);
+                # other methods' diagnostics are skipped here.
+                hyps_all = getattr(fit_output, f"{var}_hyps")
+                if (
+                    hyps_all is not None
+                    and hyps_all.shape[1] == 5
+                    and np.isfinite(hyps_all[i_time]).all()
+                ):
+                    var_h, l1, l2, lw, x0 = hyps_all[i_time]
+                    ax.text(
+                        0.98,
+                        0.98,
+                        f"var={var_h:.2f}  l1={l1:.2f}  l2={l2:.2f}\n"
+                        f"lw={lw:.2f}  x0={x0:.2f}",
+                        transform=ax.transAxes,
+                        ha="right",
+                        va="top",
+                        fontsize=7,
+                        family="monospace",
+                    )
+
+                ax = axes[1, i_var]
+                _plot_fit_band(
+                    ax,
+                    rho_fit,
+                    getattr(fit_output, f"{var}_grad")[i_time, :],
+                    getattr(fit_output, f"{var}_grad_std")[i_time, :],
+                    "GP gradient",
+                )
+                ax.axhline(0.0, color="gray", lw=0.8, alpha=0.5)
+                _style_ts_panel(ax, grad_label, title)
+
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    return len(live)
