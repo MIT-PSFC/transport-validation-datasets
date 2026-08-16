@@ -1,4 +1,5 @@
 import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -141,6 +142,7 @@ class TestGPFit:
         for shot in workflow.shotlist[:max_num_shots]:
             assert shot in results["shot"].values, f"GP fit results missing shot {shot}"
 
+    @staticmethod
     def _ssh_host_configured(alias: str) -> bool:
         # True if ~/.ssh/config has a Host entry naming this alias
         cfg = Path.home() / ".ssh" / "config"
@@ -163,9 +165,27 @@ class TestGPFit:
         max_num_shots = 1
         cluster_config = ClusterFitConfig(
             ssh_host="orcd-login",
-            partitions="sched_mit_psfc_r8",
+            partitions="sched_mit_psfc_r8@8:00:00",
             job_name_prefix="test_gpfit",
+            remote_workdir="/home/zkeith/orcd/scratch/tests/transport_validation_datasets/test_dispatched",
+            venv_path="/home/zkeith/orcd/scratch/tests/transport_validation_datasets/.venv",
+            shots_per_batch=1,
         )
+
+        # Delete all files (minus the venv) in the remote workdir to ensure a clean test environment
+        subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                cluster_config.ssh_host,
+                f"mkdir -p {cluster_config.remote_workdir} && "
+                f"cd {cluster_config.remote_workdir} && "
+                "find . -mindepth 1 -maxdepth 1 ! -name '.venv' -exec rm -rf {} +",
+            ],
+            check=True,
+        )
+
         workflow = cmod_workflow(
             test_dir, max_num_shots=max_num_shots, cluster_config=cluster_config
         )
@@ -208,4 +228,56 @@ class TestGPFit:
         assert results_path.exists(), "Collected GP fit results file does not exist"
         results = xr.open_dataset(results_path)
         for shot in workflow.shotlist[:max_num_shots]:
+            assert shot in results["shot"].values, f"GP fit results missing shot {shot}"
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(
+        not _ssh_host_configured("orcd-login"),
+        reason="no orcd-login entry in ~/.ssh/config",
+    )
+    @pytest.mark.parametrize("method", ["zk"])
+    def test_dispatched_20(self, method: str):
+        # check that GP fitting can be done via the dispatcher on a cluster for many full shots
+        test_dir = self.test_dir / "test_dispatched_20" / method
+        max_num_shots = 20
+        cluster_config = ClusterFitConfig(
+            ssh_host="orcd-login",
+            partitions="sched_mit_psfc_r8@8:00:00",
+            job_name_prefix="test_gpfit",
+            remote_workdir="/home/zkeith/orcd/scratch/tests/transport_validation_datasets/test_dispatched_20",
+            venv_path="/home/zkeith/orcd/scratch/tests/transport_validation_datasets/.venv",
+            shots_per_batch=4,
+        )
+
+        # Delete all files (minus the venv) in the remote workdir to ensure a clean test environment
+        subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                cluster_config.ssh_host,
+                f"mkdir -p {cluster_config.remote_workdir} && "
+                f"cd {cluster_config.remote_workdir} && "
+                "find . -mindepth 1 -maxdepth 1 ! -name '.venv' -exec rm -rf {} +",
+            ],
+            check=True,
+        )
+
+        workflow = cmod_workflow(
+            test_dir, max_num_shots=max_num_shots, cluster_config=cluster_config
+        )
+
+        workflow.make_unprocessed_data_files()
+        workflow.run_gp_fitting(method=method)
+
+        # Check that every shot with an unprocessed data file made it into the
+        # collected fit results (shots skipped at the unprocessed stage do not count)
+        unprocessed_shots = sorted(
+            int(p.stem) for p in workflow.unprocessed_data_dir.glob("*.nc")
+        )
+        assert unprocessed_shots, "No unprocessed data files were created"
+        results_path = workflow.fit_results_dir / method / "fit_results.nc"
+        assert results_path.exists(), "Collected GP fit results file does not exist"
+        results = xr.open_dataset(results_path)
+        for shot in unprocessed_shots:
             assert shot in results["shot"].values, f"GP fit results missing shot {shot}"
