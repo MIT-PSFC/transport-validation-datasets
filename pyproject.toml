@@ -6,12 +6,15 @@ readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "disruption-py>=0.14.0",
+    "fire>=0.7.1",
     "freeqdsk>=0.5.2",
     "matplotlib>=3.11.1",
     "mkgp==3.1.4",
     "numpy>=1.26",
     "pre-commit>=4.6.2",
+    "s3fs>=2026.7.0",
     "scipy>=1.14",
+    "zarr>=3.1.5",
 ]
 
 [dependency-groups]

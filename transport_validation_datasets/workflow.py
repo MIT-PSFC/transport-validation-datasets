@@ -1,4 +1,5 @@
 import os
+import shutil
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -439,6 +440,31 @@ class DataWorkflow(ABC):
             dispatcher.run(batches)
         self.collect_fit_results(method)
         self.plot_fit_results(method)
+
+    def clean_fit_state(self, method: str):
+        """Delete every staged fit batch so the next run refits from scratch.
+
+        Destructive: fits already computed are lost, unprocessed data files are
+        untouched. With a cluster_config this also cancels the dataset's queued
+        jobs and clears its remote batch files, which a from-scratch cluster
+        fit needs: otherwise the next run adopts the cancelled jobs or pulls
+        back the leftover results (see ClusterFitDispatcher.clean).
+
+        Args:
+            method: Fitting method name, part of the cluster job names.
+        """
+        if self.cluster_config is not None:
+            from transport_validation_datasets.gp_fitting.dispatcher import (
+                ClusterFitDispatcher,
+            )
+
+            dispatcher = ClusterFitDispatcher(
+                self.cluster_config, self.ds_name, self.fit_batches_dir, method
+            )
+            dispatcher.clean()
+        elif self.fit_batches_dir.exists():
+            shutil.rmtree(self.fit_batches_dir)
+        logger.info(f"Cleaned fit staging state in {self.fit_batches_dir}")
 
     def stage_fit_batches(self, shots: list[int]) -> dict[str, list[int]]:
         """Stage fit inputs for the given shots into batch npz files.
