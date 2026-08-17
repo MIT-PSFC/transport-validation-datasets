@@ -6,10 +6,10 @@ module-level entry points:
     fit_batch(batch: FitBatch, num_workers: int = 1) -> dict[int, ShotFitOutput]
     main(argv: list[str] | None = None)
 
-main is the cluster CLI (`python -m ...worker_x input.npz output.npz
---num-workers N`); run_worker_cli implements it once for all workers.
+main is the cluster CLI that run_worker_cli implements once for all workers.
+(`python -m ...worker_x input.npz output.npz --num-workers N`)
 map_slices implements the per-(shot, time slice) fan-out for workers whose
-method fits slices independently; a worker with a different structure can
+method fits slices independently. A worker with a different structure can
 ignore it and implement fit_batch directly.
 
 Diagnostics use print (not loguru) on purpose: workers run on the cluster

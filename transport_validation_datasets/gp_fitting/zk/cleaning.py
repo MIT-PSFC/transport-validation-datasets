@@ -25,14 +25,10 @@ from transport_validation_datasets.gp_fitting.zk.kernel import build_kernel
 # An isolated channel whose error bar is many times its rho-neighbors' poisons
 # the heteroscedastic noise model: the HSGP error kernel smooths error bars in
 # rho, so one huge-error channel inflates the effective noise of every channel
-# near it and the fit goes slack across that region (C-Mod 1160810001
-# t=1.22 s: a 2.5 +- 0.74 garbage edge channel let the ne fit ignore ten
-# consecutive falling channels and hold a plateau over them). The comparison
-# is on ABSOLUTE errors: a relative-to-value rule flags honest low-value SOL
+# near it and the fit goes slack across that region.
+# The comparison is on ABSOLUTE errors: a relative-to-value rule flags low-value SOL
 # points (large relative error is normal there), while the absolute ratio
 # leaves them alone and MAST's uniform fractional errors almost never trip it
-# (measured: MAST 0.03% of points - value spikes whose synthetic error scales
-# with the value - vs C-Mod 0.4%, all in the garbage-channel class).
 _ERR_OUTLIER_FACTOR = 5.0
 _ERR_OUTLIER_HALFWIDTH = 0.1
 _ERR_OUTLIER_MIN_NEIGHBORS = 3

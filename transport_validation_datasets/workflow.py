@@ -443,10 +443,10 @@ class DataWorkflow(ABC):
     def stage_fit_batches(self, shots: list[int]) -> dict[str, list[int]]:
         """Stage fit inputs for the given shots into batch npz files.
 
-        Shots already covered by an existing batch file keep their batch (and
-        with it the batch id a restarted cluster run lines up on); the rest
-        are packed into new batches. A shot whose prepare_fit_input returns
-        None is recorded as failed and skipped on later runs.
+        Shots already covered by an existing batch file keep their batch
+        (and with it the batch id a restarted cluster run lines up on),
+        the rest are packed into new batches.
+        A shot whose prepare_fit_input returns None is recorded as failed and skipped on later runs.
 
         Args:
             shots: Shot numbers with unprocessed data files.
@@ -520,9 +520,9 @@ class DataWorkflow(ABC):
         """Collect every batch's fit results into one dataset on disk.
 
         Rebuilt from the batch result files on every call (cheap) and written
-        atomically to fit_results_dir/<method>/fit_results.nc. Profiles are
-        converted back from the fit units to SI (Te [eV], ne [m^-3]) to match
-        the unprocessed files' conventions; gradients are per unit rho.
+        atomically to fit_results_dir/<method>/fit_results.nc
+        Profiles are converted back from the fit units to SI (Te [eV], ne [m^-3])
+        to match the unprocessed files' conventions, gradients are per unit rho.
         Batches without a result file yet are skipped with a warning, so a
         partially fit dataset still collects.
 

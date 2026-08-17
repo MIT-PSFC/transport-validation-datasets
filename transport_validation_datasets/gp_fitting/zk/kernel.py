@@ -24,20 +24,6 @@ from transport_validation_datasets.gp_fitting.batch_io import FitBounds
 HYP_START = np.array([2.0, 0.8, 0.4, 0.1, 1.0])
 # Bounds define the optimizer's random-restart ranges (drawn uniform in log10)
 HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.2, 0.05, 0.95], [2.0e1, 0.9, 0.5, 0.2, 1.05]])
-# The x0 lower bound is device-dependent (FitBounds.x0_min, staged per batch):
-# edge-peaked MAST ne (early-time edge accumulation, e.g. 28978 t=0.26) has
-# its sharp structure at rho 0.85-0.95, and with the transition center held
-# at 0.95+ only the long core length scale covers that region, flattening a
-# data-supported edge peak into a shelf - MAST runs 0.85. C-Mod keeps the
-# default 0.95: its pedestals live at 0.95-1.05 and widening the restart
-# range there just dilutes the draws into late-pedestal basins (round-5
-# sample validation, 2026-07-30 stupid_fits audit).
-# The l1 (core length scale) floor is likewise device-dependent
-# (FitBounds.l1_min): 0.4 keeps a stiff core that cannot chase channel
-# scatter, but is too stiff to bend down-up-down through a hollow MAST ne
-# profile - the fit rounds off the off-axis crest. MAST runs 0.2 (crest bias
-# gone, monotonic control fits unchanged, icddps2 audit 2026-07); C-Mod runs
-# 0.35 for te and 0.55 for ne.
 
 # Error kernel (heteroscedastic noise model): a squared-exponential GP is fit
 # to the input error bars themselves (mkgp's HSGP path, make_HSGP_errors).
@@ -45,9 +31,9 @@ HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.2, 0.05, 0.95], [2.0e1, 0.9, 0.5, 0.2, 1.
 # ones, and predictions get a rho-varying noise estimate, so the reported
 # predictive std widens where the data is genuinely noisy (sparse fat-error
 # core) and narrows across dense precise channels - instead of the constant
-# RMS-of-errors band mkgp falls back to without an error kernel. Hyps:
-# [amplitude, length scale] on scale_per_slice-normalized data (errors are
-# O(0.01-0.3)). Length scale floor 0.2 keeps the noise model a smooth radial
+# RMS-of-errors band mkgp falls back to without an error kernel.
+# Hyps: [amplitude, length scale] on scale_per_slice-normalized data (errors are O(0.01-0.3)).
+# Length scale floor 0.2 keeps the noise model a smooth radial
 # trend rather than chasing individual channels' error bars.
 ERR_HYP_START = np.array([0.1, 0.5])
 ERR_HYP_BOUNDS = np.array([[1.0e-3, 0.2], [1.0, 1.5]])
@@ -123,13 +109,12 @@ class Tanh_WarpingFunction(_WarpingFunction):
 def build_kernel(hyperparams: np.ndarray | None = None) -> Gibbs_Kernel:
     """Build the Gibbs kernel with the tanh warp.
 
-    Bound enforcement is turned on for both the kernel and its warp. mkgp's
-    gradient-ascent optimizer never clamps to kbounds, so without this the
-    hyperparameters can wander out of the physical region into the degenerate
-    "all noise" fit (amplitude -> 0, edge length scale -> inf, profile pulled
-    to ~0). Enforcement also lets run_gp pin the pedestal location by
-    narrowing the x0 bounds. set_kernel/__copy__ both preserve the enforce
-    flag.
+    Bound enforcement is turned on for both the kernel and its warp.
+    mkgp's gradient-ascent optimizer never clamps to kbounds, so without this the
+    hyperparameters can become a degenerate "all noise" fit
+    (amplitude -> 0, edge length scale -> inf, profile pulled to ~0).
+    Enforcement also lets run_gp pin the pedestal location by narrowing the x0 bounds.
+    set_kernel/__copy__ both preserve the enforce flag.
 
     Args:
         hyperparams: [var, l1, l2, lw, x0] to build at; None uses HYP_START.
@@ -183,15 +168,13 @@ def pinned_hyperparams(hyps: np.ndarray, kbounds: np.ndarray) -> bool:
 
     Flags only pins a differently-seeded restart could plausibly escape.
     Bound enforcement (build_kernel) keeps a bad restart out of the degenerate
-    collapse mkgp is prone to (amplitude -> 0, edge scale -> infinity). A
-    hyperparameter still sitting at that bound after optimization means the
+    collapse mkgp is prone to (amplitude -> 0, edge scale -> infinity).
+    A hyperparameter still sitting at that bound after optimization means the
     search ran out of room rather than converging, so run_gp retries from a
     different restart.
 
-    Two edges are excluded because a retry provably re-lands on them (measured
-    on a real shot: x0 pinned in 10/10 sampled slices, l2's ceiling in half,
-    every retry re-landing, tripling fit time for no change):
-    - x0 (pedestal location): its bounds are tight by design, not slack.
+    Two edges are excluded because a retry typically re-lands on them
+    - x0 (pedestal location): bounds are tight by design
     - l2's ceiling: with x0 held near the edge there is often no short-scale
       structure left beyond it, so a long, smooth l2 is the right answer.
 
@@ -217,22 +200,18 @@ def pinned_hyperparams(hyps: np.ndarray, kbounds: np.ndarray) -> bool:
 
 
 def deterministic_seed(*arrays: np.ndarray, salt: int = 0) -> int:
-    """Derive a stable RNG seed from the fit's own input data, not call order.
+    """Derive a stable RNG seed from the fit's own input data.
 
-    mkgp draws its optimizer restarts from the global numpy RNG (see
-    GaussianProcess.GPRFit), so without reseeding a fit's result depends on
-    whatever else already consumed random draws earlier in the process: slice
-    processing order in serial mode, or multiprocessing.Pool scheduling and
-    fork-inherited RNG state in parallel mode. Hashing the fit's own inputs
-    makes every fit reproducible regardless of how the batch happens to be
-    scheduled.
+    Hashing the fit's own inputs makes every fit reproducible
+    regardless of how the batch happens to be scheduled.
 
     Args:
         *arrays: The fit's input arrays; hashed as float64 bytes.
         salt: Distinguishes retry attempts on the same input.
 
     Returns:
-        32-bit seed for np.random.seed.
+        32-bit seed for np.random.seed
+
     """
     h = hashlib.sha256()
     for arr in arrays:

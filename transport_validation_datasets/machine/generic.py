@@ -175,8 +175,7 @@ def _lcfs_crossing_radius(
         psi_n_from_axis: Normalized poloidal flux at those radii.
 
     Returns:
-        The linearly interpolated crossing radius [m], or NaN if psi_n never
-        reaches 1.
+        The linearly interpolated crossing radius [m], or NaN if psi_n never reaches 1.
     """
     above = psi_n_from_axis >= 1.0
     if not above.any():
@@ -188,7 +187,8 @@ def _lcfs_crossing_radius(
     p0, p1 = float(psi_n_from_axis[idx - 1]), float(psi_n_from_axis[idx])
     if p1 == p0:
         return r1
-    return r0 + (1.0 - p0) * (r1 - r0) / (p1 - p0)
+    r_cross = r0 + (1.0 - p0) * (r1 - r0) / (p1 - p0)
+    return r_cross
 
 
 def _refine_axis_radius(
@@ -196,8 +196,9 @@ def _refine_axis_radius(
 ) -> float:
     """Refine the magnetic axis radius from the midplane psi_n minimum.
 
-    Parabola-refined around the grid minimum, since the EFIT grid is coarse
-    (a few cm).
+    When defining rho = (r - r_axis) / (r_lcfs - r_axis), must know where the axis is.
+    EFIT grid can be coarse (a few cm), so may get rho errors ~ 5% (worst in the core).
+    Here, use a simple 3-point parabola fit to refine the axis radius.
 
     Args:
         r_grid: Midplane radii [m].
@@ -227,12 +228,12 @@ def _refine_axis_radius(
 def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
     """Map TS channel (R, Z) positions onto normalized minor radius per slice.
 
-    rho is the normalized outboard midplane minor radius (0 = axis, 1 = LCFS),
+    rho is the normalized minor radius (0 = axis, 1 = LCFS),
     each channel's psi_n (bilinear interpolation of the equilibrium's psirz at the channel position)
     is inverted through the midplane psi_n profile at the magnetic axis height to the outboard
-    midplane radius, then normalized by the axis-to-LCFS distance. Only the
-    outboard inversion branch is used: mapping through psi_n always lands a
-    channel on the outboard side, regardless of which side it was measured on.
+    midplane radius, then normalized by the axis-to-LCFS distance.
+    Choice to use outboard midplane is arbitrary, could use any line from magnetic axis to the LCFS.
+    This one is convenient though because it is one dimension (R) and increases with psi.
 
     Only times with at least one finite TS value are mapped.
     A slice whose equilibrium is missing or degenerate keeps a NaN rho row,
@@ -250,15 +251,12 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     if "shot" in ds_shot.dims:
         ds_shot = ds_shot.squeeze("shot", drop=True)
 
-    ts_values = (
-        ds_shot["ts_channel_t_e"].notnull() | ds_shot["ts_channel_n_e"].notnull()
-    )
-    ts_mask = ts_values.any(dim="ts_channel").transpose("time").values
-    ts_idx = np.flatnonzero(ts_mask)
-    ts_times = ds_shot["time"].values[ts_idx]
+    ts_valid = ds_shot["ts_channel_t_e"].notnull() | ds_shot["ts_channel_n_e"].notnull()
+    ts_mask = ts_valid.any(dim="ts_channel").transpose("time").values
+    ts_idxs = np.flatnonzero(ts_mask)  # Indices where TS exists
+    ts_times = ds_shot["time"].values[ts_idxs]
 
-    # Slice via named dims: the on-disk dim order of the merged file differs
-    # from the retrieval-time order.
+    # guarantee load has correct array layout with explicit named dimension transpose
     psirz = ds_shot["psirz"].transpose("time", "r_grid", "z_grid").values
     simagx = ds_shot["simagx"].transpose("time").values
     sibdry = ds_shot["sibdry"].transpose("time").values
@@ -268,20 +266,21 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     r_grid = ds_shot["r_grid"].values
     z_grid = ds_shot["z_grid"].values
 
-    rho = np.full((ts_idx.size, ts_r.shape[1]), np.nan)
+    rho = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
     n_no_equilibrium = 0
-    for row, i_t in enumerate(ts_idx):
-        denom = sibdry[i_t] - simagx[i_t]
-        psi_slice = psirz[i_t]
+    for i, ts_idx in enumerate(ts_idxs):
+        # get psi_n at for this timeslice
+        psi_range = sibdry[ts_idx] - simagx[ts_idx]
+        psi_slice = psirz[ts_idx]
         if (
-            not np.isfinite(denom)
-            or np.abs(denom) < 1e-10
-            or not np.isfinite(zmagx[i_t])
-            or not np.all(np.isfinite(psi_slice))
+            not np.isfinite(psi_range)  # psi range NaN or inf
+            or np.abs(psi_range) < 1e-10  # psi range too small to be physical
+            or not np.isfinite(zmagx[ts_idx])  # Z magnetic axis NaN or inf
+            or not np.all(np.isfinite(psi_slice))  # psi slice has NaN or inf
         ):
             n_no_equilibrium += 1
             continue
-        psi_n_grid = (psi_slice - simagx[i_t]) / denom
+        psi_n_grid = (psi_slice - simagx[ts_idx]) / psi_range
 
         # Channel psi_n at the measured (R, Z)
         # NaN positions or positions off the grid stay NaN.
@@ -289,37 +288,35 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
             (r_grid, z_grid), psi_n_grid, bounds_error=False, fill_value=np.nan
         )
         with np.errstate(invalid="ignore"):
-            psi_n_ch = interp(np.column_stack([ts_r[i_t], ts_z[i_t]]))
+            psi_n_ch = interp(np.column_stack([ts_r[ts_idx], ts_z[ts_idx]]))
 
         # psi_n along the midplane (z = magnetic axis height)
         psi_n_mid = np.array(
             [
-                np.interp(zmagx[i_t], z_grid, psi_n_grid[j, :])
+                np.interp(zmagx[ts_idx], z_grid, psi_n_grid[j, :])
                 for j in range(len(r_grid))
             ]
         )
         i_axis = int(np.argmin(psi_n_mid))
         r_axis = _refine_axis_radius(r_grid, psi_n_mid, i_axis)
-        r_lcfs_out = _lcfs_crossing_radius(r_grid[i_axis:], psi_n_mid[i_axis:])
-        if not np.isfinite(r_lcfs_out) or r_lcfs_out <= r_axis:
+        r_lcfs_outboard = _lcfs_crossing_radius(r_grid[i_axis:], psi_n_mid[i_axis:])
+        if not np.isfinite(r_lcfs_outboard) or r_lcfs_outboard <= r_axis:
             n_no_equilibrium += 1
             continue
 
-        # Invert psi_n to the outboard midplane radius. The outboard branch is
-        # monotone increasing inside the LCFS but can fold in the far SOL, so
-        # keep only its running-maximum points; channels beyond the last kept
-        # psi_n clamp to the grid edge and are cut later by the rho > 1
-        # cleaning.
-        psi_out = psi_n_mid[i_axis:]
-        r_out = r_grid[i_axis:]
-        keep = psi_out == np.maximum.accumulate(psi_out)
-        r_mid_ch = np.interp(psi_n_ch, psi_out[keep], r_out[keep])
+        # Map each channel's psi_n to the outboard midplane radius, then normalize to rho.
+        psi_outboard = psi_n_mid[i_axis:]
+        r_outboard = r_grid[i_axis:]
+        keep = psi_outboard == np.maximum.accumulate(
+            psi_outboard
+        )  # Ensure monotonicity for interp
+        r_mid_ch = np.interp(psi_n_ch, psi_outboard[keep], r_outboard[keep])
         with np.errstate(invalid="ignore"):
-            rho[row, :] = (r_mid_ch - r_axis) / (r_lcfs_out - r_axis)
+            rho[i, :] = (r_mid_ch - r_axis) / (r_lcfs_outboard - r_axis)
 
     if n_no_equilibrium:
         logger.debug(
-            f"No usable equilibrium at {n_no_equilibrium} of {ts_idx.size} TS slices"
+            f"No usable equilibrium at {n_no_equilibrium} of {ts_idxs.size} TS slices"
         )
     return ts_times, rho
 

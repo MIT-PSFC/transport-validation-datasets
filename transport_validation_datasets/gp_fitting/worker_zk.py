@@ -1,27 +1,23 @@
 """GP profile fitting with mkgp (Gibbs kernel, tanh-warped length scale).
 
-The method: each (shot, time slice) is fit independently, ne first, and when
+Each (shot, time slice) is fit independently, ne first, and when
 the ne fit resolves a clear pedestal location its x0 pins the Te fit's, so
-both profiles place the high-gradient region at the same rho (density is the
-cleaner pedestal indicator in C-Mod H-mode). Each variable's fit runs the
-cleaning pipeline (cleaning.py), the GP fit with edge boundary conditions and
-monotonic-edge repair (gp.py), and the nonphysical-fit checks with up to two
-repairs (quality.py; see _fit_variable).
+both profiles place the high-gradient region at the same rho
+(density is the cleaner pedestal indicator in C-Mod H-mode).
+Each variable's fit runs the cleaning pipeline (cleaning.py),
+the GP fit with edge boundary conditions and monotonic-edge repair (gp.py),
+and the nonphysical-fit checks with up to two repairs (quality.py, see _fit_variable).
 
-Runs standalone on the cluster as
-`python -m transport_validation_datasets.gp_fitting.worker_zk
-input.npz output.npz --num-workers N`; the import chain must stay within
-stdlib + numpy + mkgp (see batch_io module docstring).
+Runs standalone on the cluster like so:
+`python -m transport_validation_datasets.gp_fitting.worker_zk input.npz output.npz --num-workers N`
+The import chain must stay within stdlib + numpy + mkgp (see batch_io module docstring)
 """
 
 import os
 
 # Limit BLAS threads before numpy loads so slice-level multiprocessing
-# (fit_batch num_workers) does not oversubscribe cores; mkgp is
-# single-threaded, so one thread per worker is right. Only effective when this
-# module is the program entry point (the cluster `python -m` path). The local
-# pipeline path fits serially in one process, where free BLAS threading is
-# harmless.
+# (fit_batch num_workers) does not oversubscribe cores
+# mkgp is single-threaded, so one thread per worker is right.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -143,15 +139,15 @@ def _fit_variable(
 ) -> VariableFit:
     """Fit one variable of one time slice, with up to two repairs.
 
-    The sequence: first fit; if nonphysical and the pedestal was pinned,
-    retry unpinned (repair 1: pinning can force the optimizer into a
-    pathological basin on sparse-core data - huge variance, invented interior
-    hump, or an amplitude collapse under the bias guard - that the free fit
-    does not have); if still nonphysical with a peak over droppable channels,
-    drop the channels under it (a stray point or a miscalibrated block) and
-    refit once (repair 2); otherwise cull. A peak sitting where there is no
-    data to drop is pure extrapolation ringing, and a biased fit with no peak
-    has no channel subset that repairs it - both cull rather than emit.
+    1: Attempt to fit the variable
+    2: If nonphysical and the pedestal was pinned, retry unpinned
+    (repair a: pinning can force the optimizer into a pathological basin on sparse-core data,
+    huge variance, invented interior hump, or an amplitude collapse under the bias guard,
+    that the free fit does not have)
+    3: if still nonphysical with a peak over droppable channels, retry with fewer channels
+    (repair b: a stray point or a miscalibrated block)
+    4: A peak sitting where there is no data to drop is pure extrapolation ringing,
+    and a biased fit with no peak has no channel subset that repairs it. Both get culled.
 
     Args:
         x: Channel rho positions.
@@ -182,7 +178,7 @@ def _fit_variable(
     if peak is None and not biased:
         return VariableFit(*result, status=STATUS_OK)
 
-    # Repair 1: release the te-to-ne x0 pin and refit.
+    # Repair a: release the te-to-ne x0 pin and refit.
     if pin_x0 is not None:
         result = _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, None)
         if result is None:
@@ -191,7 +187,7 @@ def _fit_variable(
         if peak is None and not biased:
             return VariableFit(*result, status=STATUS_REPAIRED)
 
-    # Repair 2: drop the channels under the nonphysical peak and refit once.
+    # Repair b: drop the channels under the nonphysical peak and refit once.
     if peak is None:
         return _no_fit(STATUS_CULLED)
     drop = valid & (np.abs(x - peak) <= REPAIR_HALFWIDTH)
@@ -213,9 +209,9 @@ def _fit_variable(
 def _fit_slice(task: SliceTask) -> SliceResult:
     """Fit Te and ne for one (shot, time slice).
 
-    ne is fit first; when its pedestal location is clearly resolved it pins
-    Te's, so both profiles place the high-gradient region at the same rho. If
-    the ne pedestal is not clearly resolved, Te is fit freely.
+    ne is fit first; when its pedestal location is clearly resolved it pins Te's,
+    so both profiles place the high-gradient region at the same rho.
+    If the ne pedestal is not clearly resolved, Te is fit freely.
 
     Args:
         task: The slice's channel data and fit settings.

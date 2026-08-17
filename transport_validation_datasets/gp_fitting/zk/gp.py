@@ -32,11 +32,10 @@ from transport_validation_datasets.gp_fitting.zk.quality import (
     rise_is_data_supported,
 )
 
-# Edge boundary conditions, informed by Chilenski 2016. Columns: (rho, value,
-# error). Value BCs pull the profile to ~0 past the separatrix; gradient BCs
-# flatten it at the axis (rho=0) and past the edge. The axis gradient uses a
-# small positive error (mkgp needs a positive diagonal entry to stay
-# invertible).
+# Edge boundary conditions, informed by Chilenski 2016. Columns: (rho, value, error).
+# Value BCs pull the profile to ~0 past the separatrix
+# Gradient BCs flatten it at the axis (rho=0) and past the edge.
+# The axis gradient uses a small positive error (mkgp needs a positive diagonal entry to stay invertible)
 VALUE_BC = np.array(
     [[1.1, 0.0, 0.01], [1.2, 0.0, 0.01], [1.3, 0.0, 0.01], [1.4, 0.0, 0.01]]
 )
@@ -56,8 +55,8 @@ X0_PIN_HALFWIDTH = 1.0e-3
 # Extra optimizer attempts (beyond the first) when a fit pins a hyperparameter
 # at its bound - a different random restart usually escapes the same basin.
 MAX_HYP_RETRIES = 2
-# Optimizer random restarts for a real fit; the cleaning module's rough
-# reference fit runs fewer (its result is only an outlier-judging reference).
+# Optimizer random restarts for a real fit.
+# The cleaning module's rough reference fit runs fewer (only an outlier-judging reference).
 NRESTARTS = 8
 
 
@@ -100,14 +99,14 @@ def run_gp(
     GP predicts at the given (or default start) hyperparameters with no
     optimization.
 
-    The restarts are seeded from the fit's own input data
-    (deterministic_seed), so the result only depends on (data_X, data_y,
-    err_y), never on multiprocessing scheduling or slice processing order.
+    The restarts are seeded from the fit's own input data (deterministic_seed),
+    so the result only depends on (data_X, data_y, err_y),
+    never on multiprocessing scheduling or slice processing order.
     When optimizing, a fit that pins a hyperparameter at its bound
     (pinned_hyperparams) is retried from a fresh, differently-seeded restart
-    set up to hyp_retries times; the attempt with the best log marginal
-    likelihood is kept even if every attempt stays pinned (a genuinely
-    unresolvable slice should still return its least-bad fit).
+    set up to hyp_retries times. The attempt with the best log marginal
+    likelihood is kept even if every attempt stays pinned
+    (an unresolvable slice should still return its least-bad fit).
 
     Args:
         data_X: Channel rho positions (NaN-free).
@@ -174,9 +173,8 @@ def run_gp(
         if do_optimize:
             fit_restarts = nrestarts
         else:
-            # predict-only at fixed hyperparameters. The public maxiter clamps
-            # to >=50, so poke _imax=0 to skip the gradient-ascent loop
-            # entirely.
+            # predict-only at fixed hyperparameters
+            # The public maxiter clamps to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
             gp._imax = 0
             fit_restarts = 0
         try:
@@ -213,16 +211,16 @@ def fit_profile(
 ) -> ProfileFit | None:
     """Fit one cleaned profile slice and predict on x_star.
 
-    Expects data that already went through cleaning.clean_channels (NaN-free,
-    outliers removed, normalized when scale_per_slice); the hyperparameters
-    are always optimized. The fitted hyperparameters are returned so callers
-    can read the pedestal location (x0).
+    Expects data that already went through cleaning.clean_channels
+    (NaN-free, outliers removed, normalized when scale_per_slice).
+    the hyperparameters are always optimized. The fitted hyperparameters
+    are returned so callers can read the pedestal location (x0).
 
     After the fit, positive posterior gradients on the edge check grid are
     suppressed by virtual zero-slope observations and a refit at fixed
-    hyperparameters (see MONO_CHECK_RHO in quality.py). The returned
-    hyperparameters are always the original fit's, since the refit runs at
-    fixed hyperparameters.
+    hyperparameters (see MONO_CHECK_RHO in quality.py).
+    The returned hyperparameters are always the original fit's,
+    since the refit runs at fixed hyperparameters.
 
     Args:
         data_X: Channel rho positions.
@@ -284,16 +282,16 @@ def fit_profile(
 
     # Te/ne are physical (positive) quantities but the GP posterior is
     # Gaussian with unbounded support, so the mean can dip slightly negative
-    # past the separatrix where the value BC pulls it to zero. Clip the mean
-    # at 0; downstream should read the band as truncated at 0 likewise.
+    # past the separatrix where the value BC pulls it to zero.
+    # Clip the mean at 0 (downstream should read the band as truncated at 0 likewise)
     fit = np.maximum(np.asarray(gp.get_gp_mean(), dtype=float).ravel()[:n_out], 0.0)
-    # Predictive std (includes observation noise), not the latent-function
-    # std. With few, high-error core channels the latent band collapses to a
+    # Predictive std (includes observation noise), not the latent-function std.
+    # With few, high-error core channels the latent band collapses to a
     # misleadingly tight interval - it conditions on the fitted amplitude
-    # being exactly right and ignores the measurement scatter. noise_flag=True
-    # widens the band where the data is noisy; the noise term is rho-varying
-    # because run_gp fits an error kernel (HSGP), so the band tracks the local
-    # error bars instead of a constant RMS.
+    # being exactly right and ignores the measurement scatter.
+    # noise_flag=True widens the band where the data is noisy.
+    # the noise term is rho-varying because run_gp fits an error kernel (HSGP),
+    # so the band tracks the local error bars instead of a constant RMS.
     # The derivative std stays latent (the gradient is never directly
     # observed, so folding in point noise there is not meaningful).
     std = np.asarray(gp.get_gp_std(noise_flag=True), dtype=float).ravel()[:n_out]

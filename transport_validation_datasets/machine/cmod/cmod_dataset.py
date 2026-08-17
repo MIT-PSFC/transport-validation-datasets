@@ -43,27 +43,14 @@ class CModDataWorkflow(DataWorkflow):
     # GP fit staging knobs (values ported from the transport_study C-Mod
     # config, with their calibration notes).
     fit_rho = np.linspace(0.0, 1.1, 56)
-    # Minimum valid (rho, value) pairs required per timestep to run the GP
-    # fit, compared against the channel count AFTER the per-shot quality
-    # screens (_remove_broken_channels). 9 rather than 10: many C-Mod shots
-    # carry exactly 10 channels, and dropping one demonstrably-broken channel
-    # must not skip the whole slice (1160527014 lost 34 ne slices at 10) -
-    # the guard targets sparse prior-dominated fits (1-4 channels), and the
-    # per-slice LOO cleaning already fits through deeper drops than this.
+    # Minimum valid (rho, value) pairs required per timestep to run the GP fit,
+    # compared against the channel count AFTER the per-shot quality screens (_drop_broken_channels).
+    # Many C-Mod shots carry exactly 10 channels, so tolerate one bad channel.
     fit_min_points = 9
     fit_scale_per_slice = True
+    # Hyperparameter bounds for the GP fit, per variable.
     fit_bounds = {
-        # te l1 floor 0.35: a modest loosening from the historical 0.4 -
-        # C-Mod te fits are clean and its profiles are rarely hollow
-        # (icddps2 audit 2026-07).
         "te": FitBounds(l1_min=0.35),
-        # Stiffer ne core than te: with the 1.5x ne error inflation, 0.35 let
-        # ne fits invent interior waves (curvature flips on ~60% of preflight
-        # slices - humps and dips the channels do not support). 0.55 kills
-        # the wave class while the pedestal cliff stays sharp (the cliff is
-        # governed by the edge scale and x0, not l1); 0.45 left residual
-        # S-curves and 0.65 gained nothing over 0.55 (l1 sweep on the waviest
-        # preflight slices, 2026-08-06).
         "ne": FitBounds(l1_min=0.55),
     }
 
@@ -249,13 +236,10 @@ class CModDataWorkflow(DataWorkflow):
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
         """Build GP fit inputs for one shot from its unprocessed dataset.
 
-        Maps the TS channels onto rho through the shot's own equilibria
-        (map_ts_channels_to_rho), converts to the fit units (Te [keV],
-        ne [1e20 m^-3]), and applies the C-Mod channel quality screens and
-        error floors, calibrated in those units. A per-shot ne scaling against
-        the interferometer (n_e_line_average is already in the unprocessed
-        files) would slot in right after the unit conversion, before the
-        error floors; deferred for now.
+        1: Maps the TS channels onto rho through magnetics-only EFIT
+        2: convert to the fit units (Te [keV], ne [1e20 m^-3])
+        3: C-Mod channel quality screens and error floors, calibrated in those units
+        4: TODO(ZanderKeith) optionally correct density with interferometry
 
         Args:
             shot: Shot number being staged.
@@ -295,12 +279,7 @@ class CModDataWorkflow(DataWorkflow):
         # (rho~1.05) drove a spike to ne~19 at rho=1.0.
         ne_y = np.where(ne_err > 1.0, np.nan, ne_y)
         # Drop density points past the separatrix (rho>1.0) reading > 0.9e20:
-        # SOL density is low out there, so such a point is a bad channel, and
-        # a lone high one beyond the last pedestal channel makes the GP
-        # overshoot upward toward it (shot 1160503029: a rho~1.07, ne~1.45
-        # point with a small error bar - so not caught above - drove a spike
-        # to ne~13 at rho=1.0). Restricted to rho>1.0 so genuine H-mode
-        # density pedestals at rho 0.9-1.0 are kept.
+        # SOL density is low out there, so such a point is a bad channel
         ne_y = np.where((rho > 1.0) & (ne_y > 0.9), np.nan, ne_y)
 
         # If data or error bar is incredibly small, set to NaN since it is
@@ -310,23 +289,14 @@ class CModDataWorkflow(DataWorkflow):
         ne_y = np.where(ne_y < 0.001, np.nan, ne_y)
         ne_err = np.where(ne_err < 0.001, np.nan, ne_err)
 
-        # Near the magnetic axis, Te this low is not physically real - almost
-        # certainly a broken channel, not a genuine reading (unlike near the
-        # edge, where Te legitimately falls this low).
+        # Near the magnetic axis, Te this low is not physically real
         core_problem = (rho >= 0.0) & (rho < 0.4) & (te_y < 0.4)
         te_y = np.where(core_problem, np.nan, te_y)
 
-        # Error floors. Te: absolute 0.1 keV (vetted against the
-        # core-collapse failure mode; a relative floor made it worse). ne:
-        # the raw TS errors are nonphysically optimistic - against the GP
-        # fits the per-block chi2 median was 2.17 (residuals ~1.5x the error
-        # bars, while te sits at 0.6-0.9). Inflate the measured error 1.5x
-        # and floor at 10 percent of the value with a 0.01 absolute floor.
-        # (2x hit chi2 ~0.9 but oversmoothed data-supported pedestal
-        # flat-tops - the tight edge TS errors are what pin the cliff; 1.5x
-        # keeps that anchor. An absolute 0.1 floor in 1e20 units is wrong in
-        # the other direction: it floored 70-98 percent of the real measured
-        # errors and made low-density fits 30-50 percent loose.)
+        # Error floors. Sometimes C-Mod TS has extremely tiny error bars
+        # which I don't think are real. This increases them where needed.
+        # Te: absolute 0.1 keV
+        # ne: Multiply 'measured' error 1.5x and floor at 10 percent of the value with a 1e18/m3 absolute floor.
         te_err = np.where(te_err < 0.1, 0.1, te_err)
         ne_err = np.maximum(1.5 * ne_err, np.maximum(0.10 * np.abs(ne_y), 0.01))
 
@@ -360,35 +330,32 @@ class CModDataWorkflow(DataWorkflow):
         ]
 
 
-def _remove_broken_channels(
-    data_x: np.ndarray, data_y: np.ndarray, err_y: np.ndarray
+def _drop_broken_channels(
+    var_name: str, data_x: np.ndarray, data_y: np.ndarray, err_y: np.ndarray
 ) -> np.ndarray:
-    """NaN out channels biased the same way against their neighbors all shot.
+    """NaN out channels biased against their neighbors in the same way for an entire shot.
 
     Per-slice outlier removal (the fit worker's LOO pass) judges each slice in
-    isolation, so a channel that is only ~2-4 sigma off per slice can survive
-    - and with the 1.5x error inflation it started steering fits
-    (1160527001/002: a core ne channel reading ~0.2 against neighbors at ~0.9
-    dragged the axis down). Persistence across the shot is what separates
-    broken hardware from real structure: plasma features move and change
-    sign, a miscalibrated channel is biased the same direction all shot.
+    isolation, so a channel that is only ~2-4 sigma off per slice can survive.
+    Persistence across the shot is what separates broken hardware from real structure.
+    A healthy channel has neighbors above and below it, a miscalibrated channel is
+    significantly biased in the same direction all shot.
+    (Note that slight biasing is expected because profiles are monatonic-ish,
+    this just looks for consitently extreme cases like [4, 1, 3], [9, 2, 7], etc.)
 
     Per slice, each channel with both rho-neighbors finite gets
-    z = (y - neighbor_mean) / combined sigma; a channel is dropped when
-    |median z| >= 3.5 with >= 90 percent of slices on the same side, over
-    >= 10 slices. Thresholds calibrated on the 100-shot ne-error preflight
-    (2026-08-06): the broken 1160527-day core channel family sits at
-    |median z| 3.5-9.7 / same-sign 1.00, while the benign persistent
-    cross-calibration offsets (several-percent channel ripple present on
-    whole run days) top out at |median z| ~3.05.
+    z = (y - neighbor_mean) / combined sigma, and a channel is dropped when
+    |median z| >= 3.5 with >= 90 percent of slices on the same side, over >= 10 slices.
 
     Args:
+        var_name: Variable name for the log line.
         data_x: (n_t, n_ch) channel rho positions.
         data_y: (n_t, n_ch) channel values.
         err_y: (n_t, n_ch) channel errors, with the fit's floors applied.
 
     Returns:
         data_y with broken channels NaNed (a copy if any were).
+
     """
     n_t, n_ch = data_y.shape
     z_sum: list[list[float]] = [[] for _ in range(n_ch)]
@@ -415,34 +382,10 @@ def _remove_broken_channels(
             broken.append(c)
     if not broken:
         return data_y
+    logger.info(f"ts {var_name}: dropped persistently-biased channel(s) {broken}")
     data_y = data_y.copy()
-    for c in broken:
-        data_y[:, c] = np.nan
+    data_y[:, broken] = np.nan
     return data_y
-
-
-def _drop_broken_channels(
-    var_name: str, data_x: np.ndarray, data_y: np.ndarray, err_y: np.ndarray
-) -> np.ndarray:
-    """Run the persistence screen and log any channels it drops.
-
-    Args:
-        var_name: Variable name for the log line.
-        data_x: (n_t, n_ch) channel rho positions.
-        data_y: (n_t, n_ch) channel values.
-        err_y: (n_t, n_ch) channel errors.
-
-    Returns:
-        data_y with broken channels NaNed.
-    """
-    cleaned = _remove_broken_channels(data_x, data_y, err_y)
-    if cleaned is not data_y:
-        dropped = sorted(
-            set(np.flatnonzero(np.isnan(cleaned).all(axis=0)).tolist())
-            - set(np.flatnonzero(np.isnan(data_y).all(axis=0)).tolist())
-        )
-        logger.info(f"ts {var_name}: dropped persistently-biased channel(s) {dropped}")
-    return cleaned
 
 
 def _is_empty_result(result: xr.Dataset) -> bool:
