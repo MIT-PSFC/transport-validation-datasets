@@ -289,6 +289,12 @@ class DataWorkflow(ABC):
         # sit side by side rather than overwriting each other.
         self.fit_shots_dir = self.fit_results_dir / fit_method
         self.fit_plots_dir = self.fit_results_dir / "ts_fits" / fit_method
+        # Optional; only touched by export_to_imas(), which needs the
+        # `imas` extra (imas-python, eqdsk, megpy, fusio). One subdirectory
+        # per shot, scoped by fit method like fit_shots_dir, since the
+        # exported profiles/Zeff/impurity composition all derive from that
+        # method's fit output.
+        self.imas_export_dir = self.data_assembly_dir / "imas_export" / fit_method
 
         # Log the run to a timestamped file named for when it was launched.
         # One file sink per process: a later workflow in the same process
@@ -1205,6 +1211,66 @@ class DataWorkflow(ABC):
                 f"and are left out of the internal dataset"
             )
         return sorted(unprocessed & fitted)
+
+    def export_to_imas(self, overwrite: bool = False):
+        """Writes every fitted shot's equilibrium/core_profiles/summary/wall to IMAS format.
+
+        Optional post-fitting step, requiring the `imas` extra (imas-python,
+        eqdsk, megpy, fusio) -- the only stage that does; the rest of this
+        package works without it. One shot-scoped output directory per shot
+        under `imas_export_dir`, holding `equilibrium.nc`/`core_profiles.nc`/
+        `summary.nc`/`wall.nc` plus the per-equilibrium-time `.geqdsk` files
+        the equilibrium IDS was built from.
+
+        `core_profiles` here carries electrons + a single hydrogenic main ion
+        only (Zeff=1, n_D=n_e) -- Zeff and impurity composition are
+        deliberately not computed anywhere in this package. A standalone
+        `postprocess_ion_composition.py` script, kept entirely outside this
+        repo (in `cmod_to_imas`, not wired into this workflow, to avoid a
+        TORAX dependency clash this repo can't take on), can be run
+        afterward on the written output if those are wanted.
+
+        Args:
+            overwrite: Rewrite a shot's IMAS output even if it already exists.
+        """
+        from transport_validation_datasets.imas_export.scenario_export import (
+            build_imas_from_shot,
+            write_wall_ids,
+        )
+
+        shots = self._final_dataset_shots()
+        if not shots:
+            logger.warning(
+                "No shots have both unprocessed data and fit results; nothing to export to IMAS"
+            )
+            return
+
+        n_written = 0
+        for shot in shots:
+            shot_dir = self.imas_export_dir / str(shot)
+            if (shot_dir / "core_profiles.nc").exists() and not overwrite:
+                continue
+            fit_ds = xr.open_dataset(self.fit_shots_dir / f"{shot}.nc")
+            unprocessed_ds = xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc")
+            try:
+                obj, wall = build_imas_from_shot(
+                    shot,
+                    fit_ds,
+                    unprocessed_ds,
+                    geqdsk_dir=shot_dir / "geqdsk",
+                )
+            except Exception as e:
+                logger.warning(f"IMAS export failed for shot {shot}: {type(e).__name__}: {e}")
+                continue
+            shot_dir.mkdir(parents=True, exist_ok=True)
+            obj.write(str(shot_dir), side="input", overwrite=True)
+            write_wall_ids(wall, shot_dir, overwrite=True)
+            n_written += 1
+
+        logger.info(
+            f"Wrote IMAS output for {n_written} of {len(shots)} shots to {self.imas_export_dir} "
+            f"({len(shots) - n_written} already up to date or failed)"
+        )
 
     def _internal_dataset_dim_sizes(self, shots: list[int]) -> dict[str, int]:
         """Find the largest size of every non-episode dimension over the shots.
