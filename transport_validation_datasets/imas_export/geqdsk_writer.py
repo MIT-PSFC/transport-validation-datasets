@@ -1,0 +1,87 @@
+"""Writes one equilibrium reconstruction time to a real `.geqdsk` file.
+
+`transport_validation_datasets` has no "EFIT -> .geqdsk file" writer today
+(`cmod_to_imas/fit_cmod.py`'s `convert_equilibria_to_eqdsk`, using `megpy`, is
+the only one in this project's history, and isn't being ported -- see
+gp_fitting/worker_akho.py's scope notes for the equivalent reasoning about
+that module's raw-data-fetch code). This one is new, and simple: the GEQDSK
+block already staged in a shot's unprocessed file
+(`machine.generic.make_geqdsk_dataset`'s schema, `FreeQDSK canonical names,
+COCOS 1`, see `workflow.FINAL_EQUILIBRIUM_SIGNALS`) already matches
+`freeqdsk.geqdsk`'s own field names almost one-to-one, so writing is a
+straight field copy plus NaN-stripping for the boundary/limiter contours
+(their point counts can vary slice to slice; the staged arrays are padded to
+a common width with NaN).
+
+`scenario_export.py`'s equilibrium builder needs a real file on disk because
+the `eqdsk`/`megpy` packages it uses for COCOS conversion and flux-surface
+tracing both read one, so this writer runs once per real equilibrium time
+before those packages are handed the path.
+"""
+
+from pathlib import Path
+from typing import Mapping
+
+import numpy as np
+from freeqdsk import geqdsk
+
+# GEQDSK block field -> freeqdsk.geqdsk field. Only `current` differs from
+# make_geqdsk_dataset's own naming (freeqdsk calls it `cpasma`); `psirz` maps
+# to freeqdsk's `psi`.
+_SCALAR_FIELDS = (
+    "rdim", "zdim", "rcentr", "rleft", "zmid",
+    "rmagx", "zmagx", "simagx", "sibdry", "bcentr",
+)
+_PROFILE_FIELDS = ("fpol", "pres", "ffprime", "pprime", "qpsi")
+
+
+def write_geqdsk(
+    path: Path | str,
+    eq_slice: Mapping,
+    shot: int = 0,
+    time_ms: int = 0,
+    label: str | None = None,
+) -> Path:
+    """Write one equilibrium reconstruction time to a `.geqdsk` file.
+
+    Args:
+        path: Destination `.geqdsk` path; parent directories are created.
+        eq_slice: One time slice of the GEQDSK block (an
+            `xr.Dataset.isel(idx=i)`, or any mapping with the same field
+            names) -- `machine.generic.make_geqdsk_dataset`'s schema.
+        shot: Shot number recorded in the file header.
+        time_ms: Reconstruction time in milliseconds, recorded in the file
+            header.
+        label: Header label; `freeqdsk` defaults to `"FREEGS"` if omitted.
+
+    Returns:
+        The written path.
+    """
+
+    def _get(name: str) -> np.ndarray:
+        return np.asarray(eq_slice[name], dtype=float)
+
+    def _finite_contour(r_name: str, z_name: str) -> tuple[np.ndarray, np.ndarray]:
+        r, z = _get(r_name), _get(z_name)
+        finite = np.isfinite(r) & np.isfinite(z)
+        return r[finite], z[finite]
+
+    data = {name: float(eq_slice[name]) for name in _SCALAR_FIELDS}
+    data["cpasma"] = float(eq_slice["current"])
+    for name in _PROFILE_FIELDS:
+        data[name] = _get(name)
+    data["psi"] = _get("psirz")
+
+    rbdry, zbdry = _finite_contour("rbdry", "zbdry")
+    if rbdry.size > 0:
+        data["rbdry"], data["zbdry"] = rbdry, zbdry
+    if "rlim" in eq_slice and "zlim" in eq_slice:
+        rlim, zlim = _finite_contour("rlim", "zlim")
+        if rlim.size > 0:
+            data["rlim"], data["zlim"] = rlim, zlim
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        geqdsk.write(data, fh, label=label, shot=int(shot), time=int(time_ms))
+    return path
