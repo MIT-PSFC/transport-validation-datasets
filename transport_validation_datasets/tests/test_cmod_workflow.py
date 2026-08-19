@@ -139,7 +139,7 @@ class TestGPFit:
     test_dir = TEST_DIR / "test_gp_fit"
 
     @pytest.mark.slow  # serial GP fit, ~80s per TS slice
-    @pytest.mark.parametrize("method", ["zk"])
+    @pytest.mark.parametrize("method", ["zk", "akho"])
     def test_serial(self, method: str):
         # Basic check that GP fitting can be performed on unprocessed data files
         test_dir = self.test_dir / "test_serial" / method
