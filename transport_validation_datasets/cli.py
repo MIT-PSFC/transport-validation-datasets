@@ -270,7 +270,7 @@ class DatasetCLI:
                 cluster_max_retries=cluster_max_retries,
                 cluster_pending_timeout_s=cluster_pending_timeout_s,
             ),
-            **({} if prepare_workers is None else {"prepare_workers": prepare_workers}),
+            prepare_workers=prepare_workers,
         )
         _execute(workflow, stage, clean_fit_state, mb_per_chunk)
 

@@ -79,7 +79,7 @@ def build_tensorized_dataset(
     for identifier in identifiers:
         try:
             ds = process_fn(identifier)
-        except Exception as exception:  # noqa: BLE001 - one bad episode must not kill the run
+        except Exception as exception:
             logger.warning(f"Error processing {identifier}: {exception}")
             continue
         if ds is None:
