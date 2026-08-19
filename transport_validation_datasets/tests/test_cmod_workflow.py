@@ -154,7 +154,7 @@ class TestGPFit:
         for shot in workflow.unprocessed_shots():
             _trim_to_three_ts_slices(workflow.unprocessed_data_dir / f"{shot}.nc")
 
-        workflow.run_gp_fitting()
+        workflow.run_gp_fitting(max_pages=20)
 
         # Check that the per-shot fit result files were written and cover the shots
         for shot in workflow.unprocessed_shots():
@@ -208,7 +208,7 @@ class TestGPFit:
         for shot in workflow.unprocessed_shots():
             _trim_to_three_ts_slices(workflow.unprocessed_data_dir / f"{shot}.nc")
 
-        workflow.run_gp_fitting()
+        workflow.run_gp_fitting(max_pages=20)
 
         # Check that the per-shot fit result files were written and cover the shots
         for shot in workflow.unprocessed_shots():
@@ -286,7 +286,7 @@ class TestFinalAssembly:
         for shot in workflow.unprocessed_shots():
             _trim_to_three_ts_slices(workflow.unprocessed_data_dir / f"{shot}.nc")
 
-        workflow.run_gp_fitting()
+        workflow.run_gp_fitting(max_pages=20)
         workflow.assemble_final_dataset()
 
         # Check that the final assembled dataset was created and covers the shots

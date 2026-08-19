@@ -354,7 +354,7 @@ def plot_ts_fits(
     fit_output,
     rho_fit: np.ndarray,
     channel_groups: list[tuple[np.ndarray, str, str]] | None = None,
-    max_pages: int = 20,
+    max_pages: int | None = None,
 ) -> int:
     """Save a PDF comparing the GP fits to the raw TS measurements of one shot.
 
@@ -377,7 +377,8 @@ def plot_ts_fits(
             channels by diagnostic; one blue "raw TS" group when None. A mask
             is (n_ch,) for a fixed split (C-Mod core vs edge Thomson) or
             (n_t, n_ch) when the split varies per slice.
-        max_pages: Sample the fitted slices down to at most this many pages.
+        max_pages: Evenly sample the fitted slices down to at most this many
+            pages. None plots every fitted slice.
 
     Returns:
         The number of pages written; a shot with no fitted slice writes an
@@ -394,14 +395,13 @@ def plot_ts_fits(
     has_fit = np.isfinite(fit_output.te_fit).any(axis=-1) | np.isfinite(
         fit_output.ne_fit
     ).any(axis=-1)
-    fitted = np.flatnonzero(has_fit)
-    # Evenly spread samples rather than a stride, which overshoots max_pages
-    # whenever the fitted count is not a multiple of it
-    live = fitted[
-        np.unique(
-            np.linspace(0, fitted.size - 1, min(fitted.size, max_pages)).round()
-        ).astype(int)
-    ]
+    live = np.flatnonzero(has_fit)
+    if max_pages is not None and live.size > max_pages:
+        # Evenly spread samples rather than a stride, which overshoots
+        # max_pages whenever the fitted count is not a multiple of it
+        live = live[
+            np.unique(np.linspace(0, live.size - 1, max_pages).round()).astype(int)
+        ]
 
     n_ch = rho_ch.shape[1]
     groups = (

@@ -693,7 +693,7 @@ class DataWorkflow(ABC):
         """
         return sorted(int(p.stem) for p in self.unprocessed_data_dir.glob("*.nc"))
 
-    def run_gp_fitting(self):
+    def run_gp_fitting(self, max_pages: int | None = None):
         """Run GP profile fitting on the unprocessed data files.
 
         The stages, each skipping work that already exists on disk:
@@ -706,6 +706,9 @@ class DataWorkflow(ABC):
         3. Write the batch results out as one netCDF per shot into
            fit_shots_dir.
         4. Plot the fits per shot into fit_plots_dir.
+
+        Args:
+            max_pages: Maximum number of pages to plot per shot. None plots all.
         """
         shots = self.unprocessed_shots()
         skipped = {s for s in shots if self.fit_already_failed(s)}
@@ -729,7 +732,7 @@ class DataWorkflow(ABC):
             )
             dispatcher.run(batches)
         self.write_fit_results()
-        self.plot_fit_results()
+        self.plot_fit_results(max_pages=max_pages)
 
     def clean_fit_state(self):
         """Delete every staged fit batch so the next run refits from scratch.
@@ -1009,12 +1012,15 @@ class DataWorkflow(ABC):
         """
         return None
 
-    def plot_fit_results(self):
+    def plot_fit_results(self, max_pages: int | None = None):
         """Plot the GP fits of every fitted shot, one PDF per shot.
 
         Plots the exact (cleaned, floored) channel data the fit consumed,
         straight from the staged batch files. Skips shots whose PDF already
         exists.
+
+        Args:
+            max_pages: Maximum number of pages to plot per shot. None plots all.
         """
         for in_path in sorted(self.fit_batches_dir.glob("batch_*.npz")):
             if "_out_" in in_path.name:
@@ -1050,6 +1056,7 @@ class DataWorkflow(ABC):
                     fit_output=so,
                     rho_fit=batch.x_star,
                     channel_groups=self.fit_plot_channel_groups(shot),
+                    max_pages=max_pages,
                 )
                 logger.info(f"Plotted {n_pages} fit pages for shot {shot}")
 
