@@ -69,6 +69,15 @@ filterwarnings = [
     "ignore::FutureWarning:disruption_py.*",
     # fork() in a multi-threaded process, from disruption_py spawning workers
     "ignore:This process:DeprecationWarning:multiprocessing.*",
+    # inf - inf inside scipy's interp1d slope calculation, reached through
+    # disruption_py's interp1: some intermediate disruption-py signal
+    # derivations produce transient infs. The existing disruption_py ignore
+    # above cannot catch this one because numpy floating-point warnings carry
+    # scipy's module, not the caller's. Should be benign, don't spam test output.
+    "ignore:invalid value encountered in subtract:RuntimeWarning:scipy.interpolate",
+    # consolidated=True everywhere is deliberate (fast opens on many-file stores)
+    # the spec caveat only matters to non-zarr-python readers.
+    "ignore:Consolidated metadata is currently not part in the Zarr format 3 specification:UserWarning",
 ]
 
 [tool.hatch.build.targets.sdist]
