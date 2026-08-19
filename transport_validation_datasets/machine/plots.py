@@ -394,7 +394,14 @@ def plot_ts_fits(
     has_fit = np.isfinite(fit_output.te_fit).any(axis=-1) | np.isfinite(
         fit_output.ne_fit
     ).any(axis=-1)
-    live = np.flatnonzero(has_fit)[:: max(1, np.count_nonzero(has_fit) // max_pages)]
+    fitted = np.flatnonzero(has_fit)
+    # Evenly spread samples rather than a stride, which overshoots max_pages
+    # whenever the fitted count is not a multiple of it
+    live = fitted[
+        np.unique(
+            np.linspace(0, fitted.size - 1, min(fitted.size, max_pages)).round()
+        ).astype(int)
+    ]
 
     n_ch = rho_ch.shape[1]
     groups = (
