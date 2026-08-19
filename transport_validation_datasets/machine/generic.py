@@ -121,13 +121,14 @@ def make_geqdsk_dataset(
 def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     """Snap an EFIT reconstruction (dim 'idx', 'time'/'shot' coords) onto grid_times.
 
-    Nearest-neighbor snap with tie-break toward later grid points. No interpolation, no fill.
-
-    Each EFIT slice goes to its nearest grid time, with no interpolation of the
-    reconstruction. The snap only absorbs sub-step machine jitter in the EFIT clock,
-    so ties break toward the later grid point: an EFIT at 9.5 ms on a 1 ms grid lands
-    at 10 ms, never feeding the 9 ms slice a future reconstruction. Grid times with no
-    EFIT slice (e.g. before the first reconstruction) come back as NaN
+    Each EFIT slice goes to its nearest grid time, no interpolation, no fill.
+    The snap only absorbs sub-step jitter in the EFIT clock, so ties break toward
+    the later grid point: an EFIT at 9.5 ms on a 1 ms grid lands at 10 ms, never
+    feeding the 9 ms slice a future reconstruction. Slices further than half a
+    grid step outside the grid are dropped rather than piled onto the first or
+    last grid time, since a reconstruction from before or after the shot window
+    is not a measurement of either end of it. Grid times left with no slice come
+    back as NaN.
 
     Args:
         ds: EFIT reconstruction with dim 'idx' and 'time'/'shot' coords.
@@ -137,24 +138,28 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
         The reconstruction on grid_times, NaN at grid times with no EFIT slice.
     """
     grid_times = np.asarray(grid_times)
-    efit_times = ds["time"].values
+    step = float(np.median(np.diff(grid_times)))
+    # tol sits well below any real EFIT timing gap but far above float32
+    # round-off at the grid step
+    tol = 1e-4 * step
+
     shot_id = ds["shot"].values[0]
+    in_range = (ds["time"].values >= grid_times[0] - 0.5 * step - tol) & (
+        ds["time"].values <= grid_times[-1] + 0.5 * step + tol
+    )
+    ds = ds.isel(idx=in_range)
+    efit_times = ds["time"].values
 
     # Nearest grid point per EFIT slice
-    # ties (and float noise within a hair of a half-step) break toward the later point,
-    # so the snap only ever absorbs sub-step jitter and never feeds an earlier slice a future reconstruction
-    # tol sits well below any real EFIT timing gap but far above float32 round-off at the grid step.
     pos = np.searchsorted(grid_times, efit_times, side="left")
     left = np.clip(pos - 1, 0, len(grid_times) - 1)
     right = np.clip(pos, 0, len(grid_times) - 1)
-    tol = 1e-4 * np.median(np.diff(grid_times))
     take_left = (grid_times[right] - efit_times) - (efit_times - grid_times[left]) > tol
-    target = np.where(take_left, left, right)
+    snapped = grid_times[np.where(take_left, left, right)]
 
     # snapped is non-decreasing (both arrays sorted), so duplicate slots are adjacent
     # keep the last EFIT slice that lands in each, then NaN-fill the empty grid times
-    snapped = grid_times[target]
-    keep = np.append(np.diff(snapped) != 0, True)
+    keep = np.append(np.diff(snapped) != 0, True)[: snapped.size]
     ds = ds.drop_vars(["time", "shot"]).assign_coords(idx=snapped).isel(idx=keep)
     ds = ds.reindex(idx=grid_times).reset_index("idx", drop=True)
     return ds.assign_coords(
@@ -321,6 +326,49 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     return ts_times, rho
 
 
+def channel_rows_at_times(data: xr.DataArray, ts_times: np.ndarray) -> np.ndarray:
+    """Take the rows of a (time, ts_channel) variable at the TS slice times.
+
+    Args:
+        data: Channel variable carrying a "time" coordinate.
+        ts_times: TS slice times [s], as returned by map_ts_channels_to_rho.
+
+    Returns:
+        The (n_t, n_ch) rows at those times.
+    """
+    values = data.transpose("time", "ts_channel").values
+    return values[np.isin(data["time"].values, ts_times)]
+
+
+def ts_channel_fit_rows(
+    ds_shot: xr.Dataset, ts_times: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Read the TS channel rows at the slice times, converted to the fit units.
+
+    The unprocessed files are SI (Te [eV], ne [m^-3]); the fits and every
+    device's cleaning threshold are calibrated in Te [keV] and ne [1e20 m^-3].
+
+    Args:
+        ds_shot: One shot's unprocessed dataset, shot dim squeezed out.
+        ts_times: TS slice times [s].
+
+    Returns:
+        (te_y, te_err, ne_y, ne_err), each (n_t, n_ch) in the fit units.
+    """
+    rows = {
+        name: np.asarray(
+            channel_rows_at_times(ds_shot[f"ts_channel_{name}"], ts_times), float
+        )
+        for name in ("t_e", "t_e_error", "n_e", "n_e_error")
+    }
+    return (
+        rows["t_e"] * 1e-3,
+        rows["t_e_error"] * 1e-3,
+        rows["n_e"] * 1e-20,
+        rows["n_e_error"] * 1e-20,
+    )
+
+
 def efit_cocos_from_signs(current, bcentr, logger_override=None) -> int:
     """Identify the EFIT COCOS from the signs of median Ip and B0.
 
@@ -369,7 +417,7 @@ def orient_signal(geqdsk_data, efit_time):
         Returns:
             The array with time on axis 0.
         """
-        if data is None or data.ndim < 2:
+        if data.ndim < 2:
             return data
         if data.shape[0] == n_time:
             return data
@@ -380,8 +428,6 @@ def orient_signal(geqdsk_data, efit_time):
 
     n_time = len(efit_time)
     for param, data in geqdsk_data.items():
-        if data is None:
-            continue
         data = _time_first(data, n_time)
         # psirz comes back (T, z, r) from MDS (dim_of order reversed vs numpy);
         # the dataset labels dims (idx, r_grid, z_grid), so swap to (T, r, z).

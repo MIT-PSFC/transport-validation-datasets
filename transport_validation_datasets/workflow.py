@@ -1,6 +1,7 @@
 import os
 import shutil
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     ShotFitOutput,
     default_fit_bounds,
     pack_fit_batch,
+    read_batch_shots,
     unpack_fit_batch,
     unpack_fit_results,
 )
@@ -122,19 +124,25 @@ FINAL_TS_SIGNALS = (
 
 
 class DataWorkflow(ABC):
-    """Class that handles organization of data processing steps.
+    """Device-independent stages of building one device's dataset.
 
-    For this study, the general workflow is:
-    1. Pull unprocessed data from source and filter down to regions of validity
-    - One file per shot
-    - Standardized signal names
-    - On a common timebase (1 kHz)
-    - Slower signals are forward-filled, but tagged as being 'fresh' or not if this is relevant
-    - drop regions of invalid data or fix where possible (if plasma current too low, clip negative power to 0, etc.)
-    - logging of issues encountered, with plots where relevant to see why
-    2. Process and filter data as needed to remove bad shots / fix signals where possible
+    1. make_unprocessed_data_files:
+      pull each shot from the device's source (get_source_dataset),
+      filter it down to the regions of validity (filter_and_plot),
+      and write one netCDF plus one plot per shot.
+    2. run_gp_fitting:
+      map the Thomson channels onto rho (prepare_fit_input),
+      stage method-agnostic batches,
+      fit them here or on a cluster,
+      and write one netCDF of fitted profiles per shot.
+    3. assemble_final_dataset:
+      stack every shot that has both into one Zarr store,
+      with the slower profiles and equilibria held forward onto the
+      1 kHz grid and flagged where they carry a sample of their own.
 
-    3. Combine all shots together into a single xarray Dataset and save to disk
+    Each stage resumes from what is already on disk, except assembly, which
+    always rebuilds. A device subclass supplies the source and the filter
+    thresholds, everything else lives here.
     """
 
     @property
@@ -206,6 +214,14 @@ class DataWorkflow(ABC):
             List of shot numbers to exclude.
         """
 
+    # Threads used to stage source data.
+    # Only above 1 for sources that tolerate concurrent reads
+    # MAST reads public S3 and does, disruption-py's MDSplus connections do not.
+    default_prepare_workers = 1
+
+    # The process's log file sink, replaced when a new workflow starts.
+    _log_sink_id = None
+
     # GP fit staging knobs
     fit_rho = np.linspace(0.0, 1.0, 51)
     fit_min_points = 10
@@ -220,7 +236,7 @@ class DataWorkflow(ABC):
         max_num_shots: int | None = None,
         fit_method: str = "zk",
         cluster_config: ClusterFitConfig | None = None,
-        prepare_workers: int | None = 1,
+        prepare_workers: int | None = None,
     ):
         """Set up the dataset directories and resolve the shotlist.
 
@@ -229,7 +245,7 @@ class DataWorkflow(ABC):
             data_assembly_dir: Directory where data files are stored and final
                 dataset will be saved.
             shotlist_file: Path to file containing list of shots to process. If None,
-                will call _get_shotlist_from_source() to retrieve shotlist from
+                will call get_shotlist_from_source() to retrieve shotlist from
                 device-specific source.
             max_num_shots: Maximum number of shots to process (for testing). If None,
                 process all shots.
@@ -238,9 +254,8 @@ class DataWorkflow(ABC):
             cluster_config: If provided, GP profile fitting is dispatched to a SLURM
                 cluster (see gp_fitting/dispatcher.py).
                 If None, fitting runs single-threaded in this process.
-            prepare_workers: Threads used to stage source data.
-                Should only be > 1 for sources that tolerate concurrent reads
-                (MAST reads public S3 and does, disruption_py's MDSplus connections do not)
+            prepare_workers: Threads used to stage source data. None takes the
+                device's default_prepare_workers.
         """
         self.ds_name = ds_name
         self.data_assembly_dir = data_assembly_dir / self.ds_name
@@ -252,7 +267,9 @@ class DataWorkflow(ABC):
             self.final_ds_dir = self.data_assembly_dir / f"dataset_{max_num_shots}"
         self.fit_method = fit_method
         self.cluster_config = cluster_config
-        self.prepare_workers = prepare_workers
+        self.prepare_workers = (
+            self.default_prepare_workers if prepare_workers is None else prepare_workers
+        )
 
         # Set up subdirectories for unprocessed data, fit staging, and final dataset
         self.unprocessed_data_dir = self.data_assembly_dir / "01_unprocessed"
@@ -269,18 +286,23 @@ class DataWorkflow(ABC):
         self.fit_plots_dir = self.fit_results_dir / "ts_fits" / fit_method
 
         # Log the run to a timestamped file named for when it was launched.
+        # One file sink per process: a later workflow in the same process
+        # (tests, back-to-back builds) replaces the sink instead of adding a
+        # second one, which would write both datasets' logs into both files.
         self.logs_dir = self.data_assembly_dir / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         launch_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.log_file = self.logs_dir / f"{ds_name}_{launch_time}.log"
-        logger.add(self.log_file)
+        if DataWorkflow._log_sink_id is not None:
+            logger.remove(DataWorkflow._log_sink_id)
+        DataWorkflow._log_sink_id = logger.add(self.log_file)
         logger.info(f"Logging this run to {self.log_file}")
 
         if shotlist_file is None:
             logger.info(
                 "No shotlist file provided, retrieving shotlist from device-specific source"
             )
-            self.shotlist = self._get_shotlist_from_source()
+            self.shotlist = self.get_shotlist_from_source()
             logger.info(f"Retrieved {len(self.shotlist)} shots from source")
         else:
             with open(shotlist_file) as f:
@@ -341,7 +363,7 @@ class DataWorkflow(ABC):
         return (self.failed_fits_dir / f"{shot}.txt").exists()
 
     @abstractmethod
-    def _get_shotlist_from_source(self) -> list[int]:
+    def get_shotlist_from_source(self) -> list[int]:
         """Retrieve shotlist from device-specific source.
 
         This method is called when no shotlist file is provided. Subclasses should
@@ -353,15 +375,125 @@ class DataWorkflow(ABC):
         """
 
     @abstractmethod
+    def get_source_dataset(self, shot: int) -> xr.Dataset | None:
+        """Read one shot from the device's source into standardized signals.
+
+        Everything the final dataset needs, under the standardized names, on
+        the shot's uniform 1 kHz timebase. Filtering, plotting, and writing are
+        make_unprocessed_data_files' job.
+
+        Args:
+            shot: Shot number to read.
+
+        Returns:
+            The standardized dataset, or None when the shot cannot be built.
+            A permanent problem (no source data, missing signals, no plasma)
+            should also be recorded with record_failed_shot so later runs skip
+            the shot; a transient read failure should only be logged, so that
+            the next run retries it.
+        """
+
     def make_unprocessed_data_files(self):
         """Pull data from source and filter down to regions of validity.
 
-        Saves one file per shot in the unprocessed_data_dir. Resulting files have
-        standardized signal names and are on a common timebase (1 kHz).
+        Saves one file per shot in unprocessed_data_dir, with standardized
+        signal names on a common 1 kHz timebase, plus a plot per shot showing
+        what was kept and why.
 
-        Also makes plots for each shot to visualize the data and any issues
-        encountered.
+        Resumes: shots that already have a file, are blacklisted, or failed on
+        an earlier run are skipped without touching the source. Source reads
+        run prepare_workers at a time; filtering, plotting, and writing stay on
+        this thread, since they are matplotlib and netCDF work.
         """
+        self.unprocessed_data_dir.mkdir(parents=True, exist_ok=True)
+        workers = max(1, self.prepare_workers or 1)
+        shots = iter(self.shotlist)
+        n_files = 0
+        exhausted = False
+
+        while not exhausted and (
+            self.max_num_shots is None or n_files < self.max_num_shots
+        ):
+            # Fill a batch with shots that actually need a source read, so a
+            # run that is mostly resuming does not stage one shot at a time
+            batch: list[int] = []
+            while len(batch) < workers:
+                if (
+                    self.max_num_shots is not None
+                    and n_files + len(batch) >= self.max_num_shots
+                ):
+                    break
+                shot = next(shots, None)
+                if shot is None:
+                    exhausted = True
+                    break
+                if shot in self.shot_blacklist:
+                    logger.info(f"Shot {shot} is blacklisted. Skipping.")
+                    continue
+                if (self.unprocessed_data_dir / f"{shot}.nc").exists():
+                    logger.info(
+                        f"Unprocessed data file for shot {shot} already exists. Skipping."
+                    )
+                    n_files += 1
+                    continue
+                if self.shot_already_failed(shot):
+                    logger.info(f"Shot {shot} failed on a previous run. Skipping.")
+                    continue
+                batch.append(shot)
+            n_files += self._read_and_write_shots(batch, workers)
+
+        logger.info(f"Finished with {n_files} {self.ds_name} unprocessed data files.")
+
+    def _read_and_write_shots(self, shots: list[int], workers: int) -> int:
+        """Read a batch of shots from the source, then filter and write them.
+
+        Args:
+            shots: Shot numbers to read.
+            workers: Threads to read them with.
+
+        Returns:
+            How many unprocessed data files were written.
+        """
+        if not shots:
+            return 0
+
+        def read(shot: int) -> xr.Dataset | None:
+            """Read one shot, keeping a failure from killing the whole run.
+
+            Args:
+                shot: Shot number to read.
+
+            Returns:
+                The standardized dataset, or None if it could not be read.
+            """
+            try:
+                return self.get_source_dataset(shot)
+            except Exception as e:
+                logger.warning(f"Shot {shot}: failed to read source data: {e}")
+                logger.opt(exception=True).debug(e)
+                return None
+
+        if len(shots) == 1 or workers == 1:
+            datasets = [read(shot) for shot in shots]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                datasets = list(pool.map(read, shots))
+
+        n_written = 0
+        for shot, ds_standardized in zip(shots, datasets, strict=True):
+            if ds_standardized is None:
+                continue
+            ds_unprocessed = self.filter_and_plot(ds_standardized)
+            if ds_unprocessed is None:
+                logger.warning(
+                    f"Shot {shot} did not pass filtering. Skipping unprocessed data file creation."
+                )
+                self.record_failed_shot(shot, "Did not pass filtering.")
+                continue
+            ds_unprocessed.to_netcdf(self.unprocessed_data_dir / f"{shot}.nc")
+            logger.info(f"Created unprocessed data file for shot {shot}.")
+            n_written += 1
+        return n_written
 
     def filter_and_plot(self, ds_input: xr.Dataset) -> xr.Dataset | None:
         """Take datasets with standardized names, run filtering on them, and plot results.
@@ -448,11 +580,16 @@ class DataWorkflow(ABC):
             kept_mask, coords={"time": times}, dims="time"
         )
 
+        # Load-bearing broadcast: valid_mask carries the shot and time dims, so
+        # this also gives every static quantity (the limiter contour, the fixed
+        # grid extents, C-Mod's fixed channel positions) a time axis.
+        # The final dataset carries them per slice like everything else, and
+        # _hold_equilibrium indexes them by grid time.
         ds_filtered = ds_input.where(valid_mask, drop=True)
 
         # If there is not sufficient data after filtering, return None to indicate that this shot should be rejected:
-        # the first and last non-nan ip must be at least min_pulse_length apart, and the
-        # non-nan segments within must sum to at least min_usable_time
+        # the first and last non-nan ip must be at least min_pulse_length apart,
+        # and the non-nan segments within must sum to at least min_usable_time
         ip_valid_filtered = ds_filtered["ip"].notnull().any(dim="shot")
         ip_times = ds_filtered["time"].values[ip_valid_filtered.values]
         if ip_times.size < 2:
@@ -571,12 +708,12 @@ class DataWorkflow(ABC):
         4. Plot the fits per shot into fit_plots_dir.
         """
         shots = self.unprocessed_shots()
-        skipped = [s for s in shots if self.fit_already_failed(s)]
+        skipped = {s for s in shots if self.fit_already_failed(s)}
         if skipped:
             logger.info(
                 f"Skipping {len(skipped)} shots that failed fit staging on a previous run"
             )
-        shots = [s for s in shots if s not in set(skipped)]
+        shots = [s for s in shots if s not in skipped]
         logger.info(f"GP fitting {len(shots)} shots with method '{self.fit_method}'")
 
         batches = self.stage_fit_batches(shots)
@@ -647,8 +784,8 @@ class DataWorkflow(ABC):
                 continue
             shot_inputs = {}
             for shot in batch_shots:
-                ds = xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc")
-                fit_input = self.prepare_fit_input(shot, ds)
+                with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
+                    fit_input = self.prepare_fit_input(shot, ds)
                 if fit_input is None:
                     self.record_failed_fit(shot, "No fittable Thomson channel data.")
                     continue
@@ -857,11 +994,12 @@ class DataWorkflow(ABC):
             },
         )
 
-    def _fit_plot_channel_groups(self, shot: int) -> list | None:
+    def fit_plot_channel_groups(self, shot: int) -> list | None:
         """Get the channel grouping used to color the fit plots.
 
-        Subclasses can split channels by diagnostic (e.g. C-Mod core vs edge
-        Thomson); the base implementation plots them as one group.
+        Subclasses can split channels by diagnostic
+        (e.g. C-Mod core vs edge Thomson).
+        The base implementation plots them as one group.
 
         Args:
             shot: Shot number being plotted.
@@ -885,6 +1023,13 @@ class DataWorkflow(ABC):
             out_path = self._batch_out_path(batch_id)
             if not out_path.exists():
                 continue
+            # Read the shot list first, so a batch whose plots are all on disk
+            # never has its profile arrays unpacked
+            if all(
+                (self.fit_plots_dir / f"{shot}.pdf").exists()
+                for shot in read_batch_shots(out_path)
+            ):
+                continue
             batch = None
             for shot, so in unpack_fit_results(out_path).items():
                 pdf_path = self.fit_plots_dir / f"{shot}.pdf"
@@ -904,7 +1049,7 @@ class DataWorkflow(ABC):
                     },
                     fit_output=so,
                     rho_fit=batch.x_star,
-                    channel_groups=self._fit_plot_channel_groups(shot),
+                    channel_groups=self.fit_plot_channel_groups(shot),
                 )
                 logger.info(f"Plotted {n_pages} fit pages for shot {shot}")
 
