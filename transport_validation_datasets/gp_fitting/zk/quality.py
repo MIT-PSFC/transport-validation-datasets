@@ -1,27 +1,24 @@
-"""Nonphysical-fit detection for the zk method (numpy only, no mkgp).
+"""Nonphysical-fit detection for the zk method.
 
 Te and ne fall monotonically from the core, so a fitted slice that peaks
 off-axis is suspect. Two triggers:
-  Edge bump: the fit at rho >= _EDGE_RHO exceeds everything interior to it by
-    more than _EDGE_MARGIN. The margin keeps flat profiles whose global max
-    lands in the edge region by noise (a zero-margin rule culled those). This
-    fires whether or not the scatter supports the bump: a data-supported edge
-    bump above the whole interior means miscalibrated edge channels (C-Mod
-    edge-vs-core TS cross-calibration blocks), and the repair drops them.
-  Data overshoot: the fit exceeds the local scatter envelope (data_envelope)
-    by more than _ENVELOPE_MARGIN - the GP ringing above its own data (e.g. a
-    14 keV spike off a 5 keV stray point). Only the true extrapolation region
-    inside the innermost finite channel is exempt: a peaked profile
-    legitimately rises above its innermost channel toward the axis, but a
-    hump BETWEEN channels (rho bracketed by data on both sides) is
-    interpolation and has no business beating the envelope - a blanket
-    rho < 0.4 exemption once let a pinned te fit invent a 6.4 keV peak at
-    rho 0.26 between 4 keV channels (C-Mod 1160503008 t=1.311).
-    Data-supported off-axis humps (hollow ramp-up ne) pass: real physics, not
-    an artifact.
+  Edge bump: the fit at rho >= _EDGE_RHO beats everything interior to it by
+    more than _EDGE_MARGIN. The margin spares flat profiles whose global max
+    lands in the edge by noise. It fires even when the scatter supports the
+    bump, since a data-backed edge bump above the whole interior means
+    miscalibrated edge channels (C-Mod edge-vs-core TS cross-calibration
+    blocks) and the repair drops them.
+  Data overshoot: the fit beats the local scatter envelope (data_envelope) by
+    more than _ENVELOPE_MARGIN, i.e. the GP ringing above its own data. Only
+    the extrapolation inside the innermost finite channel is exempt: a peaked
+    profile may legitimately rise toward the axis, but a hump BETWEEN
+    channels is interpolation (a blanket rho < 0.4 exemption once let a
+    pinned te fit invent a 6.4 keV peak at rho 0.26 between 4 keV channels,
+    C-Mod 1160503008 t=1.311). Data-supported off-axis humps (hollow ramp-up
+    ne) pass.
 A flagged slice is repaired by refitting without the channels under the peak
-(see the worker's _fit_variable; a pinned te fit is first retried unpinned);
-it is culled only if the repairs are exhausted.
+(see the worker's _fit_variable; a pinned te fit is first retried unpinned),
+and culled only once the repairs are exhausted.
 """
 
 import numpy as np
@@ -31,56 +28,46 @@ _EDGE_MARGIN = 1.1
 _ENVELOPE_MARGIN = 1.2
 REPAIR_HALFWIDTH = 0.1
 
-# A fit whose innermost channels sit >= _FIT_BIAS_CORE_SIGMA ABOVE it is a
+# A fit whose innermost channels sit >= _FIT_BIAS_CORE_SIGMA above it is a
 # core amplitude collapse: LML can prefer a tiny variance that hugs the prior
-# below a sparse noisy core cluster (C-Mod 1160503008 t=0.911, var=0.12 with
-# the 2.5-2.8 keV core cluster 2.6 sigma above the fit). The check is
-# one-sided (fit-below-data only: a fit riding above a garbage-low channel
-# subset - outlier-removed miscalibrated blocks the interferometer
-# contradicts, e.g. the C-Mod 1160920xxx run day - is the fit doing its job,
-# and the fit-above-data direction belongs to nonphysical_peak's envelope
-# check) and CORE-ONLY: a general sliding-window version was tried and culled
-# ~3% of healthy C-Mod ne slices whose dense tight-error runs sit 2 sigma off
-# for benign reasons, versus 0.01-0.16% for this innermost-channel form
-# (full-rebuild calibration: innermost-4 bias p99 is 1.1-1.7 per device/var,
-# the collapse class sits at 2.6+). Pinned fits retry unpinned; otherwise the
-# slice is culled - no channel subset repairs a core the fit refuses to reach.
+# below a sparse noisy core cluster
+# (C-Mod 1160503008 t=0.911, var=0.12 with the 2.5-2.8 keV core cluster 2.6 sigma above the fit)
+# One-sided on purpose: a fit riding ABOVE a garbage-low channel subset is the
+# fit doing its job, and that direction is nonphysical_peak's envelope check.
+# Core-only on purpose: a sliding-window version culled ~3% of healthy C-Mod
+# ne slices against 0.01-0.16% here (innermost-4 bias p99 is 1.1-1.7 per
+# device/var, the collapse class sits at 2.6+).
+# Pinned fits retry unpinned, otherwise the slice is culled: no channel subset
+# repairs a core the fit refuses to reach.
 _FIT_BIAS_CORE_N = 4
 _FIT_BIAS_CORE_SIGMA = 2.5
 
 # Monotonic-edge constraint (virtual zero-slope observations). Te and ne fall
-# monotonically toward the edge, but the GP can ring up into a small bump
-# around rho ~1.0, between the outermost channel and the value BCs at 1.1+
-# where the short edge length scale wiggles freely (nonphysical_peak only
-# catches bumps beating the whole interior by _EDGE_MARGIN, so a pedestal-top
-# bump passes). fit_profile checks the posterior gradient on MONO_CHECK_RHO
-# and, wherever it exceeds MONO_GRAD_TOL, adds a virtual gradient observation
+# monotonically toward the edge, but the GP can ring up into a bump around
+# rho ~1.0, between the outermost channel and the value BCs at 1.1+, where
+# the short edge length scale wiggles freely. nonphysical_peak only catches
+# bumps beating the whole interior by _EDGE_MARGIN, so this one passes it.
+# fit_profile checks the posterior gradient on MONO_CHECK_RHO and, wherever
+# it exceeds MONO_GRAD_TOL, adds a virtual gradient observation
 # (rho, 0, MONO_GRAD_ERR) and refits at the same hyperparameters, up to
-# MONO_MAX_PASSES times (a refit can push the bump sideways into an
-# unconstrained neighbor). Observations are added only where violated AND
-# where the channel data itself does not support a rise
+# MONO_MAX_PASSES times (a refit can push the bump sideways).
+# Only rises the channel data does not corroborate are constrained
 # (rise_is_data_supported): hollow MAST ne genuinely rises through rho
-# 0.6-0.9, and constraining a data-backed rise flattened both the valley and
-# the off-axis peak of every hollow profile (icddps2 audit, 2026-07: e.g.
-# shot 30097 t=0.245 s). With the gate, only rises the data does not
-# corroborate (ringing between the outermost channel and the value BCs, or
-# bumps inside data gaps) are suppressed. The constraint is soft
-# (MONO_GRAD_ERR is the virtual observation's error bar), so a sharp bump
-# flattens toward a plateau rather than to exactly zero slope. Tolerance and
-# error are in scale_per_slice-normalized units, like every other constant
-# here.
+# 0.6-0.9, and constraining that flattened the valley and the off-axis peak
+# of every hollow profile (icddps2 audit 2026-07, e.g. shot 30097 t=0.245 s).
+# The constraint is soft (MONO_GRAD_ERR is the virtual observation's error
+# bar), so a sharp bump flattens toward a plateau, not to exactly zero slope.
+# Tolerance and error are in scale_per_slice-normalized units.
 MONO_CHECK_RHO = np.concatenate([np.linspace(0.6, 0.85, 6), np.linspace(0.9, 1.09, 20)])
 MONO_GRAD_TOL = 0.01
 MONO_GRAD_ERR = 0.05
 MONO_MAX_PASSES = 3
-# Data-support gate for the mono constraint: window half-width around the
-# violation point, minimum channels in the window, and the t-statistic the
-# local weighted-least-squares slope must exceed for the rise to count as
-# data-supported (and thus be left alone). MIN_POINTS = 5 encodes the breadth
-# distinction: a genuine hollow-profile flank spans many channels (MAST has
-# ~20 per window), while a narrow 2-3 channel bump on the pedestal shoulder -
-# the artifact this constraint exists for - cannot muster 5, so sparse or
-# narrow features keep the old always-constrain behavior.
+# Data-support gate for the mono constraint: window half-width, minimum
+# channels in the window, and the t-statistic the local weighted-least-squares
+# slope must beat for the rise to count as data-supported (and be left alone).
+# MIN_POINTS = 5 encodes the breadth distinction: a genuine hollow-profile
+# flank spans many channels (MAST has ~20 per window), while the narrow 2-3
+# channel pedestal-shoulder bump this constraint exists for cannot muster 5.
 _MONO_SUPPORT_HALFWIDTH = 0.08
 _MONO_SUPPORT_MIN_POINTS = 5
 _MONO_SUPPORT_TSTAT = 1.0
