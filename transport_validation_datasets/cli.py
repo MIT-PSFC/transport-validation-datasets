@@ -13,7 +13,7 @@ import fire
 # Dataset creation plots every shot and normally runs headless
 os.environ.setdefault("MPLBACKEND", "Agg")
 
-STAGES = ("unprocessed", "fit", "all")
+STAGES = ("unprocessed", "fit", "assemble", "all")
 
 DEFAULT_METHOD = "zk"
 
@@ -89,13 +89,15 @@ class DatasetCLI:
 
         python -m transport_validation_datasets.cli mast /path/to/data_assembly_dir
 
-    One stage per invocation, or both with --stage all (the default):
+    One stage per invocation, or all of them with --stage all (the default):
 
         unprocessed: pull the source data, filter it, one netCDF per shot
         fit:         GP fit the Thomson profiles of every unprocessed shot
+        assemble:    combine both into the final Zarr store
 
-    Both stages resume: work already on disk is skipped, so a killed run is
-    restarted by running the same command again.
+    Every stage resumes: work already on disk is skipped, so a killed run is
+    restarted by running the same command again. Assembly is the exception, it
+    always rebuilds the store from what the first two stages left on disk.
 
     GP fitting can be dispatched to a SLURM cluster. Set that up once per
     cluster: a Host entry in ~/.ssh/config with ControlMaster configured, then
@@ -127,6 +129,7 @@ class DatasetCLI:
         stage: str = "all",
         method: str = DEFAULT_METHOD,
         clean_fit_state: bool = False,
+        mb_per_chunk: int = 50,
         cluster_ssh_host: str | None = None,
         cluster_partitions: str | None = None,
         cluster_remote_workdir: str | None = None,
@@ -154,6 +157,8 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
+            mb_per_chunk: Target size of a chunk of the final Zarr store,
+                which is chunked along the shot dimension.
             cluster_ssh_host: See _build_cluster_config.
             cluster_partitions: See _build_cluster_config.
             cluster_remote_workdir: See _build_cluster_config.
@@ -174,6 +179,7 @@ class DatasetCLI:
             data_assembly_dir=Path(data_assembly_dir),
             shotlist_file=shotlist_file,
             max_num_shots=max_num_shots,
+            fit_method=method,
             cluster_config=_build_cluster_config(
                 cluster_ssh_host=cluster_ssh_host,
                 cluster_partitions=cluster_partitions,
@@ -187,7 +193,7 @@ class DatasetCLI:
                 cluster_pending_timeout_s=cluster_pending_timeout_s,
             ),
         )
-        _execute(workflow, stage, method, clean_fit_state)
+        _execute(workflow, stage, clean_fit_state, mb_per_chunk)
 
     def mast(
         self,
@@ -198,6 +204,7 @@ class DatasetCLI:
         stage: str = "all",
         method: str = DEFAULT_METHOD,
         clean_fit_state: bool = False,
+        mb_per_chunk: int = 50,
         prepare_workers: int | None = None,
         cluster_ssh_host: str | None = None,
         cluster_partitions: str | None = None,
@@ -226,6 +233,8 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
+            mb_per_chunk: Target size of a chunk of the final Zarr store,
+                which is chunked along the shot dimension.
             prepare_workers: Threads used to read source data. None keeps the
                 MAST default, which the public S3 store tolerates.
             cluster_ssh_host: See _build_cluster_config.
@@ -248,6 +257,7 @@ class DatasetCLI:
             data_assembly_dir=Path(data_assembly_dir),
             shotlist_file=shotlist_file,
             max_num_shots=max_num_shots,
+            fit_method=method,
             cluster_config=_build_cluster_config(
                 cluster_ssh_host=cluster_ssh_host,
                 cluster_partitions=cluster_partitions,
@@ -262,17 +272,17 @@ class DatasetCLI:
             ),
             **({} if prepare_workers is None else {"prepare_workers": prepare_workers}),
         )
-        _execute(workflow, stage, method, clean_fit_state)
+        _execute(workflow, stage, clean_fit_state, mb_per_chunk)
 
 
-def _execute(workflow, stage: str, method: str, clean_fit_state: bool):
+def _execute(workflow, stage: str, clean_fit_state: bool, mb_per_chunk: int):
     """Run the requested stages of an already built workflow.
 
     Args:
         workflow: The device's DataWorkflow.
         stage: Which stage to run, one of STAGES.
-        method: GP fitting method.
         clean_fit_state: Wipe the staged fit batches before fitting.
+        mb_per_chunk: Target chunk size of the final Zarr store.
 
     Raises:
         ValueError: If the stage is not one of STAGES.
@@ -283,8 +293,10 @@ def _execute(workflow, stage: str, method: str, clean_fit_state: bool):
         workflow.make_unprocessed_data_files()
     if stage in ("fit", "all"):
         if clean_fit_state:
-            workflow.clean_fit_state(method)
-        workflow.run_gp_fitting(method=method)
+            workflow.clean_fit_state()
+        workflow.run_gp_fitting()
+    if stage in ("assemble", "all"):
+        workflow.assemble_final_dataset(mb_per_chunk=mb_per_chunk)
 
 
 if __name__ == "__main__":

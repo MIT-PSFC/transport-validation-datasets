@@ -27,6 +27,7 @@ class CModDataWorkflow(DataWorkflow):
 
     min_pulse_length = 0.5
     min_usable_time = 0.2
+    min_segment_length = 0.1
     valid_filter = {
         "ip": {"min_abs": 100e3},  # Only care about magnitude of ip
         "n_e_line_average": {"min": 1e18, "max": 4e20},
@@ -96,7 +97,7 @@ class CModDataWorkflow(DataWorkflow):
         return shotlist
 
     def make_unprocessed_data_files(self):
-        """Create unprocessed data files for each shot in the shotlist.
+        """Create unprocessed data files for each shot in the requested shotlist.
 
         Unprocessed data files contain everything needed to create the final dataset.
         Signals have standardized names and are on a common timebase
