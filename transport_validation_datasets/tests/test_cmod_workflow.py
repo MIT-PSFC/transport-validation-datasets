@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -55,7 +56,7 @@ class TestMakeUnprocessedDataFiles:
         workflow.make_unprocessed_data_files()
 
         # Check that as many unprocessed data files as were asked for got created
-        shots = workflow.unprocessed_shots(workflow)
+        shots = workflow.unprocessed_shots()
         assert len(shots) == max_num_shots, (
             f"Expected {max_num_shots} unprocessed data files, got {len(shots)}: {shots}"
         )
@@ -116,6 +117,24 @@ def _trim_to_three_ts_slices(nc_path: Path):
     ds.to_netcdf(nc_path)
 
 
+@cache
+def ssh_host_reachable(alias: str) -> bool:
+    # The dispatcher needs an already-authenticated ControlMaster session
+    # (the login node's 2FA prompt cannot be answered from a test), so
+    # check that one really answers rather than just that the alias exists.
+    # Cached: this runs at collection time, once per alias, not per skipif.
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", alias, "true"],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 class TestGPFit:
     test_dir = TEST_DIR / "test_gp_fit"
 
@@ -132,33 +151,21 @@ class TestGPFit:
         workflow.make_unprocessed_data_files()
 
         # Trim the files to three TS slices each to reduce test time
-        for shot in workflow.unprocessed_shots(workflow):
+        for shot in workflow.unprocessed_shots():
             _trim_to_three_ts_slices(workflow.unprocessed_data_dir / f"{shot}.nc")
 
         workflow.run_gp_fitting()
 
         # Check that the per-shot fit result files were written and cover the shots
-        for shot in workflow.unprocessed_shots(workflow):
+        for shot in workflow.unprocessed_shots():
             shot_path = workflow.fit_shots_dir / f"{shot}.nc"
             assert shot_path.exists(), (
                 f"GP fit results file for shot {shot} does not exist"
             )
 
-    @staticmethod
-    def _ssh_host_configured(alias: str) -> bool:
-        # True if ~/.ssh/config has a Host entry naming this alias
-        cfg = Path.home() / ".ssh" / "config"
-        if not cfg.exists():
-            return False
-        for line in cfg.read_text().splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 2 and parts[0].lower() == "host" and alias in parts[1:]:
-                return True
-        return False
-
     @pytest.mark.skipif(
-        not _ssh_host_configured("orcd-login"),
-        reason="no orcd-login entry in ~/.ssh/config",
+        not ssh_host_reachable("orcd-login"),
+        reason="no authenticated ssh session to orcd-login",
     )
     @pytest.mark.parametrize("method", ["zk"])
     def test_dispatched(self, method: str):
@@ -197,31 +204,6 @@ class TestGPFit:
 
         workflow.make_unprocessed_data_files()
 
-        def _trim_to_three_ts_slices(nc_path: Path):
-            # Keep only the first, middle, and last TS slices of an unprocessed data
-            # file (the serial GP fit takes ~80s per slice, a full shot has ~90)
-            ds = xr.load_dataset(nc_path)
-            ts_vars = [
-                "ts_channel_t_e",
-                "ts_channel_t_e_error",
-                "ts_channel_n_e",
-                "ts_channel_n_e_error",
-            ]
-            # TS slices are the times where any channel has a finite te or ne
-            ts_any = (
-                (ds["ts_channel_t_e"].notnull() | ds["ts_channel_n_e"].notnull())
-                .any(dim="ts_channel")
-                .squeeze("shot", drop=True)
-                .transpose("time")
-                .values
-            )
-            ts_idx = np.flatnonzero(ts_any)
-            keep = ts_idx[[0, len(ts_idx) // 2, -1]]
-            drop = np.setdiff1d(ts_idx, keep)
-            for name in ts_vars:
-                ds[name][{"time": drop}] = np.nan
-            ds.to_netcdf(nc_path)
-
         # Trim the files to three TS slices each to reduce test time
         for shot in workflow.unprocessed_shots():
             _trim_to_three_ts_slices(workflow.unprocessed_data_dir / f"{shot}.nc")
@@ -237,8 +219,8 @@ class TestGPFit:
 
     @pytest.mark.slow
     @pytest.mark.skipif(
-        not _ssh_host_configured("orcd-login"),
-        reason="no orcd-login entry in ~/.ssh/config",
+        not ssh_host_reachable("orcd-login"),
+        reason="no authenticated ssh session to orcd-login",
     )
     @pytest.mark.parametrize("method", ["zk"])
     def test_dispatched_20(self, method: str):
