@@ -140,8 +140,10 @@ class ClusterFitConfig:
             submitted to the first partition; it falls back to the next (wrapping
             around) when its job is killed or sits PENDING longer than
             pending_timeout_s.
-        remote_workdir: Scratch directory on the cluster where batch files, the
-            worker package, and job logs are placed. Cluster-specific.
+        remote_workdir: Scratch directory on the cluster. Each dataset works
+            in its own {remote_workdir}/{ds_name}/ subdirectory, holding that
+            dataset's batch files, worker package, job scripts, and logs, so
+            datasets sharing a workdir never touch each other's files.
         venv_path: Path to a pre-built venv on the cluster (see bootstrap_remote.sh).
         max_concurrent_jobs: Cap on simultaneously queued/running fitting jobs, to be
             a good cluster citizen.
@@ -285,14 +287,15 @@ class _SSHBackend:
     Jobs found in none of the three are omitted, which the caller reads as UNKNOWN.
     """
 
-    def __init__(self, config: ClusterFitConfig):
+    def __init__(self, config: ClusterFitConfig, workdir: str):
         """Remember the target host and resolve the ssh username.
 
         Args:
             config: Cluster launch options.
+            workdir: Remote directory job scripts are written into.
         """
         self._host = config.ssh_host
-        self._workdir = config.remote_workdir
+        self._workdir = workdir
         self._username = _ssh_config_user(config.ssh_host)
         if not self._username:
             logger.warning(
@@ -583,7 +586,11 @@ class ClusterFitDispatcher:
         self.worker_module = registry.worker_module(method)
         self.batches_dir = Path(batches_dir)
         self.batches_dir.mkdir(parents=True, exist_ok=True)
-        self.backend = _SSHBackend(config)
+        # Everything this dataset puts on the cluster (batch files, worker
+        # package, job scripts, logs) lives in its own subdirectory, so
+        # datasets sharing a remote_workdir never touch each other's files.
+        self.remote_workdir = f"{config.remote_workdir.rstrip('/')}/{ds_name}"
+        self.backend = _SSHBackend(config, self.remote_workdir)
 
     def job_name(self, batch_id: str) -> str:
         """Build the base job name of a batch.
@@ -667,10 +674,9 @@ class ClusterFitDispatcher:
 
         Call before run() for a from-scratch fit: otherwise plan_batches and
         _run_jobs would adopt the cancelled jobs or reuse leftover batch
-        outputs on the cluster. Job cancellation covers every method of this
-        dataset, but the remote file removal is workdir-wide (batch file names
-        are content hashes, with no dataset in them), so give each dataset its
-        own remote_workdir or a clean here wipes the other's staged batches.
+        outputs on the cluster. Both the cancellation and the file removal
+        cover every method of this dataset and only this dataset: the files
+        live in the dataset's own remote_workdir subdirectory.
         """
         prefix = f"{self.config.job_name_prefix}-{self.ds_name}-"
         for name, job_id in self.backend.queued_jobs():
@@ -690,7 +696,7 @@ class ClusterFitDispatcher:
         # adopted as pre-existing results by the next run. The trailing * also
         # takes the .npz.tmp a killed worker leaves behind mid-write. Raises
         # on failure so a clean that did not actually clean stops the run.
-        self.backend.remove_glob(self.config.remote_workdir, "batch_*.npz*")
+        self.backend.remove_glob(self.remote_workdir, "batch_*.npz*")
         if self.batches_dir.exists():
             shutil.rmtree(self.batches_dir)
         self.batches_dir.mkdir(parents=True, exist_ok=True)
@@ -749,7 +755,7 @@ class ClusterFitDispatcher:
         import transport_validation_datasets
 
         pkg_root = Path(transport_validation_datasets.__file__).parent
-        remote_pkg = f"{self.config.remote_workdir}/pkg/transport_validation_datasets"
+        remote_pkg = f"{self.remote_workdir}/pkg/transport_validation_datasets"
         pushes = [(pkg_root / "__init__.py", remote_pkg)]
         pushes += [
             (p, f"{remote_pkg}/gp_fitting")
@@ -779,7 +785,7 @@ class ClusterFitDispatcher:
         # back (e.g. the pull failed transiently), so check the cluster
         # before submitting anything.
         for state in todo:
-            remote_out = f"{self.config.remote_workdir}/{state.output_path.name}"
+            remote_out = f"{self.remote_workdir}/{state.output_path.name}"
             if self.backend.pull_file(remote_out, self.batches_dir):
                 state.done = True
                 logger.info(
@@ -789,10 +795,10 @@ class ClusterFitDispatcher:
         if not todo:
             return
 
-        logger.info(f"Uploading worker package to {self.config.remote_workdir}/pkg")
+        logger.info(f"Uploading worker package to {self.remote_workdir}/pkg")
         self._push_worker_package()
         # sbatch does not create --output directories
-        self.backend.ensure_dir(f"{self.config.remote_workdir}/logs")
+        self.backend.ensure_dir(f"{self.remote_workdir}/logs")
 
         # Adopt jobs already in the queue from a previous run
         queued = dict(self.backend.queued_jobs())
@@ -876,7 +882,7 @@ class ClusterFitDispatcher:
         Returns:
             The sbatch script text.
         """
-        workdir = self.config.remote_workdir
+        workdir = self.remote_workdir
         lines = [
             "#!/bin/bash",
             "",
@@ -917,7 +923,7 @@ class ClusterFitDispatcher:
         Returns:
             The submitted SLURM job id.
         """
-        workdir = self.config.remote_workdir
+        workdir = self.remote_workdir
         self.backend.push_file(state.input_path, workdir)
 
         part = self.config.partitions[state.partition_idx]
@@ -952,7 +958,7 @@ class ClusterFitDispatcher:
                 state.pending_since = None
                 continue
             # Terminal or unknown: the output file is the source of truth
-            remote_out = f"{self.config.remote_workdir}/{state.output_path.name}"
+            remote_out = f"{self.remote_workdir}/{state.output_path.name}"
             if self.backend.pull_file(remote_out, self.batches_dir):
                 state.done = True
                 logger.info(
@@ -1054,7 +1060,7 @@ class ClusterFitDispatcher:
             )
             logger.error(
                 f"Batch {state.batch_id}: {state.fail_reason}; giving up, see logs "
-                f"in {self.config.remote_workdir}/logs"
+                f"in {self.remote_workdir}/logs"
             )
             return
         state.partition_idx = (state.partition_idx + 1) % len(self.config.partitions)
