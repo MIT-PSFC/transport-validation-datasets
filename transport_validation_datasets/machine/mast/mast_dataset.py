@@ -458,7 +458,7 @@ class MASTDataWorkflow(DataWorkflow):
         nearest grid time without interpolation, since neither is meaningful
         interpolated. The equilibrium is written as a full GEQDSK, so only the
         ~1 grid time in 5 that carries an EFIT slice has one (the rest are NaN,
-        as are the trailing slots of the NaN-padded boundary contour). The
+        as are the trailing slots of the NaN-padded boundary contour).
         Thomson slices land on their own ~4.2 ms laser cadence, which is why
         the fit staging has to reach for a nearby reconstruction
         (see _equilibrium_at_ts_times).
