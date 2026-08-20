@@ -567,7 +567,7 @@ class DataWorkflow(ABC):
         time_mask = (
             valid_mask.any(dim="shot") if "shot" in valid_mask.dims else valid_mask
         )
-        kept_mask, dropped_lengths = self._drop_short_segments(
+        kept_mask, dropped_lengths = _drop_short_segments(
             time_mask.values, times, self.min_segment_length
         )
         if dropped_lengths:
@@ -634,39 +634,6 @@ class DataWorkflow(ABC):
                 kept_spans=list(zip(span_starts.tolist(), span_ends.tolist())),
             )
             return ds_filtered
-
-    @staticmethod
-    def _drop_short_segments(
-        keep: np.ndarray, times: np.ndarray, min_length: float
-    ) -> tuple[np.ndarray, list[float]]:
-        """Clear the runs of kept samples that are shorter than min_length.
-
-        A segment is measured from its first to its last sample, the same way the
-        pulse length and the plotted spans are, so a segment of n samples on the
-        1 kHz grid is n - 1 milliseconds long.
-
-        Args:
-            keep: Mask over times, True where the sample survived the filters.
-            times: The shot's timebase in seconds.
-            min_length: Shortest segment to keep, in seconds.
-
-        Returns:
-            The mask with the short runs cleared, and the lengths in seconds of
-            the runs that were cleared.
-        """
-        keep = np.asarray(keep, dtype=bool).copy()
-        # Pad with False on both sides so a run touching either end still has an edge
-        edges = np.diff(np.concatenate(([False], keep, [False])).astype(np.int8))
-        starts = np.flatnonzero(edges == 1)
-        ends = np.flatnonzero(edges == -1) - 1  # Inclusive
-
-        dropped_lengths = []
-        for start, end in zip(starts, ends):
-            length = float(times[end] - times[start])
-            if length < min_length:
-                keep[start : end + 1] = False
-                dropped_lengths.append(length)
-        return keep, dropped_lengths
 
     @abstractmethod
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
@@ -1295,9 +1262,7 @@ class DataWorkflow(ABC):
         # the times come back as a per-shot variable at the end
         ds_unprocessed = ds_unprocessed.drop_vars(TIME_COORD)
 
-        slice_index, fresh_profile = self._hold_onto_grid(
-            grid, slice_times, forward_fill
-        )
+        slice_index, fresh_profile = _hold_onto_grid(grid, slice_times, forward_fill)
         if not fresh_profile.any():
             raise ValueError(
                 f"Shot {shot}: none of the {slice_times.size} fitted slice times are on "
@@ -1321,7 +1286,7 @@ class DataWorkflow(ABC):
         if missing:
             logger.debug(f"Shot {shot}: filling {missing} with NaN, not on this device")
 
-        equilibrium, fresh_equilibrium = self._hold_equilibrium(
+        equilibrium, fresh_equilibrium = _hold_equilibrium(
             ds_unprocessed, grid, forward_fill
         )
         data_vars.update(equilibrium)
@@ -1334,7 +1299,7 @@ class DataWorkflow(ABC):
         for name in ("t_e_fit_status", "n_e_fit_status"):
             if name in ds_fit:
                 ds_fit[name] = ds_fit[name].astype(np.float32)
-        ds_fit = self._hold_fits_onto_grid(ds_fit, slice_index)
+        ds_fit = _hold_fits_onto_grid(ds_fit, slice_index)
 
         ds_grid = xr.Dataset(data_vars).rename({TIME_COORD: TIME_DIM})
         ordinal = np.arange(grid.size)
@@ -1380,116 +1345,6 @@ class DataWorkflow(ABC):
         return ds_final
 
     @staticmethod
-    def _hold_onto_grid(
-        grid: np.ndarray, sample_times: np.ndarray, forward_fill: bool
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Map every grid time onto the sample it takes its values from.
-
-        A grid time that carries a sample of its own takes that one. The rest
-        take the most recent earlier sample, held for at most MAX_HOLD_PERIODS
-        sampling periods so that nothing is carried across a long gap: the end
-        of the shot, a diagnostic dropping out, or a stretch the filtering cut
-        away. With forward_fill False nothing is held and only the grid times
-        that carry a sample of their own come out.
-
-        Args:
-            grid: The shot's 1 kHz timebase [s].
-            sample_times: Times of the samples to place on it [s], ascending.
-            forward_fill: Hold each sample forward until the next one.
-
-        Returns:
-            (sample_index, fresh): sample_index[i] is the index of the sample
-            that grid time i draws from, -1 where it draws from none, and
-            fresh[i] marks the grid times that carry a sample of their own.
-        """
-        sample_index = np.full(grid.size, -1, dtype=int)
-        fresh = np.zeros(grid.size, dtype=bool)
-        if sample_times.size == 0:
-            return sample_index, fresh
-
-        # Index of the last sample at or before each grid time
-        previous_sample = (
-            np.searchsorted(sample_times, grid + SAMPLE_TIME_TOL, side="right") - 1
-        )
-        has_previous = previous_sample >= 0
-        age = grid - sample_times[np.clip(previous_sample, 0, None)]
-        fresh = has_previous & (np.abs(age) <= SAMPLE_TIME_TOL)
-        if not forward_fill:
-            sample_index[fresh] = previous_sample[fresh]
-            return sample_index, fresh
-
-        # One sample on its own has no period to hold for,
-        # so it only fills the grid step it sits on
-        period = np.median(
-            np.diff(sample_times) if sample_times.size > 1 else np.diff(grid)
-        )
-        still_held = has_previous & (age <= MAX_HOLD_PERIODS * float(period))
-        sample_index[still_held] = previous_sample[still_held]
-        return sample_index, fresh
-
-    @staticmethod
-    def _hold_fits_onto_grid(ds_fit: xr.Dataset, slice_index: np.ndarray) -> xr.Dataset:
-        """Place a shot's fit results on its 1 kHz grid.
-
-        Args:
-            ds_fit: The shot's fit results, one row per Thomson slice.
-            slice_index: Slice each grid time draws from, from _hold_onto_grid.
-
-        Returns:
-            The fit results on the grid, NaN at the grid times that draw on no
-            slice.
-        """
-        ds_grid = ds_fit.isel({TIME_DIM: np.clip(slice_index, 0, None)})
-        return ds_grid.where(xr.DataArray(slice_index >= 0, dims=TIME_DIM))
-
-    @classmethod
-    def _hold_equilibrium(
-        cls, ds_unprocessed: xr.Dataset, grid: np.ndarray, forward_fill: bool
-    ) -> tuple[dict[str, xr.DataArray], np.ndarray]:
-        """Place a shot's equilibria on its 1 kHz grid.
-
-        The equilibrium is reconstructed on its own clock, which is slower than
-        the grid on some devices (MAST reconstructs every 5 ms, C-Mod every
-        millisecond). The grid times a reconstruction landed on are the ones
-        with a finite simagx, the rest hold the last one.
-
-        Args:
-            ds_unprocessed: The shot's unprocessed dataset, on the grid, with
-                its time coordinate already dropped.
-            grid: The shot's 1 kHz timebase [s].
-            forward_fill: Hold each reconstruction forward until the next one.
-
-        Returns:
-            (equilibrium, fresh): the GEQDSK variables on the grid, and the
-            mask of grid times carrying a reconstruction of their own.
-        """
-        names = [name for name in FINAL_EQUILIBRIUM_SIGNALS if name in ds_unprocessed]
-        if "simagx" not in ds_unprocessed:
-            return {name: ds_unprocessed[name] for name in names}, np.zeros(
-                grid.size, dtype=bool
-            )
-
-        reconstructed = np.flatnonzero(
-            ds_unprocessed["simagx"]
-            .squeeze(EPISODE_DIM, drop=True)
-            .transpose(TIME_COORD)
-            .notnull()
-            .values
-        )
-        reconstruction_index, fresh = cls._hold_onto_grid(
-            grid, grid[reconstructed], forward_fill
-        )
-        # reconstruction_index counts reconstructions, the dataset is indexed by
-        # grid time, so index the grid times the reconstructions landed on
-        ds_held = ds_unprocessed[names].isel(
-            {TIME_COORD: reconstructed[np.clip(reconstruction_index, 0, None)]}
-        )
-        ds_held = ds_held.where(
-            xr.DataArray(reconstruction_index >= 0, dims=TIME_COORD)
-        )
-        return {name: ds_held[name] for name in names}, fresh
-
-    @staticmethod
     def _time_variables(
         grid: np.ndarray, fresh_profile: np.ndarray, fresh_equilibrium: np.ndarray
     ) -> xr.Dataset:
@@ -1528,3 +1383,144 @@ class DataWorkflow(ABC):
                 ),
             }
         )
+
+
+def _drop_short_segments(
+    keep: np.ndarray, times: np.ndarray, min_length: float
+) -> tuple[np.ndarray, list[float]]:
+    """Clear the runs of kept samples that are shorter than min_length.
+
+    A segment is measured from its first to its last sample, the same way the
+    pulse length and the plotted spans are, so a segment of n samples on the
+    1 kHz grid is n - 1 milliseconds long.
+
+    Args:
+        keep: Mask over times, True where the sample survived the filters.
+        times: The shot's timebase in seconds.
+        min_length: Shortest segment to keep, in seconds.
+
+    Returns:
+        The mask with the short runs cleared, and the lengths in seconds of
+        the runs that were cleared.
+    """
+    keep = np.asarray(keep, dtype=bool).copy()
+    # Pad with False on both sides so a run touching either end still has an edge
+    edges = np.diff(np.concatenate(([False], keep, [False])).astype(np.int8))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1) - 1  # Inclusive
+
+    dropped_lengths = []
+    for start, end in zip(starts, ends):
+        length = float(times[end] - times[start])
+        if length < min_length:
+            keep[start : end + 1] = False
+            dropped_lengths.append(length)
+    return keep, dropped_lengths
+
+
+def _hold_onto_grid(
+    grid: np.ndarray, sample_times: np.ndarray, forward_fill: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map every grid time onto the sample it takes its values from.
+
+    A grid time that carries a sample of its own takes that one. The rest
+    take the most recent earlier sample, held for at most MAX_HOLD_PERIODS
+    sampling periods so that nothing is carried across a long gap: the end
+    of the shot, a diagnostic dropping out, or a stretch the filtering cut
+    away. With forward_fill False nothing is held and only the grid times
+    that carry a sample of their own come out.
+
+    Args:
+        grid: The shot's 1 kHz timebase [s].
+        sample_times: Times of the samples to place on it [s], ascending.
+        forward_fill: Hold each sample forward until the next one.
+
+    Returns:
+        (sample_index, fresh): sample_index[i] is the index of the sample
+        that grid time i draws from, -1 where it draws from none, and
+        fresh[i] marks the grid times that carry a sample of their own.
+    """
+    sample_index = np.full(grid.size, -1, dtype=int)
+    fresh = np.zeros(grid.size, dtype=bool)
+    if sample_times.size == 0:
+        return sample_index, fresh
+
+    # Index of the last sample at or before each grid time
+    previous_sample = (
+        np.searchsorted(sample_times, grid + SAMPLE_TIME_TOL, side="right") - 1
+    )
+    has_previous = previous_sample >= 0
+    age = grid - sample_times[np.clip(previous_sample, 0, None)]
+    fresh = has_previous & (np.abs(age) <= SAMPLE_TIME_TOL)
+    if not forward_fill:
+        sample_index[fresh] = previous_sample[fresh]
+        return sample_index, fresh
+
+    # One sample on its own has no period to hold for,
+    # so it only fills the grid step it sits on
+    period = np.median(
+        np.diff(sample_times) if sample_times.size > 1 else np.diff(grid)
+    )
+    still_held = has_previous & (age <= MAX_HOLD_PERIODS * float(period))
+    sample_index[still_held] = previous_sample[still_held]
+    return sample_index, fresh
+
+
+def _hold_fits_onto_grid(ds_fit: xr.Dataset, slice_index: np.ndarray) -> xr.Dataset:
+    """Place a shot's fit results on its 1 kHz grid.
+
+    Args:
+        ds_fit: The shot's fit results, one row per Thomson slice.
+        slice_index: Slice each grid time draws from, from _hold_onto_grid.
+
+    Returns:
+        The fit results on the grid, NaN at the grid times that draw on no
+        slice.
+    """
+    ds_grid = ds_fit.isel({TIME_DIM: np.clip(slice_index, 0, None)})
+    return ds_grid.where(xr.DataArray(slice_index >= 0, dims=TIME_DIM))
+
+
+def _hold_equilibrium(
+    ds_unprocessed: xr.Dataset, grid: np.ndarray, forward_fill: bool
+) -> tuple[dict[str, xr.DataArray], np.ndarray]:
+    """Place a shot's equilibria on its 1 kHz grid.
+
+    The equilibrium is reconstructed on its own clock, which is slower than
+    the grid on some devices (MAST reconstructs every 5 ms, C-Mod every
+    millisecond). The grid times a reconstruction landed on are the ones
+    with a finite simagx, the rest hold the last one.
+
+    Args:
+        ds_unprocessed: The shot's unprocessed dataset, on the grid, with
+            its time coordinate already dropped.
+        grid: The shot's 1 kHz timebase [s].
+        forward_fill: Hold each reconstruction forward until the next one.
+
+    Returns:
+        (equilibrium, fresh): the GEQDSK variables on the grid, and the
+        mask of grid times carrying a reconstruction of their own.
+    """
+    names = [name for name in FINAL_EQUILIBRIUM_SIGNALS if name in ds_unprocessed]
+    if "simagx" not in ds_unprocessed:
+        return {name: ds_unprocessed[name] for name in names}, np.zeros(
+            grid.size, dtype=bool
+        )
+
+    reconstructed = np.flatnonzero(
+        ds_unprocessed["simagx"]
+        .squeeze(EPISODE_DIM, drop=True)
+        .transpose(TIME_COORD)
+        .notnull()
+        .values
+    )
+    reconstruction_index, fresh = _hold_onto_grid(
+        grid, grid[reconstructed], forward_fill
+    )
+    # reconstruction_index counts reconstructions, the dataset is indexed by
+    # grid time, so index the grid times the reconstructions landed on
+    ds_held = ds_unprocessed[names].isel(
+        {TIME_COORD: reconstructed[np.clip(reconstruction_index, 0, None)]}
+    )
+    ds_held = ds_held.where(xr.DataArray(reconstruction_index >= 0, dims=TIME_COORD))
+    return {name: ds_held[name] for name in names}, fresh
