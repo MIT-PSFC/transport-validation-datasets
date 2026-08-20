@@ -44,7 +44,6 @@ LOCAL_SHOTS_PER_BATCH = 1
 # The radial coordinate every profile is fit on.
 RHO_DEFINITION = (
     "Normalized outboard midplane minor radius: 0 at the magnetic axis, 1 at the LCFS."
-    "See machine.generic.map_ts_channels_to_rho."
 )
 
 # Per-slice fit statuses that count as a usable profile, see gp_fitting.batch_io.
@@ -62,9 +61,9 @@ MAX_HOLD_PERIODS = 1.5
 
 # Unprocessed signals carried into the final dataset. The union over every
 # device: a signal the device does not have comes through as NaN, so all the
-# devices' final datasets share one schema. Dropped on the way in are only the
-# things the final dataset has no use for (currently the C-Mod ts_array labels,
-# which are strings and so cannot be padded across shots).
+# devices' final datasets share one schema. The raw Thomson channel
+# measurements stay in the unprocessed files and are not released in the
+# final dataset, which carries only the fitted profiles.
 FINAL_0D_SIGNALS = (
     "ip",
     "b0",
@@ -109,17 +108,6 @@ FINAL_EQUILIBRIUM_SIGNALS = (
     "zbdry",
     "rlim",
     "zlim",
-)
-
-# Raw Thomson channel data, kept so the fits can be checked against what they
-# were fit to without going back to the unprocessed files.
-FINAL_TS_SIGNALS = (
-    "ts_channel_r",
-    "ts_channel_z",
-    "ts_channel_t_e",
-    "ts_channel_t_e_error",
-    "ts_channel_n_e",
-    "ts_channel_n_e_error",
 )
 
 
@@ -1159,12 +1147,13 @@ class DataWorkflow(ABC):
                     for dim, size in ds_fit.sizes.items()
                     if dim not in (EPISODE_DIM, TIME_DIM, "hyperparameter")
                 }
+            # ts_channel is skipped: the raw Thomson channels never enter the store
             with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_shot:
                 shot_sizes.update(
                     {
                         (TIME_DIM if dim == TIME_COORD else dim): size
                         for dim, size in ds_shot.sizes.items()
-                        if dim != EPISODE_DIM
+                        if dim not in (EPISODE_DIM, "ts_channel")
                     }
                 )
             for dim, size in shot_sizes.items():
@@ -1290,9 +1279,6 @@ class DataWorkflow(ABC):
             ds_unprocessed, grid, forward_fill
         )
         data_vars.update(equilibrium)
-        for name in FINAL_TS_SIGNALS:
-            if name in ds_unprocessed:
-                data_vars[name] = ds_unprocessed[name]
 
         # Grid times are NaN padded up to the longest shot in the store, so the
         # integer status codes have to be floats to carry the padding
@@ -1312,8 +1298,8 @@ class DataWorkflow(ABC):
             ],
             combine_attrs="drop_conflicts",
         )
-        # Non-index coordinates (the C-Mod ts_array labels) would become
-        # per-shot variables in the store, and strings cannot be NaN padded
+        # Non-index coordinates would become per-shot variables in the store,
+        # and string-valued ones cannot be NaN padded
         extra_coords = [
             name
             for name in ds_final.coords

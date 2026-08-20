@@ -155,7 +155,7 @@ SIGNAL_ATTRS = {
         "ref": "/summary/line_average/n_e/value",
     },
     "power_ohm": {
-        "description": "Ohmic heating power, see _ohmic_power",
+        "description": "Ohmic heating power, Ip * (V_loop - L dIp/dt), clipped at 0",
         "units": "W",
         "ref": "/summary/global_quantities/power_ohm/value",
     },
