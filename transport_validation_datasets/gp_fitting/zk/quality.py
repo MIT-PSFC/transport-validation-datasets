@@ -9,13 +9,17 @@ off-axis is suspect. Two triggers:
     miscalibrated edge channels (C-Mod edge-vs-core TS cross-calibration
     blocks) and the repair drops them.
   Data overshoot: the fit beats the local scatter envelope (data_envelope) by
-    more than _ENVELOPE_MARGIN, i.e. the GP ringing above its own data. Only
-    the extrapolation inside the innermost finite channel is exempt: a peaked
-    profile may legitimately rise toward the axis, but a hump BETWEEN
-    channels is interpolation (a blanket rho < 0.4 exemption once let a
-    pinned te fit invent a 6.4 keV peak at rho 0.26 between 4 keV channels,
-    C-Mod 1160503008 t=1.311). Data-supported off-axis humps (hollow ramp-up
-    ne) pass.
+    more than _ENVELOPE_MARGIN, i.e. the GP ringing above its own data.
+    Checked only between the innermost and outermost finite channels: a hump
+    BETWEEN channels is interpolation (a blanket rho < 0.4 exemption once let
+    a pinned te fit invent a 6.4 keV peak at rho 0.26 between 4 keV channels,
+    C-Mod 1160503008 t=1.311), but a peaked profile may legitimately rise
+    toward the axis inside the innermost channel, and past the outermost
+    channel the profile is near zero, so the relative margin divides one
+    near-zero number by another and flags harmless sub-percent SOL ringing
+    (MAST 28956 t=0.179, fit 0.006e20 vs envelope 0.004e20 at rho 1.1) that
+    the monotonic-edge constraint and the value BCs already govern.
+    Data-supported off-axis humps (hollow ramp-up ne) pass.
 A flagged slice is repaired by refitting without the channels under the peak
 (see the worker's _fit_variable; a pinned te fit is first retried unpinned),
 and culled only once the repairs are exhausted.
@@ -203,8 +207,10 @@ def nonphysical_peak(y, x_star, data_x, data_y, data_err) -> float | None:
             return float(x[edge][np.nanargmax(y[edge])])
         ch_finite = np.isfinite(data_x) & np.isfinite(data_y)
         innermost = float(np.min(data_x[ch_finite])) if ch_finite.any() else np.inf
+        outermost = float(np.max(data_x[ch_finite])) if ch_finite.any() else -np.inf
         worst_rho, worst = None, _ENVELOPE_MARGIN
-        for i in np.flatnonzero((x >= innermost) & np.isfinite(y) & (y > 0)):
+        in_span = (x >= innermost) & (x <= outermost)
+        for i in np.flatnonzero(in_span & np.isfinite(y) & (y > 0)):
             env = data_envelope(data_x, data_y, data_err, x[i])
             if np.isfinite(env) and env > 0 and y[i] / env > worst:
                 worst_rho, worst = float(x[i]), y[i] / env

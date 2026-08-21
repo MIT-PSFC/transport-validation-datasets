@@ -693,10 +693,13 @@ class DataWorkflow(ABC):
         """Delete every staged fit batch so the next run refits from scratch.
 
         Destructive: fits already computed are lost, unprocessed data files are
-        untouched. With a cluster_config this also cancels the dataset's queued
-        jobs and clears its remote batch files, which a from-scratch cluster
-        fit needs: otherwise the next run adopts the cancelled jobs or pulls
-        back the leftover results (see ClusterFitDispatcher.clean).
+        untouched. This method's fit result files and fit plots are deleted
+        too: both are rebuilt from the new fits, and the plots would otherwise
+        survive the rebuild (plot_fit_results skips shots whose PDF exists).
+        With a cluster_config this also cancels the dataset's queued jobs and
+        clears its remote batch files, which a from-scratch cluster fit needs:
+        otherwise the next run adopts the cancelled jobs or pulls back the
+        leftover results (see ClusterFitDispatcher.clean).
         """
         if self.cluster_config is not None:
             from transport_validation_datasets.gp_fitting.dispatcher import (
@@ -709,6 +712,9 @@ class DataWorkflow(ABC):
             dispatcher.clean()
         elif self.fit_batches_dir.exists():
             shutil.rmtree(self.fit_batches_dir)
+        for out_dir in (self.fit_shots_dir, self.fit_plots_dir):
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
         logger.info(f"Cleaned fit staging state in {self.fit_batches_dir}")
 
     def stage_fit_batches(self, shots: list[int]) -> dict[str, list[int]]:

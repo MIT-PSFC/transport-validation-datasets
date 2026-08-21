@@ -139,6 +139,7 @@ def bounds_for(fit_bounds: FitBounds) -> np.ndarray:
         (2, 5) array of [lower, upper] hyperparameter bounds.
     """
     bounds = HYP_BOUNDS.astype(float).copy()
+    bounds[1, 0] = float(fit_bounds.var_max)
     bounds[0, 1] = float(fit_bounds.l1_min)
     bounds[0, 4] = float(fit_bounds.x0_min)
     return bounds

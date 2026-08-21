@@ -22,7 +22,6 @@ from loguru import logger
 from transport_validation_datasets import PACKAGE_ROOT
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
-    channel_rows_at_times,
     efit_cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
@@ -361,45 +360,20 @@ class MASTDataWorkflow(DataWorkflow):
     }
     # MAST's ip record runs through the current quench, so a small ip cutoff
     # still lets disruption transients in. Has to be longer than C-Mod's 20 ms.
-    end_margin = 0.08
-    # Early campaign shots with known problems, plus 29430, whose bolometer the
-    # earlier MAST workflow found broken: its raw radiated power spans -2.2 to
-    # +40.5 MW while MAST input power stays below 5 MW, so the whole record is
-    # untrustworthy.
+    end_margin = 0.04
+    # Shots the validity filtering rejects outright (checked 2026-08-20 by
+    # running them through the pipeline), skipped here to save the processing.
+    # 29430 is the worst of them: its bolometer is broken, the raw radiated
+    # power spans -2.2 to +40.5 MW while MAST input power stays below 5 MW.
+    # The rest of the "early campaign shots with known problems" list this
+    # inherited from the older MAST workflow had no recorded reasons, passed
+    # both the store probe and the filtering, and was dropped the same day.
     shot_blacklist = [
-        28897,
-        28898,
-        28899,
-        28900,
-        28901,
-        28906,
-        28907,
-        28909,
-        28910,
-        28911,
         28938,
-        28939,
-        28956,
-        28957,
-        28972,
-        28973,
-        28975,
         28976,
-        28982,
-        28986,
         28988,
-        28989,
-        28991,
-        28993,
         28995,
-        28996,
         29008,
-        29009,
-        29012,
-        29017,
-        29020,
-        29120,
-        29144,
         29430,
         30317,
         30318,
@@ -411,18 +385,20 @@ class MASTDataWorkflow(DataWorkflow):
     fit_min_points = 10
     fit_scale_per_slice = True
     # Both variables share the same bounds on MAST:
-    # - l1 floor 0.2: hollow ne needs a core length scale short enough to bend
-    #   down-up-down through the off-axis crest, at 0.4 the fit rounds the crest
-    #   off (shots 30097/30064, monotonic control fits were unaffected).
-    # - x0 down to 0.85: edge-peaked ne (early-time edge accumulation, the
-    #   28978 t=0.26 class) has its structure at rho 0.85-0.95, out of reach of
-    #   the short edge scale with the default 0.95 bound.
-    # Both were calibrated against the older MAST rho (distance along the
-    # Thomson chord, see prepare_fit_input), so they are a starting point on
-    # this flux-mapped rho, not a settled answer.
+    # - l1 floor 0.4: the chord's tangency point leaves many slices with no
+    #   data inside rho ~0.4, and an l1 of 0.2 lets the fit collapse onto the
+    #   zero prior there (core dives below the innermost channels, amplitude
+    #   rails, fit_ignores_data culls the slice).
+    # - x0 down to 0.85: edge-peaked ne (ears) has its structure at rho 0.85-0.95,
+    #   out of reach of the short edge scale with the default 0.95 bound.
+    # - var ceiling 5: on slices with an empty core the marginal likelihood
+    #   rails the amplitude at the default ceiling of 20, which invents core
+    #   values several times the slice max with a band to match.
+    #   5 allows a prior amplitude of ~2x the slice max and
+    #   leaves every data-covered region untouched.
     fit_bounds = {
-        "te": FitBounds(l1_min=0.2, x0_min=0.85),
-        "ne": FitBounds(l1_min=0.2, x0_min=0.85),
+        "te": FitBounds(l1_min=0.4, x0_min=0.85, var_max=5.0),
+        "ne": FitBounds(l1_min=0.4, x0_min=0.85, var_max=5.0),
     }
 
     # The public S3 store tolerates concurrent reads, and every read is a
@@ -541,25 +517,17 @@ class MASTDataWorkflow(DataWorkflow):
         1: Give every TS slice the nearest reconstruction to map through
         2: Map the TS channels onto rho through that flux map
         3: Convert to the fit units (Te [keV], ne [1e20 m^-3])
-        4: Drop the channels MAST cannot fit on this coordinate
+        4: Drop the channels outside the fittable rho range
 
-        Only the OUTBOARD channels are fit. The inboard side maps onto the same
-        rho through the reconstruction's interior flux, but a magnetics-only
-        reconstruction does not pin that interior profile, and on a spherical
-        tokamak Te is not necessarily a flux function anyway (poloidal
-        asymmetries can be real), so there is no principled way to merge the two
-        sides. Fitting the outboard side alone matches the outboard-midplane
-        convention rho is defined on.
+        BOTH sides of the chord are fit. The inboard side maps onto the same
+        rho through the reconstruction's interior flux, which a magnetics-only
+        reconstruction does not pin precisely, and on a spherical tokamak Te
+        is not strictly a flux function (poloidal asymmetries can be real).
 
-        Note the innermost fitted channel usually reaches no further in than
-        rho ~0.3-0.4, not to the axis: the Thomson chord runs along
-        z = TS_CHANNEL_Z while these MAST equilibria put the magnetic axis
-        0.15-0.25 m lower, so the chord passes above the axis and never crosses
-        the innermost flux surfaces. (Checked against the data: the radial
-        extent of the measured Te matches the psi_n = 1 crossings at
-        z = TS_CHANNEL_Z, not the wider ones at the axis height.) The older
-        MAST workflow hid this by calling the chord's innermost point rho = 0,
-        which mislabels it, so its fits are not directly comparable to these.
+        NOTE: The Thomson chord runs along z = TS_CHANNEL_Z while the MAST
+        equilibria may put the magnetic axis 0.15-0.25 m lower, so the chord
+        passes above the axis and never crosses the innermost flux surfaces.
+        This may lead to extrapolation in the core.
 
         Args:
             shot: Shot number being staged.
@@ -576,10 +544,6 @@ class MASTDataWorkflow(DataWorkflow):
 
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
 
-        # Channel positions and the magnetic axis broadcast against each other,
-        # so this works whether or not ts_channel_r carries a time dimension.
-        outboard = ds_shot["ts_channel_r"] >= ds_shot["rmagx"]
-        rho = np.where(channel_rows_at_times(outboard, ts_times), rho, np.nan)
         with np.errstate(invalid="ignore"):
             rho = np.where((rho >= 0.0) & (rho <= MAX_FIT_RHO), rho, np.nan)
 
