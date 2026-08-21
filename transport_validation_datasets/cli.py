@@ -36,8 +36,9 @@ def _build_cluster_config(
         cluster_ssh_host: Host alias from ~/.ssh/config for the cluster login node.
         cluster_partitions: Ordered partition preference list,
             name@time_limit[@constraint], comma separated.
-        cluster_remote_workdir: Scratch directory on the cluster for batch files
-            and job logs.
+        cluster_remote_workdir: Scratch directory on the cluster. Each dataset
+            keeps its batch files, worker package, and job logs in its own
+            <workdir>/<ds_name>/ subdirectory.
         cluster_venv: Pre-built venv on the cluster (see bootstrap_remote.sh).
         cluster_max_jobs: Cap on simultaneously queued or running fitting jobs.
         cluster_shots_per_batch: Shots packed into one job.
@@ -270,7 +271,7 @@ class DatasetCLI:
                 cluster_max_retries=cluster_max_retries,
                 cluster_pending_timeout_s=cluster_pending_timeout_s,
             ),
-            **({} if prepare_workers is None else {"prepare_workers": prepare_workers}),
+            prepare_workers=prepare_workers,
         )
         _execute(workflow, stage, clean_fit_state, mb_per_chunk)
 

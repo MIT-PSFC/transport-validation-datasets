@@ -14,6 +14,7 @@ The import chain must stay within stdlib + numpy + mkgp (see batch_io module doc
 """
 
 import os
+from dataclasses import replace
 
 # Limit BLAS threads before numpy loads so slice-level multiprocessing
 # (fit_batch num_workers) does not oversubscribe cores
@@ -59,6 +60,11 @@ from transport_validation_datasets.gp_fitting.zk.quality import (  # noqa: E402
 # Columns of the hyps diagnostic arrays in this method's outputs.
 HYP_NAMES = ("var", "l1", "l2", "lw", "x0")
 
+# Core length-scale floor of the smooth-rescue attempt (see _fit_variable).
+# High enough to force the optimizer out of a short-l1 basin, below the 0.9
+# ceiling so the optimizer still has a range to search.
+SMOOTH_RESCUE_L1_MIN = 0.7
+
 
 def _no_fit(status: int) -> VariableFit:
     """Build the all-None VariableFit for a slice that produced no fit.
@@ -74,7 +80,7 @@ def _no_fit(status: int) -> VariableFit:
     )
 
 
-def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0):
+def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0, seed_salt=0):
     """Clean, fit, and rescale one variable of one slice, once.
 
     Args:
@@ -85,6 +91,7 @@ def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0):
         scale_per_slice: Normalize by the cleaned slice max before fitting.
         bounds: The variable's staged bound knobs.
         pin_x0: Hold the pedestal location at this value, or None.
+        seed_salt: Restart seed offset for a reseeded retry (see run_gp).
 
     Returns:
         (fit, std, grad, grad_std, hyps) in the data's own units, or None when
@@ -95,7 +102,7 @@ def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0):
     if cleaned is None:
         return None
     cx, cy, cerr, scale = cleaned
-    pf = fit_profile(cx, cy, cerr, x_star, bounds, pin_x0=pin_x0)
+    pf = fit_profile(cx, cy, cerr, x_star, bounds, pin_x0=pin_x0, seed_salt=seed_salt)
     if pf is None:
         return None
     return (
@@ -137,16 +144,27 @@ def _fit_variable(
     bounds: FitBounds,
     pin_x0: float | None,
 ) -> VariableFit:
-    """Fit one variable of one time slice, with up to two repairs.
+    """Fit one variable of one time slice, with up to three repairs.
 
     1: Attempt to fit the variable
     2: If nonphysical and the pedestal was pinned, retry unpinned
     (repair a: pinning can force the optimizer into a pathological basin on sparse-core data,
     huge variance, invented interior hump, or an amplitude collapse under the bias guard,
     that the free fit does not have)
-    3: if still nonphysical with a peak over droppable channels, retry with fewer channels
-    (repair b: a stray point or a miscalibrated block)
-    4: A peak sitting where there is no data to drop is pure extrapolation ringing,
+    3: If still nonphysical or failed, retry from a fresh restart seed
+    (repair b: a borderline slice sits between two near-equal LML basins and
+    the input-hashed seed picks one, so float-level input noise can flip an
+    identical-looking slice between healthy and nonphysical; a different,
+    still deterministic draw can land the healthy basin)
+    4: If still nonphysical, retry with the core length scale floored at
+    SMOOTH_RESCUE_L1_MIN
+    (repair c: the LML can genuinely prefer a short-l1 basin that explains
+    mid-profile wiggles by sacrificing the innermost channel cluster, MAST
+    28956 t=0.179; raising the floor forces the smooth basin, which the
+    checks then judge like any other fit)
+    5: if still nonphysical with a peak over droppable channels, retry with fewer channels
+    (repair d: a stray point or a miscalibrated block)
+    6: A peak sitting where there is no data to drop is pure extrapolation ringing,
     and a biased fit with no peak has no channel subset that repairs it. Both get culled.
 
     Args:
@@ -171,23 +189,35 @@ def _fit_variable(
     if int(valid.sum()) < min_points:
         return _no_fit(STATUS_SKIPPED)
 
-    result = _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0)
-    if result is None:
-        return _no_fit(STATUS_FAILED)
-    peak, biased = _fit_problems(result[0], x_star, x, y, err)
-    if peak is None and not biased:
-        return VariableFit(*result, status=STATUS_OK)
-
-    # Repair a: release the te-to-ne x0 pin and refit.
+    # The attempt ladder: as staged, then unpinned (repair a, only when
+    # pinned), then a fresh restart draw (repair b), then the smooth basin
+    # (repair c). The first clean fit returns; the last flagged fit feeds the
+    # channel-drop repair below.
+    attempts = [(pin_x0, 0, bounds)]
     if pin_x0 is not None:
-        result = _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, None)
+        attempts.append((None, 0, bounds))
+    attempts.append((None, 1, bounds))
+    if bounds.l1_min < SMOOTH_RESCUE_L1_MIN:
+        attempts.append((None, 1, replace(bounds, l1_min=SMOOTH_RESCUE_L1_MIN)))
+
+    last_flagged = None
+    for n_attempt, (pin, seed_salt, attempt_bounds) in enumerate(attempts):
+        result = _attempt_fit(
+            x, y, err, x_star, scale_per_slice, attempt_bounds, pin, seed_salt=seed_salt
+        )
         if result is None:
-            return _no_fit(STATUS_CULLED)
+            continue
         peak, biased = _fit_problems(result[0], x_star, x, y, err)
         if peak is None and not biased:
-            return VariableFit(*result, status=STATUS_REPAIRED)
+            status = STATUS_OK if n_attempt == 0 else STATUS_REPAIRED
+            return VariableFit(*result, status=status)
+        last_flagged = (peak, biased)
 
-    # Repair b: drop the channels under the nonphysical peak and refit once.
+    if last_flagged is None:
+        return _no_fit(STATUS_FAILED)
+    peak, biased = last_flagged
+
+    # Repair d: drop the channels under the nonphysical peak and refit once.
     if peak is None:
         return _no_fit(STATUS_CULLED)
     drop = valid & (np.abs(x - peak) <= REPAIR_HALFWIDTH)

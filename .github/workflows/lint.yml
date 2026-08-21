@@ -1,0 +1,39 @@
+---
+name: Lint & Format
+
+"on":
+  pull_request: null
+  push:
+    branches:
+      - "main"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint_and_format:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install Python 3.13
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --python 3.13 --group dev
+
+      - name: Run pre-commit
+        run: >-
+          uv run pre-commit run
+          --show-diff-on-failure --color=always --all-files

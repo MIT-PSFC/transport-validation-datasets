@@ -31,8 +31,10 @@ PYVER="${3:-3.12}"
 MKGP_SPEC="mkgp==3.1.4"
 
 echo "==> Creating $WORKDIR on $HOST"
+# Only the workdir itself: each dataset makes its own <workdir>/<ds_name>/
+# subdirectory (batch files, job scripts, logs) at dispatch time.
 # shellcheck disable=SC2029  # client-side expansion of WORKDIR is intended
-ssh "$HOST" "mkdir -p '$WORKDIR/logs'"
+ssh "$HOST" "mkdir -p '$WORKDIR'"
 
 echo "==> Building venv with python $PYVER (installs uv if missing)"
 # shellcheck disable=SC2087  # client-side expansion into the heredoc is

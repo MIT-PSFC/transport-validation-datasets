@@ -3,34 +3,12 @@ Consolidated methods for generating datasets to validate transport codes and tra
 
 # Dataset structure
 
-| Signals | Description |  IMAS | C-Mod Source | MAST Source | DIII-D Source | TCV Source | 
-| ------ | ------ |        ------      |     ------        |      ------         |       ------     |
-| ip | Measured plasma current | /summary/global_quantities/ip/value | 
-| B0
-| a_minor
-| R0
-| kappa
-| delta_top
-| delta_bot
-| ne20_line_avg
-| betan
-| Wtot_MJ | /equilibrium/time_slice(itime)/global_quantities/energy_mhd (total kinetic pressure, includes fast ions)
-| -------|
-| ------ |
-| P_RAD
-| P_OH
-| P_NBI
-| P_ECRH
-| P_ICRH
-| P_LH
-| ----|
-| ----- |
-| ne20_rho
-| Te_keV_rho
-| fresh_profiles
-| ---- |
-| Equilibrium things to re-make an EQDSK? TBD |
-| fresh_equilibria
+Every device is reduced to one schema, listed under [Final dataset](#final-dataset).
+Signal names are IMAS-like, units are SI, and each variable carries its IMAS
+data dictionary path under its `ref` attribute in the stored files. The
+per-device sources of each signal live next to their attributes in
+`machine/mast/mast_dataset.py` (`SIGNAL_ATTRS`) and
+`machine/cmod/dispy_methods.py`.
 
 # Workflow
 
@@ -64,7 +42,6 @@ shot had no Thomson pulse there.
 | Time | time, fresh_profile, fresh_equilibrium | (shot, time_idx) |
 | Fitted profiles | t_e, n_e, their _error, _gradient, _gradient_error, _fit_status | (shot, time_idx, rho) |
 | Equilibrium | the full GEQDSK block: psirz, fpol, pres, ffprime, pprime, qpsi, rbdry, zbdry, rlim, zlim, rmagx, zmagx, simagx, sibdry, bcentr, current, rcentr, rleft, rdim, zmid, zdim | (shot, time_idx, grid) |
-| Thomson | ts_channel_r/z, ts_channel_t_e, ts_channel_n_e and their errors | (shot, time_idx, ts_channel) |
 
 A signal the device does not have comes through as NaN, so the devices share
 one schema. Everything is float32, flags included, because the padding between
@@ -101,7 +78,9 @@ rebuilds the store.
 
 # Sources
 
-| Device | Source | Notes |
-| ------ | ------ | ----- |
-| C-Mod | MDSplus through disruption-py | Needs to run somewhere with tree access |
-| MAST | Level 2 Zarr store at https://s3.echo.stfc.ac.uk/mast/level2/shots, plus two level 1 groups: EFM for the GEQDSK safety factor and AYC for the Thomson profiles | Public, anonymous, read in a thread pool (`--prepare_workers`) |
+| Device | Source | Shotlist | Notes |
+| ------ | ------ | -------- | ----- |
+| C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access |
+| MAST | Level 2 Zarr store at https://s3.echo.stfc.ac.uk/mast/level2/shots, plus two level 1 groups: EFM for the GEQDSK safety factor and AYC for the Thomson profiles | 1101 shots from the M8 and M9 campaigns, shipped with the package | Public, anonymous, read in a thread pool (`--prepare_workers`) |
+| DIII-D | | | |
+| TCV | | | |

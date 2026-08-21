@@ -41,13 +41,13 @@ class FitBounds:
     """Per-variable fit bound knobs carried in the batch file.
 
     Their semantics are defined by the fitting method
-    (for zk: the core length-scale floor and the pedestal-center lower bound)
     other methods may ignore fields they do not use.
     One instance per fitted variable, so each variable of each device can run its own range.
     """
 
     l1_min: float = 0.4
     x0_min: float = 0.95
+    var_max: float = 20.0
 
 
 def default_fit_bounds() -> dict[str, FitBounds]:

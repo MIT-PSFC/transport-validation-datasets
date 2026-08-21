@@ -14,8 +14,6 @@ One shot costs ~60-90 s of round trips, which puts the
 packaged 1101-shot list at a few hours on the default 8 threads.
 """
 
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 import xarray as xr
 from disruption_py.core.utils.math import causal_boxcar_smooth, interp1
@@ -29,6 +27,7 @@ from transport_validation_datasets.machine.generic import (
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho,
     snap_to_grid,
+    ts_channel_fit_rows,
 )
 from transport_validation_datasets.workflow import DataWorkflow
 
@@ -53,11 +52,7 @@ REQUIRED_TS_VARIABLES = ("radius", "te", "te_error", "ne", "ne_error")
 EQUILIBRIUM_TIME_TOL = 1e-4
 
 # Shotlist for M8 and M9 campaigns
-DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "machine" / "mast" / "mast_shotlist"
-
-# Threads used to stage source data. Staging scales almost linearly with this
-# until the store starts throttling, since every read is an S3 round trip.
-DEFAULT_PREPARE_WORKERS = 8
+DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "machine" / "mast" / "mast_shotlist_M8_M9"
 
 # The core Thomson system (AYC) views along a horizontal chord at the midplane,
 # so every channel is at the same height and only its major radius varies.
@@ -159,7 +154,7 @@ SIGNAL_ATTRS = {
         "ref": "/summary/line_average/n_e/value",
     },
     "power_ohm": {
-        "description": "Ohmic heating power, see _ohmic_power",
+        "description": "Ohmic heating power, Ip * (V_loop - L dIp/dt), clipped at 0",
         "units": "W",
         "ref": "/summary/global_quantities/power_ohm/value",
     },
@@ -365,45 +360,20 @@ class MASTDataWorkflow(DataWorkflow):
     }
     # MAST's ip record runs through the current quench, so a small ip cutoff
     # still lets disruption transients in. Has to be longer than C-Mod's 20 ms.
-    end_margin = 0.08
-    # Early campaign shots with known problems, plus 29430, whose bolometer the
-    # earlier MAST workflow found broken: its raw radiated power spans -2.2 to
-    # +40.5 MW while MAST input power stays below 5 MW, so the whole record is
-    # untrustworthy.
+    end_margin = 0.04
+    # Shots the validity filtering rejects outright (checked 2026-08-20 by
+    # running them through the pipeline), skipped here to save the processing.
+    # 29430 is the worst of them: its bolometer is broken, the raw radiated
+    # power spans -2.2 to +40.5 MW while MAST input power stays below 5 MW.
+    # The rest of the "early campaign shots with known problems" list this
+    # inherited from the older MAST workflow had no recorded reasons, passed
+    # both the store probe and the filtering, and was dropped the same day.
     shot_blacklist = [
-        28897,
-        28898,
-        28899,
-        28900,
-        28901,
-        28906,
-        28907,
-        28909,
-        28910,
-        28911,
         28938,
-        28939,
-        28956,
-        28957,
-        28972,
-        28973,
-        28975,
         28976,
-        28982,
-        28986,
         28988,
-        28989,
-        28991,
-        28993,
         28995,
-        28996,
         29008,
-        29009,
-        29012,
-        29017,
-        29020,
-        29120,
-        29144,
         29430,
         30317,
         30318,
@@ -415,32 +385,27 @@ class MASTDataWorkflow(DataWorkflow):
     fit_min_points = 10
     fit_scale_per_slice = True
     # Both variables share the same bounds on MAST:
-    # - l1 floor 0.2: hollow ne needs a core length scale short enough to bend
-    #   down-up-down through the off-axis crest, at 0.4 the fit rounds the crest
-    #   off (shots 30097/30064, monotonic control fits were unaffected).
-    # - x0 down to 0.85: edge-peaked ne (early-time edge accumulation, the
-    #   28978 t=0.26 class) has its structure at rho 0.85-0.95, out of reach of
-    #   the short edge scale with the default 0.95 bound.
-    # Both were calibrated against the older MAST rho (distance along the
-    # Thomson chord, see prepare_fit_input), so they are a starting point on
-    # this flux-mapped rho, not a settled answer.
+    # - l1 floor 0.4: the chord's tangency point leaves many slices with no
+    #   data inside rho ~0.4, and an l1 of 0.2 lets the fit collapse onto the
+    #   zero prior there (core dives below the innermost channels, amplitude
+    #   rails, fit_ignores_data culls the slice).
+    # - x0 down to 0.85: edge-peaked ne (ears) has its structure at rho 0.85-0.95,
+    #   out of reach of the short edge scale with the default 0.95 bound.
+    # - var ceiling 5: on slices with an empty core the marginal likelihood
+    #   rails the amplitude at the default ceiling of 20, which invents core
+    #   values several times the slice max with a band to match.
+    #   5 allows a prior amplitude of ~2x the slice max and
+    #   leaves every data-covered region untouched.
     fit_bounds = {
-        "te": FitBounds(l1_min=0.2, x0_min=0.85),
-        "ne": FitBounds(l1_min=0.2, x0_min=0.85),
+        "te": FitBounds(l1_min=0.4, x0_min=0.85, var_max=5.0),
+        "ne": FitBounds(l1_min=0.4, x0_min=0.85, var_max=5.0),
     }
 
-    def __init__(self, *args, prepare_workers: int = DEFAULT_PREPARE_WORKERS, **kwargs):
-        """Set up the workflow, defaulting to threaded staging.
+    # The public S3 store tolerates concurrent reads, and every read is a
+    # round trip, so staging scales almost linearly until the store throttles
+    default_prepare_workers = 8
 
-        Args:
-            *args: Positional arguments of DataWorkflow.
-            prepare_workers: Threads used to stage source data. The MAST store
-                is public S3 and tolerates concurrent reads.
-            **kwargs: Keyword arguments of DataWorkflow.
-        """
-        super().__init__(*args, prepare_workers=prepare_workers, **kwargs)
-
-    def _get_shotlist_from_source(self) -> list[int]:
+    def get_shotlist_from_source(self) -> list[int]:
         """Read the shotlist shipped with the package.
 
         MAST has no SQL database reachable outside Culham, so the shotlist has
@@ -460,104 +425,7 @@ class MASTDataWorkflow(DataWorkflow):
         with open(DEFAULT_SHOTLIST_FILE) as f:
             return [int(line.strip()) for line in f if line.strip().isdigit()]
 
-    def make_unprocessed_data_files(self):
-        """Create unprocessed data files for each shot in the shotlist.
-
-        Source reads run prepare_workers at a time in a thread pool, since they
-        are S3 latency. Filtering, plotting, and writing stay on this thread:
-        they are matplotlib and netCDF work, and neither is worth threading.
-        """
-        self.unprocessed_data_dir.mkdir(parents=True, exist_ok=True)
-        workers = max(1, self.prepare_workers or 1)
-        shots = iter(self.shotlist)
-        unprocessed_shots = 0
-        exhausted = False
-
-        while not exhausted and (
-            self.max_num_shots is None or unprocessed_shots < self.max_num_shots
-        ):
-            # Fill a batch with shots that actually need a source read, so a
-            # run that is mostly resuming does not stage one shot at a time
-            batch: list[int] = []
-            while len(batch) < workers:
-                if (
-                    self.max_num_shots is not None
-                    and unprocessed_shots + len(batch) >= self.max_num_shots
-                ):
-                    break
-                shot = next(shots, None)
-                if shot is None:
-                    exhausted = True
-                    break
-                if shot in self.shot_blacklist:
-                    logger.info(f"Shot {shot} is blacklisted. Skipping.")
-                    continue
-                if (self.unprocessed_data_dir / f"{shot}.nc").exists():
-                    logger.info(
-                        f"Unprocessed data file for shot {shot} already exists. Skipping."
-                    )
-                    unprocessed_shots += 1
-                    continue
-                if self.shot_already_failed(shot):
-                    logger.info(f"Shot {shot} failed on a previous run. Skipping.")
-                    continue
-                batch.append(shot)
-            unprocessed_shots += self._read_and_write_shots(batch, workers)
-
-        logger.info(f"Finished with {unprocessed_shots} MAST unprocessed data files.")
-
-    def _read_and_write_shots(self, shots: list[int], workers: int) -> int:
-        """Read a batch of shots from the store, then filter and write them.
-
-        Args:
-            shots: Shot numbers to read.
-            workers: Threads to read them with.
-
-        Returns:
-            How many unprocessed data files were written.
-        """
-        if not shots:
-            return 0
-
-        def read(shot: int) -> xr.Dataset | None:
-            """Read one shot, keeping a failure from killing the whole run.
-
-            Args:
-                shot: Shot number to read.
-
-            Returns:
-                The standardized dataset, or None if it could not be read.
-            """
-            try:
-                return self._get_source_dataset(shot)
-            except Exception as e:
-                logger.warning(f"Shot {shot}: failed to read source data: {e}")
-                logger.opt(exception=True).debug(e)
-                return None
-
-        if len(shots) == 1 or workers == 1:
-            datasets = [read(shot) for shot in shots]
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                datasets = list(pool.map(read, shots))
-
-        n_written = 0
-        for shot, ds_standardized in zip(shots, datasets, strict=True):
-            if ds_standardized is None:
-                continue
-            ds_unprocessed = self.filter_and_plot(ds_standardized)
-            if ds_unprocessed is None:
-                logger.warning(
-                    f"Shot {shot} did not pass filtering. Skipping unprocessed data file creation."
-                )
-                self.record_failed_shot(shot, "Did not pass filtering.")
-                continue
-            ds_unprocessed.to_netcdf(self.unprocessed_data_dir / f"{shot}.nc")
-            logger.info(f"Created unprocessed data file for shot {shot}.")
-            n_written += 1
-        return n_written
-
-    def _get_source_dataset(self, shot: int) -> xr.Dataset | None:
+    def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         """Read one shot from the MAST stores into standardized signals.
 
         The three sources are put on the shot's 1 kHz timebase differently:
@@ -566,7 +434,7 @@ class MASTDataWorkflow(DataWorkflow):
         nearest grid time without interpolation, since neither is meaningful
         interpolated. The equilibrium is written as a full GEQDSK, so only the
         ~1 grid time in 5 that carries an EFIT slice has one (the rest are NaN,
-        as are the trailing slots of the NaN-padded boundary contour). The
+        as are the trailing slots of the NaN-padded boundary contour).
         Thomson slices land on their own ~4.2 ms laser cadence, which is why
         the fit staging has to reach for a nearby reconstruction
         (see _equilibrium_at_ts_times).
@@ -576,13 +444,10 @@ class MASTDataWorkflow(DataWorkflow):
 
         Returns:
             The standardized dataset, or None when the shot cannot be built.
-            Permanent problems (no store, missing signals, no plasma) are also
-            recorded with record_failed_shot so later runs skip the shot,
-            transient read failures are only logged so they are retried.
         """
         data_tree = _open_level2(shot)
         if data_tree is None:
-            if not _level2_store_exists(shot):
+            if not _store_path_exists(f"{LEVEL2_PATH}/{shot}.zarr"):
                 self.record_failed_shot(shot, "No level 2 store for this shot.")
             return None
 
@@ -608,7 +473,7 @@ class MASTDataWorkflow(DataWorkflow):
 
         thomson = _open_level1_group(shot, LEVEL1_TS_GROUP)
         if thomson is None:
-            if not _level1_group_exists(shot, LEVEL1_TS_GROUP):
+            if not _store_path_exists(f"{LEVEL1_PATH}/{shot}.zarr/{LEVEL1_TS_GROUP}"):
                 self.record_failed_shot(
                     shot, f"No level 1 {LEVEL1_TS_GROUP} Thomson group for this shot."
                 )
@@ -652,25 +517,17 @@ class MASTDataWorkflow(DataWorkflow):
         1: Give every TS slice the nearest reconstruction to map through
         2: Map the TS channels onto rho through that flux map
         3: Convert to the fit units (Te [keV], ne [1e20 m^-3])
-        4: Drop the channels MAST cannot fit on this coordinate
+        4: Drop the channels outside the fittable rho range
 
-        Only the OUTBOARD channels are fit. The inboard side maps onto the same
-        rho through the reconstruction's interior flux, but a magnetics-only
-        reconstruction does not pin that interior profile, and on a spherical
-        tokamak Te is not necessarily a flux function anyway (poloidal
-        asymmetries can be real), so there is no principled way to merge the two
-        sides. Fitting the outboard side alone matches the outboard-midplane
-        convention rho is defined on.
+        BOTH sides of the chord are fit. The inboard side maps onto the same
+        rho through the reconstruction's interior flux, which a magnetics-only
+        reconstruction does not pin precisely, and on a spherical tokamak Te
+        is not strictly a flux function (poloidal asymmetries can be real).
 
-        Note the innermost fitted channel usually reaches no further in than
-        rho ~0.3-0.4, not to the axis: the Thomson chord runs along
-        z = TS_CHANNEL_Z while these MAST equilibria put the magnetic axis
-        0.15-0.25 m lower, so the chord passes above the axis and never crosses
-        the innermost flux surfaces. (Checked against the data: the radial
-        extent of the measured Te matches the psi_n = 1 crossings at
-        z = TS_CHANNEL_Z, not the wider ones at the axis height.) The older
-        MAST workflow hid this by calling the chord's innermost point rho = 0,
-        which mislabels it, so its fits are not directly comparable to these.
+        NOTE: The Thomson chord runs along z = TS_CHANNEL_Z while the MAST
+        equilibria may put the magnetic axis 0.15-0.25 m lower, so the chord
+        passes above the axis and never crosses the innermost flux surfaces.
+        This may lead to extrapolation in the core.
 
         Args:
             shot: Shot number being staged.
@@ -685,31 +542,8 @@ class MASTDataWorkflow(DataWorkflow):
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None
 
-        ts_mask = np.isin(ds_shot["time"].values, ts_times)
+        te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
 
-        def ts_rows(name: str) -> np.ndarray:
-            """Extract a TS channel variable at the TS slice times.
-
-            Args:
-                name: Variable name in the unprocessed dataset.
-
-            Returns:
-                The (n_t, n_ch) float array at the TS slice times.
-            """
-            values = ds_shot[name].transpose("time", "ts_channel").values
-            return np.asarray(values, dtype=float)[ts_mask]
-
-        te_y = ts_rows("ts_channel_t_e") * 1e-3  # eV -> keV
-        te_err = ts_rows("ts_channel_t_e_error") * 1e-3
-        ne_y = ts_rows("ts_channel_n_e") * 1e-20  # m^-3 -> 1e20 m^-3
-        ne_err = ts_rows("ts_channel_n_e_error") * 1e-20
-
-        # Channel positions and the magnetic axis broadcast against each other,
-        # so this works whether or not ts_channel_r carries a time dimension.
-        outboard = (ds_shot["ts_channel_r"] >= ds_shot["rmagx"]).transpose(
-            "time", "ts_channel"
-        )
-        rho = np.where(np.asarray(outboard.values)[ts_mask], rho, np.nan)
         with np.errstate(invalid="ignore"):
             rho = np.where((rho >= 0.0) & (rho <= MAX_FIT_RHO), rho, np.nan)
 
@@ -754,21 +588,35 @@ def _equilibrium_at_ts_times(ds_shot: xr.Dataset) -> xr.Dataset:
     )
 
 
-def _make_store_map(shot: int):
-    """Build the S3 key-value store of one shot's level 2 Zarr store.
-
-    Args:
-        shot: Shot number.
+def _s3():
+    """Open the anonymous filesystem the MAST stores are published on.
 
     Returns:
-        The s3fs mapping to hand to the zarr engine.
+        The s3fs filesystem.
     """
     # Imported lazily: s3fs pulls in aiobotocore, which is slow to import and
     # useless to a run that only fits already staged shots.
     import s3fs
 
-    fs = s3fs.S3FileSystem(anon=True, endpoint_url=S3_ENDPOINT)
-    return s3fs.S3Map(f"{LEVEL2_PATH}/{shot}.zarr", s3=fs)
+    return s3fs.S3FileSystem(anon=True, endpoint_url=S3_ENDPOINT)
+
+
+def _store_path_exists(path: str) -> bool:
+    """Check whether a path exists in the public MAST buckets.
+
+    Separates a shot or group that was never published (a permanent failure
+    worth recording) from an S3 hiccup (worth retrying on the next run).
+
+    Args:
+        path: Bucket-qualified path, e.g. "mast/level2/shots/30097.zarr".
+
+    Returns:
+        True if the path exists, False if it does not or cannot be listed.
+    """
+    try:
+        return bool(_s3().ls(path, detail=False))
+    except Exception:
+        return False
 
 
 def _open_level2(shot: int) -> xr.DataTree | None:
@@ -780,9 +628,14 @@ def _open_level2(shot: int) -> xr.DataTree | None:
     Returns:
         The store's data tree, or None if it could not be opened.
     """
+    import s3fs
+
     try:
         return xr.open_datatree(
-            _make_store_map(shot), engine="zarr", chunks=None, consolidated=True
+            s3fs.S3Map(f"{LEVEL2_PATH}/{shot}.zarr", s3=_s3()),
+            engine="zarr",
+            chunks=None,
+            consolidated=True,
         )
     except Exception as e:
         logger.warning(f"Shot {shot}: failed to open the level 2 store: {e}")
@@ -799,15 +652,15 @@ def _open_level1_group(shot: int, group: str) -> xr.Dataset | None:
 
     Returns:
         The group, or None if it could not be opened. A group the shot never
-        had and an S3 hiccup both land here, _level1_group_exists tells them
-        apart.
+        had and an S3 hiccup both land here, _store_path_exists tells them
+        apart. Roughly 3% of the packaged shotlist has no ayc group, all of
+        them shots the level 2 store also publishes no Thomson for.
     """
     import s3fs
 
     try:
-        fs = s3fs.S3FileSystem(anon=True, endpoint_url=S3_ENDPOINT)
         return xr.open_zarr(
-            s3fs.S3Map(f"{LEVEL1_PATH}/{shot}.zarr", s3=fs),
+            s3fs.S3Map(f"{LEVEL1_PATH}/{shot}.zarr", s3=_s3()),
             group=group,
             chunks=None,
             consolidated=True,
@@ -816,51 +669,6 @@ def _open_level1_group(shot: int, group: str) -> xr.Dataset | None:
         logger.warning(f"Shot {shot}: failed to open level 1 {group}: {e}")
         logger.opt(exception=True).debug(e)
         return None
-
-
-def _level1_group_exists(shot: int, group: str) -> bool:
-    """Check whether a level 1 group of a shot exists at all.
-
-    Same purpose as _level2_store_exists: separate a group that was never
-    published from a read that happened to fail. Roughly 3% of the packaged
-    shotlist has no ayc group, all of them shots the level 2 store also
-    publishes no Thomson for.
-
-    Args:
-        shot: Shot number to check.
-        group: Level 1 group name.
-
-    Returns:
-        True if the group exists, False if it does not or cannot be listed.
-    """
-    import s3fs
-
-    try:
-        fs = s3fs.S3FileSystem(anon=True, endpoint_url=S3_ENDPOINT)
-        return bool(fs.ls(f"{LEVEL1_PATH}/{shot}.zarr/{group}", detail=False))
-    except Exception:
-        return False
-
-
-def _level2_store_exists(shot: int) -> bool:
-    """Check whether the store of a shot exists at all.
-
-    Separates a shot that was never published (a permanent failure worth
-    recording) from an S3 hiccup (worth retrying on the next run).
-
-    Args:
-        shot: Shot number to check.
-
-    Returns:
-        True if the store exists, False if it does not or cannot be listed.
-    """
-    import s3fs
-
-    try:
-        fs = s3fs.S3FileSystem(anon=True, endpoint_url=S3_ENDPOINT)
-        return bool(fs.ls(f"{LEVEL2_PATH}/{shot}.zarr", detail=False))
-    except Exception:
-        return False
 
 
 def _has_path(data_tree: xr.DataTree, path: str) -> bool:

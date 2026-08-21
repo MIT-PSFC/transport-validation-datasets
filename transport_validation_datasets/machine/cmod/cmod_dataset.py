@@ -18,6 +18,7 @@ from transport_validation_datasets.machine.generic import (
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho,
     snap_to_grid,
+    ts_channel_fit_rows,
 )
 from transport_validation_datasets.workflow import DataWorkflow
 
@@ -55,7 +56,7 @@ class CModDataWorkflow(DataWorkflow):
         "ne": FitBounds(l1_min=0.55),
     }
 
-    def _get_shotlist_from_source(self) -> list[int]:
+    def get_shotlist_from_source(self) -> list[int]:
         """Retrieve shotlist from C-Mod SQL database.
 
         Returns:
@@ -96,84 +97,41 @@ class CModDataWorkflow(DataWorkflow):
         shotlist = [shot for shot in shotlist if shot // 1000 in blessed_days]
         return shotlist
 
-    def make_unprocessed_data_files(self):
-        """Create unprocessed data files for each shot in the requested shotlist.
+    def get_source_dataset(self, shot: int) -> xr.Dataset | None:
+        """Read one shot from MDSplus, through disruption-py, into standardized signals.
 
-        Unprocessed data files contain everything needed to create the final dataset.
-        Signals have standardized names and are on a common timebase
+        Three retrievals rather than one, because their native timebases
+        differ: the fast 0D signals (Ip, B0, shaping, density, power) and the
+        EFIT reconstruction are both native 1 kHz, Thomson scattering is
+        native ~20 Hz and gets snapped onto the 1 kHz grid.
 
+        Args:
+            shot: Shot number to read.
+
+        Returns:
+            The standardized dataset, or None when the shot cannot be built.
         """
-        unprocessed_shots = 0
-        for shot in self.shotlist:
-            if self.max_num_shots and (unprocessed_shots >= self.max_num_shots):
-                logger.info(
-                    f"Reached maximum number of unprocessed shots ({self.max_num_shots}). Stopping."
-                )
-                break
+        datasets = []
+        for name, getter in (
+            ("fast", _get_fast_dataset),
+            ("efit", _get_efit_dataset),
+            ("thomson", _get_thomson_dataset),
+        ):
+            ds = getter(shot)
+            if ds is None:
+                reason = f"Missing retrievable {name} data."
+                logger.warning(f"Shot {shot} is {reason.lower()} Skipping.")
+                self.record_failed_shot(shot, reason)
+                return None
+            datasets.append(ds)
 
-            if shot in self.shot_blacklist:
-                logger.info(f"Shot {shot} is blacklisted. Skipping.")
-                continue
-
-            unprocessed_ds_path = self.unprocessed_data_dir / f"{shot}.nc"
-            if unprocessed_ds_path.exists():
-                logger.info(
-                    f"Unprocessed data file for shot {shot} already exists. Skipping."
-                )
-                unprocessed_shots += 1
-                continue
-
-            if self.shot_already_failed(shot):
-                logger.info(f"Shot {shot} failed on a previous run. Skipping.")
-                continue
-
-            # Get data for this shot using disruption-py.
-            # Three datasets created separately due to timebase differences:
-            # fast 0D signals (Ip, B0, shaping, density, power, all native 1 kHz),
-            # the EFIT dataset (native 1 kHz on C-Mod),
-            # and Thomson scattering (native 20 Hz).
-            datasets = []
-            missing = False
-            for name, getter in (
-                ("fast", _get_fast_dataset),
-                ("efit", _get_efit_dataset),
-                ("thomson", _get_thomson_dataset),
-            ):
-                ds = getter(shot)
-                if ds is None:
-                    reason = f"Missing retrievable {name} data."
-                    logger.warning(
-                        f"Shot {shot} is missing retrievable {name} data. "
-                        "Skipping unprocessed data file creation."
-                    )
-                    self.record_failed_shot(shot, reason)
-                    missing = True
-                    break
-                datasets.append(ds)
-            if missing:
-                continue
-
-            ds_merged = xr.merge(datasets, compat="no_conflicts", join="outer")
-
-            ds_standardized = self.standardize_signal_names(ds_merged)
-            if ds_standardized is None:
-                logger.warning(
-                    f"Shot {shot} is missing critical signals. Skipping unprocessed data file creation."
-                )
-                self.record_failed_shot(shot, "Missing critical signals.")
-                continue
-
-            ds_unprocessed = self.filter_and_plot(ds_standardized)
-            if ds_unprocessed is None:
-                logger.warning(
-                    f"Shot {shot} did not pass filtering. Skipping unprocessed data file creation."
-                )
-                self.record_failed_shot(shot, "Did not pass filtering.")
-                continue
-
-            ds_unprocessed.to_netcdf(unprocessed_ds_path)
-            logger.info(f"Created unprocessed data file for shot {shot}.")
-            unprocessed_shots += 1
+        ds_standardized = self.standardize_signal_names(
+            xr.merge(datasets, compat="no_conflicts", join="outer")
+        )
+        if ds_standardized is None:
+            logger.warning(f"Shot {shot} is missing critical signals. Skipping.")
+            self.record_failed_shot(shot, "Missing critical signals.")
+        return ds_standardized
 
     def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
         """Rename signals to IMAS-like names, keeping freeqdsk names for EFIT signals.
@@ -240,7 +198,6 @@ class CModDataWorkflow(DataWorkflow):
         1: Maps the TS channels onto rho through magnetics-only EFIT
         2: convert to the fit units (Te [keV], ne [1e20 m^-3])
         3: C-Mod channel quality screens and error floors, calibrated in those units
-        4: TODO(ZanderKeith) optionally correct density with interferometry
 
         Args:
             shot: Shot number being staged.
@@ -254,25 +211,9 @@ class CModDataWorkflow(DataWorkflow):
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None
 
-        ds_shot = ds.squeeze("shot", drop=True)
-        ts_mask = np.isin(ds_shot["time"].values, ts_times)
-
-        def ts_rows(name: str) -> np.ndarray:
-            """Extract a TS channel variable at the TS slice times.
-
-            Args:
-                name: Variable name in the unprocessed dataset.
-
-            Returns:
-                The (n_t, n_ch) float array at the TS slice times.
-            """
-            values = ds_shot[name].transpose("time", "ts_channel").values
-            return np.asarray(values, dtype=float)[ts_mask]
-
-        te_y = ts_rows("ts_channel_t_e") * 1e-3  # eV -> keV
-        te_err = ts_rows("ts_channel_t_e_error") * 1e-3
-        ne_y = ts_rows("ts_channel_n_e") * 1e-20  # m^-3 -> 1e20 m^-3
-        ne_err = ts_rows("ts_channel_n_e_error") * 1e-20
+        te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(
+            ds.squeeze("shot", drop=True), ts_times
+        )
 
         # Drop density channels too uncertain to constrain the fit
         # (error > 1e20 m^-3). These are typically bad edge/SOL channels.
@@ -314,7 +255,7 @@ class CModDataWorkflow(DataWorkflow):
             return None
         return fit_input
 
-    def _fit_plot_channel_groups(self, shot: int) -> list | None:
+    def fit_plot_channel_groups(self, shot: int) -> list | None:
         """Split the fit-plot channels into the core and edge TS systems.
 
         Args:
@@ -323,8 +264,8 @@ class CModDataWorkflow(DataWorkflow):
         Returns:
             (mask, color, label) triples for the two Thomson arrays.
         """
-        ds = xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc")
-        ts_array = ds["ts_array"].values
+        with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
+            ts_array = ds["ts_array"].values
         return [
             (ts_array == "core", "tab:blue", "core TS"),
             (ts_array == "edge", "tab:orange", "edge TS"),
