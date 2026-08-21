@@ -91,6 +91,7 @@ def run_gp(
     extra_grad_bc=None,
     nrestarts=NRESTARTS,
     hyp_retries=MAX_HYP_RETRIES,
+    seed_salt=0,
 ) -> GaussianProcess | None:
     """Set up the GP with edge BCs and fit it.
 
@@ -124,6 +125,9 @@ def run_gp(
             monotonic-edge virtual observations, see MONO_CHECK_RHO).
         nrestarts: Optimizer random restarts per attempt.
         hyp_retries: Extra attempts when a fit pins a hyperparameter.
+        seed_salt: Offsets the deterministic restart seeds, so a caller can
+            rerun the same data with a fresh, still reproducible restart draw
+            (the worker's reseeded repair of a nonphysical fit).
 
     Returns:
         The fitted GaussianProcess, or None if every attempt failed.
@@ -169,7 +173,9 @@ def run_gp(
         # Seed even on the predict-only path: the error-kernel fit inside
         # GPRFit runs its own random restarts, so an unseeded RNG would make
         # the result depend on process history (serial vs parallel workers).
-        np.random.seed(deterministic_seed(data_X, data_y, err_y, salt=attempt))
+        np.random.seed(
+            deterministic_seed(data_X, data_y, err_y, salt=attempt + 17 * seed_salt)
+        )
         if do_optimize:
             fit_restarts = nrestarts
         else:
@@ -208,6 +214,7 @@ def fit_profile(
     x_star: np.ndarray,
     fit_bounds: FitBounds,
     pin_x0: float | None = None,
+    seed_salt: int = 0,
 ) -> ProfileFit | None:
     """Fit one cleaned profile slice and predict on x_star.
 
@@ -229,6 +236,7 @@ def fit_profile(
         x_star: Target rho grid.
         fit_bounds: The variable's staged bound knobs.
         pin_x0: Hold the pedestal location at this value (see run_gp).
+        seed_salt: Restart seed offset for a reseeded retry (see run_gp).
 
     Returns:
         The fitted slice, or None if the GP fit failed.
@@ -239,7 +247,9 @@ def fit_profile(
     x_out = np.asarray(x_star, dtype=float).ravel()
     n_out = x_out.size
     x_eval = np.concatenate([x_out, MONO_CHECK_RHO])
-    gp = run_gp(data_X, data_y, err_y, x_eval, fit_bounds, pin_x0=pin_x0)
+    gp = run_gp(
+        data_X, data_y, err_y, x_eval, fit_bounds, pin_x0=pin_x0, seed_salt=seed_salt
+    )
     if gp is None:
         return None
     hyps_out = np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
@@ -275,6 +285,7 @@ def fit_profile(
             optimize=False,
             pin_x0=pin_x0,
             extra_grad_bc=mono_bc,
+            seed_salt=seed_salt,
         )
         if gp_mono is None:
             break
