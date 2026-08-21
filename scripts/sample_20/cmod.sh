@@ -1,5 +1,6 @@
 #!/bin/bash
 # Script used to make 20-shot sample dataset for C-Mod
+# NOTE: Expects to have run bootstrap_remote.sh to set up the cluster environment first
 
 MAX_NUM_SHOTS=20
 
