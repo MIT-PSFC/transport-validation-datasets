@@ -3,7 +3,7 @@ Consolidated methods for generating datasets to validate transport codes and tra
 
 # Dataset structure
 
-Every device is reduced to one schema, listed under [Final dataset](#final-dataset).
+Every device is reduced to one schema, listed under [The datasets](#the-datasets).
 Signal names are IMAS-like, units are SI, and each variable carries its IMAS
 data dictionary path under its `ref` attribute in the stored files. The
 per-device sources of each signal live next to their attributes in
@@ -14,14 +14,22 @@ per-device sources of each signal live next to their attributes in
 
 1: Pull unprocessed data from source and filter down to regions of validity
 2: Perform GP profile fitting
-3: Assemble dataset
+3: Stack shots into the internal dataset
+4: Publish dataset, stripping the internal-only signals
 
-# Final dataset
+# The datasets
 
-One Zarr store per device, at `<data_assembly_dir>/<ds_name>/dataset_full/<ds_name>.zarr`,
-built by `DataWorkflow.assemble_final_dataset`. Shots are stacked along `shot`
-and NaN padded along every other dimension, so shots of different lengths line
-up. Only one shot is ever held in memory while it is built.
+Two Zarr stores per device, under `<data_assembly_dir>/<ds_name>/04_datasets/`:
+
+- `<ds_name>_internal.zarr`, the store for internal use, carrying every signal
+  below. Built by `DataWorkflow.stack_internal_dataset` (the stack stage).
+- `<ds_name>_published.zarr`, the store for release, derived from the internal
+  one with the device's `published_strip_signals` stripped out. Built by
+  `DataWorkflow.publish_dataset` (the publish stage).
+
+Shots are stacked along `shot` and NaN padded along every other dimension, so
+shots of different lengths line up. Only one shot is ever held in memory while
+the internal store is built, and the published store is streamed from it.
 
 The timebase is the unprocessed data's uniform 1 kHz grid. `time_idx` is the
 grid ordinal, so shots of different lengths pad to a common size, and the
@@ -42,6 +50,7 @@ shot had no Thomson pulse there.
 | Time | time, fresh_profile, fresh_equilibrium | (shot, time_idx) |
 | Fitted profiles | t_e, n_e, their _error, _gradient, _gradient_error, _fit_status | (shot, time_idx, rho) |
 | Equilibrium | the full GEQDSK block: psirz, fpol, pres, ffprime, pprime, qpsi, rbdry, zbdry, rlim, zlim, rmagx, zmagx, simagx, sibdry, bcentr, current, rcentr, rleft, rdim, zmid, zdim | (shot, time_idx, grid) |
+| Raw Thomson channels (internal store only) | ts_channel_r, ts_channel_z, ts_channel_t_e, ts_channel_n_e, their _error | (shot, time_idx, ts_channel) |
 
 A signal the device does not have comes through as NaN, so the devices share
 one schema. Everything is float32, flags included, because the padding between
@@ -67,14 +76,18 @@ uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_d
     --cluster_remote_workdir /path/on/cluster \
     --cluster_venv /path/on/cluster/.venv
 
-# Assemble the final Zarr store from what the first two stages left on disk
+# Stack the internal Zarr store from what the first two stages left on disk
 uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_dir \
-    --stage assemble
+    --stage stack
+
+# Derive the published store from the internal one
+uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_dir \
+    --stage publish
 ```
 
 `--help` lists every flag, and the stages resume: rerunning the same command
-picks up whatever is not on disk yet. Assembly is the exception, it always
-rebuilds the store.
+picks up whatever is not on disk yet. Stack and publish are the exceptions,
+each always rebuilds its store.
 
 # Sources
 
