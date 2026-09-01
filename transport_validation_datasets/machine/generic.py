@@ -310,8 +310,14 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
             continue
 
         # Map each channel's psi_n to the outboard midplane radius, then normalize to rho.
-        psi_outboard = psi_n_mid[i_axis:]
-        r_outboard = r_grid[i_axis:]
+        # Anchor the table on the refined axis, where psi_n is 0 by definition, and keep
+        # only the grid nodes outboard of it (otherwise might get negative rho)
+        outboard = r_grid[i_axis:] > r_axis
+        psi_outboard = np.concatenate([[0.0], psi_n_mid[i_axis:][outboard]])
+        r_outboard = np.concatenate([[r_axis], r_grid[i_axis:][outboard]])
+        if r_outboard.size < 2:
+            n_no_equilibrium += 1
+            continue
         keep = psi_outboard == np.maximum.accumulate(
             psi_outboard
         )  # Ensure monotonicity for interp
