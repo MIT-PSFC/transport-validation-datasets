@@ -55,6 +55,8 @@ shot had no Thomson pulse there.
 A signal the device does not have comes through as NaN, so the devices share
 one schema. Everything is float32, flags included, because the padding between
 shots of different lengths is NaN.
+The power signals (power_ohm/radiated/nbi/ic/lh) are clipped at zero since source records often dip negative
+(bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
 
 # Running
 

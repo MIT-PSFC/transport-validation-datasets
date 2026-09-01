@@ -495,6 +495,7 @@ class DataWorkflow(ABC):
                 )
                 self.record_failed_shot(shot, "Did not pass filtering.")
                 continue
+            ds_unprocessed = _clip_powers(ds_unprocessed)
             ds_unprocessed.to_netcdf(self.unprocessed_data_dir / f"{shot}.nc")
             logger.info(f"Created unprocessed data file for shot {shot}.")
             n_written += 1
@@ -1456,6 +1457,28 @@ class DataWorkflow(ABC):
                 ),
             }
         )
+
+
+def _clip_powers(ds: xr.Dataset) -> xr.Dataset:
+    """Clip every power signal at zero before the unprocessed file is written.
+
+    Source power records dip negative (bolometer baseline drift on cmod's
+    power_radiated, ICRF pickup, MAST's power_nbi baseline), and no heating or
+    radiated power is physically negative. Runs after filtering so the validity
+    and transient gates still judge the values the device recorded.
+
+    Args:
+        ds: One shot's filtered dataset with standardized names.
+
+    Returns:
+        The same dataset with power signals clipped to >= 0, NaN untouched.
+    """
+    for name in DATASET_0D_SIGNALS:
+        if name.startswith("power_") and name in ds:
+            attrs = ds[name].attrs
+            ds[name] = ds[name].clip(min=0.0) + 0.0  # -0.0 -> 0.0
+            ds[name].attrs = attrs
+    return ds
 
 
 def _drop_short_segments(
