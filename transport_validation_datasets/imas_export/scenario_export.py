@@ -11,9 +11,14 @@ plan notes for the full reasoning. In particular:
     the shot's unprocessed data (its own, full native time base -- not
     thinned to or deduped against the Thomson slice times).
   - `summary` is written at its own full native (1 kHz) 0D-signal
-    resolution, for the same reason.
+    resolution, for the same reason, and carries every
+    `workflow.FINAL_0D_SIGNALS` entry the shot has (see
+    `_SUMMARY_SIGNAL_PATHS` for where each one lands).
   - `core_profiles` gets one `profiles_1d` per usable Thomson slice time,
-    electrons + a single hydrogenic main ion (Zeff=1, n_D=n_e). Zeff/impurity
+    electrons (with the GP fit's 1-sigma uncertainties in the DD's
+    `*_error_upper` fields; `*_error_lower` is left unset, which the IMAS
+    convention reads as a symmetric error) + a single hydrogenic
+    main ion (Zeff=1, n_D=n_e). Zeff/impurity
     composition are deliberately NOT computed here, and this package holds no
     code for them at all -- that physics lives in a standalone
     `postprocess_ion_composition.py` script kept entirely outside this repo
@@ -108,6 +113,9 @@ class ShotExportSlice:
             (see `build_equilibrium`'s `derived_by_time`), for placing
             `profiles_1d.grid.psi`.
         ip: Nearest-time plasma current [A].
+        t_e_error: 1-sigma uncertainty of `t_e` [eV], or None if the fit
+            file carries none.
+        n_e_error: 1-sigma uncertainty of `n_e` [m^-3], or None likewise.
     """
 
     time: float
@@ -118,6 +126,8 @@ class ShotExportSlice:
     psi_boundary: float
     psin_neo: np.ndarray
     ip: float
+    t_e_error: np.ndarray | None = None
+    n_e_error: np.ndarray | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -582,10 +592,20 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
         p1d.electrons.density = s.n_e
         p1d.electrons.density_thermal = s.n_e
         p1d.electrons.temperature = s.t_e
+        # The GP fit's 1-sigma predictive uncertainty is symmetric: per the
+        # IMAS convention, filling only `*_error_upper` and leaving
+        # `*_error_lower` unset declares exactly that.
+        if s.t_e_error is not None:
+            p1d.electrons.temperature_error_upper = s.t_e_error
+        if s.n_e_error is not None:
+            p1d.electrons.density_error_upper = s.n_e_error
+            p1d.electrons.density_thermal_error_upper = s.n_e_error
         p1d.zeff = np.ones_like(s.rho, dtype=float)
         # D is the only ion species, so T_i = T_e (as every species would be
         # assigned anyway) makes the density-weighted average exactly t_e.
         p1d.t_i_average = s.t_e
+        if s.t_e_error is not None:
+            p1d.t_i_average_error_upper = s.t_e_error
 
         p1d.ion.resize(1)
         ion = p1d.ion[0]
@@ -593,6 +613,13 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
         ion.density = s.n_e
         ion.density_thermal = s.n_e
         ion.temperature = s.t_e
+        # n_D = n_e exactly (single species, Zeff=1), so its uncertainty is
+        # n_e's; T_i = T_e likewise.
+        if s.n_e_error is not None:
+            ion.density_error_upper = s.n_e_error
+            ion.density_thermal_error_upper = s.n_e_error
+        if s.t_e_error is not None:
+            ion.temperature_error_upper = s.t_e_error
         ion.z_ion_1d = np.ones_like(s.t_e, dtype=float)
         ion.z_ion = 1.0
         _, a, z_n = define_ion_species(short_name=_MAIN_ION_FUSIO_NAME)
@@ -611,26 +638,60 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
 # ---------------------------------------------------------------------------
 
 
-def build_summary(factory, time, ip, b0, power_ohm, power_radiated, power_ic):
+# `workflow.FINAL_0D_SIGNALS` name -> (summary sub-structure, field) it is
+# written to; each target is a `summary_dynamic` node whose `.value` holds the
+# time series. Every FINAL_0D_SIGNALS entry has a home here, and the paths
+# match the `ref` attrs the machine modules record on the unprocessed signals
+# (confirmed against the installed DD 4.0.0 by introspection).
+_SUMMARY_SIGNAL_PATHS = {
+    "ip": ("global_quantities", "ip"),
+    "b0": ("global_quantities", "b0"),
+    "energy_mhd": ("global_quantities", "energy_mhd"),
+    "beta_tor_norm": ("global_quantities", "beta_tor_norm"),
+    "power_ohm": ("global_quantities", "power_ohm"),
+    "power_radiated": ("global_quantities", "power_radiated"),
+    "n_e_line_average": ("line_average", "n_e"),
+    "minor_radius": ("boundary", "minor_radius"),
+    "geometric_axis_r": ("boundary", "geometric_axis_r"),
+    "elongation": ("boundary", "elongation"),
+    "triangularity_upper": ("boundary", "triangularity_upper"),
+    "triangularity_lower": ("boundary", "triangularity_lower"),
+    "power_nbi": ("heating_current_drive", "power_nbi"),
+    "power_ic": ("heating_current_drive", "power_ic"),
+    "power_lh": ("heating_current_drive", "power_lh"),
+}
+
+
+def build_summary(factory, time, signals):
     """`summary` IDS at its own full native (unprocessed-file) 0D-signal resolution.
 
     Args:
         factory: `imas.IDSFactory` to build the IDS from.
         time: (n,) time base [s] -- the unprocessed file's own 0D-signal
             sampling, independent of `equilibrium.time`/`core_profiles.time`.
-        ip, b0, power_ohm, power_radiated, power_ic: (n,) 0D signals on `time`.
+        signals: `workflow.FINAL_0D_SIGNALS` name -> (n,) signal on `time`.
+            Any subset; a signal that is absent, or NaN everywhere (how a
+            device without it stages it), is left unset in the IDS. A name
+            with no entry in `_SUMMARY_SIGNAL_PATHS` is an error, so a new
+            FINAL_0D_SIGNALS entry cannot be dropped silently.
 
     Returns:
         The validated `summary` IDS.
     """
+    unknown = sorted(set(signals) - set(_SUMMARY_SIGNAL_PATHS))
+    if unknown:
+        raise ValueError(f"No summary IDS field mapped for 0D signal(s) {unknown}")
+
     sm = factory.summary()
     sm.ids_properties.homogeneous_time = 1
     sm.time = np.asarray(time, dtype=float)
-    sm.global_quantities.ip.value = np.asarray(ip, dtype=float)
-    sm.global_quantities.b0.value = np.asarray(b0, dtype=float)
-    sm.global_quantities.power_ohm.value = np.asarray(power_ohm, dtype=float)
-    sm.global_quantities.power_radiated.value = np.asarray(power_radiated, dtype=float)
-    sm.heating_current_drive.power_ic.value = np.asarray(power_ic, dtype=float)
+    for name, (group, field) in _SUMMARY_SIGNAL_PATHS.items():
+        if name not in signals:
+            continue
+        values = np.asarray(signals[name], dtype=float)
+        if not np.any(np.isfinite(values)):
+            continue
+        getattr(getattr(sm, group), field).value = values
     sm.validate()
     return sm
 
@@ -718,11 +779,11 @@ def build_imas_from_shot(
             `n_e_fit_status` on `(shot, TIME_DIM, rho)`, real slice times in
             `TIME_COORD`.
         unprocessed_ds: This shot's unprocessed data
-            (`01_unprocessed/<shot>.nc`) -- needs `ip`/`b0`/`power_ohm`/
-            `power_radiated`/`power_ic` (5 of `workflow.FINAL_0D_SIGNALS`)
-            and `workflow.FINAL_EQUILIBRIUM_SIGNALS`, all on the shot's
-            common time grid (the equilibrium signals NaN outside a real
-            EFIT reconstruction time).
+            (`01_unprocessed/<shot>.nc`) -- needs `ip` and
+            `workflow.FINAL_EQUILIBRIUM_SIGNALS`, all on the shot's common
+            time grid (the equilibrium signals NaN outside a real EFIT
+            reconstruction time). Every other `workflow.FINAL_0D_SIGNALS`
+            entry present is written to `summary` (see `build_summary`).
         geqdsk_dir: Directory to write this shot's per-equilibrium-time
             `.geqdsk` files into (see `geqdsk_writer.write_geqdsk`).
         dd_version: IMAS data dictionary version.
@@ -733,16 +794,12 @@ def build_imas_from_shot(
         `wall` IDS (see `write_wall_ids`).
     """
     from transport_validation_datasets.workflow import (
+        FINAL_0D_SIGNALS,
         FINAL_EQUILIBRIUM_SIGNALS,
         TIME_COORD,
         TIME_DIM,
         USABLE_FIT_STATUSES,
     )
-
-    # Only the 5 signals build_summary/ShotExportSlice.ip actually use -- not
-    # the rest of workflow.FINAL_0D_SIGNALS, which this module has no use
-    # for and should not require a shot to have.
-    _0D_SIGNAL_NAMES = ("ip", "b0", "power_ohm", "power_radiated", "power_ic")
 
     factory = imas.IDSFactory(version=dd_version)
     geqdsk_dir = Path(geqdsk_dir)
@@ -779,12 +836,19 @@ def build_imas_from_shot(
     rho = fit_ds["rho"].to_numpy().astype(float)
     te_arr = fit_ds["t_e"].to_numpy().astype(float)
     ne_arr = fit_ds["n_e"].to_numpy().astype(float)
+    te_err_arr = fit_ds["t_e_error"].to_numpy().astype(float) if "t_e_error" in fit_ds else None
+    ne_err_arr = fit_ds["n_e_error"].to_numpy().astype(float) if "n_e_error" in fit_ds else None
 
     unprocessed_time = unprocessed_ds["time"].to_numpy().astype(float)
+    # Whichever FINAL_0D_SIGNALS the shot has; only `ip` is required (for
+    # core_profiles.global_quantities.ip).
     signal_0d = {
         name: unprocessed_ds[name].to_numpy().astype(float)
-        for name in _0D_SIGNAL_NAMES
+        for name in FINAL_0D_SIGNALS
+        if name in unprocessed_ds
     }
+    if "ip" not in signal_0d:
+        raise KeyError(f"Shot {shot}'s unprocessed data has no `ip` signal")
 
     slices = []
     for i, t in enumerate(ts_times):
@@ -812,15 +876,13 @@ def build_imas_from_shot(
                 psi_boundary=derived.psi_boundary,
                 psin_neo=psin_neo,
                 ip=signal_0d["ip"][idx0d],
+                t_e_error=None if te_err_arr is None else te_err_arr[i],
+                n_e_error=None if ne_err_arr is None else ne_err_arr[i],
             )
         )
 
     cp = build_core_profiles(factory, slices)
-    sm = build_summary(
-        factory, unprocessed_time,
-        signal_0d["ip"], signal_0d["b0"], signal_0d["power_ohm"],
-        signal_0d["power_radiated"], signal_0d["power_ic"],
-    )
+    sm = build_summary(factory, unprocessed_time, signal_0d)
     wall = build_wall(factory, eq_times[0], eq_mp_by_time[float(eq_times[0])])
 
     dsvec = [
