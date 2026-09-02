@@ -1,11 +1,6 @@
 """Writes one equilibrium reconstruction time to a real `.geqdsk` file.
 
-`transport_validation_datasets` has no "EFIT -> .geqdsk file" writer today
-(`cmod_to_imas/fit_cmod.py`'s `convert_equilibria_to_eqdsk`, using `megpy`, is
-the only one in this project's history, and isn't being ported -- see
-gp_fitting/worker_akho.py's scope notes for the equivalent reasoning about
-that module's raw-data-fetch code). This one is new, and simple: the GEQDSK
-block already staged in a shot's unprocessed file
+Simple by design: the GEQDSK block already staged in a shot's unprocessed file
 (`machine.generic.make_geqdsk_dataset`'s schema, `FreeQDSK canonical names,
 COCOS 1`, see `workflow.FINAL_EQUILIBRIUM_SIGNALS`) already matches
 `freeqdsk.geqdsk`'s own field names almost one-to-one, so writing is a
@@ -14,9 +9,8 @@ straight field copy plus NaN-stripping for the boundary/limiter contours
 a common width with NaN).
 
 `scenario_export.py`'s equilibrium builder needs a real file on disk because
-the `eqdsk`/`megpy` packages it uses for COCOS conversion and flux-surface
-tracing both read one, so this writer runs once per real equilibrium time
-before those packages are handed the path.
+the `eqdsk` package it uses for COCOS conversion reads one, so this writer
+runs once per real equilibrium time before that package is handed the path.
 """
 
 from pathlib import Path
