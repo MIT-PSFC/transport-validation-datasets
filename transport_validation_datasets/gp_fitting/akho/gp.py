@@ -93,13 +93,17 @@ def fit_residual(x, residual, err, x_star) -> ResidualFit | None:
         dydata=np.array([0.0]),
         dyerr=np.array([0.0]),
     )
-    gp.set_search_parameters(epsilon=1.0e-1, method='adam', spars=[1.0e-2, 0.9, 0.99])
-    gp.set_error_search_parameters(epsilon=1.0e-1, method='adam', spars=[1.0e-2, 0.9, 0.99])
+    gp.set_search_parameters(epsilon=1.0e-1, method="adam", spars=[1.0e-2, 0.9, 0.99])
+    gp.set_error_search_parameters(
+        epsilon=1.0e-1, method="adam", spars=[1.0e-2, 0.9, 0.99]
+    )
 
     try:
         # mkgp prints optimizer status to stdout; keep worker logs clean.
         with contextlib.redirect_stdout(io.StringIO()):
-            gp.GPRFit(np.asarray(x_star, dtype=float), hsgp_flag=True, nrestarts=_NRESTARTS)
+            gp.GPRFit(
+                np.asarray(x_star, dtype=float), hsgp_flag=True, nrestarts=_NRESTARTS
+            )
     except (ValueError, np.linalg.LinAlgError, FloatingPointError):
         return None
 

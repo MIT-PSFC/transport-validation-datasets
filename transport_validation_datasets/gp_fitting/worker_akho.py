@@ -51,8 +51,8 @@ from transport_validation_datasets.gp_fitting.akho.fit_functions import (  # noq
     evaluate_with_gradient,
     get_fit_function,
 )
-from transport_validation_datasets.gp_fitting.akho.gp import (  # noqa: E402
-    HYP_NAMES,  # noqa: F401 -- re-exported: workflow.py reads it off this module
+from transport_validation_datasets.gp_fitting.akho.gp import (  # noqa: F401 -- re-exported: workflow.py reads it off this module; noqa: E402
+    HYP_NAMES,
     fit_residual,
 )
 from transport_validation_datasets.gp_fitting.batch_io import (  # noqa: E402
@@ -128,9 +128,16 @@ def _fit_variable(
         return _no_fit(STATUS_FAILED)
 
     prof, _chi, fname, popt = _fit_one_profile(
-        cx, cy / scale, cerr / scale, cx, _FIT_FUNC, _N_PARAMS,
-        enforce_mtanh=False, use_edge_chi_squared=False,
-        profile_type=variable, edge_thresh=0.93,
+        cx,
+        cy / scale,
+        cerr / scale,
+        cx,
+        _FIT_FUNC,
+        _N_PARAMS,
+        enforce_mtanh=False,
+        use_edge_chi_squared=False,
+        profile_type=variable,
+        edge_thresh=0.93,
     )
     if prof is None:
         return _no_fit(STATUS_FAILED)
@@ -166,7 +173,11 @@ def _fit_variable(
     grad = scale * (mean_grad_x_star + resid.grad)
     grad_std = scale * resid.grad_std
     return VariableFit(
-        fit=fit, std=std, grad=grad, grad_std=grad_std, hyps=resid.hyps,
+        fit=fit,
+        std=std,
+        grad=grad,
+        grad_std=grad_std,
+        hyps=resid.hyps,
         status=STATUS_OK,
     )
 
@@ -180,8 +191,12 @@ def _fit_slice(task: SliceTask) -> SliceResult:
     Returns:
         Both variables' fits for the slice.
     """
-    te = _fit_variable(task.x, task.te_y, task.te_err, task.x_star, task.min_points, "te")
-    ne = _fit_variable(task.x, task.ne_y, task.ne_err, task.x_star, task.min_points, "ne")
+    te = _fit_variable(
+        task.x, task.te_y, task.te_err, task.x_star, task.min_points, "te"
+    )
+    ne = _fit_variable(
+        task.x, task.ne_y, task.ne_err, task.x_star, task.min_points, "ne"
+    )
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)
 
 
