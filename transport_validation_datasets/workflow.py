@@ -290,7 +290,7 @@ class DataWorkflow(ABC):
         self.fit_shots_dir = self.fit_results_dir / fit_method
         self.fit_plots_dir = self.fit_results_dir / "ts_fits" / fit_method
         # Optional; only touched by export_to_imas(), which needs the
-        # `imas` extra (imas-python, eqdsk, megpy, fusio). One subdirectory
+        # `imas` extra (imas-python, eqdsk, megpy). One subdirectory
         # per shot, scoped by fit method like fit_shots_dir, since the
         # exported profiles/Zeff/impurity composition all derive from that
         # method's fit output.
@@ -1216,7 +1216,7 @@ class DataWorkflow(ABC):
         """Writes every fitted shot's equilibrium/core_profiles/summary/wall to IMAS format.
 
         Optional post-fitting step, requiring the `imas` extra (imas-python,
-        eqdsk, megpy, fusio) -- the only stage that does; the rest of this
+        eqdsk, megpy) -- the only stage that does; the rest of this
         package works without it. One shot-scoped output directory per shot
         under `imas_export_dir`, holding `equilibrium.nc`/`core_profiles.nc`/
         `summary.nc`/`wall.nc` plus the per-equilibrium-time `.geqdsk` files
@@ -1235,7 +1235,7 @@ class DataWorkflow(ABC):
         """
         from transport_validation_datasets.imas_export.scenario_export import (
             build_imas_from_shot,
-            write_wall_ids,
+            write_ids,
         )
 
         shots = self._final_dataset_shots()
@@ -1253,7 +1253,7 @@ class DataWorkflow(ABC):
             fit_ds = xr.open_dataset(self.fit_shots_dir / f"{shot}.nc")
             unprocessed_ds = xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc")
             try:
-                obj, wall = build_imas_from_shot(
+                ids_list = build_imas_from_shot(
                     shot,
                     fit_ds,
                     unprocessed_ds,
@@ -1262,9 +1262,8 @@ class DataWorkflow(ABC):
             except Exception as e:
                 logger.warning(f"IMAS export failed for shot {shot}: {type(e).__name__}: {e}")
                 continue
-            shot_dir.mkdir(parents=True, exist_ok=True)
-            obj.write(str(shot_dir), side="input", overwrite=True)
-            write_wall_ids(wall, shot_dir, overwrite=True)
+            for ids in ids_list:
+                write_ids(ids, shot_dir, overwrite=True)
             n_written += 1
 
         logger.info(

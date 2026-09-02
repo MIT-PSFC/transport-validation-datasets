@@ -36,13 +36,17 @@ plan notes for the full reasoning. In particular:
   - No `imas_export/consolidate.py` / scenario file -- reads the two
     xr.Datasets directly (see `build_imas_from_shot`).
 
-Mechanically unchanged from the original: each IDS is built as a real `imas`
-library object (`imas.IDSFactory(...).<ids>()`, field assignment,
-`.validate()`), then converted to `fusio`'s dotted-key `xr.Dataset`
-convention via `imas.util.to_xarray` + a rename (`_ids_to_dotted_dataset`),
-merged into one `imas_io()` instance's `.input`. `wall` is written directly
-via `imas.DBEntry(...).put()` instead of through that same path -- see
-`write_wall_ids`'s docstring for why.
+Each IDS is built as a real `imas` library object
+(`imas.IDSFactory(...).<ids>()`, field assignment, `.validate()`) and written
+straight to `<output_dir>/<ids>.nc` via `imas.DBEntry(...).put()`
+(`write_ids`). The original went through `fusio`'s dotted-key `xr.Dataset`
+round trip (`imas.util.to_xarray` -> `imas_io().write()`) for everything but
+`wall`. That ended in the very same `DBEntry.put()` call, and its
+array-of-structures shape inference silently kept the nested per-slice
+arrays (`profiles_1d[i].ion[...]`, `time_slice[i].profiles_2d[...]`) only
+for the first time slice, emptying them on every later one (confirmed
+against fusio 0.4.4 on synthetic 4-slice IDS). Writing the built IDS
+directly fixes that and drops the `fusio` dependency.
 """
 
 from dataclasses import dataclass
@@ -53,8 +57,6 @@ import imas
 import megpy
 import numpy as np
 import xarray as xr
-from fusio.classes.imas import imas_io
-from fusio.utils.plasma_tools import define_ion_species
 from megpy import tracer as megpy_tracer
 from scipy.integrate import cumulative_simpson
 from scipy.interpolate import RectBivariateSpline
@@ -71,9 +73,13 @@ _TARGET_COCOS = 11
 
 DD_VERSION = "4.0.0"
 
-# fusio.utils.plasma_tools.define_ion_species short_name for core_profiles'
-# one ion species (see build_core_profiles).
-_MAIN_ION_FUSIO_NAME = "D"
+# core_profiles' one ion species (see build_core_profiles): deuterium, with
+# the same nominal mass number (2.0, not 2.014) and nuclear charge
+# fusio.utils.plasma_tools.define_ion_species("D") used to supply, so the
+# written output is unchanged.
+_MAIN_ION_NAME = "D"
+_MAIN_ION_A = 2.0
+_MAIN_ION_Z_N = 1
 
 # A true X-point is a magnetic null (B_pol = 0) sitting on the LCFS. Below
 # this fraction of the LCFS's typical (median) B_pol, the minimum found by
@@ -128,32 +134,6 @@ class ShotExportSlice:
     ip: float
     t_e_error: np.ndarray | None = None
     n_e_error: np.ndarray | None = None
-
-
-# ---------------------------------------------------------------------------
-# fusio/imas plumbing (unchanged from export_scenario_to_imas.py)
-# ---------------------------------------------------------------------------
-
-
-def _ids_to_dotted_dataset(ids_struct, ids_name, aos_roots=()):
-    """Converts a validated IDS struct into the dotted-key `xr.Dataset`
-    convention `imas_io.input`/`.output` use, injecting the one synthetic
-    `<path>:i` array-of-structures coordinate `imas.util.to_xarray` does not
-    add automatically for each IDS's own top-level, time-indexed array of
-    structures (e.g. `equilibrium.time_slice`, `core_profiles.profiles_1d`)
-    -- every more deeply nested array-of-structures already gets one from
-    `to_xarray` itself. Mirrors `fusio`'s own `imas_io.from_plasma`/
-    `from_gacode`.
-    """
-    ds_ids = imas.util.to_xarray(ids_struct)
-    unique_names = list(
-        set(list(ds_ids.dims) + list(ds_ids.coords) + list(ds_ids.data_vars) + list(ds_ids.attrs))
-    )
-    newcoords = {}
-    for aos_root in aos_roots:
-        if f"{aos_root}:i" not in unique_names and "time" in unique_names:
-            newcoords[f"{ids_name}.{aos_root}:i"] = np.arange(ds_ids["time"].size).astype(int)
-    return ds_ids.rename({k: f"{ids_name}.{k}" for k in unique_names}).assign_coords(newcoords)
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +589,7 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
 
         p1d.ion.resize(1)
         ion = p1d.ion[0]
-        ion.name = "D"
+        ion.name = _MAIN_ION_NAME
         ion.density = s.n_e
         ion.density_thermal = s.n_e
         ion.temperature = s.t_e
@@ -622,10 +602,9 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
             ion.temperature_error_upper = s.t_e_error
         ion.z_ion_1d = np.ones_like(s.t_e, dtype=float)
         ion.z_ion = 1.0
-        _, a, z_n = define_ion_species(short_name=_MAIN_ION_FUSIO_NAME)
         ion.element.resize(1)
-        ion.element[0].z_n = int(z_n)
-        ion.element[0].a = float(a)
+        ion.element[0].z_n = _MAIN_ION_Z_N
+        ion.element[0].a = _MAIN_ION_A
 
     cp.global_quantities.ip = np.asarray([s.ip for s in slices], dtype=float)
     cp.validate()
@@ -730,27 +709,25 @@ def build_wall(factory, time, eq_mp):
     return wall
 
 
-def write_wall_ids(wall, output_dir, dd_version=DD_VERSION, overwrite=False):
-    """Writes the `wall` IDS to `<output_dir>/wall.nc` directly via
-    `imas.DBEntry`/`.put()`, not through `imas_io`'s dotted-`xr.Dataset`
-    round trip the other IDS use.
+def write_ids(ids, output_dir, dd_version=DD_VERSION, overwrite=False):
+    """Writes one IDS to `<output_dir>/<ids name>.nc` via
+    `imas.DBEntry`/`.put()` -- the same call every other IMAS netCDF writer
+    (fusio's included) bottoms out in.
 
-    `fusio`'s own array-of-structures shape inference only correctly infers
-    sizes when each nested AOS's immediate dotted-path parent is itself also
-    an AOS; `wall.description_2d[i].limiter.unit[j]` breaks that assumption
-    (`unit`, an AOS, sits inside `limiter`, a plain sub-structure, inside
-    `description_2d`, an AOS) and crashes `fusio`'s shape inference. Writing
-    `wall` directly via the same underlying `imas.DBEntry(...).put()` call
-    `fusio` itself uses internally sidesteps it (confirmed in
-    cmod_to_imas/export_scenario_to_imas.py to round-trip exactly).
+    Args:
+        ids: A populated, validated IDS object (e.g. from
+            `build_equilibrium`); its own `metadata.name` picks the file name.
+        output_dir: Directory the `.nc` file goes in (created if missing).
+        dd_version: IMAS data dictionary version to write with.
+        overwrite: Rewrite the file if it already exists.
     """
     output_dir = Path(output_dir)
-    wall_path = output_dir / "wall.nc"
-    if wall_path.exists() and not overwrite:
+    ids_path = output_dir / f"{ids.metadata.name}.nc"
+    if ids_path.exists() and not overwrite:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
-    with imas.DBEntry(str(wall_path), "w", dd_version=dd_version) as entry:
-        entry.put(wall)
+    with imas.DBEntry(str(ids_path), "w", dd_version=dd_version) as entry:
+        entry.put(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -765,8 +742,8 @@ def build_imas_from_shot(
     geqdsk_dir: Path | str,
     dd_version: str = DD_VERSION,
 ):
-    """Builds an `imas_io` instance (`.input` populated) plus the `wall` IDS
-    for one shot, from its fit results and unprocessed data.
+    """Builds one shot's `equilibrium`/`core_profiles`/`summary`/`wall` IDS
+    from its fit results and unprocessed data.
 
     `core_profiles` gets electrons + a single hydrogenic main ion (see
     `build_core_profiles`) -- no Zeff/impurity composition; see the module
@@ -789,9 +766,9 @@ def build_imas_from_shot(
         dd_version: IMAS data dictionary version.
 
     Returns:
-        (obj, wall): `obj` is an `imas_io` instance with `.input` covering
-        `equilibrium`/`core_profiles`/`summary`; `wall` is the separate
-        `wall` IDS (see `write_wall_ids`).
+        The four populated, validated IDS objects, in the order
+        `equilibrium`, `core_profiles`, `summary`, `wall`; write each with
+        `write_ids`.
     """
     from transport_validation_datasets.workflow import (
         FINAL_0D_SIGNALS,
@@ -884,16 +861,4 @@ def build_imas_from_shot(
     cp = build_core_profiles(factory, slices)
     sm = build_summary(factory, unprocessed_time, signal_0d)
     wall = build_wall(factory, eq_times[0], eq_mp_by_time[float(eq_times[0])])
-
-    dsvec = [
-        _ids_to_dotted_dataset(eq, "equilibrium", aos_roots=["time_slice"]),
-        _ids_to_dotted_dataset(cp, "core_profiles", aos_roots=["profiles_1d"]),
-        _ids_to_dotted_dataset(sm, "summary", aos_roots=[]),
-    ]
-    combined = xr.Dataset(attrs={"data_dictionary_version": dd_version})
-    for dss in dsvec:
-        combined = combined.assign_coords(dss.coords).assign(dss.data_vars).assign_attrs(**dss.attrs)
-
-    obj = imas_io()
-    obj.input = combined
-    return obj, wall
+    return eq, cp, sm, wall
