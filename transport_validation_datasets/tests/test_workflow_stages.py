@@ -26,19 +26,12 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     read_batch_fit_mode,
     unpack_fit_batch,
 )
-from transport_validation_datasets.gp_fitting.registry import WORKER_MODULES
 from transport_validation_datasets.machine.generic import (
     channel_rows_at_times,
     make_uniform_1kHz_timebase,
     ts_channel_fit_rows,
 )
-from transport_validation_datasets.machine.plots import (
-    plot_ts_fits,
-    plot_unprocessed_data,
-)
 from transport_validation_datasets.workflow import DataWorkflow
-
-LINEAR_WORKER = "transport_validation_datasets.tests.linear_worker"
 
 DURATION = 0.3  # s of source data per shot
 SAMPLE_PERIOD_MS = 20
@@ -183,13 +176,8 @@ def expected_te(shot: int, rho: np.ndarray) -> np.ndarray:
 
 
 @pytest.fixture(autouse=True)
-def linear_method(monkeypatch):
-    monkeypatch.setitem(WORKER_MODULES, "linear", LINEAR_WORKER)
-
-
-@pytest.fixture(autouse=True)
 def no_plots(monkeypatch):
-    # Plotting is the slow part of both stages, TestPlots covers it
+    # Plotting is the slow part of both stages, test_cmod_workflow plots for real
     monkeypatch.setattr(workflow_module, "plot_unprocessed_data", lambda *a, **k: None)
     monkeypatch.setattr(workflow_module, "plot_ts_fits", lambda *a, **k: 0)
 
