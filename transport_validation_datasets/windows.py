@@ -45,10 +45,11 @@ def read_shotlist(
 ) -> tuple[list[int], dict[int, list[tuple[float, float]]] | None]:
     """Read a shotlist file, with or without time windows.
 
-    Two formats. Plain: one shot number per line, anything else ignored.
+    Two formats.
+    Plain: one shot number per line, anything else ignored.
     Windowed: a CSV whose header holds shot, t_start and t_end [s], other
-    columns ignored; a shot appears on one row per window. The shot column
-    may also be called pulse_no.
+    columns ignored; a shot appears on one row per window.
+    The shot column may also be called pulse_no.
 
     Args:
         path: The shotlist file.
