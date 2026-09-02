@@ -35,14 +35,14 @@ The timebase is the unprocessed data's uniform 1 kHz grid. `time_idx` is the
 grid ordinal, so shots of different lengths pad to a common size, and the
 `time` variable carries the times themselves.
 
-Profiles arrive one per Thomson pulse and equilibria on the reconstruction
+Profiles arrive one per Thomson sample and equilibria on the reconstruction
 clock, both far slower than 1 kHz, so both are held forward over the grid times
 that follow them and `fresh_profile` / `fresh_equilibrium` mark the grid times
 that carry a sample of their own. A sample is held for at most
 `MAX_HOLD_PERIODS` of its own sampling period, so nothing is carried across the
 end of the shot or a stretch the filtering cut away. By default the slices
 whose Te and ne fits did not both come back usable are ignored, as though the
-shot had no Thomson pulse there.
+shot had no Thomson sample there.
 
 | Group | Signals | Dimensions |
 | ------ | ------ | ------ |
@@ -90,6 +90,50 @@ uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_d
 `--help` lists every flag, and the stages resume: rerunning the same command
 picks up whatever is not on disk yet. Stack and publish are the exceptions,
 each always rebuilds its store.
+
+# Shotlists and time windows
+
+`--shotlist_file` takes one of two formats:
+
+- plain: one shot number per line
+- windowed: a CSV whose header holds `shot` (or `pulse_no`), `t_start` and
+  `t_end` [s], one row per window and a shot on as many rows as it has windows.
+  Other columns are ignored. Windows of one shot may overlap, but no two may
+  share a center (closer than 1 ms), because the center is where the averaged profile
+  is labeled.
+
+Without a shotlist file the device's own list is used (C-Mod queries its SQL
+summary table, MAST reads the list shipped with the package).
+
+The unprocessed stage is the same in every case: the whole shot is read,
+filtered, and written, so the unprocessed files can be reused when the windows
+change. Windows act on the fit and stack stages, in one of two modes:
+
+| Mode | Flags | Fit stage | Store |
+| ---- | ----- | --------- | ----- |
+| per sample | plain shotlist | every Thomson sample fit on its own | the whole accepted shot |
+| windowed per sample | windowed shotlist | only the Thomson samples inside a window are fit, on their own | only the grid times inside the windows, profiles held forward but never across a window boundary |
+| window average | windowed shotlist and `--average_windows` | every rho-mapped Thomson point inside a window is pooled and fit as one profile (a sample in overlapping windows goes into each) | only the grid times inside the windows, each window filled with its one profile, `fresh_profile` set at the grid time nearest the window center. Where windows overlap a grid time carries the profile of the holding window whose center is nearest |
+
+`--average_windows` with a plain shotlist is an error. Every staged batch and
+every fit result records the mode and the windows it was built with, and the
+fit and stack stages compare them with the shotlist before doing anything. A
+shot whose windows changed, a shot the shotlist no longer lists, or a mode
+switch stops the run with an error, so an edited shotlist can never quietly
+ship profiles fit for other windows. `--clean_fit_state` restages everything
+(or build under a new `--ds_name`). The window list of each shot and the
+window of each fitted row are kept in the `03_fit_results` files for debugging (`windows`
+attribute, `window_index` coordinate), not in the final stores.
+
+```bash
+# C-Mod scenarios, one fit per Thomson sample inside each window
+uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_dir \
+    --ds_name cmod_scenarios --shotlist_file scenarios.csv
+
+# The same windows, one pooled fit per window
+uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_dir \
+    --ds_name cmod_scenarios_avg --shotlist_file scenarios.csv --average_windows
+```
 
 # Sources
 
