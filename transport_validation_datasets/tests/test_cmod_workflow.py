@@ -279,19 +279,21 @@ class TestFinalAssembly:
         workflow = cmod_workflow(
             test_dir, clean=False, max_num_shots=max_num_shots, fit_method="zk"
         )
-        if workflow.final_ds_dir.exists():
-            shutil.rmtree(workflow.final_ds_dir)
+        if workflow.stores_dir.exists():
+            shutil.rmtree(workflow.stores_dir)
 
         workflow.make_unprocessed_data_files()
         for shot in workflow.unprocessed_shots():
             _trim_to_three_ts_slices(workflow.unprocessed_data_dir / f"{shot}.nc")
 
         workflow.run_gp_fitting(max_pages=20)
-        workflow.assemble_final_dataset()
+        workflow.stack_internal_dataset()
 
-        # Check that the final assembled dataset was created and covers the shots
-        final_ds_path = workflow.final_ds_dir / "cmod_test.zarr"
-        assert final_ds_path.exists(), "Final assembled dataset does not exist"
-        final_ds = xr.open_dataset(final_ds_path)
+        # Check that the internal dataset was created and covers the shots
+        internal_ds_path = workflow.stores_dir / "cmod_test_internal.zarr"
+        assert internal_ds_path.exists(), "Internal dataset does not exist"
+        internal_ds = xr.open_dataset(internal_ds_path)
         for shot in workflow.unprocessed_shots():
-            assert shot in final_ds["shot"].values, f"Final dataset missing shot {shot}"
+            assert shot in internal_ds["shot"].values, (
+                f"Internal dataset missing shot {shot}"
+            )

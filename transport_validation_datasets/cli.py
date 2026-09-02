@@ -13,7 +13,7 @@ import fire
 # Dataset creation plots every shot and normally runs headless
 os.environ.setdefault("MPLBACKEND", "Agg")
 
-STAGES = ("unprocessed", "fit", "assemble", "all")
+STAGES = ("unprocessed", "fit", "stack", "publish", "all")
 
 DEFAULT_METHOD = "zk"
 
@@ -94,11 +94,15 @@ class DatasetCLI:
 
         unprocessed: pull the source data, filter it, one netCDF per shot
         fit:         GP fit the Thomson profiles of every unprocessed shot
-        assemble:    combine both into the final Zarr store
+        stack:       combine both into the internal Zarr store
+        publish:     derive the published store from the internal one, with
+                     the device's published_strip_signals stripped out
 
     Every stage resumes: work already on disk is skipped, so a killed run is
-    restarted by running the same command again. Assembly is the exception, it
-    always rebuilds the store from what the first two stages left on disk.
+    restarted by running the same command again. Stack and publish are the
+    exceptions: stack always rebuilds the internal store from what the first
+    two stages left on disk, and publish always rebuilds the published store
+    from the internal one.
 
     GP fitting can be dispatched to a SLURM cluster. Set that up once per
     cluster: a Host entry in ~/.ssh/config with ControlMaster configured, then
@@ -146,7 +150,7 @@ class DatasetCLI:
 
         Args:
             data_assembly_dir: Directory holding the intermediate files, plots,
-                logs, and final dataset.
+                logs, and datasets.
             ds_name: Dataset name, used in paths and cluster job names.
             shotlist_file: File with one shot number per line. None queries the
                 C-Mod SQL database instead.
@@ -158,7 +162,7 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
-            mb_per_chunk: Target size of a chunk of the final Zarr store,
+            mb_per_chunk: Target size of a chunk of the internal Zarr store,
                 which is chunked along the shot dimension.
             cluster_ssh_host: See _build_cluster_config.
             cluster_partitions: See _build_cluster_config.
@@ -222,7 +226,7 @@ class DatasetCLI:
 
         Args:
             data_assembly_dir: Directory holding the intermediate files, plots,
-                logs, and final dataset.
+                logs, and datasets.
             ds_name: Dataset name, used in paths and cluster job names.
             shotlist_file: File with one shot number per line. None uses the
                 shotlist shipped with the package.
@@ -234,7 +238,7 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
-            mb_per_chunk: Target size of a chunk of the final Zarr store,
+            mb_per_chunk: Target size of a chunk of the internal Zarr store,
                 which is chunked along the shot dimension.
             prepare_workers: Threads used to read source data. None keeps the
                 MAST default, which the public S3 store tolerates.
@@ -283,7 +287,7 @@ def _execute(workflow, stage: str, clean_fit_state: bool, mb_per_chunk: int):
         workflow: The device's DataWorkflow.
         stage: Which stage to run, one of STAGES.
         clean_fit_state: Wipe the staged fit batches before fitting.
-        mb_per_chunk: Target chunk size of the final Zarr store.
+        mb_per_chunk: Target chunk size of the internal Zarr store.
 
     Raises:
         ValueError: If the stage is not one of STAGES.
@@ -296,8 +300,10 @@ def _execute(workflow, stage: str, clean_fit_state: bool, mb_per_chunk: int):
         if clean_fit_state:
             workflow.clean_fit_state()
         workflow.run_gp_fitting()
-    if stage in ("assemble", "all"):
-        workflow.assemble_final_dataset(mb_per_chunk=mb_per_chunk)
+    if stage in ("stack", "all"):
+        workflow.stack_internal_dataset(mb_per_chunk=mb_per_chunk)
+    if stage in ("publish", "all"):
+        workflow.publish_dataset()
 
 
 if __name__ == "__main__":

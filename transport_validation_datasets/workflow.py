@@ -59,12 +59,10 @@ SAMPLE_TIME_TOL = 1e-6
 # real gap: the end of the shot, or a stretch the filtering cut away.
 MAX_HOLD_PERIODS = 1.5
 
-# Unprocessed signals carried into the final dataset. The union over every
+# Unprocessed signals carried into the internal dataset. The union over every
 # device: a signal the device does not have comes through as NaN, so all the
-# devices' final datasets share one schema. The raw Thomson channel
-# measurements stay in the unprocessed files and are not released in the
-# final dataset, which carries only the fitted profiles.
-FINAL_0D_SIGNALS = (
+# devices' datasets share one schema.
+DATASET_0D_SIGNALS = (
     "ip",
     "b0",
     "energy_mhd",
@@ -86,7 +84,7 @@ FINAL_0D_SIGNALS = (
 # See machine.generic.make_geqdsk_dataset. The five that are constant in time
 # (rcentr, rleft, rdim, zmid, zdim) and the limiter contour are carried per
 # slice like the rest: they compress to nothing and keep the layout uniform.
-FINAL_EQUILIBRIUM_SIGNALS = (
+DATASET_EQUILIBRIUM_SIGNALS = (
     "rmagx",
     "zmagx",
     "simagx",
@@ -110,6 +108,17 @@ FINAL_EQUILIBRIUM_SIGNALS = (
     "zlim",
 )
 
+# The raw Thomson channel measurements and chord geometry.
+# In the internal dataset, stripped from the published one by default
+RAW_TS_CHANNEL_SIGNALS = (
+    "ts_channel_r",
+    "ts_channel_z",
+    "ts_channel_t_e",
+    "ts_channel_t_e_error",
+    "ts_channel_n_e",
+    "ts_channel_n_e_error",
+)
+
 
 class DataWorkflow(ABC):
     """Device-independent stages of building one device's dataset.
@@ -123,14 +132,17 @@ class DataWorkflow(ABC):
       stage method-agnostic batches,
       fit them here or on a cluster,
       and write one netCDF of fitted profiles per shot.
-    3. assemble_final_dataset:
+    3. stack_internal_dataset:
       stack every shot that has both into one Zarr store,
       with the slower profiles and equilibria held forward onto the
       1 kHz grid and flagged where they carry a sample of their own.
+    4. publish_dataset:
+      derive the published copy of the internal store, with
+      published_strip_signals stripped out.
 
-    Each stage resumes from what is already on disk, except assembly, which
-    always rebuilds. A device subclass supplies the source and the filter
-    thresholds, everything else lives here.
+    Each stage resumes from what is already on disk, except the last two,
+    which always rebuild their store. A device subclass supplies the source
+    and the filter thresholds, everything else lives here.
     """
 
     @property
@@ -187,7 +199,7 @@ class DataWorkflow(ABC):
         """Minimum length of a single contiguous segment kept by the filters.
 
         Shorter segments are dropped, so that the sporadic few-millisecond chunks
-        the filters leave behind do not reach the fits or the final dataset.
+        the filters leave behind do not reach the fits or the datasets.
 
         Returns:
             Minimum segment length in seconds.
@@ -206,6 +218,11 @@ class DataWorkflow(ABC):
     # Only above 1 for sources that tolerate concurrent reads
     # MAST reads public S3 and does, disruption-py's MDSplus connections do not.
     default_prepare_workers = 1
+
+    # Variables stripped from the published dataset.
+    # The internal dataset keeps them.
+    # Device subclasses override this to release more or hold back more.
+    published_strip_signals: tuple[str, ...] = RAW_TS_CHANNEL_SIGNALS
 
     # The process's log file sink, replaced when a new workflow starts.
     _log_sink_id = None
@@ -230,8 +247,8 @@ class DataWorkflow(ABC):
 
         Args:
             ds_name: Name of the dataset.
-            data_assembly_dir: Directory where data files are stored and final
-                dataset will be saved.
+            data_assembly_dir: Directory where data files are stored and the
+                datasets will be saved.
             shotlist_file: Path to file containing list of shots to process. If None,
                 will call get_shotlist_from_source() to retrieve shotlist from
                 device-specific source.
@@ -250,16 +267,16 @@ class DataWorkflow(ABC):
 
         self.max_num_shots = max_num_shots
         if max_num_shots is None:
-            self.final_ds_dir = self.data_assembly_dir / "dataset_full"
+            self.stores_dir = self.data_assembly_dir / "04_datasets"
         else:
-            self.final_ds_dir = self.data_assembly_dir / f"dataset_{max_num_shots}"
+            self.stores_dir = self.data_assembly_dir / f"04_datasets_{max_num_shots}"
         self.fit_method = fit_method
         self.cluster_config = cluster_config
         self.prepare_workers = (
             self.default_prepare_workers if prepare_workers is None else prepare_workers
         )
 
-        # Set up subdirectories for unprocessed data, fit staging, and final dataset
+        # Set up subdirectories for unprocessed data, fit staging, and the datasets
         self.unprocessed_data_dir = self.data_assembly_dir / "01_unprocessed"
         self.rejected_shots_dir = self.unprocessed_data_dir / "rejected_shots"
         self.accepted_shots_dir = self.unprocessed_data_dir / "accepted_shots"
@@ -366,7 +383,7 @@ class DataWorkflow(ABC):
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         """Read one shot from the device's source into standardized signals.
 
-        Everything the final dataset needs, under the standardized names, on
+        Everything the datasets need, under the standardized names, on
         the shot's uniform 1 kHz timebase. Filtering, plotting, and writing are
         make_unprocessed_data_files' job.
 
@@ -478,6 +495,7 @@ class DataWorkflow(ABC):
                 )
                 self.record_failed_shot(shot, "Did not pass filtering.")
                 continue
+            ds_unprocessed = _clip_powers(ds_unprocessed)
             ds_unprocessed.to_netcdf(self.unprocessed_data_dir / f"{shot}.nc")
             logger.info(f"Created unprocessed data file for shot {shot}.")
             n_written += 1
@@ -571,7 +589,7 @@ class DataWorkflow(ABC):
         # Load-bearing broadcast: valid_mask carries the shot and time dims, so
         # this also gives every static quantity (the limiter contour, the fixed
         # grid extents, C-Mod's fixed channel positions) a time axis.
-        # The final dataset carries them per slice like everything else, and
+        # The internal dataset carries them per slice like everything else, and
         # _hold_equilibrium indexes them by grid time.
         ds_filtered = ds_input.where(valid_mask, drop=True)
 
@@ -1021,20 +1039,22 @@ class DataWorkflow(ABC):
                 )
                 logger.info(f"Plotted {n_pages} fit pages for shot {shot}")
 
-    def assemble_final_dataset(
+    def stack_internal_dataset(
         self,
         mb_per_chunk: int | None = 50,
         drop_unfit_slices: bool = True,
         forward_fill: bool = True,
         extend_existing: bool = False,
     ) -> Path:
-        """Assemble the final dataset from the unprocessed data and the fit results.
+        """Stack the unprocessed data and the fit results into the internal dataset.
 
-        One tensorized Zarr store at final_ds_dir/<ds_name>.zarr, holding every
-        shot that has both an unprocessed data file and a fit result file.
-        Shots are stacked along EPISODE_DIM and NaN padded along every other
-        dimension, so shots of different lengths still line up.
+        One tensorized Zarr store at stores_dir/<ds_name>_internal.zarr,
+        holding every shot that has both an unprocessed data file and a fit
+        result file. Shots are stacked along EPISODE_DIM and NaN padded along
+        every other dimension, so shots of different lengths still line up.
         Only one shot is held in memory at a time.
+
+        The store carries every signal needed for internal analysis.
 
         The timebase is the unprocessed data's uniform 1 kHz grid. TIME_DIM is
         the grid ordinal, so shots of different lengths can be padded to a
@@ -1066,18 +1086,20 @@ class DataWorkflow(ABC):
             ValueError: If no shot has both an unprocessed data file and a fit
                 result file.
         """
-        shots = self._final_dataset_shots()
+        shots = self._internal_dataset_shots()
         if not shots:
             raise ValueError(
                 f"No shots have both an unprocessed data file in {self.unprocessed_data_dir} "
                 f"and a '{self.fit_method}' fit result file in {self.fit_shots_dir}"
             )
-        logger.info(f"Assembling {len(shots)} shots into the final dataset")
+        logger.info(f"Stacking {len(shots)} shots into the internal dataset")
 
-        zarr_path = self.final_ds_dir / f"{self.ds_name}.zarr"
+        zarr_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
         if zarr_path.exists():
             if not extend_existing:
-                logger.warning(f"Replacing the existing final dataset at {zarr_path}")
+                logger.warning(
+                    f"Replacing the existing internal dataset at {zarr_path}"
+                )
                 shutil.rmtree(zarr_path)
             else:
                 with xr.open_zarr(zarr_path, consolidated=True) as ds_store:
@@ -1092,11 +1114,11 @@ class DataWorkflow(ABC):
 
         # Bound every non-episode dimension up front so that no shot ever has to
         # extend the store, which would rewrite the chunks of every shot in it.
-        dim_sizes = self._final_dataset_dim_sizes(shots)
-        logger.info(f"Final dataset dimension bounds: {dim_sizes}")
+        dim_sizes = self._internal_dataset_dim_sizes(shots)
+        logger.info(f"Internal dataset dimension bounds: {dim_sizes}")
 
         ds = build_tensorized_dataset(
-            process_fn=lambda shot: self._final_shot_dataset(
+            process_fn=lambda shot: self._internal_shot_dataset(
                 shot, drop_unfit_slices, forward_fill
             ),
             identifiers=shots,
@@ -1108,13 +1130,67 @@ class DataWorkflow(ABC):
             dim_sizes=dim_sizes,
         )
         logger.info(
-            f"Final dataset at {zarr_path}: {dict(ds.sizes)}, "
+            f"Internal dataset at {zarr_path}: {dict(ds.sizes)}, "
             f"{len(ds.data_vars)} variables"
         )
         return zarr_path
 
-    def _final_dataset_shots(self) -> list[int]:
-        """List the shots that can go into the final dataset.
+    def publish_dataset(self) -> Path:
+        """Derive the published dataset from the internal one by stripping signals.
+
+        The published store is the internal store minus published_strip_signals,
+        with the dimensions only those variables used dropped along with them,
+        coordinates included.
+
+        Returns:
+            Path of the published Zarr store,
+            stores_dir/<ds_name>_published.zarr.
+
+        Raises:
+            ValueError: If there is no internal store to derive from.
+        """
+        internal_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
+        published_path = self.stores_dir / f"{self.ds_name}_published.zarr"
+        if not internal_path.exists():
+            raise ValueError(
+                f"No internal dataset at {internal_path}, run stack_internal_dataset first"
+            )
+
+        ds_internal = xr.open_zarr(internal_path, consolidated=True)
+        stripped = [
+            name
+            for name in self.published_strip_signals
+            if name in ds_internal.data_vars
+        ]
+        absent = sorted(set(self.published_strip_signals) - set(stripped))
+        if absent:
+            logger.warning(
+                f"Signals to strip that the internal dataset does not carry: {absent}"
+            )
+        ds_published = ds_internal.drop_vars(stripped)
+        used_dims = {
+            dim for variable in ds_published.data_vars.values() for dim in variable.dims
+        }
+        ds_published = ds_published.drop_dims(
+            [dim for dim in ds_published.dims if dim not in used_dims]
+        )
+        ds_published.attrs["stripped_signals"] = (
+            ", ".join(stripped) if stripped else "none"
+        )
+
+        if published_path.exists():
+            logger.warning(f"Replacing the published dataset at {published_path}")
+            shutil.rmtree(published_path)
+        ds_published.to_zarr(published_path, mode="w", consolidated=True)
+        ds_internal.close()
+        logger.info(
+            f"Published dataset at {published_path}: "
+            f"{len(ds_published.data_vars)} variables, {len(stripped)} stripped"
+        )
+        return published_path
+
+    def _internal_dataset_shots(self) -> list[int]:
+        """List the shots that can go into the internal dataset.
 
         Returns:
             Sorted shots that have both an unprocessed data file and a fit
@@ -1126,18 +1202,18 @@ class DataWorkflow(ABC):
         if missing:
             logger.warning(
                 f"{len(missing)} unprocessed shots have no '{self.fit_method}' fit results yet "
-                f"and are left out of the final dataset"
+                f"and are left out of the internal dataset"
             )
         return sorted(unprocessed & fitted)
 
-    def _final_dataset_dim_sizes(self, shots: list[int]) -> dict[str, int]:
+    def _internal_dataset_dim_sizes(self, shots: list[int]) -> dict[str, int]:
         """Find the largest size of every non-episode dimension over the shots.
 
         Reads only the headers of the files, so this stays cheap no matter how
         many shots the dataset has.
 
         Args:
-            shots: Shots that will go into the final dataset.
+            shots: Shots that will go into the internal dataset.
 
         Returns:
             Upper bound per non-episode dimension.
@@ -1153,13 +1229,12 @@ class DataWorkflow(ABC):
                     for dim, size in ds_fit.sizes.items()
                     if dim not in (EPISODE_DIM, TIME_DIM, "hyperparameter")
                 }
-            # ts_channel is skipped: the raw Thomson channels never enter the store
             with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_shot:
                 shot_sizes.update(
                     {
                         (TIME_DIM if dim == TIME_COORD else dim): size
                         for dim, size in ds_shot.sizes.items()
-                        if dim not in (EPISODE_DIM, "ts_channel")
+                        if dim != EPISODE_DIM
                     }
                 )
             for dim, size in shot_sizes.items():
@@ -1175,7 +1250,7 @@ class DataWorkflow(ABC):
         varying.pop(TIME_DIM, None)
         if varying:
             logger.warning(
-                f"Dimensions differ between shots: {varying}. The final dataset takes "
+                f"Dimensions differ between shots: {varying}. The internal dataset takes "
                 f"their coordinate values from the first shot and NaN pads the rest."
             )
         return sizes
@@ -1196,12 +1271,12 @@ class DataWorkflow(ABC):
             mask &= np.isin(status, USABLE_FIT_STATUSES)
         return mask
 
-    def _final_shot_dataset(
+    def _internal_shot_dataset(
         self, shot: int, drop_unfit_slices: bool, forward_fill: bool
     ) -> xr.Dataset | None:
-        """Build one shot's contribution to the final dataset.
+        """Build one shot's contribution to the internal dataset.
 
-        Final dataset is on a 1 kHz timebase from the unprocessed dataset.
+        Internal dataset is on a 1 kHz timebase from the unprocessed dataset.
         The fitted profiles are sampled far more slowly than that (one per Thomson pulse).
         In addition, on some devices the equilibria are sampled more slowly
         and on some devices the equilibrium is too, so both are held forward
@@ -1231,7 +1306,7 @@ class DataWorkflow(ABC):
         )
         if not keep.any():
             logger.warning(
-                f"Shot {shot}: no usable {self.fit_method} fits, leaving it out of the final dataset"
+                f"Shot {shot}: no usable {self.fit_method} fits, leaving it out of the internal dataset"
             )
             return None
         if not keep.all():
@@ -1267,11 +1342,11 @@ class DataWorkflow(ABC):
 
         data_vars = {}
         missing = []
-        for name in FINAL_0D_SIGNALS:
+        for name in DATASET_0D_SIGNALS:
             if name in ds_unprocessed:
                 data_vars[name] = ds_unprocessed[name]
             else:
-                # Kept as NaN so every device's final dataset has one schema
+                # Kept as NaN so every device's dataset has one schema
                 missing.append(name)
                 data_vars[name] = xr.DataArray(
                     np.full((1, grid.size), np.nan, dtype=np.float32),
@@ -1286,6 +1361,13 @@ class DataWorkflow(ABC):
         )
         data_vars.update(equilibrium)
 
+        # Every other unprocessed signal (the raw Thomson channels) comes
+        # through as it sits on the grid. Internal-only ones are stripped from
+        # the published store, not here (publish_dataset).
+        for name in ds_unprocessed.data_vars:
+            if name not in data_vars:
+                data_vars[name] = ds_unprocessed[name]
+
         # Grid times are NaN padded up to the longest shot in the store, so the
         # integer status codes have to be floats to carry the padding
         for name in ("t_e_fit_status", "n_e_fit_status"):
@@ -1296,7 +1378,7 @@ class DataWorkflow(ABC):
         ds_grid = xr.Dataset(data_vars).rename({TIME_COORD: TIME_DIM})
         ordinal = np.arange(grid.size)
         # drop_conflicts, not drop: the latter also drops the per-variable attrs
-        ds_final = xr.merge(
+        ds_stacked = xr.merge(
             [
                 ds_grid.assign_coords({TIME_DIM: ordinal}),
                 ds_fit.assign_coords({TIME_DIM: ordinal}),
@@ -1308,21 +1390,21 @@ class DataWorkflow(ABC):
         # and string-valued ones cannot be NaN padded
         extra_coords = [
             name
-            for name in ds_final.coords
-            if name not in ds_final.dims and name != TIME_COORD
+            for name in ds_stacked.coords
+            if name not in ds_stacked.dims and name != TIME_COORD
         ]
-        ds_final = ds_final.drop_vars(extra_coords)
-        ds_final = ds_final.transpose(EPISODE_DIM, TIME_DIM, ...)
+        ds_stacked = ds_stacked.drop_vars(extra_coords)
+        ds_stacked = ds_stacked.transpose(EPISODE_DIM, TIME_DIM, ...)
 
         # One dtype across the devices, whatever their staging wrote: the fits
         # are float32 already and the unprocessed files stay the full precision
         # source. Halves the store, which psirz dominates.
-        for name, variable in ds_final.data_vars.items():
+        for name, variable in ds_stacked.data_vars.items():
             if variable.dtype == np.float64:
-                ds_final[name] = variable.astype(np.float32)
+                ds_stacked[name] = variable.astype(np.float32)
 
         volatile = ("time", "user", "host")
-        ds_final.attrs = {
+        ds_stacked.attrs = {
             **{k: v for k, v in ds_unprocessed.attrs.items() if k not in volatile},
             "dataset_name": self.ds_name,
             "fit_method": self.fit_method,
@@ -1334,7 +1416,7 @@ class DataWorkflow(ABC):
             ),
             "source_attributes": "Those of the first shot in the store",
         }
-        return ds_final
+        return ds_stacked
 
     @staticmethod
     def _time_variables(
@@ -1375,6 +1457,28 @@ class DataWorkflow(ABC):
                 ),
             }
         )
+
+
+def _clip_powers(ds: xr.Dataset) -> xr.Dataset:
+    """Clip every power signal at zero before the unprocessed file is written.
+
+    Source power records dip negative (bolometer baseline drift on cmod's
+    power_radiated, ICRF pickup, MAST's power_nbi baseline), and no heating or
+    radiated power is physically negative. Runs after filtering so the validity
+    and transient gates still judge the values the device recorded.
+
+    Args:
+        ds: One shot's filtered dataset with standardized names.
+
+    Returns:
+        The same dataset with power signals clipped to >= 0, NaN untouched.
+    """
+    for name in DATASET_0D_SIGNALS:
+        if name.startswith("power_") and name in ds:
+            attrs = ds[name].attrs
+            ds[name] = ds[name].clip(min=0.0) + 0.0  # -0.0 -> 0.0
+            ds[name].attrs = attrs
+    return ds
 
 
 def _drop_short_segments(
@@ -1493,7 +1597,7 @@ def _hold_equilibrium(
         (equilibrium, fresh): the GEQDSK variables on the grid, and the
         mask of grid times carrying a reconstruction of their own.
     """
-    names = [name for name in FINAL_EQUILIBRIUM_SIGNALS if name in ds_unprocessed]
+    names = [name for name in DATASET_EQUILIBRIUM_SIGNALS if name in ds_unprocessed]
     if "simagx" not in ds_unprocessed:
         return {name: ds_unprocessed[name] for name in names}, np.zeros(
             grid.size, dtype=bool

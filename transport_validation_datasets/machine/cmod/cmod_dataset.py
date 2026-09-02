@@ -33,7 +33,7 @@ class CModDataWorkflow(DataWorkflow):
         "ip": {"min_abs": 100e3},  # Only care about magnitude of ip
         "n_e_line_average": {"min": 1e18, "max": 4e20},
         "energy_mhd": {"min": 3e3},
-        "beta_tor_norm": {"min": 0.0, "max": 2.0},
+        "beta_tor_norm": {"min": 0.08, "max": 2.0},
     }
     transient_filter = {
         "power_ohm": 5.0e6,

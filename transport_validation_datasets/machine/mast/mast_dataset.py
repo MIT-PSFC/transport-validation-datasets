@@ -109,10 +109,12 @@ GEQDSK_PROFILES = {
     "pprime": "dpressure_dpsi",
 }
 
-# Store paths a shot must carry to be worth staging. Everything else is either
-# derived or optional (power_nbi is filled with zeros when absent).
+# Store paths a shot must carry to be worth staging. Everything else is derived.
+# summary/power_nbi is required rather than zero filled: nothing in the archive
+# can tell a shot whose beams were off from one whose beam record is missing.
 REQUIRED_LEVEL2_PATHS = (
     "summary/ip",
+    "summary/power_nbi",
     "equilibrium/psi",
     "equilibrium/psi_axis",
     "equilibrium/psi_boundary",
@@ -782,11 +784,7 @@ def _zero_d_dataset(
         equilibrium["vloop_dynamic"].values,
         timebase,
     )
-    if "power_nbi" in summary:
-        data["power_nbi"] = interp1(summary_time, summary["power_nbi"].values, timebase)
-    else:
-        logger.warning(f"Shot {shot}: no summary/power_nbi in the store, filling zeros")
-        data["power_nbi"] = np.zeros_like(timebase, dtype=float)
+    data["power_nbi"] = interp1(summary_time, summary["power_nbi"].values, timebase)
     # MAST has no ICRF or lower hybrid, zero where ip is valid
     data["power_ic"] = data["ip"] * 0.0
     data["power_lh"] = data["ip"] * 0.0
