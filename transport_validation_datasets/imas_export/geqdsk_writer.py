@@ -23,8 +23,16 @@ from freeqdsk import geqdsk
 # make_geqdsk_dataset's own naming (freeqdsk calls it `cpasma`); `psirz` maps
 # to freeqdsk's `psi`.
 _SCALAR_FIELDS = (
-    "rdim", "zdim", "rcentr", "rleft", "zmid",
-    "rmagx", "zmagx", "simagx", "sibdry", "bcentr",
+    "rdim",
+    "zdim",
+    "rcentr",
+    "rleft",
+    "zmid",
+    "rmagx",
+    "zmagx",
+    "simagx",
+    "sibdry",
+    "bcentr",
 )
 _PROFILE_FIELDS = ("fpol", "pres", "ffprime", "pprime", "qpsi")
 

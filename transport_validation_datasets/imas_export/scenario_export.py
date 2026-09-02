@@ -1,7 +1,7 @@
-"""Builds one shot's `equilibrium`/`core_profiles`/`summary`/`wall` IMAS IDS
-from its fit results and unprocessed data, and writes them out.
+"""Builds and writes a shot's `equilibrium`/`core_profiles`/`summary`/`wall` IDS.
 
-Builds N time slices per shot straight from the two per-shot files
+Each shot's IMAS IDS set is built from its fit results and unprocessed data,
+N time slices per shot, straight from the two per-shot files
 (fit_shots_dir/<shot>.nc, 01_unprocessed/<shot>.nc) -- no intermediate
 consolidated scenario file. Design notes:
 
@@ -134,19 +134,21 @@ class ShotExportSlice:
 
 
 def _spline_scalar(spline, r, z):
-    """`RectBivariateSpline(..., grid=False)` at one scalar `(r, z)` point,
-    as a plain float regardless of whether the installed scipy returns a
-    0-d array, a shape-(1,) array, or a bare float for scalar inputs.
+    """`RectBivariateSpline(..., grid=False)` at one scalar `(r, z)` point.
+
+    Returns:
+        The spline value as a plain float, regardless of whether the
+        installed scipy returns a 0-d array, a shape-(1,) array, or a bare
+        float for scalar inputs.
     """
     return float(np.ravel(spline(r, z, grid=False))[0])
 
 
 def _find_x_point(eqi, bp_spline):
-    """Locates the magnetic null (X-point) nearest the LCFS, if any, and
-    classifies the equilibrium as diverted or limited, for
-    `equilibrium.time_slice.boundary.type`.
+    """Locates the magnetic null (X-point) nearest the LCFS, if any.
 
-    Uses the physical definition of an X-point directly:
+    Classifies the equilibrium as diverted or limited, for
+    `equilibrium.time_slice.boundary.type`. Uses the physical definition of an X-point directly:
     B_pol vanishes there, so the minimum of B_pol along
     the LCFS boundary contour sits at (or very near) any true X-point,
     refined by locally minimizing the B_pol spline from that starting point.
@@ -209,9 +211,9 @@ def _diverted(eqi):
 
 @dataclass
 class _EquilibriumTimeDerived:
-    """Per-equilibrium-time quantities needed alongside the IDS fields
-    `_populate_equilibrium_time_slice` writes directly into `ts`.
+    """Per-equilibrium-time quantities returned by `_populate_equilibrium_time_slice`.
 
+    These are needed alongside the IDS fields it writes directly into `ts`.
     `rho_tor_norm`/`psi_norm` are this equilibrium time's own arrays (the
     ones written to `ts.profiles_1d.rho_tor_norm`/`psi_norm`), reused
     directly in `build_imas_from_shot` to map a Thomson rho onto this psi
@@ -227,9 +229,10 @@ class _EquilibriumTimeDerived:
 
 
 def _populate_equilibrium_time_slice(ts, eqi):
-    """Fills one `equilibrium.time_slice[i]` from one equilibrium
-    reconstruction (`eqi`, an `eqdsk.EQDSKInterface` already converted to
-    target-COCOS), writing only what the EQDSK fields themselves supply:
+    """Fills one `equilibrium.time_slice[i]` from one equilibrium reconstruction.
+
+    `eqi` is an `eqdsk.EQDSKInterface` already converted to target-COCOS.
+    Writes only what the EQDSK fields themselves supply:
     the 1D psi-grid profiles, the 2D psi map, the boundary contour, and the
     global scalars, plus `phi`/`rho_tor` (a pure 1D integral of the EQDSK's
     own q profile -- in target-COCOS `q = dphi/dpsi`, so
@@ -269,7 +272,9 @@ def _populate_equilibrium_time_slice(ts, eqi):
     # rho_tor needs a reference field to carry units of meters; a zero
     # vacuum field is nonphysical, but fall back to the dimensionless
     # sqrt(psi_norm) rather than divide by zero.
-    rho_tor = np.sqrt(phi / (np.pi * abs(bcentr))) if abs(bcentr) > 0 else np.sqrt(psi_norm)
+    rho_tor = (
+        np.sqrt(phi / (np.pi * abs(bcentr))) if abs(bcentr) > 0 else np.sqrt(psi_norm)
+    )
     rho_tor_a = rho_tor[-1] if rho_tor[-1] > 0.0 else 1.0
     ts.profiles_1d.phi = phi
     ts.profiles_1d.rho_tor = rho_tor
@@ -332,7 +337,9 @@ def build_equilibrium(factory, times, geqdsk_paths):
     bcentr_per_time = np.empty(len(times))
     r0 = None
     for i, (t, geqdsk_path) in enumerate(zip(times, geqdsk_paths)):
-        eqi = eqdsk.EQDSKInterface.from_file(str(geqdsk_path), from_cocos=_SOURCE_COCOS, to_cocos=_TARGET_COCOS)
+        eqi = eqdsk.EQDSKInterface.from_file(
+            str(geqdsk_path), from_cocos=_SOURCE_COCOS, to_cocos=_TARGET_COCOS
+        )
         ts = eq.time_slice[i]
         derived = _populate_equilibrium_time_slice(ts, eqi)
         derived_by_time[t] = derived
@@ -473,6 +480,9 @@ def build_summary(factory, time, signals):
 
     Returns:
         The validated `summary` IDS.
+
+    Raises:
+        ValueError: If a signal name has no `_SUMMARY_SIGNAL_PATHS` entry.
     """
     unknown = sorted(set(signals) - set(_SUMMARY_SIGNAL_PATHS))
     if unknown:
@@ -528,9 +538,10 @@ def build_wall(factory, time, eqi):
 
 
 def write_ids(ids, output_dir, dd_version=DD_VERSION, overwrite=False):
-    """Writes one IDS to `<output_dir>/<ids name>.nc` via
-    `imas.DBEntry`/`.put()` -- the same call every other IMAS netCDF writer
-    (fusio's included) bottoms out in.
+    """Writes one IDS to `<output_dir>/<ids name>.nc`.
+
+    Goes via `imas.DBEntry`/`.put()` -- the same call every other IMAS
+    netCDF writer (fusio's included) bottoms out in.
 
     Args:
         ids: A populated, validated IDS object (e.g. from
@@ -560,9 +571,9 @@ def build_imas_from_shot(
     geqdsk_dir: Path | str,
     dd_version: str = DD_VERSION,
 ):
-    """Builds one shot's `equilibrium`/`core_profiles`/`summary`/`wall` IDS
-    from its fit results and unprocessed data.
+    """Builds one shot's `equilibrium`/`core_profiles`/`summary`/`wall` IDS.
 
+    The IDS set is built from the shot's fit results and unprocessed data.
     `core_profiles` gets electrons + a single hydrogenic main ion (see
     `build_core_profiles`) -- no Zeff/impurity composition; see the module
     docstring above for the standalone script that adds those afterward.
@@ -587,6 +598,9 @@ def build_imas_from_shot(
         The four populated, validated IDS objects, in the order
         `equilibrium`, `core_profiles`, `summary`, `wall`; write each with
         `write_ids`.
+
+    Raises:
+        KeyError: If the shot's unprocessed data has no `ip` signal.
     """
     from transport_validation_datasets.workflow import (
         FINAL_0D_SIGNALS,
@@ -631,8 +645,12 @@ def build_imas_from_shot(
     rho = fit_ds["rho"].to_numpy().astype(float)
     te_arr = fit_ds["t_e"].to_numpy().astype(float)
     ne_arr = fit_ds["n_e"].to_numpy().astype(float)
-    te_err_arr = fit_ds["t_e_error"].to_numpy().astype(float) if "t_e_error" in fit_ds else None
-    ne_err_arr = fit_ds["n_e_error"].to_numpy().astype(float) if "n_e_error" in fit_ds else None
+    te_err_arr = (
+        fit_ds["t_e_error"].to_numpy().astype(float) if "t_e_error" in fit_ds else None
+    )
+    ne_err_arr = (
+        fit_ds["n_e_error"].to_numpy().astype(float) if "n_e_error" in fit_ds else None
+    )
 
     unprocessed_time = unprocessed_ds["time"].to_numpy().astype(float)
     # Whichever FINAL_0D_SIGNALS the shot has; only `ip` is required (for

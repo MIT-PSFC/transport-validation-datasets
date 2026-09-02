@@ -1255,7 +1255,9 @@ class DataWorkflow(ABC):
                     geqdsk_dir=shot_dir / "geqdsk",
                 )
             except Exception as e:
-                logger.warning(f"IMAS export failed for shot {shot}: {type(e).__name__}: {e}")
+                logger.warning(
+                    f"IMAS export failed for shot {shot}: {type(e).__name__}: {e}"
+                )
                 continue
             for ids in ids_list:
                 write_ids(ids, shot_dir, overwrite=True)
