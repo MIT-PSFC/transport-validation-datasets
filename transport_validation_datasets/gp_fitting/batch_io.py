@@ -13,12 +13,18 @@ It ships to the cluster alongside the workers, where the venv holds nothing else
 """
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
 
 FIT_VARIABLES = ("te", "ne")
+
+# How the staged rows were built. Workers do not care.
+# Carried in the batch file so a resumed run never mixes them (see workflow.stage_fit_batches).
+FIT_MODE_SAMPLE = "sample"  # one row per Thomson sample
+FIT_MODE_WINDOW_SAMPLE = "window_sample"  # one row per Thomson sample in a time window
+FIT_MODE_WINDOW_AVERAGE = "window_average"  # one row per time window, samples pooled
 
 # Per-slice fit statuses, stored as int8 arrays in the result files.
 STATUS_OK = 0  # clean fit
@@ -66,6 +72,11 @@ class ShotFitInput:
     All channel arrays are (n_t, n_ch). x is the radial coordinate of each
     channel (normalized minor radius rho), shared between te and ne since both
     come from the same channels. Invalid points are NaN.
+
+    windows is the shot's (n_w, 2) time window bounds [s] and window_index
+    the (n_t,) window each row belongs to (see transport_validation_datasets.windows).
+    A shot staged without windows has an empty windows array and -1 in every window_index.
+    In a pooled row a channel appears once per Thomson sample, so n_ch is then samples x channels.
     """
 
     x: np.ndarray
@@ -74,6 +85,12 @@ class ShotFitInput:
     ne_y: np.ndarray
     ne_err: np.ndarray
     time: np.ndarray
+    windows: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
+    window_index: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.window_index is None:
+            self.window_index = np.full(np.asarray(self.time).shape, -1, dtype=np.int64)
 
     def has_fittable_points(self) -> bool:
         """Check that te and ne each have at least one finite (x, y, err) point.
@@ -100,6 +117,7 @@ class FitBatch:
         min_points: Minimum valid channels per slice to attempt a fit.
         scale_per_slice: Normalize each slice by its max before fitting.
         bounds: Per-variable fit bound knobs, keyed by FIT_VARIABLES.
+        fit_mode: One of the FIT_MODE_* values, how the rows were built.
     """
 
     shot_inputs: dict[int, ShotFitInput]
@@ -107,6 +125,7 @@ class FitBatch:
     min_points: int
     scale_per_slice: bool
     bounds: dict[str, FitBounds]
+    fit_mode: str = FIT_MODE_SAMPLE
 
 
 @dataclass
@@ -175,6 +194,7 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         "x_star": np.asarray(batch.x_star, dtype=np.float64),
         "min_points": np.int64(batch.min_points),
         "scale_per_slice": np.bool_(batch.scale_per_slice),
+        "fit_mode": np.str_(batch.fit_mode),
     }
     for var in FIT_VARIABLES:
         for f in fields(FitBounds):
@@ -188,6 +208,8 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         arrays[f"{shot}:te_err"] = np.asarray(si.te_err, dtype=np.float32)
         arrays[f"{shot}:ne_y"] = np.asarray(si.ne_y, dtype=np.float32)
         arrays[f"{shot}:ne_err"] = np.asarray(si.ne_err, dtype=np.float32)
+        arrays[f"{shot}:windows"] = np.asarray(si.windows, dtype=np.float64)
+        arrays[f"{shot}:window_index"] = np.asarray(si.window_index, dtype=np.int64)
     _atomic_savez(path, arrays)
 
 
@@ -220,6 +242,8 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
                 ne_y=data[f"{shot}:ne_y"],
                 ne_err=data[f"{shot}:ne_err"],
                 time=data[f"{shot}:time"],
+                windows=data[f"{shot}:windows"],
+                window_index=data[f"{shot}:window_index"],
             )
             for shot in data["shots"].tolist()
         }
@@ -229,6 +253,7 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
             min_points=int(data["min_points"]),
             scale_per_slice=bool(data["scale_per_slice"]),
             bounds=bounds,
+            fit_mode=str(data["fit_mode"].item()),
         )
 
 
@@ -243,6 +268,35 @@ def read_batch_shots(path: Path | str) -> list[int]:
     """
     with np.load(path) as data:
         return data["shots"].tolist()
+
+
+def read_batch_windows(path: Path | str) -> dict[int, np.ndarray]:
+    """Read only the time windows each shot of a batch input npz was staged with.
+
+    Cheap: the channel arrays are never touched.
+
+    Args:
+        path: Batch input npz path.
+
+    Returns:
+        Per shot its (n_w, 2) window bounds [s], empty for a shot staged
+        without windows.
+    """
+    with np.load(path) as data:
+        return {shot: data[f"{shot}:windows"] for shot in data["shots"].tolist()}
+
+
+def read_batch_fit_mode(path: Path | str) -> str:
+    """Read only the fit mode from a batch input npz (cheap).
+
+    Args:
+        path: Batch input npz path.
+
+    Returns:
+        One of the FIT_MODE_* values.
+    """
+    with np.load(path) as data:
+        return str(data["fit_mode"].item())
 
 
 def pack_fit_results(

@@ -73,6 +73,7 @@ def plot_unprocessed_data(
     end_margin_time: float,
     transient_margin_time: float | None = None,
     kept_spans: list[tuple[float, float]] | None = None,
+    window_spans: list[tuple[float, float]] | None = None,
 ):
     """For all the 0D signals in the dataset, plot them over time and save the figure to disk.
 
@@ -99,6 +100,8 @@ def plot_unprocessed_data(
         transient_margin_time: Time of the transient cutoff [s], if one was found.
         kept_spans: (start, end) time intervals kept by filter_and_plot, shaded
             as green vertical bars on each subplot.
+        window_spans: (start, end) time windows the shotlist asked for, shaded
+            as blue vertical bars on each subplot.
     """
     if "shot" in ds.dims:
         ds = ds.isel(shot=0)
@@ -113,6 +116,12 @@ def plot_unprocessed_data(
         for ax in axes:
             for span_start, span_end in kept_spans:
                 ax.axvspan(span_start, span_end, color="green", alpha=0.2, linewidth=0)
+    if window_spans is not None:
+        for ax in axes:
+            for span_start, span_end in window_spans:
+                ax.axvspan(
+                    span_start, span_end, color="tab:blue", alpha=0.25, linewidth=0
+                )
 
     # ip and b0 on the left y axis, wmhd on the right y axis
     ax_ip = axes[0]
@@ -355,6 +364,7 @@ def plot_ts_fits(
     rho_fit: np.ndarray,
     channel_groups: list[tuple[np.ndarray, str, str]] | None = None,
     max_pages: int | None = None,
+    window_bounds: np.ndarray | None = None,
 ) -> int:
     """Save a PDF comparing the GP fits to the raw TS measurements of one shot.
 
@@ -379,6 +389,9 @@ def plot_ts_fits(
             (n_t, n_ch) when the split varies per slice.
         max_pages: Evenly sample the fitted slices down to at most this many
             pages. None plots every fitted slice.
+        window_bounds: (n_t, 2) start and end [s] of the time window each
+            row pools, for window-averaged fits. Titles the page with the
+            window instead of a slice time. None for per-sample fits.
 
     Returns:
         The number of pages written; a shot with no fitted slice writes an
@@ -417,7 +430,11 @@ def plot_ts_fits(
     with PdfPages(pdf_path) as pdf:
         for i_time in live:
             fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            title = f"shot {shot}  t={ts_time[i_time]:.3f} s"
+            if window_bounds is None:
+                title = f"shot {shot}  t={ts_time[i_time]:.3f} s"
+            else:
+                start, end = window_bounds[i_time]
+                title = f"shot {shot}  t={start:.3f}-{end:.3f} s (window average)"
             for i_var, (var, label, grad_label, _) in enumerate(_TS_FIT_PANELS):
                 data_y, err_y = (arr[i_time, :] for arr in channel_data[var])
                 rho_at_t = rho_ch[i_time, :]

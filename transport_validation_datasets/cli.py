@@ -123,6 +123,16 @@ class DatasetCLI:
     Killed jobs are retried up to --cluster_max_retries times, and both retries
     and jobs stuck PENDING past --cluster_pending_timeout_s move to the next
     partition in the list (wrapping around).
+
+    Time windows. --shotlist_file takes either one shot number per line,
+    or a CSV with a header holding shot (or pulse_no), t_start and t_end [s],
+    one row per window and a shot on as many rows as it has windows (other columns are ignored).
+    If windows are provided only the Thomson samples inside them are fit,
+    and the stores hold only the grid times inside them.
+    Add --average_windows to pool every Thomson point of a window into one fit.
+    The store then holds that profile over the whole window with fresh_profile marking the window center.
+    Staged batches and fit results record the windows and mode they were built with,
+    and a run whose shotlist disagrees with them stops with an error before fitting or stacking.
     """
 
     def cmod(
@@ -131,6 +141,7 @@ class DatasetCLI:
         ds_name: str = "cmod",
         shotlist_file: Path | str | None = None,
         max_num_shots: int | None = None,
+        average_windows: bool = False,
         stage: str = "all",
         method: str = DEFAULT_METHOD,
         clean_fit_state: bool = False,
@@ -152,10 +163,13 @@ class DatasetCLI:
             data_assembly_dir: Directory holding the intermediate files, plots,
                 logs, and datasets.
             ds_name: Dataset name, used in paths and cluster job names.
-            shotlist_file: File with one shot number per line. None queries the
-                C-Mod SQL database instead.
+            shotlist_file: File with one shot number per line, or a CSV with
+                shot, t_start and t_end columns for time windows.
+                None queries the C-Mod SQL database instead.
             max_num_shots: Stop once this many shots have unprocessed data
                 files. None processes the whole shotlist.
+            average_windows: Pool the Thomson points of each time window into
+                one fit per window. Needs a shotlist with windows.
             stage: Which stage to run, one of STAGES.
             method: GP fitting method (see gp_fitting.registry).
             clean_fit_state: Before fitting, cancel this dataset's queued
@@ -184,6 +198,7 @@ class DatasetCLI:
             data_assembly_dir=Path(data_assembly_dir),
             shotlist_file=shotlist_file,
             max_num_shots=max_num_shots,
+            average_windows=average_windows,
             fit_method=method,
             cluster_config=_build_cluster_config(
                 cluster_ssh_host=cluster_ssh_host,
@@ -206,6 +221,7 @@ class DatasetCLI:
         ds_name: str = "mast",
         shotlist_file: Path | str | None = None,
         max_num_shots: int | None = None,
+        average_windows: bool = False,
         stage: str = "all",
         method: str = DEFAULT_METHOD,
         clean_fit_state: bool = False,
@@ -228,10 +244,13 @@ class DatasetCLI:
             data_assembly_dir: Directory holding the intermediate files, plots,
                 logs, and datasets.
             ds_name: Dataset name, used in paths and cluster job names.
-            shotlist_file: File with one shot number per line. None uses the
-                shotlist shipped with the package.
+            shotlist_file: File with one shot number per line, or a CSV with
+                shot, t_start and t_end columns for time windows.
+                None uses the shotlist shipped with the package.
             max_num_shots: Stop once this many shots have unprocessed data
                 files. None processes the whole shotlist.
+            average_windows: Pool the Thomson points of each time window into
+                one fit per window. Needs a shotlist with windows.
             stage: Which stage to run, one of STAGES.
             method: GP fitting method (see gp_fitting.registry).
             clean_fit_state: Before fitting, cancel this dataset's queued
@@ -262,6 +281,7 @@ class DatasetCLI:
             data_assembly_dir=Path(data_assembly_dir),
             shotlist_file=shotlist_file,
             max_num_shots=max_num_shots,
+            average_windows=average_windows,
             fit_method=method,
             cluster_config=_build_cluster_config(
                 cluster_ssh_host=cluster_ssh_host,
