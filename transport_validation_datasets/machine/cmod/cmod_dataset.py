@@ -51,15 +51,17 @@ class CModSettings(DeviceSettings):
             Thomson channels are mapped onto rho with. A tree name (EFIT21,
             EFIT18, ...), or one of disruption-py's keys: "analysis" for the
             ANALYSIS tree, "disruption" for the disruption EFIT.
-        akho_channel_filters: Apply the original akho pipeline's channel
-            filters (from the standalone fit_cmod.py) during fit staging,
-            see _apply_akho_channel_filters. Off by default: staged batches
-            are shared by every fit method, and these culls were calibrated
-            for the akho method's fits.
+        channel_prefilters: Apply the legacy pre-fit channel conditioning
+            (ported from the standalone fit_cmod.py) during fit staging:
+            the channel filters (_apply_channel_prefilters) and the SOL
+            anchor points (_append_sol_anchor_points). Off by default:
+            staged batches are shared by every fit method, and this
+            conditioning was calibrated for the akho-style fits, though any
+            method can opt in.
     """
 
     efit_nickname: str = "EFIT21"
-    akho_channel_filters: bool = False
+    channel_prefilters: bool = False
 
 
 class CModDataWorkflow(DataWorkflow):
@@ -279,10 +281,10 @@ class CModDataWorkflow(DataWorkflow):
         core_problem = (rho >= 0.0) & (rho < 0.4) & (te_y < 0.4)
         te_y = np.where(core_problem, np.nan, te_y)
 
-        # The original akho pipeline's channel filters, before the error
-        # floors so the ne error conditioning sees the measured errors.
-        if self.settings.akho_channel_filters:
-            te_y, ne_y, ne_err = _apply_akho_channel_filters(rho, te_y, ne_y, ne_err)
+        # The legacy pre-fit channel filters, before the error floors so
+        # the ne error conditioning sees the measured errors.
+        if self.settings.channel_prefilters:
+            te_y, ne_y, ne_err = _apply_channel_prefilters(rho, te_y, ne_y, ne_err)
 
         # Error floors. Sometimes C-Mod TS has extremely tiny error bars
         # which I don't think are real. This increases them where needed.
@@ -295,6 +297,15 @@ class CModDataWorkflow(DataWorkflow):
         # the fit will (its thresholds are calibrated on them).
         te_y = _drop_broken_channels("te", rho, te_y, te_err)
         ne_y = _drop_broken_channels("ne", rho, ne_y, ne_err)
+
+        # The legacy SOL anchor points, appended last: their errors are the
+        # anchors' weight and must not pass through the floors above (the
+        # original never modified them after injection), and the persistence
+        # screen must judge only real channels.
+        if self.settings.channel_prefilters:
+            rho, te_y, te_err, ne_y, ne_err = _append_sol_anchor_points(
+                rho, te_y, te_err, ne_y, ne_err
+            )
 
         fit_input = ShotFitInput(
             x=rho, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err, time=ts_times
@@ -321,22 +332,22 @@ class CModDataWorkflow(DataWorkflow):
         ]
 
 
-def _apply_akho_channel_filters(
+def _apply_channel_prefilters(
     rho: np.ndarray,
     te_y: np.ndarray,
     ne_y: np.ndarray,
     ne_err: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply the original akho pipeline's channel filters to the fit staging rows.
+    """Apply the legacy pre-fit channel filters to the fit staging rows.
 
     Ported from the standalone fit_cmod.py's filter_and_flatten_data (the
     pre-fit conditioning of the pipeline the akho worker was ported from),
     reshaped from its flattened point list onto this module's
     (n_slices, n_channels) rows and converted from its raw units (Te [eV],
-    ne [m^-3]) to the fit units here (Te [keV], ne [1e20 m^-3]). Two pieces
-    of that function are deliberately NOT ported: the synthetic SOL anchor
-    points at rho 1.05/1.08 (data injection, not filtering) and the Te error
-    rescaling (already commented out in the original).
+    ne [m^-3]) to the fit units here (Te [keV], ne [1e20 m^-3]). The SOL
+    anchor points that function also injected live in
+    _append_sol_anchor_points; the only piece deliberately NOT ported is
+    the Te error rescaling (already commented out in the original).
 
     The filters, in order:
       - ne error conditioning: edge channels (rho > 0.9) with relative error
@@ -440,8 +451,63 @@ def _apply_akho_channel_filters(
             te_y[t] = np.where(cull, np.nan, te_y[t])
 
     if n_culled:
-        logger.info(f"akho channel filters culled {n_culled} channel readings")
+        logger.info(f"channel prefilters culled {n_culled} channel readings")
     return te_y, ne_y, ne_err
+
+
+def _append_sol_anchor_points(
+    rho: np.ndarray,
+    te_y: np.ndarray,
+    te_err: np.ndarray,
+    ne_y: np.ndarray,
+    ne_err: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Append the legacy synthetic SOL anchor points as two extra channels.
+
+    Ported from fit_cmod.py's filter_and_flatten_data (its upper_rho_bc
+    block): every slice gets two synthetic boundary-condition points at
+    rho 1.05 and 1.08 pinning the fit to low SOL values, converted to the
+    fit units. Te anchors are fixed at 0.020/0.015 keV (errors
+    0.010/0.007); ne anchors are 1.0/0.6 [1e20 m^-3] (errors 0.3/0.3)
+    scaled per slice by the slice's brightest reading relative to the
+    shot's brightest core (rho < 0.2) reading, as in the original. A slice
+    with no finite ne gets NaN ne anchors, so it stays unfittable.
+
+    Call after the error floors and the persistence screen: the anchor
+    errors ARE the anchors' weight (the original never modified them after
+    injection), and only real channels belong in the persistence
+    statistics. Under window pooling every pooled sample contributes its
+    anchors, which keeps the anchor-to-data weight ratio of the per-slice
+    case.
+
+    Args:
+        rho: (n_t, n_ch) channel rho positions.
+        te_y: (n_t, n_ch) Te values [keV].
+        te_err: (n_t, n_ch) Te errors [keV].
+        ne_y: (n_t, n_ch) ne values [1e20 m^-3].
+        ne_err: (n_t, n_ch) ne errors [1e20 m^-3].
+
+    Returns:
+        (rho, te_y, te_err, ne_y, ne_err) with two anchor channels appended.
+    """
+    n_t = rho.shape[0]
+
+    core = ne_y[(rho < 0.2) & np.isfinite(ne_y)]
+    max_core_ne = float(core.max()) if core.size else 1.0e-22
+    slice_max = np.where(np.isfinite(ne_y), ne_y, -np.inf).max(axis=1)
+    slice_max = np.where(np.isfinite(slice_max), slice_max, np.nan)
+    v = (slice_max / max_core_ne)[:, None]
+
+    def rows(values: tuple[float, float]) -> np.ndarray:
+        return np.tile(np.asarray(values, dtype=float), (n_t, 1))
+
+    return (
+        np.concatenate([rho, rows((1.05, 1.08))], axis=1),
+        np.concatenate([te_y, rows((0.020, 0.015))], axis=1),
+        np.concatenate([te_err, rows((0.010, 0.007))], axis=1),
+        np.concatenate([ne_y, v * rows((1.0, 0.6))], axis=1),
+        np.concatenate([ne_err, v * rows((0.3, 0.3))], axis=1),
+    )
 
 
 def _drop_broken_channels(
