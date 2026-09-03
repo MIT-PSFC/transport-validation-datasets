@@ -149,9 +149,7 @@ def synthetic_fit(shot: int) -> xr.Dataset:
     )
 
 
-@pytest.mark.parametrize(
-    "polarity", [-1, 1], ids=["normal_field", "reversed_field"]
-)
+@pytest.mark.parametrize("polarity", [-1, 1], ids=["normal_field", "reversed_field"])
 def test_imas_export_chain_reads_back(tmp_path, polarity):
     shot = 900000001 if polarity < 0 else 900000002
     unprocessed_ds = synthetic_unprocessed(polarity)
@@ -197,8 +195,12 @@ def test_imas_export_chain_reads_back(tmp_path, polarity):
         assert te_out.shape == (N_RHO,) and np.all(te_out > 0)
         assert np.allclose(te_out, np.asarray(fit_ds["t_e"][0, i]), rtol=1e-6)
         grid_psi = np.asarray(p.grid.psi)
-        lo, hi = sorted((float(ts.global_quantities.psi_axis),
-                         float(ts.global_quantities.psi_boundary)))
+        lo, hi = sorted(
+            (
+                float(ts.global_quantities.psi_axis),
+                float(ts.global_quantities.psi_boundary),
+            )
+        )
         assert np.all((grid_psi >= lo - 1e-9) & (grid_psi <= hi + 1e-9))
 
     sm = read_back("summary")

@@ -67,6 +67,7 @@ from scipy.optimize import minimize
 
 from transport_validation_datasets.imas_export.geqdsk_writer import write_geqdsk
 
+
 def _latest_dd_version() -> str:
     """Get the newest data dictionary version the installed imas package ships.
 
@@ -116,6 +117,7 @@ def _sigma_bp(cocos: int) -> int:
         and their e_Bp=1 partners 13, 14, 17, 18), +1 for the rest.
     """
     return -1 if cocos % 10 in (3, 4, 7, 8) else 1
+
 
 # core_profiles' one ion species (see build_core_profiles): deuterium, with
 # the same nominal mass number (2.0, not 2.014) and nuclear charge
@@ -340,9 +342,7 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     # bcentr share a sign, so the ratio is positive. A zero vacuum field is
     # nonphysical, but fall back to the dimensionless sqrt(psi_norm) rather
     # than divide by zero.
-    rho_tor = (
-        np.sqrt(phi / (np.pi * bcentr)) if abs(bcentr) > 0 else np.sqrt(psi_norm)
-    )
+    rho_tor = np.sqrt(phi / (np.pi * bcentr)) if abs(bcentr) > 0 else np.sqrt(psi_norm)
     rho_tor_a = rho_tor[-1] if rho_tor[-1] > 0.0 else 1.0
     ts.profiles_1d.phi = phi
     ts.profiles_1d.rho_tor = rho_tor
