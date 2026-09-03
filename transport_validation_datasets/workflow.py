@@ -3,6 +3,7 @@ import os
 import shutil
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -135,6 +136,17 @@ RAW_TS_CHANNEL_SIGNALS = (
 )
 
 
+@dataclass(frozen=True)
+class DeviceSettings:
+    """Device-specific settings of a workflow, the [<device>] table of the config file.
+
+    The base has no fields. A device with settings of its own subclasses this
+    with one field per setting, defaults included, and points its workflow's
+    settings_cls at the subclass (see CModSettings). config.py builds the
+    instance from the TOML table by field name.
+    """
+
+
 class DataWorkflow(ABC):
     """Device-independent stages of building one device's dataset.
 
@@ -240,6 +252,10 @@ class DataWorkflow(ABC):
     # MAST reads public S3 and does, disruption-py's MDSplus connections do not.
     default_prepare_workers = 1
 
+    # The device's settings dataclass, what the [<device>] table of the
+    # config file is read into. Devices with settings override this.
+    settings_cls: type[DeviceSettings] = DeviceSettings
+
     # Variables stripped from the published dataset.
     # The internal dataset keeps them.
     # Device subclasses override this to release more or hold back more.
@@ -264,6 +280,7 @@ class DataWorkflow(ABC):
         fit_method: str = "zk",
         cluster_config: ClusterFitConfig | None = None,
         prepare_workers: int | None = None,
+        settings: DeviceSettings | None = None,
     ):
         """Set up the dataset directories and resolve the shotlist.
 
@@ -287,8 +304,12 @@ class DataWorkflow(ABC):
                 If None, fitting runs single-threaded in this process.
             prepare_workers: Threads used to stage source data. None takes the
                 device's default_prepare_workers.
+            settings: The device's settings, an instance of its settings_cls
+                (built from the config file by config.load_run_config). None
+                takes the defaults.
 
         Raises:
+            TypeError: If settings is not an instance of the device's settings_cls.
             ValueError: If average_windows is set without a windowed shotlist.
         """
         self.ds_name = ds_name
@@ -304,6 +325,12 @@ class DataWorkflow(ABC):
         self.prepare_workers = (
             self.default_prepare_workers if prepare_workers is None else prepare_workers
         )
+        self.settings = self.settings_cls() if settings is None else settings
+        if not isinstance(self.settings, self.settings_cls):
+            raise TypeError(
+                f"{type(self).__name__} takes {self.settings_cls.__name__} settings, "
+                f"got {type(self.settings).__name__}"
+            )
 
         # Set up subdirectories for unprocessed data, fit staging, and the datasets
         self.unprocessed_data_dir = self.data_assembly_dir / "01_unprocessed"
@@ -337,6 +364,7 @@ class DataWorkflow(ABC):
             logger.remove(DataWorkflow._log_sink_id)
         DataWorkflow._log_sink_id = logger.add(self.log_file)
         logger.info(f"Logging this run to {self.log_file}")
+        logger.info(f"Device settings: {self.settings}")
 
         if shotlist_file is None:
             logger.info(

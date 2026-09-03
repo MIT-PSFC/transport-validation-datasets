@@ -15,74 +15,10 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 
 STAGES = ("unprocessed", "fit", "stack", "publish", "export", "all")
 
+# The subcommands below, and the device tables a config file may hold.
+DEVICES = ("cmod", "mast")
+
 DEFAULT_METHOD = "zk"
-
-
-def _build_cluster_config(
-    cluster_ssh_host: str | None,
-    cluster_partitions: str | None,
-    cluster_remote_workdir: str | None,
-    cluster_venv: str | None,
-    cluster_max_jobs: int,
-    cluster_shots_per_batch: int,
-    cluster_cpus_per_job: int,
-    cluster_mem: str | None,
-    cluster_max_retries: int,
-    cluster_pending_timeout_s: float,
-):
-    """Build a ClusterFitConfig from the cluster options, if any were given.
-
-    Args:
-        cluster_ssh_host: Host alias from ~/.ssh/config for the cluster login node.
-        cluster_partitions: Ordered partition preference list,
-            name@time_limit[@constraint], comma separated.
-        cluster_remote_workdir: Scratch directory on the cluster. Each dataset
-            keeps its batch files, worker package, and job logs in its own
-            <workdir>/<ds_name>/ subdirectory.
-        cluster_venv: Pre-built venv on the cluster (see bootstrap_remote.sh).
-        cluster_max_jobs: Cap on simultaneously queued or running fitting jobs.
-        cluster_shots_per_batch: Shots packed into one job.
-        cluster_cpus_per_job: cpus-per-task of each fitting job.
-        cluster_mem: Memory per node, e.g. "64G". None keeps the partition default.
-        cluster_max_retries: Resubmissions allowed per batch after a job failure.
-        cluster_pending_timeout_s: Seconds a job may sit PENDING before it moves
-            to the next partition.
-
-    Returns:
-        The ClusterFitConfig, or None when no cluster host was given (fitting
-        then runs single-threaded in this process).
-
-    Raises:
-        ValueError: If a host was given without the other options the cluster needs.
-    """
-    if cluster_ssh_host is None:
-        return None
-    missing = [
-        name
-        for name, value in (
-            ("--cluster_partitions", cluster_partitions),
-            ("--cluster_remote_workdir", cluster_remote_workdir),
-            ("--cluster_venv", cluster_venv),
-        )
-        if value is None
-    ]
-    if missing:
-        raise ValueError(f"{', '.join(missing)} are required with --cluster_ssh_host")
-
-    from transport_validation_datasets.gp_fitting.dispatcher import ClusterFitConfig
-
-    return ClusterFitConfig(
-        ssh_host=cluster_ssh_host,
-        partitions=cluster_partitions,
-        remote_workdir=cluster_remote_workdir,
-        venv_path=cluster_venv,
-        max_concurrent_jobs=cluster_max_jobs,
-        shots_per_batch=cluster_shots_per_batch,
-        cpus_per_job=cluster_cpus_per_job,
-        memory_per_node=cluster_mem,
-        max_retries=cluster_max_retries,
-        pending_timeout_s=cluster_pending_timeout_s,
-    )
 
 
 class DatasetCLI:
@@ -104,24 +40,42 @@ class DatasetCLI:
     two stages left on disk, and publish always rebuilds the published store
     from the internal one.
 
-    GP fitting can be dispatched to a SLURM cluster. Set that up once per
-    cluster: a Host entry in ~/.ssh/config with ControlMaster configured, then
+    Configuration. The cluster and the device settings live in TOML files
+    passed through --config, comma separated and layered (a later file
+    overrides an earlier one key by key, see config.py). The [cluster] table
+    dispatches the fit stage to a SLURM cluster, the [cmod] or [mast] table
+    sets that device's workflow settings, e.g. the EFIT tree C-Mod reads:
+
+        [cmod]
+        efit_nickname = "EFIT21"
+
+    configs/orcd.toml is the shared file; the per-user cluster paths go in a
+    second, gitignored file:
+
+        --config configs/orcd.toml,configs/$USER.user.toml
+
+    Without --config the fits run locally and every setting keeps its default.
+
+    GP fitting on a SLURM cluster. Set that up once per cluster: a Host entry
+    in ~/.ssh/config with ControlMaster configured, then
 
         bash transport_validation_datasets/gp_fitting/bootstrap_remote.sh <host> <scratch-dir>
 
-    and pass --cluster_ssh_host <host>, --cluster_partitions <spec>,
-    --cluster_remote_workdir <scratch-dir>, and
-    --cluster_venv <scratch-dir>/.venv. An authenticated ssh session to the
-    login node must already exist (its 2FA prompt cannot be answered from here),
-    so open one with a plain `ssh <host>` first.
+    and describe it in the [cluster] table, whose keys are the fields of
+    gp_fitting.dispatcher.ClusterFitConfig:
 
-    --cluster_partitions is an ordered preference list of comma-separated
-    name@time_limit or name@time_limit@constraint entries, e.g.
+        [cluster]
+        ssh_host = "<host>"
+        partitions = "sched_mit_psfc_r8@8:00:00,mit_preemptable@8:00:00@rocky8"
+        remote_workdir = "<scratch-dir>"
+        venv_path = "<scratch-dir>/.venv"
 
-        --cluster_partitions "sched_mit_psfc_r8@8:00:00,mit_preemptable@8:00:00@rocky8"
-
-    Killed jobs are retried up to --cluster_max_retries times, and both retries
-    and jobs stuck PENDING past --cluster_pending_timeout_s move to the next
+    An authenticated ssh session to the login node must already exist (its
+    2FA prompt cannot be answered from here), so open one with a plain
+    `ssh <host>` first. partitions is an ordered preference list of
+    name@time_limit or name@time_limit@constraint entries, comma separated
+    or a TOML list. Killed jobs are retried up to max_retries times, and both
+    retries and jobs stuck PENDING past pending_timeout_s move to the next
     partition in the list (wrapping around).
 
     Time windows. --shotlist_file takes either one shot number per line,
@@ -146,16 +100,7 @@ class DatasetCLI:
         method: str = DEFAULT_METHOD,
         clean_fit_state: bool = False,
         mb_per_chunk: int = 50,
-        cluster_ssh_host: str | None = None,
-        cluster_partitions: str | None = None,
-        cluster_remote_workdir: str | None = None,
-        cluster_venv: str | None = None,
-        cluster_max_jobs: int = 8,
-        cluster_shots_per_batch: int = 10,
-        cluster_cpus_per_job: int = 32,
-        cluster_mem: str | None = None,
-        cluster_max_retries: int = 2,
-        cluster_pending_timeout_s: float = 1800.0,
+        config: Path | str | None = None,
     ):
         """Build the C-Mod dataset, sourced from MDSplus through disruption-py.
 
@@ -178,21 +123,18 @@ class DatasetCLI:
                 Unprocessed data files are kept.
             mb_per_chunk: Target size of a chunk of the internal Zarr store,
                 which is chunked along the shot dimension.
-            cluster_ssh_host: See _build_cluster_config.
-            cluster_partitions: See _build_cluster_config.
-            cluster_remote_workdir: See _build_cluster_config.
-            cluster_venv: See _build_cluster_config.
-            cluster_max_jobs: See _build_cluster_config.
-            cluster_shots_per_batch: See _build_cluster_config.
-            cluster_cpus_per_job: See _build_cluster_config.
-            cluster_mem: See _build_cluster_config.
-            cluster_max_retries: See _build_cluster_config.
-            cluster_pending_timeout_s: See _build_cluster_config.
+            config: TOML file(s), comma separated, with the [cluster] table
+                and the [cmod] settings table (see config.py, CModSettings).
+                None fits locally with the default settings.
         """
+        from transport_validation_datasets.config import load_run_config
         from transport_validation_datasets.machine.cmod.cmod_dataset import (
             CModDataWorkflow,
         )
 
+        cluster_config, settings = load_run_config(
+            config, "cmod", CModDataWorkflow.settings_cls, DEVICES
+        )
         workflow = CModDataWorkflow(
             ds_name=ds_name,
             data_assembly_dir=Path(data_assembly_dir),
@@ -200,18 +142,8 @@ class DatasetCLI:
             max_num_shots=max_num_shots,
             average_windows=average_windows,
             fit_method=method,
-            cluster_config=_build_cluster_config(
-                cluster_ssh_host=cluster_ssh_host,
-                cluster_partitions=cluster_partitions,
-                cluster_remote_workdir=cluster_remote_workdir,
-                cluster_venv=cluster_venv,
-                cluster_max_jobs=cluster_max_jobs,
-                cluster_shots_per_batch=cluster_shots_per_batch,
-                cluster_cpus_per_job=cluster_cpus_per_job,
-                cluster_mem=cluster_mem,
-                cluster_max_retries=cluster_max_retries,
-                cluster_pending_timeout_s=cluster_pending_timeout_s,
-            ),
+            cluster_config=cluster_config,
+            settings=settings,
         )
         _execute(workflow, stage, clean_fit_state, mb_per_chunk)
 
@@ -227,16 +159,7 @@ class DatasetCLI:
         clean_fit_state: bool = False,
         mb_per_chunk: int = 50,
         prepare_workers: int | None = None,
-        cluster_ssh_host: str | None = None,
-        cluster_partitions: str | None = None,
-        cluster_remote_workdir: str | None = None,
-        cluster_venv: str | None = None,
-        cluster_max_jobs: int = 8,
-        cluster_shots_per_batch: int = 10,
-        cluster_cpus_per_job: int = 32,
-        cluster_mem: str | None = None,
-        cluster_max_retries: int = 2,
-        cluster_pending_timeout_s: float = 1800.0,
+        config: Path | str | None = None,
     ):
         """Build the MAST dataset, sourced from the public level 2 Zarr store.
 
@@ -261,21 +184,18 @@ class DatasetCLI:
                 which is chunked along the shot dimension.
             prepare_workers: Threads used to read source data. None keeps the
                 MAST default, which the public S3 store tolerates.
-            cluster_ssh_host: See _build_cluster_config.
-            cluster_partitions: See _build_cluster_config.
-            cluster_remote_workdir: See _build_cluster_config.
-            cluster_venv: See _build_cluster_config.
-            cluster_max_jobs: See _build_cluster_config.
-            cluster_shots_per_batch: See _build_cluster_config.
-            cluster_cpus_per_job: See _build_cluster_config.
-            cluster_mem: See _build_cluster_config.
-            cluster_max_retries: See _build_cluster_config.
-            cluster_pending_timeout_s: See _build_cluster_config.
+            config: TOML file(s), comma separated, with the [cluster] table
+                and the [mast] settings table (see config.py; MAST has no
+                settings yet, so the table is empty or absent). None fits locally.
         """
+        from transport_validation_datasets.config import load_run_config
         from transport_validation_datasets.machine.mast.mast_dataset import (
             MASTDataWorkflow,
         )
 
+        cluster_config, settings = load_run_config(
+            config, "mast", MASTDataWorkflow.settings_cls, DEVICES
+        )
         workflow = MASTDataWorkflow(
             ds_name=ds_name,
             data_assembly_dir=Path(data_assembly_dir),
@@ -283,19 +203,9 @@ class DatasetCLI:
             max_num_shots=max_num_shots,
             average_windows=average_windows,
             fit_method=method,
-            cluster_config=_build_cluster_config(
-                cluster_ssh_host=cluster_ssh_host,
-                cluster_partitions=cluster_partitions,
-                cluster_remote_workdir=cluster_remote_workdir,
-                cluster_venv=cluster_venv,
-                cluster_max_jobs=cluster_max_jobs,
-                cluster_shots_per_batch=cluster_shots_per_batch,
-                cluster_cpus_per_job=cluster_cpus_per_job,
-                cluster_mem=cluster_mem,
-                cluster_max_retries=cluster_max_retries,
-                cluster_pending_timeout_s=cluster_pending_timeout_s,
-            ),
+            cluster_config=cluster_config,
             prepare_workers=prepare_workers,
+            settings=settings,
         )
         _execute(workflow, stage, clean_fit_state, mb_per_chunk)
 

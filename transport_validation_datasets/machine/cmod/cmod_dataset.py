@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
@@ -20,11 +22,28 @@ from transport_validation_datasets.machine.generic import (
     snap_to_grid,
     ts_channel_fit_rows,
 )
-from transport_validation_datasets.workflow import DataWorkflow
+from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
+
+
+@dataclass(frozen=True)
+class CModSettings(DeviceSettings):
+    """C-Mod settings, the [cmod] table of the config file.
+
+    Attributes:
+        efit_nickname: EFIT tree the equilibrium, the geometry signals, and
+            the shot's 1 kHz timebase are read from, and so the one the
+            Thomson channels are mapped onto rho with. A tree name (EFIT21,
+            EFIT18, ...), or one of disruption-py's keys: "analysis" for the
+            ANALYSIS tree, "disruption" for the disruption EFIT.
+    """
+
+    efit_nickname: str = "EFIT21"
 
 
 class CModDataWorkflow(DataWorkflow):
     """C-Mod specific data workflow for creating and processing datasets."""
+
+    settings_cls = CModSettings
 
     min_pulse_length = 0.5
     min_usable_time = 0.2
@@ -117,7 +136,7 @@ class CModDataWorkflow(DataWorkflow):
             ("efit", _get_efit_dataset),
             ("thomson", _get_thomson_dataset),
         ):
-            ds = getter(shot)
+            ds = getter(shot, self.settings.efit_nickname)
             if ds is None:
                 reason = f"Missing retrievable {name} data."
                 logger.warning(f"Shot {shot} is {reason.lower()} Skipping.")
@@ -343,8 +362,12 @@ def _is_empty_result(result: xr.Dataset) -> bool:
     return "shot" not in result or "time" not in result or result["time"].size == 0
 
 
-def _get_fast_dataset(shot: int) -> xr.Dataset | None:
+def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     """Retrieve fast 0D signals and EFIT dataset.
+
+    Args:
+        shot: Shot number to retrieve data for.
+        efit_nickname: EFIT tree to read, see CModSettings.
 
     Returns:
         Dataset with EFIT signals for the given shot, or None if retrieval
@@ -371,7 +394,7 @@ def _get_fast_dataset(shot: int) -> xr.Dataset | None:
     retrieval_settings = RetrievalSettings(
         run_columns=cmod_dataset_signals,
         time_setting=UniformTimeSetting(),
-        efit_nickname_setting="EFIT21",
+        efit_nickname_setting=efit_nickname,
         only_requested_columns=True,
         custom_physics_methods=[CmodGeometryMethods.get_geometric_major_radius],
     )
@@ -389,11 +412,12 @@ def _get_fast_dataset(shot: int) -> xr.Dataset | None:
     return result
 
 
-def _get_efit_dataset(shot: int) -> xr.Dataset | None:
+def _get_efit_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     """Retrieve EFIT dataset for the given shot.
 
     Args:
         shot: Shot number to retrieve data for.
+        efit_nickname: EFIT tree to read, see CModSettings.
 
     Returns:
         Dataset with GEQDSK signals for the given shot, or None if retrieval
@@ -401,7 +425,7 @@ def _get_efit_dataset(shot: int) -> xr.Dataset | None:
     """
     settings = RetrievalSettings(
         run_methods=["get_geqdsk_parameters"],
-        efit_nickname_setting="EFIT21",
+        efit_nickname_setting=efit_nickname,
         time_setting=UniformTimeSetting(),
         custom_physics_methods=[CmodEfitMethods.get_geqdsk_parameters],
     )
@@ -419,11 +443,12 @@ def _get_efit_dataset(shot: int) -> xr.Dataset | None:
     return result
 
 
-def _get_thomson_dataset(shot: int) -> xr.Dataset | None:
+def _get_thomson_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     """Retrieve Thomson scattering data for the given shot.
 
     Args:
         shot: Shot number to retrieve data for.
+        efit_nickname: EFIT tree to read, see CModSettings.
 
     Returns:
         Dataset with Thomson channel signals snapped to the uniform 1 kHz grid,
@@ -431,7 +456,7 @@ def _get_thomson_dataset(shot: int) -> xr.Dataset | None:
     """
     retrieval_settings = RetrievalSettings(
         run_methods=["get_thomson_channels"],
-        efit_nickname_setting="EFIT21",
+        efit_nickname_setting=efit_nickname,
         only_requested_columns=False,
         custom_physics_methods=[CmodThomsonMethods.get_thomson_channels],
     )
