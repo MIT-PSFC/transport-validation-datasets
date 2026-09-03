@@ -51,9 +51,15 @@ class CModSettings(DeviceSettings):
             Thomson channels are mapped onto rho with. A tree name (EFIT21,
             EFIT18, ...), or one of disruption-py's keys: "analysis" for the
             ANALYSIS tree, "disruption" for the disruption EFIT.
+        akho_channel_filters: Apply the original akho pipeline's channel
+            filters (from the standalone fit_cmod.py) during fit staging,
+            see _apply_akho_channel_filters. Off by default: staged batches
+            are shared by every fit method, and these culls were calibrated
+            for the akho method's fits.
     """
 
     efit_nickname: str = "EFIT21"
+    akho_channel_filters: bool = False
 
 
 class CModDataWorkflow(DataWorkflow):
@@ -273,6 +279,11 @@ class CModDataWorkflow(DataWorkflow):
         core_problem = (rho >= 0.0) & (rho < 0.4) & (te_y < 0.4)
         te_y = np.where(core_problem, np.nan, te_y)
 
+        # The original akho pipeline's channel filters, before the error
+        # floors so the ne error conditioning sees the measured errors.
+        if self.settings.akho_channel_filters:
+            te_y, ne_y, ne_err = _apply_akho_channel_filters(rho, te_y, ne_y, ne_err)
+
         # Error floors. Sometimes C-Mod TS has extremely tiny error bars
         # which I don't think are real. This increases them where needed.
         # Te: absolute 0.1 keV
@@ -308,6 +319,129 @@ class CModDataWorkflow(DataWorkflow):
             (ts_array == "core", "tab:blue", "core TS"),
             (ts_array == "edge", "tab:orange", "edge TS"),
         ]
+
+
+def _apply_akho_channel_filters(
+    rho: np.ndarray,
+    te_y: np.ndarray,
+    ne_y: np.ndarray,
+    ne_err: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply the original akho pipeline's channel filters to the fit staging rows.
+
+    Ported from the standalone fit_cmod.py's filter_and_flatten_data (the
+    pre-fit conditioning of the pipeline the akho worker was ported from),
+    reshaped from its flattened point list onto this module's
+    (n_slices, n_channels) rows and converted from its raw units (Te [eV],
+    ne [m^-3]) to the fit units here (Te [keV], ne [1e20 m^-3]). Two pieces
+    of that function are deliberately NOT ported: the synthetic SOL anchor
+    points at rho 1.05/1.08 (data injection, not filtering) and the Te error
+    rescaling (already commented out in the original).
+
+    The filters, in order:
+      - ne error conditioning: edge channels (rho > 0.9) with relative error
+        above 40 percent get their error shrunk 0.3x, non-edge channels with
+        relative error under 5 percent get it inflated 5x.
+      - ne cull: any reading above 1.1x the shot's brightest core
+        (rho < 0.2) density is dropped.
+      - Per slice, referenced to the mean reading of the slice's innermost
+        channel (only defined when that channel sits at rho < 0.3):
+          - ne: with edge coverage (rho > 0.9) and a bright core (at least
+            0.5x the shot's core maximum), edge readings above 0.8x the
+            slice's core value are dropped.
+          - Te: with edge coverage and a core of at least 0.3x the shot's
+            core maximum, edge readings above 0.3x the slice's core value
+            are dropped.
+          - Te: with a core hotter than 0.3 keV, readings of at most
+            0.08 keV inside rho <= 0.95 are dropped (dead or cold channels
+            inside the plasma).
+
+    Args:
+        rho: (n_t, n_ch) channel rho positions.
+        te_y: (n_t, n_ch) Te values [keV], NaN where invalid.
+        ne_y: (n_t, n_ch) ne values [1e20 m^-3], NaN where invalid.
+        ne_err: (n_t, n_ch) measured ne errors [1e20 m^-3], before the
+            fit's error floors.
+
+    Returns:
+        (te_y, ne_y, ne_err) with the filters applied, as copies.
+    """
+    te_y = te_y.copy()
+    ne_y = ne_y.copy()
+    ne_err = ne_err.copy()
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rel_err = ne_err / np.abs(ne_y)
+    ne_err = np.where((rho > 0.9) & (rel_err > 0.4), 0.3 * ne_err, ne_err)
+    ne_err = np.where((rho <= 0.9) & (rel_err < 0.05), 5.0 * ne_err, ne_err)
+
+    def shot_core_max(y: np.ndarray) -> float:
+        """Get the shot's brightest core (rho < 0.2) reading of one variable.
+
+        Args:
+            y: (n_t, n_ch) channel values.
+
+        Returns:
+            The maximum finite reading at rho < 0.2, or a tiny fallback
+            mirroring the original's 0.01-in-raw-units default when the
+            core is not covered (the relative-to-core thresholds then
+            resolve the same way they did there).
+        """
+        core = y[(rho < 0.2) & np.isfinite(y)]
+        return float(core.max()) if core.size else 1.0e-22
+
+    max_core_te = shot_core_max(te_y)
+    max_core_ne = shot_core_max(ne_y)
+
+    n_culled = int((np.isfinite(ne_y) & (ne_y > 1.1 * max_core_ne)).sum())
+    ne_y = np.where(ne_y > 1.1 * max_core_ne, np.nan, ne_y)
+
+    def slice_core(r: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
+        """Characterize one slice's coverage for the per-slice culls.
+
+        Args:
+            r: (n_ch,) channel rho positions.
+            y: (n_ch,) channel values.
+
+        Returns:
+            (core value, innermost rho, outermost rho) over the finite
+            channels; the core value is the mean reading of the innermost
+            channel, 0.0 when that channel sits at rho >= 0.3 (matching the
+            original, whose core reference stays unset then), and everything
+            is (0.0, inf, -inf) with no finite channel at all.
+        """
+        valid = np.isfinite(r) & np.isfinite(y)
+        if not valid.any():
+            return 0.0, np.inf, -np.inf
+        r_min = float(r[valid].min())
+        r_max = float(r[valid].max())
+        if r_min >= 0.3:
+            return 0.0, r_min, r_max
+        at_min = valid & np.isclose(r, r_min)
+        return float(np.mean(y[at_min])), r_min, r_max
+
+    for t in range(rho.shape[0]):
+        r = rho[t]
+
+        core, r_min, r_max = slice_core(r, ne_y[t])
+        if r_max > 0.9 and core >= 0.5 * max_core_ne:
+            cull = (r >= 0.9) & (ne_y[t] > 0.8 * core)
+            n_culled += int(np.count_nonzero(cull))
+            ne_y[t] = np.where(cull, np.nan, ne_y[t])
+
+        core, r_min, r_max = slice_core(r, te_y[t])
+        cull = np.zeros(r.shape, dtype=bool)
+        if r_max > 0.9 and core >= 0.3 * max_core_te:
+            cull |= (r >= 0.9) & (te_y[t] > 0.3 * core)
+        if r_min < 0.95 and core > 0.3:
+            cull |= (r <= 0.95) & (te_y[t] <= 0.08)
+        if cull.any():
+            n_culled += int(np.count_nonzero(cull & np.isfinite(te_y[t])))
+            te_y[t] = np.where(cull, np.nan, te_y[t])
+
+    if n_culled:
+        logger.info(f"akho channel filters culled {n_culled} channel readings")
+    return te_y, ne_y, ne_err
 
 
 def _drop_broken_channels(
