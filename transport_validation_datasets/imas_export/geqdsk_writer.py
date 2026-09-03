@@ -2,7 +2,7 @@
 
 Simple by design: the GEQDSK block already staged in a shot's unprocessed file
 (`machine.generic.make_geqdsk_dataset`'s schema, FreeQDSK canonical names,
-see `workflow.FINAL_EQUILIBRIUM_SIGNALS`) already matches
+see `workflow.DATASET_EQUILIBRIUM_SIGNALS`) already matches
 `freeqdsk.geqdsk`'s own field names almost one-to-one, so writing is a
 straight field copy plus NaN-stripping for the boundary/limiter contours
 (their point counts can vary slice to slice; the staged arrays are padded to

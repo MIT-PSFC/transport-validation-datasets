@@ -10,7 +10,7 @@ consolidated scenario file. Design notes:
     thinned to or deduped against the Thomson slice times).
   - `summary` is written at its own full native (1 kHz) 0D-signal
     resolution, for the same reason, and carries every
-    `workflow.FINAL_0D_SIGNALS` entry the shot has (see
+    `workflow.DATASET_0D_SIGNALS` entry the shot has (see
     `_SUMMARY_SIGNAL_PATHS` for where each one lands).
   - `core_profiles` gets one `profiles_1d` per usable Thomson slice time,
     electrons (with the GP fit's 1-sigma uncertainties in the DD's
@@ -215,6 +215,15 @@ def _find_x_point(eqi, bp_spline):
         options={"xatol": 1e-6, "fatol": 1e-12},
     )
     r_x, z_x = float(result.x[0]), float(result.x[1])
+    # A true X-point sits at (or just off) the LCFS's own B_pol minimum.
+    # With no null nearby (a limited plasma) the unconstrained refinement
+    # walks down the smooth B_pol landscape all the way to the magnetic
+    # axis -- a genuine null, but not an X-point -- so a refinement that
+    # left the starting point's neighborhood is discarded in favor of the
+    # boundary minimum itself.
+    minor_radius = 0.5 * float(np.max(eqi.xbdry) - np.min(eqi.xbdry))
+    if np.hypot(r_x - r0, z_x - z0) > 0.2 * minor_radius:
+        r_x, z_x = float(r0), float(z0)
     bp_min = _spline_scalar(bp_spline, r_x, z_x)
     bp_typical = float(np.median(bp_boundary))
     diverted = bool(bp_min / bp_typical < _X_POINT_BPOL_RATIO_THRESHOLD)
@@ -533,9 +542,9 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
 # ---------------------------------------------------------------------------
 
 
-# `workflow.FINAL_0D_SIGNALS` name -> (summary sub-structure, field) it is
+# `workflow.DATASET_0D_SIGNALS` name -> (summary sub-structure, field) it is
 # written to; each target is a `summary_dynamic` node whose `.value` holds the
-# time series. Every FINAL_0D_SIGNALS entry has a home here, and the paths
+# time series. Every DATASET_0D_SIGNALS entry has a home here, and the paths
 # match the `ref` attrs the machine modules record on the unprocessed signals
 # (confirmed against the installed DD 4.0.0 by introspection).
 _SUMMARY_SIGNAL_PATHS = {
@@ -564,11 +573,11 @@ def build_summary(factory, time, signals):
         factory: `imas.IDSFactory` to build the IDS from.
         time: (n,) time base [s] -- the unprocessed file's own 0D-signal
             sampling, independent of `equilibrium.time`/`core_profiles.time`.
-        signals: `workflow.FINAL_0D_SIGNALS` name -> (n,) signal on `time`.
+        signals: `workflow.DATASET_0D_SIGNALS` name -> (n,) signal on `time`.
             Any subset; a signal that is absent, or NaN everywhere (how a
             device without it stages it), is left unset in the IDS. A name
             with no entry in `_SUMMARY_SIGNAL_PATHS` is an error, so a new
-            FINAL_0D_SIGNALS entry cannot be dropped silently.
+            DATASET_0D_SIGNALS entry cannot be dropped silently.
 
     Returns:
         The validated `summary` IDS.
@@ -678,9 +687,9 @@ def build_imas_from_shot(
             `TIME_COORD`.
         unprocessed_ds: This shot's unprocessed data
             (`01_unprocessed/<shot>.nc`) -- needs `ip` and
-            `workflow.FINAL_EQUILIBRIUM_SIGNALS`, all on the shot's common
+            `workflow.DATASET_EQUILIBRIUM_SIGNALS`, all on the shot's common
             time grid (the equilibrium signals NaN outside a real EFIT
-            reconstruction time). Every other `workflow.FINAL_0D_SIGNALS`
+            reconstruction time). Every other `workflow.DATASET_0D_SIGNALS`
             entry present is written to `summary` (see `build_summary`).
         geqdsk_dir: Directory to write this shot's per-equilibrium-time
             `.geqdsk` files into (see `geqdsk_writer.write_geqdsk`).
@@ -695,8 +704,8 @@ def build_imas_from_shot(
         KeyError: If the shot's unprocessed data has no `ip` signal.
     """
     from transport_validation_datasets.workflow import (
-        FINAL_0D_SIGNALS,
-        FINAL_EQUILIBRIUM_SIGNALS,
+        DATASET_0D_SIGNALS,
+        DATASET_EQUILIBRIUM_SIGNALS,
         TIME_COORD,
         TIME_DIM,
         USABLE_FIT_STATUSES,
@@ -708,14 +717,14 @@ def build_imas_from_shot(
     if "shot" in unprocessed_ds.dims:
         unprocessed_ds = unprocessed_ds.squeeze("shot", drop=True)
 
-    # FINAL_EQUILIBRIUM_SIGNALS lives on the shot's common time grid (same as
+    # DATASET_EQUILIBRIUM_SIGNALS lives on the shot's common time grid (same as
     # the 0D signals), NaN outside a real EFIT reconstruction time -- not a
     # compact per-EFIT-time array. Filter down to the real reconstruction
     # times first (any one scalar field, e.g. simagx, is finite exactly
     # where every field in the block is, since they're all written together
     # for the same reconstruction).
     eq_valid = np.flatnonzero(np.isfinite(unprocessed_ds["simagx"].to_numpy()))
-    eq_ds = unprocessed_ds[list(FINAL_EQUILIBRIUM_SIGNALS)].isel(time=eq_valid)
+    eq_ds = unprocessed_ds[list(DATASET_EQUILIBRIUM_SIGNALS)].isel(time=eq_valid)
     eq_times = eq_ds["time"].to_numpy().astype(float)
     geqdsk_paths = [
         write_geqdsk(
@@ -747,11 +756,11 @@ def build_imas_from_shot(
     )
 
     unprocessed_time = unprocessed_ds["time"].to_numpy().astype(float)
-    # Whichever FINAL_0D_SIGNALS the shot has; only `ip` is required (for
+    # Whichever DATASET_0D_SIGNALS the shot has; only `ip` is required (for
     # core_profiles.global_quantities.ip).
     signal_0d = {
         name: unprocessed_ds[name].to_numpy().astype(float)
-        for name in FINAL_0D_SIGNALS
+        for name in DATASET_0D_SIGNALS
         if name in unprocessed_ds
     }
     if "ip" not in signal_0d:

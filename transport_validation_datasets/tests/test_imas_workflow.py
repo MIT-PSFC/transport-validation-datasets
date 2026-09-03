@@ -1,0 +1,213 @@
+"""End-to-end IMAS export chain on synthetic shots, read back through imas.
+
+Builds a self-consistent synthetic C-Mod-like shot (unprocessed dataset with
+the staged GEQDSK block plus 0D signals, and a fit-result dataset shaped
+like workflow._shot_fit_dataset's output), runs the whole export chain --
+geqdsk writing, per-shot COCOS identification, conversion to the DD's own
+convention, IDS building and writing -- then imports every written file
+back through imas.DBEntry and checks the physics-defining signs and values.
+
+Both field polarities run: C-Mod's EFIT pins psi increasing for either, so
+normal-field shots enter as COCOS 7 and reversed-field ones as COCOS 1
+(see scenario_export._source_cocos), and both must land on the same target
+convention.
+
+Needs the `imas` extra (imas-python, eqdsk); skipped without it.
+"""
+
+import numpy as np
+import pytest
+import xarray as xr
+
+imas = pytest.importorskip("imas")
+pytest.importorskip("eqdsk")
+
+from transport_validation_datasets.gp_fitting.batch_io import STATUS_OK
+from transport_validation_datasets.imas_export.scenario_export import (
+    DD_VERSION,
+    _sigma_bp,
+    _target_cocos,
+    build_imas_from_shot,
+    write_ids,
+)
+from transport_validation_datasets.workflow import (
+    DATASET_EQUILIBRIUM_SIGNALS,
+    TIME_COORD,
+    TIME_DIM,
+)
+
+R0, A_MINOR = 0.68, 0.22
+N_PSI = 33
+N_GRID = 33
+N_BDRY = 64
+N_LIM = 72
+EQ_TIMES = (0.520, 0.550, 0.580)
+TS_TIMES = (0.531, 0.561)
+N_RHO = 51
+
+
+def synthetic_unprocessed(polarity: int) -> xr.Dataset:
+    """One shot's unprocessed dataset: 0D signals + the GEQDSK block.
+
+    Circular flux surfaces around (R0, 0), psi increasing axis-to-boundary
+    (what C-Mod's EFIT writes for either polarity), q > 0, F on sign(B0),
+    pprime/ffprime negative -- the empirically verified C-Mod sign set,
+    COCOS 7 for polarity=-1 and COCOS 1 for polarity=+1.
+    """
+    ip0 = polarity * 0.8e6
+    b0 = polarity * 5.4
+    psi0, dpsi = -0.05, 0.11
+
+    time = np.round(np.arange(0.500, 0.6001, 0.001), 6)
+    n_t = time.size
+    eq_rows = np.isin(time, np.asarray(EQ_TIMES))
+
+    psi_n = np.linspace(0.0, 1.0, N_PSI)
+    qpsi = 1.0 + 2.0 * psi_n**2
+    pres = 5.0e4 * (1.0 - psi_n) + 1.0e3
+    pprime = np.full(N_PSI, -5.0e4 / dpsi)
+    fpol = R0 * b0 * (1.0 + 0.05 * (1.0 - psi_n))
+    ffprime = fpol * (R0 * b0 * (-0.05) / dpsi)
+
+    r_grid = np.linspace(0.40, 0.96, N_GRID)
+    z_grid = np.linspace(-0.28, 0.28, N_GRID)
+    rr, zz = np.meshgrid(r_grid, z_grid, indexing="ij")
+    psirz = psi0 + dpsi * (((rr - R0) ** 2 + zz**2) / A_MINOR**2)
+
+    theta_b = np.linspace(0.0, 2.0 * np.pi, N_BDRY)
+    theta_l = np.linspace(0.0, 2.0 * np.pi, N_LIM)
+
+    def on_eq_times(values: np.ndarray, dims: tuple) -> tuple:
+        full = np.full((n_t, *np.shape(values)), np.nan)
+        full[eq_rows] = values
+        return (("time", *dims), full)
+
+    scalars = {
+        "rmagx": R0,
+        "zmagx": 0.0,
+        "simagx": psi0,
+        "sibdry": psi0 + dpsi,
+        "bcentr": b0,
+        "current": ip0,
+        "rcentr": R0,
+        "rleft": float(r_grid[0]),
+        "rdim": float(r_grid[-1] - r_grid[0]),
+        "zmid": 0.0,
+        "zdim": float(z_grid[-1] - z_grid[0]),
+    }
+    profiles = {
+        "fpol": (fpol, ("psi_idx",)),
+        "pres": (pres, ("psi_idx",)),
+        "ffprime": (ffprime, ("psi_idx",)),
+        "pprime": (pprime, ("psi_idx",)),
+        "qpsi": (qpsi, ("psi_idx",)),
+        "psirz": (psirz, ("r_grid", "z_grid")),
+        "rbdry": (R0 + A_MINOR * np.cos(theta_b), ("boundary_idx",)),
+        "zbdry": (A_MINOR * np.sin(theta_b), ("boundary_idx",)),
+        "rlim": (R0 + 0.245 * np.cos(theta_l), ("limiter_idx",)),
+        "zlim": (0.245 * np.sin(theta_l), ("limiter_idx",)),
+    }
+    data_vars = {name: on_eq_times(value, ()) for name, value in scalars.items()}
+    data_vars |= {
+        name: on_eq_times(value, dims) for name, (value, dims) in profiles.items()
+    }
+    assert set(data_vars) == set(DATASET_EQUILIBRIUM_SIGNALS)
+    data_vars["ip"] = (("time",), np.full(n_t, ip0))
+    data_vars["b0"] = (("time",), np.full(n_t, b0))
+    return xr.Dataset(data_vars=data_vars, coords={"time": time})
+
+
+def synthetic_fit(shot: int) -> xr.Dataset:
+    """One shot's fit-result dataset, shaped like _shot_fit_dataset saves."""
+    rho = np.linspace(0.0, 1.0, N_RHO)
+    n_slices = len(TS_TIMES)
+    te = np.tile(1400.0 * (1.0 - 0.85 * rho**2) + 60.0, (n_slices, 1))
+    ne = np.tile((0.9 - 0.7 * rho**2) * 1.0e20 + 5.0e18, (n_slices, 1))
+    statuses = np.full((1, n_slices), STATUS_OK, dtype=np.int8)
+
+    def profile(values: np.ndarray) -> tuple:
+        return (("shot", TIME_DIM, "rho"), values[None].astype(np.float32))
+
+    return xr.Dataset(
+        data_vars={
+            "t_e": profile(te),
+            "t_e_error": profile(0.1 * te),
+            "n_e": profile(ne),
+            "n_e_error": profile(0.1 * ne),
+            "t_e_fit_status": (("shot", TIME_DIM), statuses),
+            "n_e_fit_status": (("shot", TIME_DIM), statuses),
+        },
+        coords={
+            "shot": [shot],
+            TIME_DIM: np.arange(n_slices),
+            "rho": rho,
+            TIME_COORD: (
+                ("shot", TIME_DIM),
+                np.asarray(TS_TIMES, dtype=np.float32)[None],
+            ),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "polarity", [-1, 1], ids=["normal_field", "reversed_field"]
+)
+def test_imas_export_chain_reads_back(tmp_path, polarity):
+    shot = 900000001 if polarity < 0 else 900000002
+    unprocessed_ds = synthetic_unprocessed(polarity)
+    fit_ds = synthetic_fit(shot)
+
+    ids_list = build_imas_from_shot(
+        shot, fit_ds, unprocessed_ds, geqdsk_dir=tmp_path / "geqdsk"
+    )
+    out_dir = tmp_path / "imas"
+    for ids in ids_list:
+        write_ids(ids, out_dir)
+
+    def read_back(name: str):
+        path = out_dir / f"{name}.nc"
+        assert path.exists(), f"{name} IDS file was not written"
+        with imas.DBEntry(str(path), "r") as entry:
+            return entry.get(name)
+
+    sigma_bp = _sigma_bp(_target_cocos(DD_VERSION))
+
+    eq = read_back("equilibrium")
+    assert np.allclose(np.asarray(eq.time), EQ_TIMES)
+    ts = eq.time_slice[0]
+    dpsi = float(ts.global_quantities.psi_boundary - ts.global_quantities.psi_axis)
+    assert np.sign(dpsi) == sigma_bp * polarity, "psi direction off target COCOS"
+    assert np.sign(float(ts.global_quantities.ip)) == polarity
+    p1 = ts.profiles_1d
+    assert np.all(np.asarray(p1.q) > 0)
+    assert np.sign(np.median(np.asarray(p1.phi)[1:])) == polarity, "phi off sign(B0)"
+    assert np.sign(np.median(np.asarray(p1.f))) == polarity
+    assert np.sign(np.median(np.asarray(p1.dpressure_dpsi))) == -np.sign(dpsi)
+    rho_tor = np.asarray(p1.rho_tor)
+    assert np.all(np.isfinite(rho_tor)) and np.all(np.diff(rho_tor) > 0)
+    assert np.asarray(eq.time_slice[0].profiles_2d[0].psi).shape == (N_GRID, N_GRID)
+    assert int(ts.boundary.type) == 0, "circular synthetic plasma is limited"
+
+    cp = read_back("core_profiles")
+    assert len(cp.profiles_1d) == len(TS_TIMES)
+    assert np.allclose(np.asarray(cp.time), TS_TIMES)
+    for i in range(len(TS_TIMES)):
+        p = cp.profiles_1d[i]
+        te_out = np.asarray(p.electrons.temperature)
+        assert te_out.shape == (N_RHO,) and np.all(te_out > 0)
+        assert np.allclose(te_out, np.asarray(fit_ds["t_e"][0, i]), rtol=1e-6)
+        grid_psi = np.asarray(p.grid.psi)
+        lo, hi = sorted((float(ts.global_quantities.psi_axis),
+                         float(ts.global_quantities.psi_boundary)))
+        assert np.all((grid_psi >= lo - 1e-9) & (grid_psi <= hi + 1e-9))
+
+    sm = read_back("summary")
+    assert np.allclose(np.asarray(sm.global_quantities.ip.value), polarity * 0.8e6)
+    assert np.allclose(np.asarray(sm.global_quantities.b0.value), polarity * 5.4)
+
+    wall = read_back("wall")
+    outline = wall.description_2d[0].limiter.unit[0].outline
+    assert np.asarray(outline.r).size == N_LIM
+    assert np.allclose(
+        (np.asarray(outline.r) - R0) ** 2 + np.asarray(outline.z) ** 2, 0.245**2
+    )
