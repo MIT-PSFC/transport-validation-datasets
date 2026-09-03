@@ -46,12 +46,14 @@ class CModSettings(DeviceSettings):
     """C-Mod settings, the [cmod] table of the config file.
 
     Attributes:
-        efit_nickname_by_prefix: Shot-number prefix -> EFIT tree overrides,
-            resolved before efit_nickname; the longest matching prefix wins.
-            The default sends every 103xxxxxxx shot (the 2003 campaign) to
-            the ANALYSIS tree. In TOML:
-            [cmod.efit_nickname_by_prefix] with entries like
-            "103" = "analysis". An empty table disables the overrides.
+        efit_nickname_below: Shot-number threshold -> EFIT tree overrides,
+            resolved before efit_nickname: a shot uses the tree of the
+            smallest threshold it falls below, so multiple entries split
+            the shot range into eras. The default sends every shot before
+            1050204013 (the 2003-2004 campaigns) to the ANALYSIS tree. In
+            TOML: [cmod.efit_nickname_below] with entries like
+            "1050204013" = "analysis" (keys are strings, TOML tables
+            require it). An empty table disables the overrides.
         efit_nickname: EFIT tree the equilibrium, the geometry signals, and
             the shot's 1 kHz timebase are read from, and so the one the
             Thomson channels are mapped onto rho with. A tree name (EFIT21,
@@ -71,8 +73,8 @@ class CModSettings(DeviceSettings):
     """
 
     efit_nickname: str = "EFIT21"
-    efit_nickname_by_prefix: dict[str, str] = field(
-        default_factory=lambda: {"103": "analysis"}
+    efit_nickname_below: dict[str, str] = field(
+        default_factory=lambda: {"1050204013": "analysis"}
     )
     channel_prefilters: bool = False
 
@@ -161,17 +163,15 @@ class CModDataWorkflow(DataWorkflow):
             shot: Shot number being retrieved.
 
         Returns:
-            The tree of the longest efit_nickname_by_prefix entry matching
-            the shot number, or efit_nickname when none matches.
+            The tree of the smallest efit_nickname_below threshold the shot
+            falls below, or efit_nickname when it falls below none.
         """
-        digits = str(shot)
-        best = ""
-        for prefix in self.settings.efit_nickname_by_prefix:
-            if digits.startswith(prefix) and len(prefix) > len(best):
-                best = prefix
-        if not best:
-            return self.settings.efit_nickname
-        return self.settings.efit_nickname_by_prefix[best]
+        best: tuple[int, str] | None = None
+        for threshold, tree in self.settings.efit_nickname_below.items():
+            limit = int(threshold)
+            if shot < limit and (best is None or limit < best[0]):
+                best = (limit, tree)
+        return best[1] if best is not None else self.settings.efit_nickname
 
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         """Read one shot from MDSplus, through disruption-py, into standardized signals.
