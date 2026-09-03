@@ -60,17 +60,19 @@ import eqdsk
 import imas
 import numpy as np
 import xarray as xr
+from freeqdsk import geqdsk as freeqdsk_geqdsk
 from scipy.integrate import cumulative_simpson
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import minimize
 
 from transport_validation_datasets.imas_export.geqdsk_writer import write_geqdsk
 
-# COCOS convention of this project's raw C-Mod GEQDSK data.
-_SOURCE_COCOS = 7
-# COCOS convention the written equilibrium IDS targets -- IMAS's own
-# convention.
-_TARGET_COCOS = 11
+# COCOS convention the written equilibrium IDS targets -- the IMAS data
+# dictionary's own convention, COCOS 17 as of DD 4.0 (DD 3.x used 11).
+_TARGET_COCOS = 17
+# sigma_Bp of _TARGET_COCOS, for the phi integral in
+# _populate_equilibrium_time_slice (COCOS 17 flips psi relative to 11).
+_TARGET_SIGMA_BP = -1
 
 DD_VERSION = "4.0.0"
 
@@ -104,8 +106,8 @@ class ShotExportSlice:
         t_e: Electron temperature on `rho` [eV].
         n_e: Electron density on `rho` [m^-3].
         rho: Normalized rho grid t_e/n_e are given on.
-        psi_axis: Matched equilibrium's psi at the magnetic axis (COCOS-11).
-        psi_boundary: Matched equilibrium's psi at the boundary (COCOS-11).
+        psi_axis: Matched equilibrium's psi at the magnetic axis (target COCOS).
+        psi_boundary: Matched equilibrium's psi at the boundary (target COCOS).
         psin_neo: `rho` mapped onto the matched equilibrium's psi_norm grid
             (see `build_equilibrium`'s `derived_by_time`), for placing
             `profiles_1d.grid.psi`.
@@ -235,8 +237,9 @@ def _populate_equilibrium_time_slice(ts, eqi):
     Writes only what the EQDSK fields themselves supply:
     the 1D psi-grid profiles, the 2D psi map, the boundary contour, and the
     global scalars, plus `phi`/`rho_tor` (a pure 1D integral of the EQDSK's
-    own q profile -- in target-COCOS `q = dphi/dpsi`, so
-    `phi = integral(q dpsi)` on the file's own uniform psi grid) and the
+    own q profile -- in the e_Bp=1 conventions
+    `dphi/dpsi = sigma_Bp * sigma_rho_theta_phi * q`, so in target-COCOS 17
+    `phi = -integral(q dpsi)` on the file's own uniform psi grid) and the
     diverted/limited classification (`_diverted`). Derived flux-surface
     geometry (area/volume, `r_inboard`/`r_outboard`, `j_phi`, shaping, the
     `gm*` averages) is deliberately not computed here -- see the module
@@ -265,15 +268,25 @@ def _populate_equilibrium_time_slice(ts, eqi):
     ts.profiles_1d.q = qpsi
 
     bcentr = float(eqi.bcentre)
+    # dphi/dpsi = sigma_Bp * sigma_rho_theta_phi * q in the e_Bp=1 (11-18)
+    # conventions; COCOS 17 has sigma_Bp = -1 and sigma_rho_theta_phi = +1,
+    # so phi = -integral(q dpsi), which lands phi on the sign of B0 (its
+    # physical direction) for either field polarity.
+    # cumulative_simpson needs strictly increasing x, and whether psi rises
+    # or falls axis-to-boundary depends on sign(Ip) (in COCOS 17 it falls
+    # for Ip > 0), so integrate along direction*psi and fold the direction
+    # back into the result: integral(q dpsi) = direction * integral(q d(direction*psi)).
     phi = np.zeros_like(psi)
     if len(psi) > 2:
-        phi[1:] = cumulative_simpson(y=qpsi, x=psi)[: len(psi) - 1]
-    phi = np.abs(phi)
-    # rho_tor needs a reference field to carry units of meters; a zero
-    # vacuum field is nonphysical, but fall back to the dimensionless
-    # sqrt(psi_norm) rather than divide by zero.
+        direction = 1.0 if psi[-1] >= psi[0] else -1.0
+        integral = cumulative_simpson(y=qpsi, x=direction * psi)
+        phi[1:] = _TARGET_SIGMA_BP * direction * integral[: len(psi) - 1]
+    # rho_tor needs a reference field to carry units of meters; phi and
+    # bcentr share a sign, so the ratio is positive. A zero vacuum field is
+    # nonphysical, but fall back to the dimensionless sqrt(psi_norm) rather
+    # than divide by zero.
     rho_tor = (
-        np.sqrt(phi / (np.pi * abs(bcentr))) if abs(bcentr) > 0 else np.sqrt(psi_norm)
+        np.sqrt(phi / (np.pi * bcentr)) if abs(bcentr) > 0 else np.sqrt(psi_norm)
     )
     rho_tor_a = rho_tor[-1] if rho_tor[-1] > 0.0 else 1.0
     ts.profiles_1d.phi = phi
@@ -310,6 +323,31 @@ def _populate_equilibrium_time_slice(ts, eqi):
     )
 
 
+def _source_cocos(geqdsk_path) -> int:
+    """Determine the COCOS convention of one raw C-Mod EFIT geqdsk file.
+
+    C-Mod's EFIT writes psi increasing from axis to boundary whatever the
+    signs of Ip and Bt (verified across the staged 2003-2016 campaigns:
+    574 shots, 770k reconstructions, sibdry > simagx and q > 0 in every
+    one), so no single COCOS number covers the machine: the file's sigma_Bp
+    follows sign(Ip). In the file's right-handed (R, phi, Z) frame that
+    makes normal-field shots (Ip < 0) COCOS 7 and reversed-field shots
+    (Ip > 0) COCOS 1, with sigma_rho_theta_phi = +1 throughout (q > 0 with
+    Ip and B0 always of like sign). A mismatched fixed number does not
+    corrupt silently -- eqdsk's sign identification raises -- but this
+    keeps both field polarities converting.
+
+    Args:
+        geqdsk_path: The `.geqdsk` file to classify.
+
+    Returns:
+        7 when the file's plasma current is negative, 1 otherwise.
+    """
+    with open(geqdsk_path) as fh:
+        cpasma = float(freeqdsk_geqdsk.read(fh)["cpasma"])
+    return 7 if cpasma < 0 else 1
+
+
 def build_equilibrium(factory, times, geqdsk_paths):
     """`equilibrium` IDS: one `time_slice` per real EFIT reconstruction time.
 
@@ -338,7 +376,9 @@ def build_equilibrium(factory, times, geqdsk_paths):
     r0 = None
     for i, (t, geqdsk_path) in enumerate(zip(times, geqdsk_paths)):
         eqi = eqdsk.EQDSKInterface.from_file(
-            str(geqdsk_path), from_cocos=_SOURCE_COCOS, to_cocos=_TARGET_COCOS
+            str(geqdsk_path),
+            from_cocos=_source_cocos(geqdsk_path),
+            to_cocos=_TARGET_COCOS,
         )
         ts = eq.time_slice[i]
         derived = _populate_equilibrium_time_slice(ts, eqi)
