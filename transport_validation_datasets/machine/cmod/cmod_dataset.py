@@ -1,4 +1,4 @@
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import xarray as xr
@@ -46,6 +46,12 @@ class CModSettings(DeviceSettings):
     """C-Mod settings, the [cmod] table of the config file.
 
     Attributes:
+        efit_nickname_by_prefix: Shot-number prefix -> EFIT tree overrides,
+            resolved before efit_nickname; the longest matching prefix wins.
+            The default sends every 103xxxxxxx shot (the 2003 campaign) to
+            the ANALYSIS tree. In TOML:
+            [cmod.efit_nickname_by_prefix] with entries like
+            "103" = "analysis". An empty table disables the overrides.
         efit_nickname: EFIT tree the equilibrium, the geometry signals, and
             the shot's 1 kHz timebase are read from, and so the one the
             Thomson channels are mapped onto rho with. A tree name (EFIT21,
@@ -65,6 +71,9 @@ class CModSettings(DeviceSettings):
     """
 
     efit_nickname: str = "EFIT21"
+    efit_nickname_by_prefix: dict[str, str] = field(
+        default_factory=lambda: {"103": "analysis"}
+    )
     channel_prefilters: bool = False
 
 
@@ -145,6 +154,25 @@ class CModDataWorkflow(DataWorkflow):
         shotlist = [shot for shot in shotlist if shot // 1000 in blessed_days]
         return shotlist
 
+    def _efit_nickname(self, shot: int) -> str:
+        """Resolve the EFIT tree one shot's retrievals read from.
+
+        Args:
+            shot: Shot number being retrieved.
+
+        Returns:
+            The tree of the longest efit_nickname_by_prefix entry matching
+            the shot number, or efit_nickname when none matches.
+        """
+        digits = str(shot)
+        best = ""
+        for prefix in self.settings.efit_nickname_by_prefix:
+            if digits.startswith(prefix) and len(prefix) > len(best):
+                best = prefix
+        if not best:
+            return self.settings.efit_nickname
+        return self.settings.efit_nickname_by_prefix[best]
+
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         """Read one shot from MDSplus, through disruption-py, into standardized signals.
 
@@ -165,7 +193,7 @@ class CModDataWorkflow(DataWorkflow):
             ("efit", _get_efit_dataset),
             ("thomson", _get_thomson_dataset),
         ):
-            ds = getter(shot, self.settings.efit_nickname)
+            ds = getter(shot, self._efit_nickname(shot))
             if ds is None:
                 reason = f"Missing retrievable {name} data."
                 logger.warning(f"Shot {shot} is {reason.lower()} Skipping.")
