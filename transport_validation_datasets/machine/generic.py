@@ -170,6 +170,14 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+# How far a TS slice may sit from the equilibrium reconstruction it maps
+# through (map_ts_channels_to_rho), in periods of the reconstruction's own
+# sampling. The mapping-time mirror of workflow.MAX_HOLD_PERIODS (its own
+# constant to avoid a circular import): above 1 to tolerate clock jitter,
+# low enough that nothing is borrowed across a real gap.
+EQ_MATCH_MAX_PERIODS = 1.5
+
+
 def make_uniform_1kHz_timebase(max_time: float) -> np.ndarray:
     """Create a uniform timebase at 1 kHz up to the specified maximum time.
 
@@ -409,9 +417,14 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     Choice to use outboard midplane is arbitrary, could use any line from magnetic axis to the LCFS.
     This one is convenient though because it is one dimension (R) and increases with psi.
 
-    Only times with at least one finite TS value are mapped.
-    A slice whose equilibrium is missing or degenerate keeps a NaN rho row,
-    the fit-staging min-points gate then skips it.
+    Only times with at least one finite TS value are mapped. The equilibrium
+    is not necessarily reconstructed at every one of those grid times
+    (C-Mod's EFIT21 is native 1 kHz, but its ANALYSIS tree runs on its own
+    ~20 ms clock), so each TS slice maps through the reconstruction nearest
+    in time, accepted within EQ_MATCH_MAX_PERIODS of the reconstruction's
+    own sampling period so nothing is borrowed across a real gap.
+    A slice with no reconstruction in reach, or a degenerate one, keeps a
+    NaN rho row; the fit-staging min-points gate then skips it.
 
     Args:
         ds_shot: One shot's unprocessed dataset with standardized names
@@ -440,21 +453,44 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     r_grid = ds_shot["r_grid"].values
     z_grid = ds_shot["z_grid"].values
 
+    # Reconstruction times, for the nearest-in-time equilibrium match. A
+    # single reconstruction has no period of its own, so the grid step
+    # stands in (mirroring workflow._hold_onto_grid's lone-sample fallback).
+    all_times = ds_shot["time"].values
+    eq_rows = np.flatnonzero(np.isfinite(simagx))
+    eq_times = all_times[eq_rows]
+    if eq_times.size > 1:
+        eq_period = float(np.median(np.diff(eq_times)))
+    elif all_times.size > 1:
+        eq_period = float(np.median(np.diff(all_times)))
+    else:
+        eq_period = 0.0
+    eq_tol = EQ_MATCH_MAX_PERIODS * eq_period
+
     rho = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
     n_no_equilibrium = 0
     for i, ts_idx in enumerate(ts_idxs):
-        # get psi_n at for this timeslice
-        psi_range = sibdry[ts_idx] - simagx[ts_idx]
-        psi_slice = psirz[ts_idx]
+        if eq_rows.size == 0:
+            n_no_equilibrium += 1
+            continue
+        nearest = int(np.argmin(np.abs(eq_times - ts_times[i])))
+        if abs(eq_times[nearest] - ts_times[i]) > eq_tol:
+            n_no_equilibrium += 1
+            continue
+        eq_idx = int(eq_rows[nearest])
+
+        # get psi_n for the reconstruction this timeslice maps through
+        psi_range = sibdry[eq_idx] - simagx[eq_idx]
+        psi_slice = psirz[eq_idx]
         if (
             not np.isfinite(psi_range)  # psi range NaN or inf
             or np.abs(psi_range) < 1e-10  # psi range too small to be physical
-            or not np.isfinite(zmagx[ts_idx])  # Z magnetic axis NaN or inf
+            or not np.isfinite(zmagx[eq_idx])  # Z magnetic axis NaN or inf
             or not np.all(np.isfinite(psi_slice))  # psi slice has NaN or inf
         ):
             n_no_equilibrium += 1
             continue
-        psi_n_grid = (psi_slice - simagx[ts_idx]) / psi_range
+        psi_n_grid = (psi_slice - simagx[eq_idx]) / psi_range
 
         # Channel psi_n at the measured (R, Z)
         # NaN positions or positions off the grid stay NaN.
@@ -467,7 +503,7 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
         # psi_n along the midplane (z = magnetic axis height)
         psi_n_mid = np.array(
             [
-                np.interp(zmagx[ts_idx], z_grid, psi_n_grid[j, :])
+                np.interp(zmagx[eq_idx], z_grid, psi_n_grid[j, :])
                 for j in range(len(r_grid))
             ]
         )
