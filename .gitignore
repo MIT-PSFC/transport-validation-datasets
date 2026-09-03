@@ -222,3 +222,6 @@ ref/
 scratch/
 .vscode/
 transport_validation_datasets/tests/test_outputs
+
+# Per-user config layers (cluster paths), see configs/orcd.toml
+configs/*.user.toml

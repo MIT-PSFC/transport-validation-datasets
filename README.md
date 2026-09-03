@@ -70,13 +70,9 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_dir \
     --max_num_shots 20 --stage unprocessed
 
-# GP fitting only, dispatched to a SLURM cluster
+# GP fitting only, dispatched to the SLURM cluster in the config files
 uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_dir \
-    --stage fit \
-    --cluster_ssh_host orcd-login \
-    --cluster_partitions "sched_mit_psfc_r8@8:00:00" \
-    --cluster_remote_workdir /path/on/cluster \
-    --cluster_venv /path/on/cluster/.venv
+    --stage fit --config configs/orcd.toml,configs/$USER.user.toml
 
 # Stack the internal Zarr store from what the first two stages left on disk
 uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_dir \
@@ -90,6 +86,43 @@ uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_d
 `--help` lists every flag, and the stages resume: rerunning the same command
 picks up whatever is not on disk yet. Stack and publish are the exceptions,
 each always rebuilds its store.
+
+# Configuration
+
+`--config` takes one or more TOML files, comma separated, holding what does
+not change from run to run: the cluster the fits are dispatched to and the
+device-specific settings. The files are layered, a later one overrides an
+earlier one key by key. `configs/orcd.toml` is the shared file; the cluster
+paths are per user and go in `configs/<user>.user.toml`, which git ignores:
+
+```bash
+--config configs/orcd.toml,configs/$USER.user.toml
+```
+
+```toml
+# configs/orcd.toml
+[cluster]
+ssh_host = "orcd-login"
+partitions = "sched_mit_psfc_r8@11:00:00"
+max_concurrent_jobs = 20
+
+[cmod]
+efit_nickname = "EFIT21"
+
+# configs/<user>.user.toml
+[cluster]
+remote_workdir = "/path/on/cluster"
+venv_path = "/path/on/cluster/.venv"
+```
+
+Keys are dataclass field names: `ClusterFitConfig` in `gp_fitting/dispatcher.py`
+for `[cluster]`, the device workflow's `settings_cls` for `[cmod]` and `[mast]`
+(`CModSettings` in `machine/cmod/cmod_dataset.py`; MAST has no settings yet).
+A key left out keeps its default. A key the dataclass does not have, or a table
+that is neither `cluster` nor a device, is an error. Without a `[cluster]` table
+the fits run locally in the calling process, and without `--config` everything
+keeps its default. Run-specific choices (`--ds_name`, `--shotlist_file`,
+`--stage`, `--method`, ...) stay command line flags.
 
 # Shotlists and time windows
 
