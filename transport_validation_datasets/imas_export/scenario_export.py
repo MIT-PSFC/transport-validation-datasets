@@ -67,7 +67,26 @@ from scipy.optimize import minimize
 
 from transport_validation_datasets.imas_export.geqdsk_writer import write_geqdsk
 
-DD_VERSION = "4.0.0"
+def _latest_dd_version() -> str:
+    """Get the newest data dictionary version the installed imas package ships.
+
+    The export's default DD version tracks the installed imas-python rather
+    than a hardcoded number, so upgrading the package upgrades the written
+    DD (the target COCOS follows along through _target_cocos). Falls back
+    to the DD 4.0 baseline if the lookup API is ever unavailable.
+
+    Returns:
+        The version string, e.g. "4.1.1".
+    """
+    try:
+        from imas.dd_zip import latest_dd_version
+
+        return str(latest_dd_version())
+    except Exception:
+        return "4.0.0"
+
+
+DD_VERSION = _latest_dd_version()
 
 
 def _target_cocos(dd_version: str) -> int:
