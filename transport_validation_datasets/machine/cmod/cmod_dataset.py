@@ -386,7 +386,20 @@ def _condition_ne_errors(
     return np.where((rho <= 0.9) & (rel_err < 0.05), 5.0 * ne_err, ne_err)
 
 
-def _row_core(r: np.ndarray, y: np.ndarray) -> tuple[float, float, float, float]:
+# Outer edge of the core-reference region (_row_core's core max). The
+# original fit_cmod.py used rho < 0.2 for both variables; ne's is widened
+# to 0.35 because some scenario windows' innermost mapped channel sits at
+# rho 0.25-0.31, and with no reading inside the reference region the
+# tiny-fallback core max turns the 1.1x cull into "drop every ne reading".
+# Te keeps the original region: its culls only arm WITH a core reference,
+# so the fallback is harmless there.
+_TE_CORE_RHO_MAX = 0.2
+_NE_CORE_RHO_MAX = 0.35
+
+
+def _row_core(
+    r: np.ndarray, y: np.ndarray, core_rho_max: float
+) -> tuple[float, float, float, float]:
     """Characterize one fit row's coverage for the legacy culls and anchors.
 
     A row is whatever will be fit as one profile: a Thomson slice, or a
@@ -395,18 +408,21 @@ def _row_core(r: np.ndarray, y: np.ndarray) -> tuple[float, float, float, float]
     Args:
         r: (n_ch,) channel rho positions, NaN where padded.
         y: (n_ch,) channel values.
+        core_rho_max: Outer edge of the core-reference region the core max
+            is read from.
 
     Returns:
         (core max, core value, innermost rho, outermost rho) over the
-        finite channels: core max is the brightest reading at rho < 0.2
-        (a tiny fallback mirroring the original's 0.01-in-raw-units default
-        when the core is not covered), the core value is the mean reading
-        of the innermost channel, 0.0 when that channel sits at rho >= 0.3
-        (matching the original, whose core reference stays unset then), and
-        everything is (fallback, 0.0, inf, -inf) with no finite channel.
+        finite channels: core max is the brightest reading at
+        rho < core_rho_max (a tiny fallback mirroring the original's
+        0.01-in-raw-units default when that region is not covered), the
+        core value is the mean reading of the innermost channel, 0.0 when
+        that channel sits at rho >= 0.3 (matching the original, whose core
+        reference stays unset then), and everything is
+        (fallback, 0.0, inf, -inf) with no finite channel.
     """
     valid = np.isfinite(r) & np.isfinite(y)
-    core = y[valid & (r < 0.2)]
+    core = y[valid & (r < core_rho_max)]
     core_max = float(core.max()) if core.size else 1.0e-22
     if not valid.any():
         return core_max, 0.0, np.inf, -np.inf
@@ -430,9 +446,11 @@ def _cull_channel_outliers(
     scenario window was one invocation there. Converted from its raw units
     to the fit units (Te [keV], ne [1e20 m^-3]).
 
-    Per row, with core max the row's brightest reading at rho < 0.2 and the
-    core value the mean reading of the row's innermost channel (only
-    defined when it sits at rho < 0.3):
+    Per row, with core max the row's brightest reading in the variable's
+    core-reference region (rho < 0.2 for Te as in the original; widened to
+    rho < 0.35 for ne, see _NE_CORE_RHO_MAX) and the core value the mean
+    reading of the row's innermost channel (only defined when it sits at
+    rho < 0.3):
       - ne: any reading above 1.1x the row's core max is dropped.
       - ne: with edge coverage (rho > 0.9) and a bright core (at least 0.5x
         the core max), edge readings above 0.8x the core value are dropped.
@@ -458,7 +476,7 @@ def _cull_channel_outliers(
     for t in range(rho.shape[0]):
         r = rho[t]
 
-        core_max, core, r_min, r_max = _row_core(r, ne_y[t])
+        core_max, core, r_min, r_max = _row_core(r, ne_y[t], _NE_CORE_RHO_MAX)
         cull = np.isfinite(ne_y[t]) & (ne_y[t] > 1.1 * core_max)
         if r_max > 0.9 and core >= 0.5 * core_max:
             cull |= (r >= 0.9) & (ne_y[t] > 0.8 * core)
@@ -466,7 +484,7 @@ def _cull_channel_outliers(
             n_culled += int(np.count_nonzero(cull & np.isfinite(ne_y[t])))
             ne_y[t] = np.where(cull, np.nan, ne_y[t])
 
-        core_max, core, r_min, r_max = _row_core(r, te_y[t])
+        core_max, core, r_min, r_max = _row_core(r, te_y[t], _TE_CORE_RHO_MAX)
         cull = np.zeros(r.shape, dtype=bool)
         if r_max > 0.9 and core >= 0.3 * core_max:
             cull |= (r >= 0.9) & (te_y[t] > 0.3 * core)
@@ -520,7 +538,9 @@ def _append_sol_anchor_points(
     """
     n_t = rho.shape[0]
 
-    core_max = np.array([_row_core(rho[t], ne_y[t])[0] for t in range(n_t)])
+    core_max = np.array(
+        [_row_core(rho[t], ne_y[t], _NE_CORE_RHO_MAX)[0] for t in range(n_t)]
+    )
     row_max = np.where(np.isfinite(ne_y), ne_y, -np.inf).max(axis=1)
     row_max = np.where(np.isfinite(row_max), row_max, np.nan)
     v = (row_max / core_max)[:, None]
