@@ -2233,9 +2233,14 @@ def _place_windows_on_grid(
 def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
     """Stretch per-channel plot masks over pooled rows.
 
-    A pooled row holds every channel once per Thomson sample,
-    so a (n_ch,) mask is tiled up to the row width.
-    Masks already as wide as the row, (n_t, n_ch) masks, and None pass through.
+    A pooled row holds every channel once per Thomson sample, so a (n_ch,)
+    mask is tiled up to the row width. A row can also end in extra columns
+    that are no device channel at all (the synthetic SOL anchor points a
+    device's staging may append, see CModDataWorkflow), so the tiling goes
+    to the last whole repeat and the remainder is padded False; the columns
+    no group claims are then gathered into one catch-all group so their
+    points still show. Masks already as wide as the row, (n_t, n_ch) masks,
+    and None pass through.
 
     Args:
         groups: (mask, color, label) triples from fit_plot_channel_groups.
@@ -2249,9 +2254,17 @@ def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
     tiled = []
     for mask, color, label in groups:
         mask = np.asarray(mask)
-        if mask.ndim == 1 and mask.size != n_columns and n_columns % mask.size == 0:
-            mask = np.tile(mask, n_columns // mask.size)
+        if mask.ndim == 1 and mask.size != n_columns and mask.size <= n_columns:
+            reps = n_columns // mask.size
+            mask = np.concatenate(
+                [np.tile(mask, reps), np.zeros(n_columns - reps * mask.size, bool)]
+            )
         tiled.append((mask, color, label))
+    flat = [m for m, _, _ in tiled if m.ndim == 1 and m.size == n_columns]
+    if flat and len(flat) == len(tiled):
+        unclaimed = ~np.logical_or.reduce(flat)
+        if unclaimed.any():
+            tiled.append((unclaimed, "tab:gray", "other points"))
     return tiled
 
 
