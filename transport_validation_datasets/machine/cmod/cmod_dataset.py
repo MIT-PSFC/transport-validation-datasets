@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import xarray as xr
@@ -52,9 +52,13 @@ class CModSettings(DeviceSettings):
             EFIT18, ...), or one of disruption-py's keys: "analysis" for the
             ANALYSIS tree, "disruption" for the disruption EFIT.
         channel_prefilters: Apply the legacy pre-fit channel conditioning
-            (ported from the standalone fit_cmod.py) during fit staging:
-            the channel filters (_apply_channel_prefilters) and the SOL
-            anchor points (_append_sol_anchor_points). Off by default:
+            (ported from the standalone fit_cmod.py) during fit staging, in
+            the original's steady-mode order: ne error conditioning at
+            ingest (_condition_ne_errors, in prepare_fit_input), then after
+            windowing the per-row outlier culls (_cull_channel_outliers)
+            and the SOL anchor points (_append_sol_anchor_points), both in
+            condition_staged_fit_input so a pooled window is judged as one
+            cloud and gets exactly one pair of anchors. Off by default:
             staged batches are shared by every fit method, and this
             conditioning was calibrated for the akho-style fits, though any
             method can opt in.
@@ -281,10 +285,12 @@ class CModDataWorkflow(DataWorkflow):
         core_problem = (rho >= 0.0) & (rho < 0.4) & (te_y < 0.4)
         te_y = np.where(core_problem, np.nan, te_y)
 
-        # The legacy pre-fit channel filters, before the error floors so
-        # the ne error conditioning sees the measured errors.
+        # The legacy ne error conditioning, before the error floors so it
+        # sees the measured errors -- the original applied it at ingest,
+        # before its steady-mode pooling. The culls and the SOL anchors run
+        # after windowing instead (condition_staged_fit_input).
         if self.settings.channel_prefilters:
-            te_y, ne_y, ne_err = _apply_channel_prefilters(rho, te_y, ne_y, ne_err)
+            ne_err = _condition_ne_errors(rho, ne_y, ne_err)
 
         # Error floors. Sometimes C-Mod TS has extremely tiny error bars
         # which I don't think are real. This increases them where needed.
@@ -298,15 +304,6 @@ class CModDataWorkflow(DataWorkflow):
         te_y = _drop_broken_channels("te", rho, te_y, te_err)
         ne_y = _drop_broken_channels("ne", rho, ne_y, ne_err)
 
-        # The legacy SOL anchor points, appended last: their errors are the
-        # anchors' weight and must not pass through the floors above (the
-        # original never modified them after injection), and the persistence
-        # screen must judge only real channels.
-        if self.settings.channel_prefilters:
-            rho, te_y, te_err, ne_y, ne_err = _append_sol_anchor_points(
-                rho, te_y, te_err, ne_y, ne_err
-            )
-
         fit_input = ShotFitInput(
             x=rho, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err, time=ts_times
         )
@@ -314,6 +311,38 @@ class CModDataWorkflow(DataWorkflow):
             logger.warning(f"Shot {shot}: no finite (rho, te, ne) channel data to fit")
             return None
         return fit_input
+
+    def condition_staged_fit_input(
+        self, shot: int, fit_input: ShotFitInput
+    ) -> ShotFitInput:
+        """Apply the legacy culls and SOL anchors to the rows as they are fit.
+
+        Runs after windowing, matching the original fit_cmod.py's
+        steady-mode order (its complicated filter and anchor injection came
+        after the steady-time collapse): in averaging mode each pooled
+        window is judged as one cloud with window-local core references and
+        gets exactly one pair of anchor points; in per-sample mode each
+        slice is judged on its own the same way. The anchors' errors are
+        their weight, so no error floor touches them here.
+
+        Args:
+            shot: Shot number being staged.
+            fit_input: The shot's fit input as _apply_windows staged it.
+
+        Returns:
+            The conditioned fit input.
+        """
+        if not self.settings.channel_prefilters:
+            return fit_input
+        te_y, ne_y = _cull_channel_outliers(
+            shot, fit_input.x, fit_input.te_y, fit_input.ne_y
+        )
+        x, te_y, te_err, ne_y, ne_err = _append_sol_anchor_points(
+            fit_input.x, te_y, fit_input.te_err, ne_y, fit_input.ne_err
+        )
+        return replace(
+            fit_input, x=x, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err
+        )
 
     def fit_plot_channel_groups(self, shot: int) -> list | None:
         """Split the fit-plot channels into the core and edge TS systems.
@@ -332,117 +361,114 @@ class CModDataWorkflow(DataWorkflow):
         ]
 
 
-def _apply_channel_prefilters(
-    rho: np.ndarray,
-    te_y: np.ndarray,
-    ne_y: np.ndarray,
-    ne_err: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply the legacy pre-fit channel filters to the fit staging rows.
+def _condition_ne_errors(
+    rho: np.ndarray, ne_y: np.ndarray, ne_err: np.ndarray
+) -> np.ndarray:
+    """Apply the legacy ne error conditioning to the measured errors.
 
-    Ported from the standalone fit_cmod.py's filter_and_flatten_data (the
-    pre-fit conditioning of the pipeline the akho worker was ported from),
-    reshaped from its flattened point list onto this module's
-    (n_slices, n_channels) rows and converted from its raw units (Te [eV],
-    ne [m^-3]) to the fit units here (Te [keV], ne [1e20 m^-3]). The SOL
-    anchor points that function also injected live in
-    _append_sol_anchor_points; the only piece deliberately NOT ported is
-    the Te error rescaling (already commented out in the original).
-
-    The filters, in order:
-      - ne error conditioning: edge channels (rho > 0.9) with relative error
-        above 40 percent get their error shrunk 0.3x, non-edge channels with
-        relative error under 5 percent get it inflated 5x.
-      - ne cull: any reading above 1.1x the shot's brightest core
-        (rho < 0.2) density is dropped.
-      - Per slice, referenced to the mean reading of the slice's innermost
-        channel (only defined when that channel sits at rho < 0.3):
-          - ne: with edge coverage (rho > 0.9) and a bright core (at least
-            0.5x the shot's core maximum), edge readings above 0.8x the
-            slice's core value are dropped.
-          - Te: with edge coverage and a core of at least 0.3x the shot's
-            core maximum, edge readings above 0.3x the slice's core value
-            are dropped.
-          - Te: with a core hotter than 0.3 keV, readings of at most
-            0.08 keV inside rho <= 0.95 are dropped (dead or cold channels
-            inside the plasma).
+    Ported from the standalone fit_cmod.py's filter_and_flatten_data, which
+    applied it at ingest, per point, before any pooling: edge channels
+    (rho > 0.9) with relative error above 40 percent get their error shrunk
+    0.3x, non-edge channels with relative error under 5 percent get it
+    inflated 5x. Call before the fit's error floors, on the measured errors.
 
     Args:
         rho: (n_t, n_ch) channel rho positions.
-        te_y: (n_t, n_ch) Te values [keV], NaN where invalid.
         ne_y: (n_t, n_ch) ne values [1e20 m^-3], NaN where invalid.
-        ne_err: (n_t, n_ch) measured ne errors [1e20 m^-3], before the
-            fit's error floors.
+        ne_err: (n_t, n_ch) measured ne errors [1e20 m^-3].
 
     Returns:
-        (te_y, ne_y, ne_err) with the filters applied, as copies.
+        The conditioned errors, as a copy.
     """
-    te_y = te_y.copy()
-    ne_y = ne_y.copy()
-    ne_err = ne_err.copy()
-
     with np.errstate(invalid="ignore", divide="ignore"):
         rel_err = ne_err / np.abs(ne_y)
     ne_err = np.where((rho > 0.9) & (rel_err > 0.4), 0.3 * ne_err, ne_err)
-    ne_err = np.where((rho <= 0.9) & (rel_err < 0.05), 5.0 * ne_err, ne_err)
+    return np.where((rho <= 0.9) & (rel_err < 0.05), 5.0 * ne_err, ne_err)
 
-    def shot_core_max(y: np.ndarray) -> float:
-        """Get the shot's brightest core (rho < 0.2) reading of one variable.
 
-        Args:
-            y: (n_t, n_ch) channel values.
+def _row_core(r: np.ndarray, y: np.ndarray) -> tuple[float, float, float, float]:
+    """Characterize one fit row's coverage for the legacy culls and anchors.
 
-        Returns:
-            The maximum finite reading at rho < 0.2, or a tiny fallback
-            mirroring the original's 0.01-in-raw-units default when the
-            core is not covered (the relative-to-core thresholds then
-            resolve the same way they did there).
-        """
-        core = y[(rho < 0.2) & np.isfinite(y)]
-        return float(core.max()) if core.size else 1.0e-22
+    A row is whatever will be fit as one profile: a Thomson slice, or a
+    whole pooled time window in averaging mode.
 
-    max_core_te = shot_core_max(te_y)
-    max_core_ne = shot_core_max(ne_y)
+    Args:
+        r: (n_ch,) channel rho positions, NaN where padded.
+        y: (n_ch,) channel values.
 
-    n_culled = int((np.isfinite(ne_y) & (ne_y > 1.1 * max_core_ne)).sum())
-    ne_y = np.where(ne_y > 1.1 * max_core_ne, np.nan, ne_y)
+    Returns:
+        (core max, core value, innermost rho, outermost rho) over the
+        finite channels: core max is the brightest reading at rho < 0.2
+        (a tiny fallback mirroring the original's 0.01-in-raw-units default
+        when the core is not covered), the core value is the mean reading
+        of the innermost channel, 0.0 when that channel sits at rho >= 0.3
+        (matching the original, whose core reference stays unset then), and
+        everything is (fallback, 0.0, inf, -inf) with no finite channel.
+    """
+    valid = np.isfinite(r) & np.isfinite(y)
+    core = y[valid & (r < 0.2)]
+    core_max = float(core.max()) if core.size else 1.0e-22
+    if not valid.any():
+        return core_max, 0.0, np.inf, -np.inf
+    r_min = float(r[valid].min())
+    r_max = float(r[valid].max())
+    if r_min >= 0.3:
+        return core_max, 0.0, r_min, r_max
+    at_min = valid & np.isclose(r, r_min)
+    return core_max, float(np.mean(y[at_min])), r_min, r_max
 
-    def slice_core(r: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
-        """Characterize one slice's coverage for the per-slice culls.
 
-        Args:
-            r: (n_ch,) channel rho positions.
-            y: (n_ch,) channel values.
+def _cull_channel_outliers(
+    shot: int, rho: np.ndarray, te_y: np.ndarray, ne_y: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the legacy outlier culls to the rows as they will be fit.
 
-        Returns:
-            (core value, innermost rho, outermost rho) over the finite
-            channels; the core value is the mean reading of the innermost
-            channel, 0.0 when that channel sits at rho >= 0.3 (matching the
-            original, whose core reference stays unset then), and everything
-            is (0.0, inf, -inf) with no finite channel at all.
-        """
-        valid = np.isfinite(r) & np.isfinite(y)
-        if not valid.any():
-            return 0.0, np.inf, -np.inf
-        r_min = float(r[valid].min())
-        r_max = float(r[valid].max())
-        if r_min >= 0.3:
-            return 0.0, r_min, r_max
-        at_min = valid & np.isclose(r, r_min)
-        return float(np.mean(y[at_min])), r_min, r_max
+    Ported from the standalone fit_cmod.py's filter_and_flatten_data (its
+    "complicated filter"), which ran after the steady-time collapse -- so
+    here every row (a slice, or a whole pooled window in averaging mode) is
+    judged as one cloud with row-local core references, the way each
+    scenario window was one invocation there. Converted from its raw units
+    to the fit units (Te [keV], ne [1e20 m^-3]).
+
+    Per row, with core max the row's brightest reading at rho < 0.2 and the
+    core value the mean reading of the row's innermost channel (only
+    defined when it sits at rho < 0.3):
+      - ne: any reading above 1.1x the row's core max is dropped.
+      - ne: with edge coverage (rho > 0.9) and a bright core (at least 0.5x
+        the core max), edge readings above 0.8x the core value are dropped.
+      - Te: with edge coverage and a core of at least 0.3x the core max,
+        edge readings above 0.3x the core value are dropped.
+      - Te: with a core hotter than 0.3 keV, readings of at most 0.08 keV
+        inside rho <= 0.95 are dropped (dead or cold channels inside the
+        plasma).
+
+    Args:
+        shot: Shot number, for the log line.
+        rho: (n_rows, n_ch) channel rho positions.
+        te_y: (n_rows, n_ch) Te values [keV], NaN where invalid.
+        ne_y: (n_rows, n_ch) ne values [1e20 m^-3], NaN where invalid.
+
+    Returns:
+        (te_y, ne_y) with the culls applied, as copies.
+    """
+    te_y = te_y.copy()
+    ne_y = ne_y.copy()
+    n_culled = 0
 
     for t in range(rho.shape[0]):
         r = rho[t]
 
-        core, r_min, r_max = slice_core(r, ne_y[t])
-        if r_max > 0.9 and core >= 0.5 * max_core_ne:
-            cull = (r >= 0.9) & (ne_y[t] > 0.8 * core)
-            n_culled += int(np.count_nonzero(cull))
+        core_max, core, r_min, r_max = _row_core(r, ne_y[t])
+        cull = np.isfinite(ne_y[t]) & (ne_y[t] > 1.1 * core_max)
+        if r_max > 0.9 and core >= 0.5 * core_max:
+            cull |= (r >= 0.9) & (ne_y[t] > 0.8 * core)
+        if cull.any():
+            n_culled += int(np.count_nonzero(cull & np.isfinite(ne_y[t])))
             ne_y[t] = np.where(cull, np.nan, ne_y[t])
 
-        core, r_min, r_max = slice_core(r, te_y[t])
+        core_max, core, r_min, r_max = _row_core(r, te_y[t])
         cull = np.zeros(r.shape, dtype=bool)
-        if r_max > 0.9 and core >= 0.3 * max_core_te:
+        if r_max > 0.9 and core >= 0.3 * core_max:
             cull |= (r >= 0.9) & (te_y[t] > 0.3 * core)
         if r_min < 0.95 and core > 0.3:
             cull |= (r <= 0.95) & (te_y[t] <= 0.08)
@@ -451,8 +477,10 @@ def _apply_channel_prefilters(
             te_y[t] = np.where(cull, np.nan, te_y[t])
 
     if n_culled:
-        logger.info(f"channel prefilters culled {n_culled} channel readings")
-    return te_y, ne_y, ne_err
+        logger.info(
+            f"Shot {shot}: channel prefilters culled {n_culled} channel readings"
+        )
+    return te_y, ne_y
 
 
 def _append_sol_anchor_points(
@@ -465,38 +493,37 @@ def _append_sol_anchor_points(
     """Append the legacy synthetic SOL anchor points as two extra channels.
 
     Ported from fit_cmod.py's filter_and_flatten_data (its upper_rho_bc
-    block): every slice gets two synthetic boundary-condition points at
-    rho 1.05 and 1.08 pinning the fit to low SOL values, converted to the
-    fit units. Te anchors are fixed at 0.020/0.015 keV (errors
-    0.010/0.007); ne anchors are 1.0/0.6 [1e20 m^-3] (errors 0.3/0.3)
-    scaled per slice by the slice's brightest reading relative to the
-    shot's brightest core (rho < 0.2) reading, as in the original. A slice
-    with no finite ne gets NaN ne anchors, so it stays unfittable.
+    block), which injected them after the steady-time collapse: every fit
+    row (a slice, or a whole pooled window in averaging mode) gets exactly
+    two synthetic boundary-condition points at rho 1.05 and 1.08 pinning
+    the fit to low SOL values, converted to the fit units. Te anchors are
+    fixed at 0.020/0.015 keV (errors 0.010/0.007); ne anchors are 1.0/0.6
+    [1e20 m^-3] (errors 0.3/0.3) scaled per row by the row's brightest
+    reading relative to its own core (rho < 0.2) maximum, as in the
+    original. A row with no finite ne gets NaN ne anchors, so it stays
+    unfittable.
 
-    Call after the error floors and the persistence screen: the anchor
-    errors ARE the anchors' weight (the original never modified them after
-    injection), and only real channels belong in the persistence
-    statistics. Under window pooling every pooled sample contributes its
-    anchors, which keeps the anchor-to-data weight ratio of the per-slice
-    case.
+    Call after windowing, the error floors, and the persistence screen: the
+    anchor errors ARE the anchors' weight (the original never modified them
+    after injection), and only real channels belong in the persistence
+    statistics.
 
     Args:
-        rho: (n_t, n_ch) channel rho positions.
-        te_y: (n_t, n_ch) Te values [keV].
-        te_err: (n_t, n_ch) Te errors [keV].
-        ne_y: (n_t, n_ch) ne values [1e20 m^-3].
-        ne_err: (n_t, n_ch) ne errors [1e20 m^-3].
+        rho: (n_rows, n_ch) channel rho positions.
+        te_y: (n_rows, n_ch) Te values [keV].
+        te_err: (n_rows, n_ch) Te errors [keV].
+        ne_y: (n_rows, n_ch) ne values [1e20 m^-3].
+        ne_err: (n_rows, n_ch) ne errors [1e20 m^-3].
 
     Returns:
         (rho, te_y, te_err, ne_y, ne_err) with two anchor channels appended.
     """
     n_t = rho.shape[0]
 
-    core = ne_y[(rho < 0.2) & np.isfinite(ne_y)]
-    max_core_ne = float(core.max()) if core.size else 1.0e-22
-    slice_max = np.where(np.isfinite(ne_y), ne_y, -np.inf).max(axis=1)
-    slice_max = np.where(np.isfinite(slice_max), slice_max, np.nan)
-    v = (slice_max / max_core_ne)[:, None]
+    core_max = np.array([_row_core(rho[t], ne_y[t])[0] for t in range(n_t)])
+    row_max = np.where(np.isfinite(ne_y), ne_y, -np.inf).max(axis=1)
+    row_max = np.where(np.isfinite(row_max), row_max, np.nan)
+    v = (row_max / core_max)[:, None]
 
     def rows(values: tuple[float, float]) -> np.ndarray:
         return np.tile(np.asarray(values, dtype=float), (n_t, 1))

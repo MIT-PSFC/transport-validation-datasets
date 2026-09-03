@@ -768,6 +768,26 @@ class DataWorkflow(ABC):
             caller records it as failed).
         """
 
+    def condition_staged_fit_input(
+        self, shot: int, fit_input: ShotFitInput
+    ) -> ShotFitInput:
+        """Condition one shot's fit input after windowing, before staging.
+
+        Runs on the rows exactly as they will be fit: per-sample rows, or
+        one pooled row per time window in averaging mode. The base leaves
+        the input untouched; a device overrides this for conditioning that
+        must see the pooled window rather than the individual samples (see
+        CModDataWorkflow).
+
+        Args:
+            shot: Shot number being staged.
+            fit_input: The shot's fit input as _apply_windows staged it.
+
+        Returns:
+            The conditioned fit input.
+        """
+        return fit_input
+
     def unprocessed_shots(self) -> list[int]:
         """List the shots that have unprocessed data files.
 
@@ -905,7 +925,7 @@ class DataWorkflow(ABC):
                 fit_input = self._apply_windows(shot, fit_input)
                 if fit_input is None:
                     continue
-                shot_inputs[shot] = fit_input
+                shot_inputs[shot] = self.condition_staged_fit_input(shot, fit_input)
             if not shot_inputs:
                 continue
             pack_fit_batch(
