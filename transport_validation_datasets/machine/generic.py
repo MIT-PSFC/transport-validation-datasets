@@ -1,7 +1,173 @@
+import re
+
 import numpy as np
 import xarray as xr
 from loguru import logger
 from scipy.interpolate import RegularGridInterpolator
+
+IMAS_DOCS_URL = "https://imas-data-dictionary.readthedocs.io/en/latest/generated/ids"
+
+# Attributes of the GEQDSK block make_geqdsk_dataset builds, freeqdsk names.
+# Units are those of COCOS 1 to 8, the range efit_cocos_from_signs covers,
+# where the poloidal flux is per radian; the shot's COCOS number rides on the
+# dataset's "cocos" attribute and in the store as the per-shot cocos variable.
+# "ref" is the IMAS data dictionary path, as for every other signal.
+GEQDSK_SIGNAL_ATTRS = {
+    "rmagx": {
+        "description": "Major radius of the magnetic axis",
+        "units": "m",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/magnetic_axis/r",
+    },
+    "zmagx": {
+        "description": "Height of the magnetic axis",
+        "units": "m",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/magnetic_axis/z",
+    },
+    "simagx": {
+        "description": "Poloidal flux at the magnetic axis",
+        "units": "Wb/rad",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/psi_axis",
+    },
+    "sibdry": {
+        "description": "Poloidal flux at the plasma boundary (LCFS)",
+        "units": "Wb/rad",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/psi_boundary",
+    },
+    "bcentr": {
+        "description": "Vacuum toroidal field at rcentr, from the equilibrium reconstruction",
+        "units": "T",
+        "ref": "/equilibrium/vacuum_toroidal_field/b0",
+    },
+    "current": {
+        "description": "Plasma current from the equilibrium reconstruction",
+        "units": "A",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/ip",
+    },
+    "rcentr": {
+        "description": "Major radius bcentr is given at",
+        "units": "m",
+        "ref": "/equilibrium/vacuum_toroidal_field/r0",
+    },
+    "rleft": {
+        "description": "Major radius of the inner edge of the psirz grid, r_grid[0]",
+        "units": "m",
+    },
+    "rdim": {
+        "description": "Radial extent of the psirz grid, r_grid[-1] - r_grid[0]",
+        "units": "m",
+    },
+    "zmid": {
+        "description": "Height of the center of the psirz grid",
+        "units": "m",
+    },
+    "zdim": {
+        "description": "Vertical extent of the psirz grid, z_grid[-1] - z_grid[0]",
+        "units": "m",
+    },
+    "fpol": {
+        "description": "Poloidal current function F = R B_phi on the psi_idx grid",
+        "units": "T m",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/f",
+    },
+    "pres": {
+        "description": "Plasma pressure on the psi_idx grid",
+        "units": "Pa",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/pressure",
+    },
+    "ffprime": {
+        "description": "F dF/dpsi on the psi_idx grid",
+        "units": "T^2 m^2 rad/Wb",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/f_df_dpsi",
+    },
+    "pprime": {
+        "description": "dp/dpsi on the psi_idx grid",
+        "units": "Pa rad/Wb",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/dpressure_dpsi",
+    },
+    "qpsi": {
+        "description": "Safety factor on the psi_idx grid",
+        "units": "dimensionless",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/q",
+    },
+    "psirz": {
+        "description": "Poloidal flux on the (r_grid, z_grid) grid",
+        "units": "Wb/rad",
+        "ref": "/equilibrium/time_slice(itime)/profiles_2d(i1)/psi",
+    },
+    "rbdry": {
+        "description": "Major radius of the plasma boundary contour points, NaN padded",
+        "units": "m",
+        "ref": "/equilibrium/time_slice(itime)/boundary/outline/r",
+    },
+    "zbdry": {
+        "description": "Height of the plasma boundary contour points, NaN padded",
+        "units": "m",
+        "ref": "/equilibrium/time_slice(itime)/boundary/outline/z",
+    },
+    "rlim": {
+        "description": "Major radius of the limiter contour points",
+        "units": "m",
+        "ref": "/wall/description_2d(i1)/limiter/unit(i2)/outline/r",
+    },
+    "zlim": {
+        "description": "Height of the limiter contour points",
+        "units": "m",
+        "ref": "/wall/description_2d(i1)/limiter/unit(i2)/outline/z",
+    },
+    # Coordinates
+    "r_grid": {"description": "Major radius of the psirz grid points", "units": "m"},
+    "z_grid": {"description": "Height of the psirz grid points", "units": "m"},
+    "psi_idx": {
+        "description": "Index on the uniform normalized poloidal flux grid of the "
+        "1D profiles, 0 at the magnetic axis to 1 at the boundary"
+    },
+    "boundary_idx": {"description": "Index along the plasma boundary contour"},
+    "limiter_idx": {"description": "Index along the limiter contour"},
+}
+
+
+def imas_url(ref: str) -> str:
+    """Documentation URL of an IMAS data dictionary path.
+
+    The form disruption-py records next to its paths: the IDS page, and an
+    anchor of the path with the array indices ((itime), (i1)) dropped.
+
+    Args:
+        ref: Data dictionary path, e.g. /equilibrium/time_slice(itime)/profiles_1d/q.
+
+    Returns:
+        The URL.
+    """
+    parts = [re.sub(r"\(.*?\)", "", part) for part in ref.strip("/").split("/")]
+    return f"{IMAS_DOCS_URL}/{parts[0]}.html#{'-'.join(parts)}"
+
+
+def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
+    """Bring every variable's attributes onto one convention, for the stores.
+
+    The GEQDSK signals and coordinates get GEQDSK_SIGNAL_ATTRS where the
+    device set nothing (files from before make_geqdsk_dataset set them),
+    a data dictionary path under "imas" (disruption-py's key) moves to "ref"
+    (this package's), and every ref without a url gets one (imas_url).
+    A device's own description, units, or url always win.
+
+    Args:
+        ds: Dataset whose variables and coordinates are updated in place.
+
+    Returns:
+        The same dataset.
+    """
+    for name in list(ds.variables):
+        attrs = dict(ds[name].attrs)
+        for key, value in GEQDSK_SIGNAL_ATTRS.get(name, {}).items():
+            attrs.setdefault(key, value)
+        if "imas" in attrs:
+            path = attrs.pop("imas")
+            attrs.setdefault("ref", path)
+        if "ref" in attrs and "url" not in attrs:
+            attrs["url"] = imas_url(attrs["ref"])
+        ds[name].attrs = attrs
+    return ds
 
 
 def make_uniform_1kHz_timebase(max_time: float) -> np.ndarray:
@@ -114,6 +280,9 @@ def make_geqdsk_dataset(
             "cocos": cocos_input,
         },
     )
+    for name in ds_geqdsk.variables:
+        if name in GEQDSK_SIGNAL_ATTRS:
+            ds_geqdsk[name].attrs.update(GEQDSK_SIGNAL_ATTRS[name])
 
     return ds_geqdsk
 

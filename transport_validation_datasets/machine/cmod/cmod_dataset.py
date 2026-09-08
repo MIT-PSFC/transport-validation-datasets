@@ -24,6 +24,22 @@ from transport_validation_datasets.machine.generic import (
 )
 from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 
+# Attributes of the signals this module makes rather than reads with
+# attributes attached (DataWorkflow.signal_attrs). Everything else carries
+# disruption-py's, rewritten to the shared convention at the stack stage.
+SIGNAL_ATTRS = {
+    "power_nbi": {
+        "description": "Neutral beam heating power (none on C-Mod)",
+        "units": "W",
+        "ref": "/summary/heating_current_drive/power_nbi/value",
+    },
+    "geometric_axis_r": {
+        "description": "Major radius of the geometric center of the boundary (EFIT rout)",
+        "units": "m",
+        "ref": "/equilibrium/time_slice(itime)/boundary/geometric_axis/r",
+    },
+}
+
 
 @dataclass(frozen=True)
 class CModSettings(DeviceSettings):
@@ -44,6 +60,7 @@ class CModDataWorkflow(DataWorkflow):
     """C-Mod specific data workflow for creating and processing datasets."""
 
     settings_cls = CModSettings
+    signal_attrs = SIGNAL_ATTRS
 
     min_pulse_length = 0.5
     min_usable_time = 0.2
@@ -144,9 +161,12 @@ class CModDataWorkflow(DataWorkflow):
                 return None
             datasets.append(ds)
 
-        ds_standardized = self.standardize_signal_names(
-            xr.merge(datasets, compat="no_conflicts", join="outer")
-        )
+        ds_merged = xr.merge(datasets, compat="no_conflicts", join="outer")
+        # merge keeps the first dataset's attributes only, and COCOS is in the EFIT one
+        for ds in datasets:
+            if "cocos" in ds.attrs:
+                ds_merged.attrs["cocos"] = ds.attrs["cocos"]
+        ds_standardized = self.standardize_signal_names(ds_merged)
         if ds_standardized is None:
             logger.warning(f"Shot {shot} is missing critical signals. Skipping.")
             self.record_failed_shot(shot, "Missing critical signals.")
@@ -203,11 +223,10 @@ class CModDataWorkflow(DataWorkflow):
         # C-Mod has no NBI, zero where ip is valid
         if "ip" in ds:
             ds["power_nbi"] = ds["ip"] * 0.0
-            ds["power_nbi"].attrs = {
-                "description": "Neutral beam heating power (none on C-Mod)",
-                "units": "W",
-                "ref": "/summary/heating_current_drive/power_nbi",
-            }
+            ds["power_nbi"].attrs = {}
+        for name, attrs in self.signal_attrs.items():
+            if name in ds:
+                ds[name].attrs.update(attrs)
 
         return ds
 

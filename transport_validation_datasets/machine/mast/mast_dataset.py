@@ -336,6 +336,8 @@ SIGNAL_ATTRS = {
 class MASTDataWorkflow(DataWorkflow):
     """MAST specific data workflow for creating and processing datasets."""
 
+    signal_attrs = SIGNAL_ATTRS
+
     min_pulse_length = 0.2
     min_usable_time = 0.1
     min_segment_length = 0.1

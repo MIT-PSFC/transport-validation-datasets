@@ -5,10 +5,26 @@ Consolidated methods for generating datasets to validate transport codes and tra
 
 Every device is reduced to one schema, listed under [The datasets](#the-datasets).
 Signal names are IMAS-like, units are SI, and each variable carries its IMAS
-data dictionary path under its `ref` attribute in the stored files. The
-per-device sources of each signal live next to their attributes in
-`machine/mast/mast_dataset.py` (`SIGNAL_ATTRS`) and
-`machine/cmod/dispy_methods.py`.
+data dictionary path under its `ref` attribute in the stored files, with the
+documentation page under `url`. The per-device sources of each signal live
+next to their attributes in `machine/mast/mast_dataset.py` (`SIGNAL_ATTRS`)
+and `machine/cmod/dispy_methods.py`. The GEQDSK block's attributes are shared
+(`machine/generic.py`, `GEQDSK_SIGNAL_ATTRS`). The stack stage brings every
+variable onto that convention.
+Each unprocessed file records the COCOS index of its GEQDSK signals in a root
+attribute `cocos`. The final dataset carries it as the per-shot variable `cocos`.
+
+Every file records where it came from in its root attributes.
+The unprocessed files carry the source package that pulled
+the shot (`source_package`, `source_version`, `source_url`,
+`source_retrieval_time`) and this package as it was at the time
+(`transport_validation_datasets_commit`, `_dirty`, `_branch`, `_url`,
+`_version`, plus `dependency_versions`). The stores merge those over every
+shot they hold (a key the shots disagree on becomes a JSON list of its
+values), and add the build (`build_time`, `build_host`), this package's state
+at build time, and the run configuration as JSON: `device_settings` (the
+`[<device>]` table), `filters` (every threshold the unprocessed stage
+applied), and `fit_settings` (the fit staging knobs).
 
 # Workflow
 

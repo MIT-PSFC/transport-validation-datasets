@@ -23,7 +23,11 @@ TEST_DIR = PACKAGE_ROOT / "tests" / "test_outputs" / "test_cmod_workflow"
 # so it runs by default and checks the plumbing on real C-Mod data
 # the actual GP fits take ~80 s per Thomson sample serially and are marked slow.
 # The dispatched tests stay on zk since the cluster gets gp_fitting/ only, not the tests package.
-METHODS = [pytest.param("akho", marks=pytest.mark.slow), pytest.param("zk", marks=pytest.mark.slow), "linear"]
+METHODS = [
+    pytest.param("akho", marks=pytest.mark.slow),
+    pytest.param("zk", marks=pytest.mark.slow),
+    "linear",
+]
 
 
 def cmod_workflow(
