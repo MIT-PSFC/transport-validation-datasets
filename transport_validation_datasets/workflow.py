@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+import zarr
 from loguru import logger
 
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
@@ -36,9 +37,21 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
     ClusterFitConfig,
     plan_batches,
 )
+from transport_validation_datasets.machine.generic import (
+    efit_cocos_from_signs,
+    standardize_signal_attrs,
+)
 from transport_validation_datasets.machine.plots import (
     plot_ts_fits,
     plot_unprocessed_data,
+)
+from transport_validation_datasets.provenance import (
+    SOURCE_VOLATILE_KEYS,
+    build_provenance,
+    build_stamp,
+    merge_shot_attrs,
+    source_provenance,
+    to_json,
 )
 from transport_validation_datasets.windows import (
     in_any_window,
@@ -260,6 +273,13 @@ class DataWorkflow(ABC):
     # The internal dataset keeps them.
     # Device subclasses override this to release more or hold back more.
     published_strip_signals: tuple[str, ...] = RAW_TS_CHANNEL_SIGNALS
+
+    # Per-variable attributes the device owns (description, units, ref),
+    # for the signals it renames or synthesizes rather than takes from the
+    # source with attributes attached. Applied when the unprocessed file is
+    # written and again at the stack stage, so the stores carry what the code says
+    # now, not what the file said when it was pulled.
+    signal_attrs: dict[str, dict] = {}
 
     # The process's log file sink, replaced when a new workflow starts.
     _log_sink_id = None
@@ -576,6 +596,12 @@ class DataWorkflow(ABC):
                 self.record_failed_shot(shot, "Did not pass filtering.")
                 continue
             ds_unprocessed = _clip_powers(ds_unprocessed)
+            # What pulled the shot and what this package was when it did.
+            # The source's own stamp is rewritten, see provenance.SOURCE_ATTR_KEYS.
+            ds_unprocessed.attrs = {
+                **source_provenance(ds_unprocessed.attrs),
+                **build_provenance(),
+            }
             ds_unprocessed.to_netcdf(self.unprocessed_data_dir / f"{shot}.nc")
             logger.info(f"Created unprocessed data file for shot {shot}.")
             n_written += 1
@@ -1403,6 +1429,8 @@ class DataWorkflow(ABC):
             f"Internal dataset at {zarr_path}: {dict(ds.sizes)}, "
             f"{len(ds.data_vars)} variables"
         )
+        ds.close()
+        self._write_store_provenance(zarr_path)
         return zarr_path
 
     def publish_dataset(self) -> Path:
@@ -1785,6 +1813,30 @@ class DataWorkflow(ABC):
         for name, variable in ds_stacked.data_vars.items():
             if variable.dtype == np.float64:
                 ds_stacked[name] = variable.astype(np.float32)
+        for name, attrs in self.signal_attrs.items():
+            if name in ds_stacked:
+                ds_stacked[name].attrs.update(attrs)
+        standardize_signal_attrs(ds_stacked)
+
+        # The sign convention of the GEQDSK block, per shot since a dataset
+        # may mix field directions: the unprocessed file's attribute, or
+        # inferred from the signs the way the devices set it, for files
+        # from before the attribute was kept
+        cocos = ds_unprocessed.attrs.get("cocos")
+        if cocos is None and "current" in ds_unprocessed and "bcentr" in ds_unprocessed:
+            cocos = efit_cocos_from_signs(
+                ds_unprocessed["current"].values, ds_unprocessed["bcentr"].values
+            )
+        ds_stacked["cocos"] = xr.DataArray(
+            np.array([np.nan if cocos is None else cocos], dtype=np.float32),
+            dims=(EPISODE_DIM,),
+            attrs={
+                "description": "COCOS index of the GEQDSK equilibrium signals "
+                "(psirz, fpol, qpsi, current, ...), see "
+                "https://doi.org/10.1016/j.cpc.2012.09.010. "
+                "NaN when the shot has no equilibrium."
+            },
+        )
 
         time_definition = (
             "The unprocessed data's uniform 1 kHz timebase [s]. Profiles and "
@@ -1806,17 +1858,82 @@ class DataWorkflow(ABC):
                 "and fills the whole window."
             )
 
-        volatile = ("time", "user", "host")
+        # Only what holds for the whole run.
+        # The shots' own provenance is merged over every shot in the store once it is built
         ds_stacked.attrs = {
-            **{k: v for k, v in ds_unprocessed.attrs.items() if k not in volatile},
             "dataset_name": self.ds_name,
             "fit_method": self.fit_method,
             "fit_mode": fit_mode,
             "rho_definition": RHO_DEFINITION,
             "time_definition": time_definition,
-            "source_attributes": "Those of the first shot in the store",
         }
         return ds_stacked
+
+    def _write_store_provenance(self, zarr_path: Path):
+        """Add the run's provenance to the root attributes of a finished store.
+
+        Three layers on top of the run attributes _internal_shot_dataset set:
+        the shots' own provenance (the source package and version that pulled
+        each unprocessed file, this package's commit when it did), merged over
+        every shot in the store so a key the shots disagree on is recorded as
+        the list of its values.
+        Composed of this build's stamp and this package's state now
+        (build_stamp, build_provenance), and the run configuration (_run_config_attrs).
+        Unprocessed files from before the source stamp was rewritten are rewritten here,
+        so the store never carries disruption-py's working-directory commit.
+
+        Args:
+            zarr_path: The internal store, complete and consolidated.
+        """
+        with xr.open_zarr(zarr_path, consolidated=True) as ds_store:
+            shots = [int(shot) for shot in ds_store[EPISODE_DIM].values]
+            attrs = dict(ds_store.attrs)
+        per_shot = []
+        for shot in shots:
+            with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_file:
+                per_shot.append(source_provenance(ds_file.attrs))
+        # cocos is per shot, the store carries it as a variable
+        attrs.update(
+            merge_shot_attrs(per_shot, exclude=(*SOURCE_VOLATILE_KEYS, "cocos"))
+        )
+        attrs.update(build_stamp())
+        attrs.update(build_provenance())
+        attrs.update(self._run_config_attrs())
+        zarr.open_group(zarr_path, mode="r+").attrs.put(attrs)
+        zarr.consolidate_metadata(zarr_path)
+
+    def _run_config_attrs(self) -> dict[str, str]:
+        """The choices this run was built with, as JSON attributes.
+
+        Returns:
+            device_settings (the settings_cls instance), filters (every
+            threshold the unprocessed stage applied), and fit_settings (the
+            staging knobs the fits were made with; the rho grid is the store's
+            rho coordinate).
+        """
+        return {
+            "device_settings": to_json(self.settings),
+            "filters": to_json(
+                {
+                    "valid_filter": self.valid_filter,
+                    "transient_filter": self.transient_filter,
+                    "transient_smoothing_window": TRANSIENT_SMOOTHING_WINDOW,
+                    "end_margin": self.end_margin,
+                    "min_pulse_length": self.min_pulse_length,
+                    "min_usable_time": self.min_usable_time,
+                    "min_segment_length": self.min_segment_length,
+                    "shot_blacklist": list(self.shot_blacklist),
+                }
+            ),
+            "fit_settings": to_json(
+                {
+                    "min_points": self.fit_min_points,
+                    "scale_per_slice": self.fit_scale_per_slice,
+                    "bounds": self.fit_bounds,
+                    "max_hold_periods": MAX_HOLD_PERIODS,
+                }
+            ),
+        }
 
     @staticmethod
     def _time_variables(
