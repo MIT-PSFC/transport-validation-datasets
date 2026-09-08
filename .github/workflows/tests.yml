@@ -44,7 +44,9 @@ jobs:
             venv-${{ matrix.python-version }}-
 
       - name: Setup
-        run: uv sync --python ${{ matrix.python-version }} --group dev
+        run: >-
+          uv sync --python ${{ matrix.python-version }}
+          --group dev --extra imas
 
       # The fast suite only
       # The slow marker (serial GP fits, MAST reads over S3) is deselected by pyproject addopts
