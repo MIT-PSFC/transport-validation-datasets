@@ -46,7 +46,8 @@ def read_shotlist(
     """Read a shotlist file, with or without time windows.
 
     Two formats.
-    Plain: one shot number per line, anything else ignored.
+    Plain: one shot number per line, anything else ignored, or a CSV with a
+    shot column and no window columns, other columns ignored.
     Windowed: a CSV whose header holds shot, t_start and t_end [s], other
     columns ignored; a shot appears on one row per window.
     The shot column may also be called pulse_no.
@@ -64,7 +65,8 @@ def read_shotlist(
     labelled.
 
     Raises:
-        ValueError: If a windowed file has no shot column, a window is not a
+        ValueError: If a windowed file has no shot column, a shot column
+            holds something that is not an integer, a window is not a
             finite range with t_start < t_end, or two windows of one shot
             have the same center.
     """
@@ -73,7 +75,16 @@ def read_shotlist(
         header = [column.strip() for column in f.readline().split(",")]
         f.seek(0)
         if not all(column in header for column in WINDOW_COLUMNS):
-            plain = [int(line.strip()) for line in f if line.strip().isdigit()]
+            shot_column = next((c for c in SHOT_COLUMNS if c in header), None)
+            if shot_column is None:
+                plain = [int(line.strip()) for line in f if line.strip().isdigit()]
+            else:
+                plain = []
+                for line_number, row in enumerate(csv.DictReader(f), start=2):
+                    try:
+                        plain.append(int(row[shot_column]))
+                    except (TypeError, ValueError) as e:
+                        raise ValueError(f"{path} line {line_number}: {e}") from e
             return list(dict.fromkeys(plain)), None
 
         shot_column = next((c for c in SHOT_COLUMNS if c in header), None)
