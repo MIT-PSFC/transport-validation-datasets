@@ -17,6 +17,16 @@ dependencies = [
     "zarr>=3.1.5",
 ]
 
+[project.optional-dependencies]
+# Only needed by DataWorkflow.export_to_imas() (cli.py's `--stage export`);
+# the base install, and the minimal venv gp_fitting's cluster dispatcher
+# ships, are unaffected without this extra. See imas_export/scenario_export.py's
+# module docstring for what each package is used for.
+imas = [
+    "imas-python>=2.1.0",
+    "eqdsk>=0.5.0",
+]
+
 [dependency-groups]
 dev = [
     "black>=26.5.1",

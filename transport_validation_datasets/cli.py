@@ -13,7 +13,7 @@ import fire
 # Dataset creation plots every shot and normally runs headless
 os.environ.setdefault("MPLBACKEND", "Agg")
 
-STAGES = ("unprocessed", "fit", "stack", "publish", "all")
+STAGES = ("unprocessed", "fit", "stack", "publish", "export", "all")
 
 DEFAULT_METHOD = "zk"
 
@@ -304,6 +304,10 @@ def _execute(workflow, stage: str, clean_fit_state: bool, mb_per_chunk: int):
         workflow.stack_internal_dataset(mb_per_chunk=mb_per_chunk)
     if stage in ("publish", "all"):
         workflow.publish_dataset()
+    # Deliberately not part of "all": needs the optional `imas` extra, and is
+    # its own opt-in step (see DataWorkflow.export_to_imas).
+    if stage == "export":
+        workflow.export_to_imas()
 
 
 if __name__ == "__main__":
