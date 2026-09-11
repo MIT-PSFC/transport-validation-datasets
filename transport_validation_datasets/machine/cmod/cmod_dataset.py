@@ -543,11 +543,12 @@ def _append_sol_anchor_points(
     row (a slice, or a whole pooled window in averaging mode) gets exactly
     two synthetic boundary-condition points at rho 1.05 and 1.08 pinning
     the fit to low SOL values, converted to the fit units. Te anchors are
-    fixed at 0.020/0.015 keV (errors 0.010/0.007); ne anchors are 1.0/0.6
-    [1e20 m^-3] (errors 0.3/0.3) scaled per row by the row's brightest
-    reading relative to its own core (rho < 0.2) maximum, as in the
-    original. A row with no finite ne gets NaN ne anchors, so it stays
-    unfittable.
+    fixed at 0.040/0.030 keV (2x the legacy 0.020/0.015, per explicit
+    direction; errors 0.010/0.007); ne anchors are 0.5/0.3 [1e20 m^-3]
+    (0.5x the legacy 1.0/0.6, per explicit direction; errors 0.3/0.3)
+    scaled per row by the row's brightest reading relative to its own core
+    (rho < 0.2) maximum, as in the original. A row with no finite ne gets
+    NaN ne anchors, so it stays unfittable.
 
     Call after windowing, the error floors, and the persistence screen: the
     anchor errors ARE the anchors' weight (the original never modified them
@@ -578,9 +579,9 @@ def _append_sol_anchor_points(
 
     return (
         np.concatenate([rho, rows((1.05, 1.08))], axis=1),
-        np.concatenate([te_y, rows((0.020, 0.015))], axis=1),
+        np.concatenate([te_y, rows((0.040, 0.030))], axis=1),
         np.concatenate([te_err, rows((0.010, 0.007))], axis=1),
-        np.concatenate([ne_y, v * rows((1.0, 0.6))], axis=1),
+        np.concatenate([ne_y, v * rows((0.5, 0.3))], axis=1),
         np.concatenate([ne_err, v * rows((0.3, 0.3))], axis=1),
     )
 
