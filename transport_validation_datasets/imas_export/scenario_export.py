@@ -359,7 +359,10 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     zbdry = np.asarray(eqi.zbdry, dtype=float)
     ts.boundary.outline.r = rbdry
     ts.boundary.outline.z = zbdry
-    ts.boundary.minor_radius = float((rbdry.max() - rbdry.min()) / 2.0)
+    # C-Mod EFIT boundary contours are zero-padded to a fixed size; (0, 0)
+    # pairs are unphysical (R >= 0.4 m) and must not enter the R extent.
+    real = ~((rbdry == 0.0) & (zbdry == 0.0))
+    ts.boundary.minor_radius = float((rbdry[real].max() - rbdry[real].min()) / 2.0)
     ts.boundary.type = 1 if _diverted(eqi) else 0
 
     ts.profiles_2d.resize(1)
