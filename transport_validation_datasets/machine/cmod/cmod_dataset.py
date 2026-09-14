@@ -49,11 +49,13 @@ class CModSettings(DeviceSettings):
         efit_nickname_below: Shot-number threshold -> EFIT tree overrides,
             resolved before efit_nickname: a shot uses the tree of the
             smallest threshold it falls below, so multiple entries split
-            the shot range into eras. The default sends every shot before
-            1050204013 (the 2003-2004 campaigns) to the ANALYSIS tree. In
+            the shot range into eras. Empty by default (no overrides):
+            EFIT21 was verified to exist at full 1 kHz cadence for every
+            pre-2004 shot in the scenario list (2026-09-14 MDSplus audit),
+            so nothing is routed to the sparse ANALYSIS tree anymore. In
             TOML: [cmod.efit_nickname_below] with entries like
             "1050204013" = "analysis" (keys are strings, TOML tables
-            require it). An empty table disables the overrides.
+            require it).
         efit_nickname: EFIT tree the equilibrium, the geometry signals, and
             the shot's 1 kHz timebase are read from, and so the one the
             Thomson channels are mapped onto rho with. A tree name (EFIT21,
@@ -73,9 +75,7 @@ class CModSettings(DeviceSettings):
     """
 
     efit_nickname: str = "EFIT21"
-    efit_nickname_below: dict[str, str] = field(
-        default_factory=lambda: {"1050204013": "analysis"}
-    )
+    efit_nickname_below: dict[str, str] = field(default_factory=dict)
     channel_prefilters: bool = False
 
 
@@ -176,10 +176,16 @@ class CModDataWorkflow(DataWorkflow):
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         """Read one shot from MDSplus, through disruption-py, into standardized signals.
 
-        Three retrievals rather than one, because their native timebases
-        differ: the fast 0D signals (Ip, B0, shaping, density, power) and the
-        EFIT reconstruction are both native 1 kHz, Thomson scattering is
-        native ~20 Hz and gets snapped onto the 1 kHz grid.
+        Four retrievals rather than one, because their native timebases
+        differ: the fast diagnostics (Ip, B0, density, powers) are sampled
+        at the uniform 1 kHz grid times from their own faster-than-grid
+        native data; the EFIT-derived 0D signals (stored energy, shaping)
+        stay on the EFIT tree's native timebase; the EFIT reconstruction
+        stays on its native timebase; Thomson scattering is native ~20 Hz.
+        The EFIT and Thomson retrievals are snapped onto the uniform grid
+        without interpolation, so grid times between real samples hold NaN,
+        never fabricated values (exact relabeling for EFIT21, which is
+        native 1 kHz).
 
         Args:
             shot: Shot number to read.
@@ -190,6 +196,7 @@ class CModDataWorkflow(DataWorkflow):
         datasets = []
         for name, getter in (
             ("fast", _get_fast_dataset),
+            ("efit0d", _get_efit0d_dataset),
             ("efit", _get_efit_dataset),
             ("thomson", _get_thomson_dataset),
         ):
@@ -658,27 +665,29 @@ def _is_empty_result(result: xr.Dataset) -> bool:
 
 
 def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
-    """Retrieve fast 0D signals and EFIT dataset.
+    """Retrieve the fast-diagnostic 0D signals on the uniform 1 kHz grid.
+
+    Only signals whose native timebase is at least as fast as the grid
+    belong here (magnetics, TCI, bolometry, RF power): sampling them at the
+    1 kHz grid times only ever discards surplus resolution, it never
+    fabricates values between real measurements. Every EFIT-derived 0D
+    signal lives in _get_efit0d_dataset instead, on the EFIT tree's own
+    timebase. p_oh stays here: its information rate is set by the fast loop
+    voltage and Ip, and its EFIT-li inductance correction is exact at the
+    ms-aligned EFIT21 slice times and NaN outside the EFIT range.
 
     Args:
         shot: Shot number to retrieve data for.
         efit_nickname: EFIT tree to read, see CModSettings.
 
     Returns:
-        Dataset with EFIT signals for the given shot, or None if retrieval
-        returned no data.
+        Dataset with the fast 0D signals for the given shot, or None if
+        retrieval returned no data.
     """
-    cmod_dataset_signals = [
+    fast_signals = [
         "ip",  # Plasma current
         "bt",  # On-axis magnetic field
-        "wmhd",  # Total stored energy (C-Mod has no consistent fast particle measurement, so this is all we've got)
         "n_e",  # Line average electron density [m^-3]
-        "beta_n",  # Normalized beta
-        "a_minor",  # Plasma minor radius
-        "kappa",  # Plasma elongation
-        "tritop",  # Top triangularity
-        "tribot",  # Bottom triangularity
-        "rout",  # Geometric major radius [m]
         # Power sources and sinks
         "p_oh",  # Ohmic heating power
         "p_rad",  # Bulk radiated heating power
@@ -687,8 +696,57 @@ def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     ]
 
     retrieval_settings = RetrievalSettings(
-        run_columns=cmod_dataset_signals,
+        run_columns=fast_signals,
         time_setting=UniformTimeSetting(),
+        efit_nickname_setting=efit_nickname,
+        only_requested_columns=True,
+    )
+    result = get_shots_data(
+        tokamak=Tokamak.CMOD,
+        shotlist_setting=shot,
+        retrieval_settings=retrieval_settings,
+        output_setting=DatasetOutputSetting(path=False),
+        log_settings=passive_log_settings(),
+        num_processes=1,
+    )
+    if _is_empty_result(result):
+        return None
+    result = result.set_index(idx=["shot", "time"]).unstack("idx")
+    return result
+
+
+def _get_efit0d_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
+    """Retrieve the EFIT-derived 0D signals on the native EFIT timebase.
+
+    time_setting="efit" makes params.times the EFIT tree's own timebase, so
+    the stock disruption-py methods' final interp1 onto params.times is an
+    identity: no values are fabricated between reconstructions. The result
+    is then snapped onto the uniform 1 kHz grid like the equilibrium and
+    Thomson retrievals (nearest grid point, no interpolation, NaN where the
+    tree has no slice) -- an exact relabeling for EFIT21 (native 1 kHz),
+    and honest NaN gaps for any sparser tree.
+
+    Args:
+        shot: Shot number to retrieve data for.
+        efit_nickname: EFIT tree to read, see CModSettings.
+
+    Returns:
+        Dataset with the EFIT 0D signals for the given shot, or None if
+        retrieval returned no data.
+    """
+    efit0d_signals = [
+        "wmhd",  # Total stored energy (C-Mod has no consistent fast particle measurement, so this is all we've got)
+        "beta_n",  # Normalized beta
+        "a_minor",  # Plasma minor radius
+        "kappa",  # Plasma elongation
+        "tritop",  # Top triangularity
+        "tribot",  # Bottom triangularity
+        "rout",  # Geometric major radius [m]
+    ]
+
+    retrieval_settings = RetrievalSettings(
+        run_columns=efit0d_signals,
+        time_setting="efit",
         efit_nickname_setting=efit_nickname,
         only_requested_columns=True,
         custom_physics_methods=[CmodGeometryMethods.get_geometric_major_radius],
@@ -703,6 +761,9 @@ def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     )
     if _is_empty_result(result):
         return None
+    # Native EFIT samples onto the uniform 1 kHz grid, no interpolation.
+    timebase = make_uniform_1kHz_timebase(float(result["time"].values.max()))
+    result = snap_to_grid(result, timebase)
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
