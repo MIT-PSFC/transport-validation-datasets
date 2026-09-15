@@ -34,6 +34,9 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     unpack_fit_batch,
     unpack_fit_results,
 )
+from transport_validation_datasets.gp_fitting.coordinates import (
+    substitute_channel_positions,
+)
 from transport_validation_datasets.gp_fitting.dispatcher import (
     ClusterFitConfig,
     plan_batches,
@@ -1395,11 +1398,29 @@ class DataWorkflow(ABC):
                     if batch.fit_mode == FIT_MODE_WINDOW_AVERAGE
                     else None
                 )
+                # Draw the channel data at the positions the fit actually
+                # consumed: for a substituted coordinate, the same transform
+                # the worker applied (see substitute_channel_positions) --
+                # plotting the staged rho against a fit made in another
+                # coordinate would show phantom misfits.
+                rho_ch = si.x
+                if batch.fit_coordinate != "rho":
+                    rho_ch = np.stack(
+                        [
+                            substitute_channel_positions(
+                                si.x[t],
+                                None if si.psi_norm is None else si.psi_norm[t],
+                                None if si.qpsi is None else si.qpsi[t],
+                                batch.fit_coordinate,
+                            )
+                            for t in range(si.x.shape[0])
+                        ]
+                    )
                 n_pages = plot_ts_fits(
                     pdf_path,
                     shot,
                     ts_time=si.time,
-                    rho_ch=si.x,
+                    rho_ch=rho_ch,
                     channel_data={
                         "te": (si.te_y, si.te_err),
                         "ne": (si.ne_y, si.ne_err),
@@ -1411,6 +1432,7 @@ class DataWorkflow(ABC):
                     ),
                     max_pages=max_pages,
                     window_bounds=window_bounds,
+                    rho_label=batch.fit_coordinate,
                 )
                 logger.info(f"Plotted {n_pages} fit pages for shot {shot}")
 

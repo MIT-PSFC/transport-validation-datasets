@@ -338,15 +338,16 @@ def _plot_fit_band(ax, x: np.ndarray, y: np.ndarray, err: np.ndarray, label: str
     )
 
 
-def _style_ts_panel(ax, ylabel: str, title: str):
+def _style_ts_panel(ax, ylabel: str, title: str, xlabel: str = "rho"):
     """Apply the shared TS fit panel styling.
 
     Args:
         ax: Axes to style.
         ylabel: Y-axis label.
         title: Panel title.
+        xlabel: X-axis label (the radial coordinate the fit ran in).
     """
-    ax.set_xlabel("rho")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(alpha=0.3)
@@ -365,6 +366,7 @@ def plot_ts_fits(
     channel_groups: list[tuple[np.ndarray, str, str]] | None = None,
     max_pages: int | None = None,
     window_bounds: np.ndarray | None = None,
+    rho_label: str = "rho",
 ) -> int:
     """Save a PDF comparing the GP fits to the raw TS measurements of one shot.
 
@@ -392,6 +394,10 @@ def plot_ts_fits(
         window_bounds: (n_t, 2) start and end [s] of the time window each
             row pools, for window-averaged fits. Titles the page with the
             window instead of a slice time. None for per-sample fits.
+        rho_label: X-axis label -- the radial coordinate `rho_ch`/`rho_fit`
+            are expressed in ("rho" by default; the batch's fit_coordinate
+            for a substituted fit). Both must be in the SAME coordinate, or
+            the overlay shows phantom misfits.
 
     Returns:
         The number of pages written; a shot with no fitted slice writes an
@@ -436,6 +442,8 @@ def plot_ts_fits(
                 start, end = window_bounds[i_time]
                 title = f"shot {shot}  t={start:.3f}-{end:.3f} s (window average)"
             for i_var, (var, label, grad_label, _) in enumerate(_TS_FIT_PANELS):
+                if rho_label != "rho":
+                    grad_label = grad_label.replace("drho", f"d({rho_label})")
                 data_y, err_y = (arr[i_time, :] for arr in channel_data[var])
                 rho_at_t = rho_ch[i_time, :]
 
@@ -467,7 +475,7 @@ def plot_ts_fits(
                     "GP fit",
                 )
                 ax.set_ylim(bottom=0, top=ylims[var])
-                _style_ts_panel(ax, label, title)
+                _style_ts_panel(ax, label, title, xlabel=rho_label)
                 # The annotation layout is mkgp-specific (5 hyperparameters);
                 # other methods' diagnostics are skipped here.
                 hyps_all = getattr(fit_output, f"{var}_hyps")
@@ -498,7 +506,7 @@ def plot_ts_fits(
                     "GP gradient",
                 )
                 ax.axhline(0.0, color="gray", lw=0.8, alpha=0.5)
-                _style_ts_panel(ax, grad_label, title)
+                _style_ts_panel(ax, grad_label, title, xlabel=rho_label)
 
             fig.tight_layout()
             pdf.savefig(fig)

@@ -79,7 +79,8 @@ from transport_validation_datasets.gp_fitting.batch_io import (  # noqa: E402
     ShotFitOutput,
 )
 from transport_validation_datasets.gp_fitting.coordinates import (  # noqa: E402
-    coordinates_from_psi_norm,
+    SUBSTITUTABLE_COORDINATES,
+    substitute_channel_positions,
 )
 from transport_validation_datasets.gp_fitting.worker_base import (  # noqa: E402
     SliceResult,
@@ -137,7 +138,7 @@ _OUTER_ANCHOR_PREFIT_ERR_FACTOR = 5.0
 
 # fit_coordinate values coordinates_from_psi_norm can resolve, beyond the
 # "rho" default (task.x, staged separately -- see batch_io.ShotFitInput.x).
-_ALT_COORDINATES = ("psi_norm", "sqrt_psi_norm", "phi_norm", "sqrt_phi_norm")
+_ALT_COORDINATES = SUBSTITUTABLE_COORDINATES
 
 
 def _resolve_fit_coordinate(task: SliceTask) -> np.ndarray:
@@ -146,7 +147,9 @@ def _resolve_fit_coordinate(task: SliceTask) -> np.ndarray:
     Default (`task.fit_coordinate == "rho"`) is a no-op returning `task.x`
     unchanged -- the calibrated default path. Any other coordinate pivots
     through `task.psi_norm` (see `ShotFitInput`/`SliceTask`) via
-    `gp_fitting.coordinates.coordinates_from_psi_norm`.
+    `gp_fitting.coordinates.substitute_channel_positions`, the shared
+    implementation the fit plots also draw the channel data with, so what
+    is fit and what is plotted cannot drift apart.
 
     A slice with `task.qpsi` missing/NaN (phi_norm/sqrt_phi_norm only, e.g.
     MAST's best-effort qpsi) is not special-cased here: `coordinates_from_psi_norm`
@@ -178,23 +181,9 @@ def _resolve_fit_coordinate(task: SliceTask) -> np.ndarray:
             per-slice data gap -- see `batch_io.FitBatch.fit_coordinate`),
             or `fit_coordinate` is not a name this method recognizes.
     """
-    if task.fit_coordinate == "rho":
-        return task.x
-    if task.fit_coordinate not in _ALT_COORDINATES:
-        raise ValueError(
-            f"Unknown fit_coordinate {task.fit_coordinate!r}; expected 'rho' or "
-            f"one of {_ALT_COORDINATES}"
-        )
-    if task.psi_norm is None:
-        raise ValueError(
-            f"fit_coordinate={task.fit_coordinate!r} requires psi_norm to be "
-            "staged on ShotFitInput -- this batch was not staged for it"
-        )
-    values, _jacobians = coordinates_from_psi_norm(task.psi_norm, None, task.qpsi)
-    x = np.asarray(getattr(values, task.fit_coordinate), dtype=float).copy()
-    nominal = ~np.isfinite(task.psi_norm) & np.isfinite(task.x)
-    x[nominal] = task.x[nominal]
-    return x
+    return substitute_channel_positions(
+        task.x, task.psi_norm, task.qpsi, task.fit_coordinate
+    )
 
 
 def _no_fit(status: int) -> VariableFit:

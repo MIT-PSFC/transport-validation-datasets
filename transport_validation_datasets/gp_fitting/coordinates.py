@@ -396,6 +396,68 @@ def coordinates_from_psi_norm(
     return values, jacobians
 
 
+# Coordinates substitute_channel_positions can re-express staged channel
+# positions in, beyond the "rho" identity (worker_akho re-exports this as its
+# _ALT_COORDINATES).
+SUBSTITUTABLE_COORDINATES = ("psi_norm", "sqrt_psi_norm", "phi_norm", "sqrt_phi_norm")
+
+
+def substitute_channel_positions(
+    x: np.ndarray,
+    psi_norm: np.ndarray | None,
+    qpsi: np.ndarray | None,
+    coordinate: str,
+) -> np.ndarray:
+    """Re-express one slice's staged channel positions in another radial coordinate.
+
+    The single implementation of the substitution rule, shared by the fit
+    worker (worker_akho._resolve_fit_coordinate) and the fit plots
+    (workflow.plot_fit_results) so what is fit and what is drawn can never
+    drift apart: positions pivot through `psi_norm` via
+    `coordinates_from_psi_norm`, and a channel with a finite `x` but NaN
+    `psi_norm` keeps its nominal `x`. Real channels always carry psi_norm
+    wherever x is finite (rho is derived from it at staging), so that
+    signature is exactly the synthetic boundary-condition channels injected
+    in fit-coordinate units (C-Mod's SOL anchors at 1.05/1.08, see
+    cmod_dataset.py's `_append_sol_anchor_points`) -- their positions mean
+    "just outside the LCFS" in whatever coordinate is in play.
+
+    Args:
+        x: (n_ch,) staged channel positions (rho), NaN where invalid.
+        psi_norm: (n_ch,) channel psi_norm parallel to `x`, or None if the
+            batch was never staged with it.
+        qpsi: (n_psi,) this slice's safety factor profile, or None (only
+            needed for the phi_norm pair -- see `coordinates_from_psi_norm`).
+        coordinate: "rho" (the identity, returns `x` unchanged) or one of
+            SUBSTITUTABLE_COORDINATES.
+
+    Returns:
+        (n_ch,) positions in `coordinate` units.
+
+    Raises:
+        ValueError: `coordinate` is not a recognized name, or it is not
+            "rho" and `psi_norm` was never staged (a batch/method
+            configuration mismatch, not a per-slice data gap).
+    """
+    if coordinate == "rho":
+        return x
+    if coordinate not in SUBSTITUTABLE_COORDINATES:
+        raise ValueError(
+            f"Unknown fit_coordinate {coordinate!r}; expected 'rho' or "
+            f"one of {SUBSTITUTABLE_COORDINATES}"
+        )
+    if psi_norm is None:
+        raise ValueError(
+            f"fit_coordinate={coordinate!r} requires psi_norm to be "
+            "staged on ShotFitInput -- this batch was not staged for it"
+        )
+    values, _jacobians = coordinates_from_psi_norm(psi_norm, None, qpsi)
+    out = np.asarray(getattr(values, coordinate), dtype=float).copy()
+    nominal = ~np.isfinite(psi_norm) & np.isfinite(x)
+    out[nominal] = x[nominal]
+    return out
+
+
 def transform_gradient(
     grad_wrt_from: np.ndarray,
     jac_from: np.ndarray,
