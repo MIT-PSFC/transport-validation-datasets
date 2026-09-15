@@ -44,6 +44,11 @@ class SliceTask:
     All channel arrays are (n_ch,) rows of the shot's input. Frozen and free of
     closures and module-global state so it pickles cleanly into a Pool and
     survives any multiprocessing start method.
+
+    psi_norm, qpsi, and fit_coordinate are the optional alternate-coordinate
+    fields (see batch_io.ShotFitInput/FitBatch) -- most methods (zk) ignore
+    them and fit x/x_star (rho) as before; worker_akho.py's optional
+    coordinate-substitution step reads them when fit_coordinate != "rho".
     """
 
     shot: int
@@ -58,6 +63,9 @@ class SliceTask:
     scale_per_slice: bool
     te_bounds: FitBounds
     ne_bounds: FitBounds
+    psi_norm: np.ndarray | None = None
+    qpsi: np.ndarray | None = None
+    fit_coordinate: str = "rho"
 
 
 @dataclass
@@ -133,6 +141,9 @@ def map_slices(
                 scale_per_slice=batch.scale_per_slice,
                 te_bounds=batch.bounds["te"],
                 ne_bounds=batch.bounds["ne"],
+                psi_norm=si.psi_norm[i_time, :] if si.psi_norm is not None else None,
+                qpsi=si.qpsi[i_time, :] if si.qpsi is not None else None,
+                fit_coordinate=batch.fit_coordinate,
             )
             for i_time in range(n_t)
         )
