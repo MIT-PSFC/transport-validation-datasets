@@ -155,6 +155,17 @@ def _resolve_fit_coordinate(task: SliceTask) -> np.ndarray:
     slice -- the same graceful-degradation path a slice with too few valid
     rho channels already takes.
 
+    A channel with a finite `task.x` but NaN `task.psi_norm` keeps its
+    nominal `task.x` position instead: real channels always carry psi_norm
+    wherever they carry a finite x (rho is derived from it at staging), so
+    this is exactly the synthetic boundary-condition channels injected in
+    fit-coordinate units (C-Mod's SOL anchors at 1.05/1.08, see
+    cmod_dataset.py's `_append_sol_anchor_points`) -- their positions mean
+    "just outside the LCFS" in whatever coordinate the fit runs in, and
+    keeping them nominal also keeps fit_functions.py's Te pedestal gate
+    (which identifies the anchors by their exact position) working
+    unchanged in every coordinate.
+
     Args:
         task: The slice's fit task.
 
@@ -180,7 +191,10 @@ def _resolve_fit_coordinate(task: SliceTask) -> np.ndarray:
             "staged on ShotFitInput -- this batch was not staged for it"
         )
     values, _jacobians = coordinates_from_psi_norm(task.psi_norm, None, task.qpsi)
-    return getattr(values, task.fit_coordinate)
+    x = np.asarray(getattr(values, task.fit_coordinate), dtype=float).copy()
+    nominal = ~np.isfinite(task.psi_norm) & np.isfinite(task.x)
+    x[nominal] = task.x[nominal]
+    return x
 
 
 def _no_fit(status: int) -> VariableFit:

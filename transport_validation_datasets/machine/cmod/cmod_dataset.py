@@ -394,8 +394,28 @@ class CModDataWorkflow(DataWorkflow):
         x, te_y, te_err, ne_y, ne_err = _append_sol_anchor_points(
             fit_input.x, te_y, fit_input.te_err, ne_y, fit_input.ne_err
         )
+        # The synthetic anchors are boundary conditions placed in the fit
+        # coordinate itself (rho 1.05/1.08 nominally, "just outside the
+        # LCFS"), not measurements at a flux surface, so they carry no
+        # psi_norm: pad the staged psi_norm with NaN columns to keep it
+        # channel-aligned with x. A coordinate-substituting fit method keeps
+        # such channels at their nominal x (see worker_akho.py's
+        # _resolve_fit_coordinate), which also keeps the Te pedestal gate's
+        # exact-position anchor identification working in any coordinate.
+        psi_norm = fit_input.psi_norm
+        if psi_norm is not None and psi_norm.shape[1] < x.shape[1]:
+            pad = np.full(
+                (psi_norm.shape[0], x.shape[1] - psi_norm.shape[1]), np.nan
+            )
+            psi_norm = np.concatenate([psi_norm, pad], axis=1)
         return replace(
-            fit_input, x=x, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err
+            fit_input,
+            x=x,
+            te_y=te_y,
+            te_err=te_err,
+            ne_y=ne_y,
+            ne_err=ne_err,
+            psi_norm=psi_norm,
         )
 
     def fit_plot_channel_groups(self, shot: int) -> list | None:

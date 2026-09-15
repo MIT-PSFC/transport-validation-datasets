@@ -84,3 +84,60 @@ def test_all_alt_coordinates_resolve_without_error():
         task = _task(fit_coordinate=coord, psi_norm=psi_norm, qpsi=qpsi)
         result = _resolve_fit_coordinate(task)
         assert result.shape == psi_norm.shape
+
+
+def test_synthetic_anchor_channels_keep_nominal_positions():
+    """A finite-x channel with NaN psi_norm (a synthetic SOL anchor, see
+    cmod_dataset._append_sol_anchor_points) keeps its nominal x in every
+    substituted coordinate -- the Te pedestal gate identifies the anchors by
+    those exact positions."""
+    task = SliceTask(
+        shot=1,
+        i_time=0,
+        x=np.array([0.1, 0.5, 0.9, 1.05, 1.08]),
+        te_y=np.array([1.0, 2.0, 3.0, 0.04, 0.03]),
+        te_err=np.full(5, 0.1),
+        ne_y=np.array([1.0, 2.0, 3.0, 0.5, 0.3]),
+        ne_err=np.full(5, 0.1),
+        x_star=np.linspace(0, 1, 5),
+        min_points=3,
+        scale_per_slice=True,
+        te_bounds=_DEFAULT_BOUNDS,
+        ne_bounds=_DEFAULT_BOUNDS,
+        psi_norm=np.array([0.02, 0.3, 0.85, np.nan, np.nan]),
+        qpsi=np.linspace(1.0, 4.0, 65),
+        fit_coordinate="sqrt_phi_norm",
+    )
+    result = _resolve_fit_coordinate(task)
+    assert np.all(np.isfinite(result))
+    assert result[3] == pytest.approx(1.05)
+    assert result[4] == pytest.approx(1.08)
+    # The real channels really were substituted, not passed through.
+    assert not np.allclose(result[:3], task.x[:3])
+
+
+def test_sol_channels_beyond_lcfs_stay_distinct():
+    """Real SOL channels (psi_norm > 1) must not collapse onto the LCFS in
+    the phi_norm pair -- the linear SOL extension keeps them ordered."""
+    psi_norm = np.array([0.9, 1.0, 1.03, 1.08])
+    qpsi = np.linspace(1.0, 4.0, 65)
+    task = SliceTask(
+        shot=1,
+        i_time=0,
+        x=np.array([0.9, 1.0, 1.02, 1.06]),
+        te_y=np.full(4, 1.0),
+        te_err=np.full(4, 0.1),
+        ne_y=np.full(4, 1.0),
+        ne_err=np.full(4, 0.1),
+        x_star=np.linspace(0, 1, 5),
+        min_points=3,
+        scale_per_slice=True,
+        te_bounds=_DEFAULT_BOUNDS,
+        ne_bounds=_DEFAULT_BOUNDS,
+        psi_norm=psi_norm,
+        qpsi=qpsi,
+        fit_coordinate="sqrt_phi_norm",
+    )
+    result = _resolve_fit_coordinate(task)
+    assert result[1] == pytest.approx(1.0, abs=1e-6)
+    assert result[1] < result[2] < result[3]

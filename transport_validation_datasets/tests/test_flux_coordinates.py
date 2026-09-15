@@ -259,3 +259,28 @@ def test_rho_matches_map_ts_channels_to_rho(circular_equilibrium):
 
     np.testing.assert_allclose(values.rho, rho_pipeline[0], atol=1e-3)
     np.testing.assert_allclose(psi_n_ch, psi_norm_pipeline[0], atol=1e-3)
+
+
+def test_phi_norm_extends_linearly_beyond_lcfs(circular_equilibrium):
+    """Toroidal flux is undefined in the SOL, but real SOL channels
+    (psi_norm > 1) must keep distinct, ordered positions: phi_norm extends
+    linearly with the edge slope q(1)/total_q, continuous in value and
+    derivative through the LCFS."""
+    qpsi = circular_equilibrium["qpsi"]
+    psi_query = np.array([0.98, 1.0, 1.02, 1.05, 1.10])
+    values, jac = coordinates_from_psi_norm(psi_query, None, qpsi)
+
+    total_q = Q0 * 1.0 + (QEDGE - Q0) * 0.5
+    # Exactly 1 at the LCFS, then the closed-form linear extension.
+    assert values.phi_norm[1] == pytest.approx(1.0, abs=1e-9)
+    np.testing.assert_allclose(
+        values.phi_norm[2:],
+        1.0 + (psi_query[2:] - 1.0) * QEDGE / total_q,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(values.sqrt_phi_norm, np.sqrt(values.phi_norm), atol=1e-12)
+    # Strictly increasing through and beyond the LCFS -- no clamp pile-up.
+    assert np.all(np.diff(values.phi_norm) > 0)
+    assert np.all(np.diff(values.sqrt_phi_norm) > 0)
+    # The Jacobian beyond the LCFS is the same edge slope the extension uses.
+    np.testing.assert_allclose(jac.phi_norm[1:], QEDGE / total_q, atol=1e-9)
