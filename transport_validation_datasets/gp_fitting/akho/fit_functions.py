@@ -503,7 +503,7 @@ def _fit_one_profile(
     # Te-only pedestal gate: judge whether a real pedestal-like drop is
     # needed between the confined profile and the synthetic SOL boundary
     # anchors at rho 1.05/1.08 (injected upstream by cmod_dataset.py's
-    # channel prefilters -- present as two ordinary points in psi/vals_s
+    # channel prefilters -- present as two ordinary points in rho/vals_s
     # here, identified by their exact rho since real Thomson channels never
     # land there). Draw a line through the cubic fit's values at rho 0.85
     # and 0.90 and extrapolate it to rho=1.0 (where the confined-region
@@ -526,8 +526,8 @@ def _fit_one_profile(
     if profile_type == "te" and params_mtanh is not None:
         width_ok = params_mtanh[1] <= _TE_MTANH_MAX_WIDTH
         gap_ok = True
-        anchor_1 = np.isclose(psi, 1.05, atol=1.0e-4)
-        anchor_2 = np.isclose(psi, 1.08, atol=1.0e-4)
+        anchor_1 = np.isclose(rho, 1.05, atol=1.0e-4)
+        anchor_2 = np.isclose(rho, 1.08, atol=1.0e-4)
         if (
             params_cubic is not None
             and pcov_cubic is not None
