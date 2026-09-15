@@ -338,6 +338,22 @@ def read_batch_fit_mode(path: Path | str) -> str:
         return str(data["fit_mode"].item())
 
 
+def read_batch_fit_coordinate(path: Path | str) -> str:
+    """Read only the fit coordinate from a batch input npz (cheap).
+
+    Args:
+        path: Batch input npz path.
+
+    Returns:
+        The batch's `FitBatch.fit_coordinate`; "rho" for a batch packed
+        before the field existed.
+    """
+    with np.load(path) as data:
+        if "fit_coordinate" not in data.files:
+            return "rho"
+        return str(data["fit_coordinate"])
+
+
 def pack_fit_results(
     path: Path | str, outputs: dict[int, ShotFitOutput], x_star: np.ndarray
 ):
