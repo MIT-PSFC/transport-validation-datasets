@@ -4,6 +4,10 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 from scipy.interpolate import RegularGridInterpolator
+from transport_validation_datasets.gp_fitting.coordinates import (
+    _lcfs_crossing_radius,
+    _refine_axis_radius,
+)
 
 IMAS_DOCS_URL = "https://imas-data-dictionary.readthedocs.io/en/latest/generated/ids"
 
@@ -345,68 +349,6 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     )
 
 
-def _lcfs_crossing_radius(
-    r_from_axis: np.ndarray, psi_n_from_axis: np.ndarray
-) -> float:
-    """Find the midplane radius where psi_n first crosses 1, walking outward.
-
-    Both arrays must be ordered starting at the axis and moving outward.
-
-    Args:
-        r_from_axis: Midplane radii, axis outward [m].
-        psi_n_from_axis: Normalized poloidal flux at those radii.
-
-    Returns:
-        The linearly interpolated crossing radius [m], or NaN if psi_n never reaches 1.
-    """
-    above = psi_n_from_axis >= 1.0
-    if not above.any():
-        return np.nan
-    idx = int(np.argmax(above))
-    if idx == 0:
-        return float(r_from_axis[0])
-    r0, r1 = float(r_from_axis[idx - 1]), float(r_from_axis[idx])
-    p0, p1 = float(psi_n_from_axis[idx - 1]), float(psi_n_from_axis[idx])
-    if p1 == p0:
-        return r1
-    r_cross = r0 + (1.0 - p0) * (r1 - r0) / (p1 - p0)
-    return r_cross
-
-
-def _refine_axis_radius(
-    r_grid: np.ndarray, psi_n_mid: np.ndarray, i_axis: int
-) -> float:
-    """Refine the magnetic axis radius from the midplane psi_n minimum.
-
-    When defining rho = (r - r_axis) / (r_lcfs - r_axis), must know where the axis is.
-    EFIT grid can be coarse (a few cm), so may get rho errors ~ 5% (worst in the core).
-    Here, use a simple 3-point parabola fit to refine the axis radius.
-
-    Args:
-        r_grid: Midplane radii [m].
-        psi_n_mid: Normalized poloidal flux along the midplane.
-        i_axis: Index of the psi_n_mid minimum.
-
-    Returns:
-        The refined axis radius [m].
-    """
-    r_axis = float(r_grid[i_axis])
-    if 0 < i_axis < len(r_grid) - 1:
-        p_m = psi_n_mid[i_axis - 1]
-        p_0 = psi_n_mid[i_axis]
-        p_p = psi_n_mid[i_axis + 1]
-        curv = p_m - 2 * p_0 + p_p
-        if curv > 0:
-            r_axis += (
-                0.5
-                * (p_m - p_p)
-                / curv
-                * float(r_grid[i_axis + 1] - r_grid[i_axis - 1])
-                / 2.0
-            )
-    return r_axis
-
-
 def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
     """Map TS channel (R, Z) positions onto normalized minor radius per slice.
 
@@ -426,6 +368,10 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     A slice with no reconstruction in reach, or a degenerate one, keeps a
     NaN rho row; the fit-staging min-points gate then skips it.
 
+    Thin wrapper over `map_ts_channels_to_flux_coordinates` that drops its
+    psi_norm return, kept as its own function so existing callers staging
+    only rho are unaffected by the psi_norm addition.
+
     Args:
         ds_shot: One shot's unprocessed dataset with standardized names
             (ts_channel_r/z, ts_channel_t_e/n_e, psirz, simagx, sibdry, zmagx,
@@ -434,6 +380,32 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     Returns:
         (ts_times, rho): the (n_t,) times of the TS slices [s] and the
         (n_t, n_ch) channel rho positions, NaN where the mapping failed.
+    """
+    ts_times, rho, _psi_norm = map_ts_channels_to_flux_coordinates(ds_shot)
+    return ts_times, rho
+
+
+def map_ts_channels_to_flux_coordinates(
+    ds_shot: xr.Dataset,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Map TS channel (R, Z) positions onto rho and psi_norm per slice.
+
+    Same mapping as `map_ts_channels_to_rho` (see its docstring for the
+    rho definition), additionally returning each channel's psi_n -- computed
+    here anyway as the intermediate `rho` is inverted from -- for callers
+    that want to reach the other flux coordinates
+    (gp_fitting.coordinates.coordinates_from_psi_norm's pivot, e.g.
+    worker_akho.py's optional coordinate-substitution step).
+
+    Args:
+        ds_shot: One shot's unprocessed dataset with standardized names
+            (ts_channel_r/z, ts_channel_t_e/n_e, psirz, simagx, sibdry, zmagx,
+            r_grid, z_grid).
+
+    Returns:
+        (ts_times, rho, psi_norm): the (n_t,) times of the TS slices [s], the
+        (n_t, n_ch) channel rho positions, and the (n_t, n_ch) channel
+        psi_norm positions, both NaN where the mapping failed.
     """
     if "shot" in ds_shot.dims:
         ds_shot = ds_shot.squeeze("shot", drop=True)
@@ -468,6 +440,7 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     eq_tol = EQ_MATCH_MAX_PERIODS * eq_period
 
     rho = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
+    psi_norm = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
     n_no_equilibrium = 0
     for i, ts_idx in enumerate(ts_idxs):
         if eq_rows.size == 0:
@@ -499,6 +472,10 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
         )
         with np.errstate(invalid="ignore"):
             psi_n_ch = interp(np.column_stack([ts_r[ts_idx], ts_z[ts_idx]]))
+        # Valid independent of whether the rho midplane-crossing below
+        # succeeds -- a slice can have valid psi_norm but NaN rho if only
+        # the outboard-midplane LCFS crossing is degenerate.
+        psi_norm[i, :] = psi_n_ch
 
         # psi_n along the midplane (z = magnetic axis height)
         psi_n_mid = np.array(
@@ -534,7 +511,7 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
         logger.debug(
             f"No usable equilibrium at {n_no_equilibrium} of {ts_idxs.size} TS slices"
         )
-    return ts_times, rho
+    return ts_times, rho, psi_norm
 
 
 def channel_rows_at_times(data: xr.DataArray, ts_times: np.ndarray) -> np.ndarray:
