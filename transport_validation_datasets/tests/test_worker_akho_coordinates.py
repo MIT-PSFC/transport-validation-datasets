@@ -1,0 +1,86 @@
+"""Checks for worker_akho.py's optional coordinate-substitution step
+(_resolve_fit_coordinate) -- see that module's docstring.
+
+Requires the akho method's own dependencies (scipy.optimize, mkgp) to import
+worker_akho.py at all, same as any other test touching this method.
+"""
+
+import numpy as np
+import pytest
+
+from transport_validation_datasets.gp_fitting.batch_io import FitBounds
+from transport_validation_datasets.gp_fitting.worker_akho import (
+    _ALT_COORDINATES,
+    _resolve_fit_coordinate,
+)
+from transport_validation_datasets.gp_fitting.worker_base import SliceTask
+
+_DEFAULT_BOUNDS = FitBounds()
+
+
+def _task(fit_coordinate="rho", psi_norm=None, qpsi=None) -> SliceTask:
+    return SliceTask(
+        shot=1,
+        i_time=0,
+        x=np.array([0.1, 0.5, 0.9]),
+        te_y=np.array([1.0, 2.0, 3.0]),
+        te_err=np.array([0.1, 0.1, 0.1]),
+        ne_y=np.array([1.0, 2.0, 3.0]),
+        ne_err=np.array([0.1, 0.1, 0.1]),
+        x_star=np.linspace(0, 1, 5),
+        min_points=3,
+        scale_per_slice=True,
+        te_bounds=_DEFAULT_BOUNDS,
+        ne_bounds=_DEFAULT_BOUNDS,
+        psi_norm=psi_norm,
+        qpsi=qpsi,
+        fit_coordinate=fit_coordinate,
+    )
+
+
+def test_rho_is_a_no_op():
+    task = _task(fit_coordinate="rho")
+    np.testing.assert_array_equal(_resolve_fit_coordinate(task), task.x)
+
+
+def test_psi_norm_substitution():
+    psi_norm = np.array([0.02, 0.3, 0.9])
+    task = _task(fit_coordinate="psi_norm", psi_norm=psi_norm)
+    np.testing.assert_allclose(_resolve_fit_coordinate(task), psi_norm)
+
+
+def test_sqrt_psi_norm_substitution():
+    psi_norm = np.array([0.04, 0.25, 0.81])
+    task = _task(fit_coordinate="sqrt_psi_norm", psi_norm=psi_norm)
+    np.testing.assert_allclose(_resolve_fit_coordinate(task), np.sqrt(psi_norm))
+
+
+def test_phi_norm_substitution_uses_qpsi():
+    psi_norm = np.array([0.0, 0.5, 1.0])
+    qpsi = np.linspace(1.0, 4.0, 65)
+    task = _task(fit_coordinate="phi_norm", psi_norm=psi_norm, qpsi=qpsi)
+    result = _resolve_fit_coordinate(task)
+    assert result[0] == pytest.approx(0.0, abs=1e-6)
+    assert result[-1] == pytest.approx(1.0, abs=1e-6)
+    assert result[0] < result[1] < result[2]
+
+
+def test_missing_psi_norm_raises():
+    task = _task(fit_coordinate="psi_norm", psi_norm=None)
+    with pytest.raises(ValueError, match="requires psi_norm"):
+        _resolve_fit_coordinate(task)
+
+
+def test_unknown_coordinate_raises():
+    task = _task(fit_coordinate="banana", psi_norm=np.array([0.1, 0.2, 0.3]))
+    with pytest.raises(ValueError, match="Unknown fit_coordinate"):
+        _resolve_fit_coordinate(task)
+
+
+def test_all_alt_coordinates_resolve_without_error():
+    psi_norm = np.array([0.02, 0.3, 0.9])
+    qpsi = np.linspace(1.0, 4.0, 65)
+    for coord in _ALT_COORDINATES:
+        task = _task(fit_coordinate=coord, psi_norm=psi_norm, qpsi=qpsi)
+        result = _resolve_fit_coordinate(task)
+        assert result.shape == psi_norm.shape
