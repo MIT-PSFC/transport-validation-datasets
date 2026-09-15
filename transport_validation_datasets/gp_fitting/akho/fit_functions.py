@@ -58,20 +58,20 @@ def chi_squared(ydata, yfit, yerr):
 
 
 def reduced_chi_squared_inside_separatrix(
-    psi, ydata, yfit, yerr, num_params, only_edge=False
+    rho, ydata, yfit, yerr, num_params, only_edge=False
 ):
-    """Chi-squared evaluated only inside the separatrix (psi < 1).
+    """Chi-squared evaluated only inside the separatrix (rho < 1).
 
-    If only_edge=True, restrict further to 0.6 < psi < 1.0.
+    If only_edge=True, restrict further to 0.6 < rho < 1.0.
 
     Returns:
         The reduced chi-squared over the masked points, or np.inf if there
         are not enough points to constrain the fit.
     """
     if only_edge:
-        mask = (psi > 0.6) & (psi < 1.0)
+        mask = (rho > 0.6) & (rho < 1.0)
     else:
-        mask = psi < 1.0
+        mask = rho < 1.0
     n = np.sum(mask)
     if n <= num_params:
         return np.inf
@@ -186,7 +186,7 @@ def CubicZeroAxisSlope(x, c0, c2, c3):
     return c0 + c2 * x**2 + c3 * x**3
 
 
-def Osborne_linear_initial_guesses(psi_edge, values_edge, n_params=7):
+def Osborne_linear_initial_guesses(rho_edge, values_edge, n_params=7):
     """Rough initial guesses for an Osborne tanh fit based on edge-only data.
 
     Returns:
@@ -199,20 +199,20 @@ def Osborne_linear_initial_guesses(psi_edge, values_edge, n_params=7):
     bottom = avg * 0.3
     top = avg * 1.1
 
-    max_r = psi_edge[-1]
-    min_r = psi_edge[-1]
-    for i in range(len(psi_edge) - 1, -1, -1):
+    max_r = rho_edge[-1]
+    min_r = rho_edge[-1]
+    for i in range(len(rho_edge) - 1, -1, -1):
         if values_edge[i] > bottom:
-            max_r = psi_edge[i]
+            max_r = rho_edge[i]
             break
-    for i in range(len(psi_edge) - 1, -1, -1):
+    for i in range(len(rho_edge) - 1, -1, -1):
         if values_edge[i] > top:
-            min_r = psi_edge[i]
+            min_r = rho_edge[i]
             break
 
     width = max_r - min_r
     if width <= 0:
-        width = abs(psi_edge[-3] - psi_edge[-5]) if len(psi_edge) > 5 else 0.05
+        width = abs(rho_edge[-3] - rho_edge[-5]) if len(rho_edge) > 5 else 0.05
     centre = (max_r + min_r) / 2.0
 
     return [centre, width, top, bottom] + [0.0] * (n_params - 4)
@@ -285,10 +285,10 @@ def evaluate_with_gradient(fit_func, popt, x, h=1.0e-4):
 
 
 def _fit_one_profile(
-    psi,
+    rho,
     values,
     errors,
-    psi_grid,
+    rho_grid,
     fit_func,
     n_params,
     enforce_mtanh,
@@ -393,8 +393,8 @@ def _fit_one_profile(
     # matching the original which passes raw_te_psi_edge/raw_ne_psi_edge after
     # add_SOL_zeros_in_psi_coords (functions_fit_1D.py lines 333-334, 473)
     try:
-        edge_sel = psi > edge_thresh
-        auto = Osborne_linear_initial_guesses(psi[edge_sel], vals_s[edge_sel], n_params)
+        edge_sel = rho > edge_thresh
+        auto = Osborne_linear_initial_guesses(rho[edge_sel], vals_s[edge_sel], n_params)
         guesses.insert(0, np.array(auto))
     except Exception:
         pass
@@ -427,7 +427,7 @@ def _fit_one_profile(
         try:
             params_mtanh, _ = curve_fit(
                 fit_func,
-                psi,
+                rho,
                 vals_s,
                 p0=guess,
                 sigma=errs_s,
@@ -435,16 +435,16 @@ def _fit_one_profile(
                 maxfev=2000,
                 bounds=(lb, ub),
             )
-            fitted_at_data = fit_func(psi, *params_mtanh)
+            fitted_at_data = fit_func(rho, *params_mtanh)
             chi_mtanh = reduced_chi_squared_inside_separatrix(
-                psi,
+                rho,
                 vals_s,
                 fitted_at_data,
                 errs_s,
                 n_params,
                 only_edge=use_edge_chi_squared,
             )
-            profile_mtanh = fit_func(psi_grid, *params_mtanh) * scale
+            profile_mtanh = fit_func(rho_grid, *params_mtanh) * scale
             break
         except Exception:
             continue
@@ -467,21 +467,21 @@ def _fit_one_profile(
     try:
         params_cubic, pcov_cubic = curve_fit(
             CubicZeroAxisSlope,
-            psi,
+            rho,
             vals_s,
             sigma=errs_s,
             absolute_sigma=True,
             maxfev=2000,
         )
         chi_cubic = reduced_chi_squared_inside_separatrix(
-            psi,
+            rho,
             vals_s,
-            CubicZeroAxisSlope(psi, *params_cubic),
+            CubicZeroAxisSlope(rho, *params_cubic),
             errs_s,
             3,
             only_edge=use_edge_chi_squared,
         )
-        profile_cubic = CubicZeroAxisSlope(psi_grid, *params_cubic) * scale
+        profile_cubic = CubicZeroAxisSlope(rho_grid, *params_cubic) * scale
     except Exception:
         pass
 
@@ -497,7 +497,7 @@ def _fit_one_profile(
     # discard mtanh if fewer than 3 points in the pedestal region
     if params_mtanh is not None:
         lo, hi = params_mtanh[0] - params_mtanh[1], params_mtanh[0] + params_mtanh[1]
-        if np.sum((psi > lo) & (psi < hi)) < 3:
+        if np.sum((rho > lo) & (rho < hi)) < 3:
             params_mtanh = profile_mtanh = chi_mtanh = None
 
     # Te-only pedestal gate: judge whether a real pedestal-like drop is
