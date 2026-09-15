@@ -349,6 +349,21 @@ def coordinates_from_psi_norm(
         phi_unnorm = _toroidal_flux_unnorm(qpsi_arr)
         total_q = phi_unnorm[-1]
         phi_norm = np.interp(psi_norm, psi_norm_grid, phi_unnorm / total_q)
+        # Toroidal flux is undefined beyond the LCFS (qpsi's grid ends at
+        # psi_norm = 1), but real SOL Thomson channels land there and must
+        # keep distinct positions rather than np.interp's clamp piling them
+        # all onto phi_norm = 1. Extend linearly with the edge slope
+        # q(1)/total_q -- continuous in value AND derivative through the
+        # LCFS, and exactly what the Jacobian below already reports there
+        # (q_at clamps to qpsi[-1] for psi_norm > 1). A modeling choice for
+        # a coordinate that has no physical definition in the SOL, same
+        # spirit as the rho Jacobian's edge-clamped extension above.
+        with np.errstate(invalid="ignore"):
+            phi_norm = np.where(
+                psi_norm > 1.0,
+                1.0 + (psi_norm - 1.0) * qpsi_arr[-1] / total_q,
+                phi_norm,
+            )
         q_at = np.interp(psi_norm, psi_norm_grid, qpsi_arr)
         jac_phi_norm = q_at / total_q
     else:
