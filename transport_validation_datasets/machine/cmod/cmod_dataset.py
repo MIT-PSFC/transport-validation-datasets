@@ -404,9 +404,7 @@ class CModDataWorkflow(DataWorkflow):
         # exact-position anchor identification working in any coordinate.
         psi_norm = fit_input.psi_norm
         if psi_norm is not None and psi_norm.shape[1] < x.shape[1]:
-            pad = np.full(
-                (psi_norm.shape[0], x.shape[1] - psi_norm.shape[1]), np.nan
-            )
+            pad = np.full((psi_norm.shape[0], x.shape[1] - psi_norm.shape[1]), np.nan)
             psi_norm = np.concatenate([psi_norm, pad], axis=1)
         return replace(
             fit_input,

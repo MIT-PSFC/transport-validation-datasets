@@ -22,15 +22,15 @@ import xarray as xr
 imas = pytest.importorskip("imas")
 pytest.importorskip("eqdsk")
 
-from transport_validation_datasets.gp_fitting.batch_io import STATUS_OK
-from transport_validation_datasets.imas_export.scenario_export import (
+from transport_validation_datasets.gp_fitting.batch_io import STATUS_OK  # noqa: E402
+from transport_validation_datasets.imas_export.scenario_export import (  # noqa: E402
     DD_VERSION,
     _sigma_bp,
     _target_cocos,
     build_imas_from_shot,
     write_ids,
 )
-from transport_validation_datasets.workflow import (
+from transport_validation_datasets.workflow import (  # noqa: E402
     DATASET_EQUILIBRIUM_SIGNALS,
     TIME_COORD,
     TIME_DIM,

@@ -180,7 +180,7 @@ def _resolve_fit_coordinate(task: SliceTask) -> np.ndarray:
             never staged (a batch/method configuration mismatch, not a
             per-slice data gap -- see `batch_io.FitBatch.fit_coordinate`),
             or `fit_coordinate` is not a name this method recognizes.
-    """
+    """  # noqa: DOC502 -- the ValueError propagates from substitute_channel_positions
     return substitute_channel_positions(
         task.x, task.psi_norm, task.qpsi, task.fit_coordinate
     )
@@ -343,12 +343,8 @@ def _fit_slice(task: SliceTask) -> SliceResult:
         Both variables' fits for the slice.
     """
     x = _resolve_fit_coordinate(task)
-    te = _fit_variable(
-        x, task.te_y, task.te_err, task.x_star, task.min_points, "te"
-    )
-    ne = _fit_variable(
-        x, task.ne_y, task.ne_err, task.x_star, task.min_points, "ne"
-    )
+    te = _fit_variable(x, task.te_y, task.te_err, task.x_star, task.min_points, "te")
+    ne = _fit_variable(x, task.ne_y, task.ne_err, task.x_star, task.min_points, "ne")
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)
 
 

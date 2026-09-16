@@ -247,7 +247,9 @@ def get_fit_function(core_order, sol_order, zero_axis_slope=False):
         ValueError: If no fit function exists for the requested orders.
     """
     key = (core_order, sol_order)
-    fit_map = _ZERO_AXIS_SLOPE_FIT_FUNCTION_MAP if zero_axis_slope else _FIT_FUNCTION_MAP
+    fit_map = (
+        _ZERO_AXIS_SLOPE_FIT_FUNCTION_MAP if zero_axis_slope else _FIT_FUNCTION_MAP
+    )
     if key not in fit_map:
         raise ValueError(
             f"No fit function for core_order={core_order}, sol_order={sol_order}, "
@@ -534,6 +536,7 @@ def _fit_one_profile(
             and anchor_1.sum() == 1
             and anchor_2.sum() == 1
         ):
+
             def _core_at_1(p):
                 y85 = CubicZeroAxisSlope(0.85, *p)
                 y90 = CubicZeroAxisSlope(0.90, *p)

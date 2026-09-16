@@ -278,7 +278,9 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
                 time=data[f"{shot}:time"],
                 windows=data[f"{shot}:windows"],
                 window_index=data[f"{shot}:window_index"],
-                psi_norm=data[key] if (key := f"{shot}:psi_norm") in data.files else None,
+                psi_norm=data[key]
+                if (key := f"{shot}:psi_norm") in data.files
+                else None,
                 qpsi=data[key] if (key := f"{shot}:qpsi") in data.files else None,
             )
             for shot in data["shots"].tolist()
