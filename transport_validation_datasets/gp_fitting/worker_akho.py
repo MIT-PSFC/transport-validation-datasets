@@ -29,6 +29,22 @@ heuristics, see zk/quality.py) have no counterpart in fit_cmod.py's original
 algorithm and are unused by this method -- batch_io.py's status vocabulary is
 explicitly method-defined, so this is a deliberate choice, not a gap.
 
+Optional coordinate substitution: `FitBatch.fit_coordinate` (default "rho")
+lets a batch be fit in `psi_norm`, `sqrt_psi_norm`, `phi_norm`, or
+`sqrt_phi_norm` instead -- see `_resolve_fit_coordinate`, called once per
+slice at the top of `_fit_slice`, before either variable's analytic pre-fit/
+GP-residual stages run. Unlike worker_zk.py's rho-tuned pipeline, this
+method's analytic bounds/initial guesses/edge_thresh in fit_functions.py were
+themselves ported from `fit_cmod.py` already tuned against psi_norm, not
+rho (see fit_functions.py's own history) -- so no bound recalibration is
+needed for that coordinate specifically; the other three are not recalibrated
+either, by explicit direction, since psi_norm was already the intended one.
+`x_star` is not re-derived here: it is staged directly in `fit_coordinate`'s
+units (a batch fit in psi_norm stages an x_star grid of psi_norm values, not
+a per-slice transform of a shared rho grid, since the rho<->other-coordinate
+mapping is equilibrium/time-slice dependent and there is no single shared
+grid across slices to transform).
+
 Runs standalone on the cluster like so:
 `python -m transport_validation_datasets.gp_fitting.worker_akho input.npz output.npz --num-workers N`
 The import chain must stay within stdlib + numpy + mkgp (see batch_io.py's module docstring)
@@ -61,6 +77,10 @@ from transport_validation_datasets.gp_fitting.batch_io import (  # noqa: E402
     STATUS_SKIPPED,
     FitBatch,
     ShotFitOutput,
+)
+from transport_validation_datasets.gp_fitting.coordinates import (  # noqa: E402
+    SUBSTITUTABLE_COORDINATES,
+    substitute_channel_positions,
 )
 from transport_validation_datasets.gp_fitting.worker_base import (  # noqa: E402
     SliceResult,
@@ -116,6 +136,55 @@ _OUTER_ANCHOR_ERR = {"te": 1.0e-1, "ne": 1.0e-1}
 _OUTER_ANCHOR_GRAD_ERR = {"te": 1.0e-1, "ne": 1.0e-1}
 _OUTER_ANCHOR_PREFIT_ERR_FACTOR = 5.0
 
+# fit_coordinate values coordinates_from_psi_norm can resolve, beyond the
+# "rho" default (task.x, staged separately -- see batch_io.ShotFitInput.x).
+_ALT_COORDINATES = SUBSTITUTABLE_COORDINATES
+
+
+def _resolve_fit_coordinate(task: SliceTask) -> np.ndarray:
+    """Optional top-of-method step: substitute the channel radial coordinate.
+
+    Default (`task.fit_coordinate == "rho"`) is a no-op returning `task.x`
+    unchanged -- the calibrated default path. Any other coordinate pivots
+    through `task.psi_norm` (see `ShotFitInput`/`SliceTask`) via
+    `gp_fitting.coordinates.substitute_channel_positions`, the shared
+    implementation the fit plots also draw the channel data with, so what
+    is fit and what is plotted cannot drift apart.
+
+    A slice with `task.qpsi` missing/NaN (phi_norm/sqrt_phi_norm only, e.g.
+    MAST's best-effort qpsi) is not special-cased here: `coordinates_from_psi_norm`
+    already returns an all-NaN column for it, which `_fit_variable`'s
+    existing `min_points` gate naturally turns into STATUS_SKIPPED for that
+    slice -- the same graceful-degradation path a slice with too few valid
+    rho channels already takes.
+
+    A channel with a finite `task.x` but NaN `task.psi_norm` keeps its
+    nominal `task.x` position instead: real channels always carry psi_norm
+    wherever they carry a finite x (rho is derived from it at staging), so
+    this is exactly the synthetic boundary-condition channels injected in
+    fit-coordinate units (C-Mod's SOL anchors at 1.05/1.08, see
+    cmod_dataset.py's `_append_sol_anchor_points`) -- their positions mean
+    "just outside the LCFS" in whatever coordinate the fit runs in, and
+    keeping them nominal also keeps fit_functions.py's Te pedestal gate
+    (which identifies the anchors by their exact position) working
+    unchanged in every coordinate.
+
+    Args:
+        task: The slice's fit task.
+
+    Returns:
+        (n_ch,) channel positions in `task.fit_coordinate`'s units.
+
+    Raises:
+        ValueError: `fit_coordinate` is not "rho" and `task.psi_norm` was
+            never staged (a batch/method configuration mismatch, not a
+            per-slice data gap -- see `batch_io.FitBatch.fit_coordinate`),
+            or `fit_coordinate` is not a name this method recognizes.
+    """
+    return substitute_channel_positions(
+        task.x, task.psi_norm, task.qpsi, task.fit_coordinate
+    )
+
 
 def _no_fit(status: int) -> VariableFit:
     """Build the all-None VariableFit for a slice that produced no fit.
@@ -142,10 +211,12 @@ def _fit_variable(
     """Fit one variable of one time slice: analytic pre-fit + GP-residual correction.
 
     Args:
-        x: Channel rho positions.
+        x: Channel positions, in whatever coordinate the slice is being fit
+            in (rho by default; see `_resolve_fit_coordinate` for the
+            optional substitution).
         y: Channel values, NaN where invalid.
         err: Channel errors.
-        x_star: Target rho grid.
+        x_star: Target grid, same coordinate as `x`.
         min_points: Minimum valid channels to attempt a fit.
         variable: 'te' or 'ne' (selects the pre-fit bounds, whether the
             mtanh candidate is attempted, and the outer-anchor settings).
@@ -261,17 +332,22 @@ def _fit_variable(
 def _fit_slice(task: SliceTask) -> SliceResult:
     """Fit Te and ne for one (shot, time slice), independently.
 
+    Resolves the fit coordinate once (te and ne share the same channel
+    positions) via `_resolve_fit_coordinate`, then fits both variables
+    against it.
+
     Args:
         task: The slice's channel data and fit settings.
 
     Returns:
         Both variables' fits for the slice.
     """
+    x = _resolve_fit_coordinate(task)
     te = _fit_variable(
-        task.x, task.te_y, task.te_err, task.x_star, task.min_points, "te"
+        x, task.te_y, task.te_err, task.x_star, task.min_points, "te"
     )
     ne = _fit_variable(
-        task.x, task.ne_y, task.ne_err, task.x_star, task.min_points, "ne"
+        x, task.ne_y, task.ne_err, task.x_star, task.min_points, "ne"
     )
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)
 

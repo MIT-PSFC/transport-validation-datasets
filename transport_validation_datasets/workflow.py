@@ -27,11 +27,15 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     ShotFitOutput,
     default_fit_bounds,
     pack_fit_batch,
+    read_batch_fit_coordinate,
     read_batch_fit_mode,
     read_batch_shots,
     read_batch_windows,
     unpack_fit_batch,
     unpack_fit_results,
+)
+from transport_validation_datasets.gp_fitting.coordinates import (
+    substitute_channel_positions,
 )
 from transport_validation_datasets.gp_fitting.dispatcher import (
     ClusterFitConfig,
@@ -70,10 +74,34 @@ TRANSIENT_SMOOTHING_WINDOW = 5e-3
 # resume shot by shot. Cluster runs use ClusterFitConfig.shots_per_batch.
 LOCAL_SHOTS_PER_BATCH = 1
 
-# The radial coordinate every profile is fit on.
+# The radial coordinate profiles are fit on by default.
 RHO_DEFINITION = (
     "Normalized outboard midplane minor radius: 0 at the magnetic axis, 1 at the LCFS."
 )
+
+# Definition strings per supported fit coordinate (see FitBatch.fit_coordinate),
+# recorded on the fit datasets' "rho" coordinate/attrs so downstream consumers
+# (e.g. the IMAS export, which writes the grid as core_profiles'
+# grid.rho_tor_norm) can tell what the grid actually is. The dimension keeps
+# its historical name "rho" whatever the coordinate, so every consumer of the
+# fit files keeps working; the definition metadata is what changes.
+COORDINATE_DEFINITIONS = {
+    "rho": RHO_DEFINITION,
+    "psi_norm": "Normalized poloidal flux: 0 at the magnetic axis, 1 at the LCFS.",
+    "sqrt_psi_norm": (
+        "Square root of the normalized poloidal flux (rho_pol_norm): "
+        "0 at the magnetic axis, 1 at the LCFS."
+    ),
+    "phi_norm": (
+        "Normalized toroidal flux: 0 at the magnetic axis, 1 at the LCFS, "
+        "extended linearly in psi_norm beyond the LCFS."
+    ),
+    "sqrt_phi_norm": (
+        "Square root of the normalized toroidal flux (rho_tor_norm, the IMAS "
+        "core_profiles radial coordinate): 0 at the magnetic axis, 1 at the "
+        "LCFS, extended linearly in psi_norm beyond the LCFS before the root."
+    ),
+}
 
 # Per-slice fit statuses that count as a usable profile, see gp_fitting.batch_io.
 USABLE_FIT_STATUSES = (STATUS_OK, STATUS_REPAIRED)
@@ -289,6 +317,12 @@ class DataWorkflow(ABC):
     fit_min_points = 10
     fit_scale_per_slice = False
     fit_bounds = default_fit_bounds()
+    # Radial coordinate the fits run in (see batch_io.FitBatch.fit_coordinate
+    # and COORDINATE_DEFINITIONS). "rho" is the calibrated default every
+    # method supports; anything else requires a method with coordinate
+    # substitution (worker_akho) and psi_norm/qpsi staged by the device.
+    # fit_rho is interpreted in these units either way.
+    fit_coordinate = "rho"
 
     def __init__(
         self,
@@ -913,6 +947,9 @@ class DataWorkflow(ABC):
             in_path = self._batch_in_path(batch_id)
             if in_path.exists():
                 self._check_fit_mode(read_batch_fit_mode(in_path), f"Batch {batch_id}")
+                self._check_fit_coordinate(
+                    read_batch_fit_coordinate(in_path), f"Batch {batch_id}"
+                )
                 batches[batch_id] = batch_shots
                 continue
             shot_inputs = {}
@@ -937,6 +974,7 @@ class DataWorkflow(ABC):
                     scale_per_slice=self.fit_scale_per_slice,
                     bounds=self.fit_bounds,
                     fit_mode=self.fit_mode,
+                    fit_coordinate=self.fit_coordinate,
                 ),
             )
             batches[batch_id] = sorted(shot_inputs)
@@ -975,6 +1013,24 @@ class DataWorkflow(ABC):
                 f"build the dataset under another ds_name."
             )
 
+    def _check_fit_coordinate(self, found: str, where: str):
+        """Refuse something on disk staged in another fit coordinate than this run's.
+
+        Args:
+            found: The fit coordinate it records ("rho" for a batch predating
+                the field).
+            where: What is being checked, for the message.
+
+        Raises:
+            ValueError: If the coordinates differ.
+        """
+        if found != self.fit_coordinate:
+            raise ValueError(
+                f"{where} was staged in fit coordinate '{found}', this run is in "
+                f"'{self.fit_coordinate}'. Rerun with --clean_fit_state to rebuild "
+                f"it, or build the dataset under another ds_name."
+            )
+
     def _check_staged_batches(self):
         """Refuse a staging directory that does not match this run.
 
@@ -991,6 +1047,9 @@ class DataWorkflow(ABC):
                 continue
             batch_id = in_path.stem.removeprefix("batch_")
             self._check_fit_mode(read_batch_fit_mode(in_path), f"Batch {batch_id}")
+            self._check_fit_coordinate(
+                read_batch_fit_coordinate(in_path), f"Batch {batch_id}"
+            )
             if self.shot_windows is None:
                 continue
             for shot, staged in read_batch_windows(in_path).items():
@@ -1205,6 +1264,10 @@ class DataWorkflow(ABC):
         }
         data_vars = {}
         has_hyps = False
+        # The dimension keeps its historical name "rho" whatever the fit
+        # coordinate; the descriptions/attrs say what the grid actually is
+        # (see COORDINATE_DEFINITIONS).
+        coord = self.fit_coordinate
         for var, si_factor, name, unit, desc in (
             ("te", 1.0e3, "t_e", "eV", "electron temperature"),
             ("ne", 1.0e20, "n_e", "m^-3", "electron density"),
@@ -1212,14 +1275,16 @@ class DataWorkflow(ABC):
             for suffix, out_suffix, extra in (
                 ("fit", "", ""),
                 ("std", "_error", "1-sigma predictive uncertainty of the "),
-                ("grad", "_gradient", "d/drho gradient of the "),
+                ("grad", "_gradient", f"d/d{coord} gradient of the "),
                 (
                     "grad_std",
                     "_gradient_error",
-                    "1-sigma uncertainty of the d/drho gradient of the ",
+                    f"1-sigma uncertainty of the d/d{coord} gradient of the ",
                 ),
             ):
-                grad_unit = unit if suffix in ("fit", "std") else f"{unit} per unit rho"
+                grad_unit = (
+                    unit if suffix in ("fit", "std") else f"{unit} per unit {coord}"
+                )
                 profile = getattr(so, f"{var}_{suffix}")[None] * si_factor
                 data_vars[f"{name}{out_suffix}"] = (
                     ("shot", TIME_DIM, "rho"),
@@ -1252,7 +1317,7 @@ class DataWorkflow(ABC):
             "shot": [shot],
             # Slice ordinal, not a physical coordinate
             TIME_DIM: np.arange(so.time.size),
-            "rho": ("rho", x_star, {"description": RHO_DEFINITION}),
+            "rho": ("rho", x_star, {"description": COORDINATE_DEFINITIONS[coord]}),
             TIME_COORD: (
                 ("shot", TIME_DIM),
                 np.asarray(so.time, dtype=np.float32)[None],
@@ -1264,7 +1329,8 @@ class DataWorkflow(ABC):
         attrs = {
             "fit_method": self.fit_method,
             "fit_mode": self.fit_mode,
-            "rho_definition": RHO_DEFINITION,
+            "fit_coordinate": coord,
+            "rho_definition": COORDINATE_DEFINITIONS[coord],
             "dataset_name": self.ds_name,
         }
         attrs["windows"] = json.dumps(window_bounds(windows).tolist())
@@ -1332,11 +1398,29 @@ class DataWorkflow(ABC):
                     if batch.fit_mode == FIT_MODE_WINDOW_AVERAGE
                     else None
                 )
+                # Draw the channel data at the positions the fit actually
+                # consumed: for a substituted coordinate, the same transform
+                # the worker applied (see substitute_channel_positions) --
+                # plotting the staged rho against a fit made in another
+                # coordinate would show phantom misfits.
+                rho_ch = si.x
+                if batch.fit_coordinate != "rho":
+                    rho_ch = np.stack(
+                        [
+                            substitute_channel_positions(
+                                si.x[t],
+                                None if si.psi_norm is None else si.psi_norm[t],
+                                None if si.qpsi is None else si.qpsi[t],
+                                batch.fit_coordinate,
+                            )
+                            for t in range(si.x.shape[0])
+                        ]
+                    )
                 n_pages = plot_ts_fits(
                     pdf_path,
                     shot,
                     ts_time=si.time,
-                    rho_ch=si.x,
+                    rho_ch=rho_ch,
                     channel_data={
                         "te": (si.te_y, si.te_err),
                         "ne": (si.ne_y, si.ne_err),
@@ -1348,6 +1432,7 @@ class DataWorkflow(ABC):
                     ),
                     max_pages=max_pages,
                     window_bounds=window_bounds,
+                    rho_label=batch.fit_coordinate,
                 )
                 logger.info(f"Plotted {n_pages} fit pages for shot {shot}")
 
@@ -1884,7 +1969,8 @@ class DataWorkflow(ABC):
             "dataset_name": self.ds_name,
             "fit_method": self.fit_method,
             "fit_mode": fit_mode,
-            "rho_definition": RHO_DEFINITION,
+            "fit_coordinate": self.fit_coordinate,
+            "rho_definition": COORDINATE_DEFINITIONS[self.fit_coordinate],
             "time_definition": time_definition,
         }
         return ds_stacked
