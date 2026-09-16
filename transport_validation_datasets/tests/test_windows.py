@@ -356,9 +356,10 @@ class TestAlternateCoordinateStaging:
     def make_input_with_coordinates(self) -> ShotFitInput:
         fit_input = make_fit_input()
         fit_input.psi_norm = fit_input.x**2
-        fit_input.qpsi = np.tile(
-            np.linspace(1.0, 4.0, 7), (SAMPLE_TIMES.size, 1)
-        ) + np.arange(SAMPLE_TIMES.size)[:, None]
+        fit_input.qpsi = (
+            np.tile(np.linspace(1.0, 4.0, 7), (SAMPLE_TIMES.size, 1))
+            + np.arange(SAMPLE_TIMES.size)[:, None]
+        )
         return fit_input
 
     def test_none_stays_none(self):
@@ -387,9 +388,7 @@ class TestAlternateCoordinateStaging:
 
         assert pooled.psi_norm.shape == pooled.x.shape
         finite = np.isfinite(pooled.x)
-        np.testing.assert_allclose(
-            pooled.psi_norm[finite], pooled.x[finite] ** 2
-        )
+        np.testing.assert_allclose(pooled.psi_norm[finite], pooled.x[finite] ** 2)
         # The empty third window stays all-NaN like every other array
         assert np.isnan(pooled.psi_norm[2]).all()
 
@@ -403,7 +402,5 @@ class TestAlternateCoordinateStaging:
         np.testing.assert_allclose(
             pooled.qpsi[0], fit_input.qpsi[[0, 1, 2]].mean(axis=0)
         )
-        np.testing.assert_allclose(
-            pooled.qpsi[1], fit_input.qpsi[[3, 4]].mean(axis=0)
-        )
+        np.testing.assert_allclose(pooled.qpsi[1], fit_input.qpsi[[3, 4]].mean(axis=0))
         assert np.isnan(pooled.qpsi[2]).all()

@@ -126,7 +126,9 @@ class MidplaneFluxMap:
 
     r_axis: float
     r_lcfs_outboard: float
-    r_outboard: np.ndarray  # (n,) midplane radii, axis outward, monotonic in psi_norm [m]
+    r_outboard: (
+        np.ndarray
+    )  # (n,) midplane radii, axis outward, monotonic in psi_norm [m]
     psi_norm_outboard: np.ndarray  # (n,) psi_norm at those radii, monotonic increasing
 
 

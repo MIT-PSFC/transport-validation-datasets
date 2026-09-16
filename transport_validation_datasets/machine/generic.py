@@ -4,6 +4,7 @@ import numpy as np
 import xarray as xr
 from loguru import logger
 from scipy.interpolate import RegularGridInterpolator
+
 from transport_validation_datasets.gp_fitting.coordinates import (
     _lcfs_crossing_radius,
     _refine_axis_radius,

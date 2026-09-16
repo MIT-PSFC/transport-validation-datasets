@@ -38,7 +38,9 @@ def circular_equilibrium():
     r_grid = np.linspace(0.5, 1.5, 401)
     z_grid = np.linspace(-0.4, 0.4, 321)
     rr, zz = np.meshgrid(r_grid, z_grid, indexing="ij")
-    psirz_slice = ((rr - R0) ** 2 + (zz - Z0) ** 2) / A**2  # simagx=0, sibdry=1 => == psi_n
+    psirz_slice = (
+        (rr - R0) ** 2 + (zz - Z0) ** 2
+    ) / A**2  # simagx=0, sibdry=1 => == psi_n
     psi_norm_grid = np.linspace(0.0, 1.0, N_PSI)
     qpsi = Q0 + (QEDGE - Q0) * psi_norm_grid
     return {
@@ -84,14 +86,17 @@ def test_midplane_flux_map_axis_and_lcfs(circular_equilibrium):
 
 
 def test_midplane_flux_map_degenerate_equilibrium_returns_none(circular_equilibrium):
-    assert build_midplane_flux_map(
-        circular_equilibrium["psirz_slice"],
-        circular_equilibrium["r_grid"],
-        circular_equilibrium["z_grid"],
-        simagx=0.0,
-        sibdry=0.0,  # zero flux range: degenerate
-        zmagx=0.0,
-    ) is None
+    assert (
+        build_midplane_flux_map(
+            circular_equilibrium["psirz_slice"],
+            circular_equilibrium["r_grid"],
+            circular_equilibrium["z_grid"],
+            simagx=0.0,
+            sibdry=0.0,  # zero flux range: degenerate
+            zmagx=0.0,
+        )
+        is None
+    )
 
 
 def test_coordinates_from_psi_norm_matches_closed_form(circular_equilibrium):
@@ -104,7 +109,9 @@ def test_coordinates_from_psi_norm_matches_closed_form(circular_equilibrium):
         circular_equilibrium["zmagx"],
     )
     psi_query = np.array([0.0, 0.01, 0.05, 0.2, 0.5, 0.8, 0.99, 1.0])
-    values, jac = coordinates_from_psi_norm(psi_query, fmap, circular_equilibrium["qpsi"])
+    values, jac = coordinates_from_psi_norm(
+        psi_query, fmap, circular_equilibrium["qpsi"]
+    )
 
     np.testing.assert_allclose(values.rho, np.sqrt(psi_query), atol=5e-3)
     np.testing.assert_allclose(values.sqrt_psi_norm, np.sqrt(psi_query), atol=1e-9)
@@ -112,7 +119,9 @@ def test_coordinates_from_psi_norm_matches_closed_form(circular_equilibrium):
     # interpolation between them, so it carries discretization error against
     # the exact closed form (~1e-3 relative here, shrinking as N_PSI grows) --
     # unlike sqrt_psi_norm/rho above, which have no such discretization step.
-    np.testing.assert_allclose(values.phi_norm, phi_norm_closed_form(psi_query), atol=2e-5)
+    np.testing.assert_allclose(
+        values.phi_norm, phi_norm_closed_form(psi_query), atol=2e-5
+    )
     np.testing.assert_allclose(
         values.sqrt_phi_norm, np.sqrt(phi_norm_closed_form(psi_query)), atol=1e-4
     )
@@ -190,7 +199,9 @@ def test_transform_gradient_round_trip_is_self_consistent(circular_equilibrium):
         circular_equilibrium["zmagx"],
     )
     psi_query = np.array([0.05, 0.2, 0.5, 0.8])
-    values, jac = coordinates_from_psi_norm(psi_query, fmap, circular_equilibrium["qpsi"])
+    values, jac = coordinates_from_psi_norm(
+        psi_query, fmap, circular_equilibrium["qpsi"]
+    )
 
     grad_wrt_psi_norm = 2 * psi_query
     grad_wrt_rho = transform_gradient(grad_wrt_psi_norm, jac.psi_norm, jac.rho)
@@ -278,7 +289,9 @@ def test_phi_norm_extends_linearly_beyond_lcfs(circular_equilibrium):
         1.0 + (psi_query[2:] - 1.0) * QEDGE / total_q,
         atol=1e-9,
     )
-    np.testing.assert_allclose(values.sqrt_phi_norm, np.sqrt(values.phi_norm), atol=1e-12)
+    np.testing.assert_allclose(
+        values.sqrt_phi_norm, np.sqrt(values.phi_norm), atol=1e-12
+    )
     # Strictly increasing through and beyond the LCFS -- no clamp pile-up.
     assert np.all(np.diff(values.phi_norm) > 0)
     assert np.all(np.diff(values.sqrt_phi_norm) > 0)
