@@ -920,14 +920,17 @@ def _equilibrium_dataset(
     psirz = equilibrium["psi"].transpose("time", "major_radius", "z").values
     current = np.asarray(equilibrium["ip"].values, dtype=float)
     r_grid = np.asarray(equilibrium["major_radius"].values, dtype=float)
-    # GEQDSK pairs bcentr with rcentr: a reader reconstructing the vacuum field
-    # as bcentr*rcentr/R has to land on fpol at the boundary. So scale the
-    # published vacuum field (given at the magnetic axis) by 1/R onto the same
-    # rcentr make_geqdsk_dataset writes into the file.
+    # MAST has no separate RCENTR reconstruction; use the grid midpoint as
+    # a conventional reference radius. GEQDSK pairs bcentr with rcentr: a
+    # reader reconstructing the vacuum field as bcentr*rcentr/R has to land
+    # on fpol at the boundary. So scale the published vacuum field (given at
+    # the magnetic axis) by 1/R onto the same rcentr passed to
+    # make_geqdsk_dataset below.
+    rcentr = r_grid[len(r_grid) // 2]
     bcentr = (
         np.asarray(equilibrium["bvac_rmag"].values, dtype=float)
         * np.asarray(equilibrium["magnetic_axis_r"].values, dtype=float)
-        / r_grid[len(r_grid) // 2]
+        / rcentr
     )
     profiles = {
         name: _optional_rows(shot, equilibrium, source, (eq_time.size, n_psi))
@@ -959,6 +962,7 @@ def _equilibrium_dataset(
         qpsi=_equilibrium_qpsi(shot, eq_time, n_psi),
         psirz=psirz,
         cocos_input=efit_cocos_from_signs(current, bcentr),
+        rcentr=rcentr,
         rlim=rlim,
         zlim=zlim,
         **profiles,
