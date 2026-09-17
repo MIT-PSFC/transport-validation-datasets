@@ -222,6 +222,7 @@ def make_geqdsk_dataset(
     rbdry,
     zbdry,
     cocos_input,
+    rcentr,
     rlim=None,
     zlim=None,
 ):
@@ -229,10 +230,16 @@ def make_geqdsk_dataset(
 
     FreeQDSK canonical names, COCOS 1.
 
+    Args:
+        rcentr: The fixed reference radius the vacuum toroidal field
+            (bcentr) is quoted at [m] -- a real machine/reconstruction
+            constant, not derivable from the grid geometry. Unlike
+            rleft/rdim/zmid/zdim below, which genuinely are the grid's own
+            bounding box, callers must supply the device's real value.
+
     Returns:
         Dataset with all GEQDSK signals on dim 'idx', with 'time'/'shot' coords.
     """
-    rcentr = r_grid[len(r_grid) // 2]
     rleft = r_grid[0]
     rdim = r_grid[-1] - r_grid[0]
     zmid = z_grid[len(z_grid) // 2]

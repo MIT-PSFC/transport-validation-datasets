@@ -156,6 +156,17 @@ class CmodEfitMethods:
         z_grid = np.atleast_2d(
             params.mds_conn.get_data(r"\efit_g_eqdsk:zgrid", tree_name="_efit_tree")
         )[0]
+        # RCENTR: the fixed device radius the vacuum toroidal field (bcentr)
+        # is quoted at (~0.66 m for C-Mod) -- a real machine constant, not
+        # the midpoint of the computational R grid. Stored in the tree under
+        # the name RZERO; static like the grid arrays, collapse to a scalar.
+        rcentr = float(
+            np.atleast_1d(
+                params.mds_conn.get_data(
+                    r"\efit_g_eqdsk:rzero", tree_name="_efit_tree"
+                )
+            )[0]
+        )
 
         # No per-node fallback: every one of these is needed to build a GEQDSK,
         # so a missing node fails the shot, which the workflow records and skips.
@@ -189,6 +200,7 @@ class CmodEfitMethods:
             r_grid=r_grid,
             z_grid=z_grid,
             cocos_input=cocos_input,
+            rcentr=rcentr,
             rlim=rlim,
             zlim=zlim,
             **geqdsk_data,
