@@ -162,9 +162,7 @@ class CmodEfitMethods:
         # the name RZERO; static like the grid arrays, collapse to a scalar.
         rcentr = float(
             np.atleast_1d(
-                params.mds_conn.get_data(
-                    r"\efit_g_eqdsk:rzero", tree_name="_efit_tree"
-                )
+                params.mds_conn.get_data(r"\efit_g_eqdsk:rzero", tree_name="_efit_tree")
             )[0]
         )
 
