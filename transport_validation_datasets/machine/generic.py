@@ -231,11 +231,38 @@ def make_geqdsk_dataset(
     FreeQDSK canonical names, COCOS 1.
 
     Args:
+        shot_id: Shot number, repeated along 'idx' as the 'shot' coordinate.
+        times: (n_t,) times of the reconstruction slices [s].
+        r_grid: (n_r,) major radii of the psi grid columns [m]; also sets
+            rleft and rdim.
+        z_grid: (n_z,) heights of the psi grid rows [m]; also sets zmid
+            and zdim.
+        rmagx: (n_t,) major radius of the magnetic axis [m].
+        zmagx: (n_t,) height of the magnetic axis [m].
+        simagx: (n_t,) poloidal flux at the magnetic axis [Wb/rad].
+        sibdry: (n_t,) poloidal flux at the plasma boundary [Wb/rad].
+        bcentr: (n_t,) vacuum toroidal field at rcentr [T].
+        current: (n_t,) plasma current [A].
+        fpol: (n_t, n_psi) poloidal current function R*B_t [m*T].
+        pres: (n_t, n_psi) plasma pressure [Pa].
+        ffprime: (n_t, n_psi) F dF/dpsi [m^2*T^2/(Wb/rad)].
+        pprime: (n_t, n_psi) dp/dpsi [Pa/(Wb/rad)].
+        qpsi: (n_t, n_psi) safety factor.
+        psirz: (n_t, n_r, n_z) poloidal flux on the (r_grid, z_grid)
+            grid [Wb/rad].
+        rbdry: (n_t, n_bdry) major radii of the boundary contour [m].
+        zbdry: (n_t, n_bdry) heights of the boundary contour [m].
+        cocos_input: COCOS convention the inputs follow, stored as the
+            dataset's 'cocos' attribute.
         rcentr: The fixed reference radius the vacuum toroidal field
             (bcentr) is quoted at [m] -- a real machine/reconstruction
             constant, not derivable from the grid geometry. Unlike
             rleft/rdim/zmid/zdim below, which genuinely are the grid's own
             bounding box, callers must supply the device's real value.
+        rlim: (n_lim,) major radii of the limiter contour [m]; static, and
+            only stored when both rlim and zlim are given.
+        zlim: (n_lim,) heights of the limiter contour [m]; static, and only
+            stored when both rlim and zlim are given.
 
     Returns:
         Dataset with all GEQDSK signals on dim 'idx', with 'time'/'shot' coords.
