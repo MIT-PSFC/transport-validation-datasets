@@ -47,7 +47,8 @@ grid across slices to transform).
 
 Runs standalone on the cluster like so:
 `python -m transport_validation_datasets.gp_fitting.worker_akho input.npz output.npz --num-workers N`
-The import chain must stay within stdlib + numpy + mkgp (see batch_io.py's module docstring)
+
+Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
 """
 
 import os
