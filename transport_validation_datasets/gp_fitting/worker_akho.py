@@ -62,10 +62,8 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 import numpy as np  # noqa: E402
 
 from transport_validation_datasets.gp_fitting.akho.fit_functions import (  # noqa: E402
-    CubicZeroAxisSlope,
-    _fit_one_profile,
     evaluate_with_gradient,
-    get_fit_function,
+    fit_analytic_profile,
 )
 from transport_validation_datasets.gp_fitting.akho.gp import (  # noqa: F401 -- re-exported: workflow.py reads it off this module; noqa: E402
     HYP_NAMES,
@@ -75,6 +73,7 @@ from transport_validation_datasets.gp_fitting.batch_io import (  # noqa: E402
     STATUS_FAILED,
     STATUS_OK,
     STATUS_SKIPPED,
+    FitAnchors,
     FitBatch,
     ShotFitOutput,
 )
@@ -90,51 +89,10 @@ from transport_validation_datasets.gp_fitting.worker_base import (  # noqa: E402
     run_worker_cli,
 )
 
-# The analytic pre-fit always uses a cubic-inboard, flat-SOL Osborne tanh (or
-# its zero-axis-slope cubic-polynomial fallback) -- fit_cmod.py never varied
-# this, so it is not exposed as a batch-level knob. The zero_axis_slope
-# variant (a departure from fit_cmod.py, per explicit direction) eliminates
-# the inboard linear term so the mtanh shares the cubic fallback's exact
-# df/drho = 0 axis boundary condition: the innermost Thomson channel often
-# sits at rho ~ 0.25, and an unconstrained inboard polynomial extrapolated a
-# strongly peaked, finite-slope core through the axis.
-_FIT_FUNC, _N_PARAMS = get_fit_function(core_order=3, sol_order=0, zero_axis_slope=True)
-
-# Outer-SOL anchors (an addition over fit_cmod.py's original algorithm):
-# virtual observations at rho > 1 pinning the *total* profile (analytic mean
-# + GP residual) to zero value and zero slope well outside the plasma, so the
-# GP stage cannot drift in the data-free far SOL. Applied only to the
-# variables in _OUTER_ANCHOR_VARIABLES: ne wants the far-SOL pin, while for
-# Te these points pulled the analytic edge fit away from the data (per
-# explicit direction), so Te relies on the staged rho 1.05/1.08 SOL anchor
-# channels alone. Errors are in fit units --
-# 100 eV = 1.0e-1 keV for te, 1.0e19 m^-3 = 1.0e-1 x 1e20 m^-3 for ne -- and
-# the same magnitudes per unit rho for the slope constraint. The value
-# anchors are appended to the analytic pre-fit's input data (echoing the
-# original algorithm's add_SOL_zeros_in_psi_coords, pulling the mtanh SOL
-# offset toward zero) with their errors inflated by
-# _OUTER_ANCHOR_PREFIT_ERR_FACTOR, so they only nudge the analytic shape
-# rather than deform it -- the GP stage, which sees them at full weight,
-# does the actual pinning. curve_fit takes no derivative observations, so
-# the slope constraint acts only at the GP stage. `_fit_variable` also
-# converts both to the GP's residual space (subtracting the analytic mean's
-# own value/slope and normalizing by the slice scale) before handing them to
-# fit_residual, which adds them alongside its rho=0 axis constraint.
-# Variables whose analytic pre-fit may pick the mtanh; the rest compete only
-# against the zero-axis-slope cubic fallback. Te's mtanh candidate is
-# additionally gated on edge-region evidence of a real pedestal (see
-# fit_functions._fit_one_profile's Te-only gate) -- without it mtanh's extra
-# core freedom let it win almost every window regardless of confinement
-# regime. A quintic candidate (x^4/x^5 terms) was tried and dropped: it
-# routinely overfit the data-free extrapolation region inside the innermost
-# Thomson channel into a nonphysical core dip (see fit_functions.py).
-_MTANH_VARIABLES = ("te", "ne")
-
-_OUTER_ANCHOR_VARIABLES = ("ne",)
-_OUTER_ANCHOR_RHO = np.array([1.2, 1.3, 1.4])
-_OUTER_ANCHOR_ERR = {"te": 1.0e-1, "ne": 1.0e-1}
-_OUTER_ANCHOR_GRAD_ERR = {"te": 1.0e-1, "ne": 1.0e-1}
-_OUTER_ANCHOR_PREFIT_ERR_FACTOR = 5.0
+# The value anchors join the analytic pre-fit with their errors inflated by this factor,
+# so they nudge its SOL level rather than deform its shape.
+# The GP stage sees them at full weight.
+_PREFIT_ANCHOR_ERR_FACTOR = 5.0
 
 # fit_coordinate values coordinates_from_psi_norm can resolve, beyond the
 # "rho" default (task.x, staged separately -- see batch_io.ShotFitInput.x).
@@ -207,6 +165,7 @@ def _fit_variable(
     x_star: np.ndarray,
     min_points: int,
     variable: str,
+    anchors: FitAnchors,
 ) -> VariableFit:
     """Fit one variable of one time slice: analytic pre-fit + GP-residual correction.
 
@@ -218,8 +177,9 @@ def _fit_variable(
         err: Channel errors.
         x_star: Target grid, same coordinate as `x`.
         min_points: Minimum valid channels to attempt a fit.
-        variable: 'te' or 'ne' (selects the pre-fit bounds, whether the
-            mtanh candidate is attempted, and the outer-anchor settings).
+        variable: 'te' or 'ne' (selects the pre-fit bounds, initial guesses,
+            and the Te mtanh width cap).
+        anchors: The variable's anchors, in the data's own units.
 
     Returns:
         The variable's fit with its STATUS_* code; arrays are None for
@@ -239,73 +199,53 @@ def _fit_variable(
     if not np.isfinite(scale) or scale <= 0.0:
         return _no_fit(STATUS_FAILED)
 
-    # The outer-SOL value anchors join the pre-fit's data (the slope
-    # constraint cannot: curve_fit fits values only). The residual/GP stage
-    # below still uses the bare channel data -- the anchors re-enter there as
-    # their own virtual observations. Anchored variables only (see
-    # _OUTER_ANCHOR_VARIABLES).
-    use_outer_anchors = variable in _OUTER_ANCHOR_VARIABLES
-    pre_x, pre_y, pre_err = cx, cy / scale, cerr / scale
-    if use_outer_anchors:
-        pre_anchor_err = (
-            _OUTER_ANCHOR_PREFIT_ERR_FACTOR * _OUTER_ANCHOR_ERR[variable] / scale
-        )
-        pre_x = np.concatenate([cx, _OUTER_ANCHOR_RHO])
-        pre_y = np.concatenate([pre_y, np.zeros_like(_OUTER_ANCHOR_RHO)])
-        pre_err = np.concatenate(
-            [pre_err, np.full_like(_OUTER_ANCHOR_RHO, pre_anchor_err)]
-        )
-    prof, _chi, fname, popt = _fit_one_profile(
-        pre_x,
-        pre_y,
-        pre_err,
-        pre_x,
-        _FIT_FUNC,
-        _N_PARAMS,
-        enforce_mtanh=False,
-        use_edge_chi_squared=False,
-        profile_type=variable,
-        edge_thresh=0.93,
-        attempt_mtanh=variable in _MTANH_VARIABLES,
-    )
-    if prof is None:
-        return _no_fit(STATUS_FAILED)
+    scaled_anchors = anchors.scaled(scale)
+    value_rows = scaled_anchors.value
+    grad_rows = scaled_anchors.grad
 
-    # popt is in the same normalized space as the data handed to
-    # _fit_one_profile (its historical internal 1e20 ne rescale is gone --
-    # see the note in its body), so the fit function re-evaluates directly.
-    mean_func = {
-        "mtanh": _FIT_FUNC,
-        "cubic": CubicZeroAxisSlope,
-    }[fname]
+    # curve_fit takes no gradient observations, so only the value anchors join the pre-fit
+    pre_x = np.concatenate([cx, value_rows[:, 0]])
+    pre_y = np.concatenate([cy / scale, value_rows[:, 1]])
+    prefit_anchor_err = _PREFIT_ANCHOR_ERR_FACTOR * value_rows[:, 2]
+    pre_err = np.concatenate([cerr / scale, prefit_anchor_err])
+    is_channel = np.arange(pre_x.size) < cx.size
+    analytic = fit_analytic_profile(
+        pre_x, pre_y, pre_err, is_channel, variable, edge_thresh=0.93
+    )
+    if analytic is None:
+        return _no_fit(STATUS_FAILED)
+    mean_func, popt = analytic
+
     mean_at_data, _ = evaluate_with_gradient(mean_func, popt, cx)
     mean_x_star, mean_grad_x_star = evaluate_with_gradient(mean_func, popt, x_star)
 
-    # Outer-SOL anchors in residual space: the GP fits
-    # (data / scale - analytic mean), so pinning the total profile to zero
-    # value/slope at these rho means pinning the residual to minus the
-    # analytic mean's own value/slope there.
-    anchor_kwargs = {}
-    if use_outer_anchors:
-        anchor_mean, anchor_mean_grad = evaluate_with_gradient(
-            mean_func, popt, _OUTER_ANCHOR_RHO
-        )
-        anchor_kwargs = dict(
-            anchor_x=_OUTER_ANCHOR_RHO,
-            anchor_y=-anchor_mean,
-            anchor_err=np.full_like(
-                _OUTER_ANCHOR_RHO, _OUTER_ANCHOR_ERR[variable] / scale
-            ),
-            anchor_dx=_OUTER_ANCHOR_RHO,
-            anchor_dy=-anchor_mean_grad,
-            anchor_dyerr=np.full_like(
-                _OUTER_ANCHOR_RHO, _OUTER_ANCHOR_GRAD_ERR[variable] / scale
-            ),
-        )
+    # The GP fits data / scale - analytic mean,
+    # so an anchor on the total profile becomes the anchor minus the mean there.
+    mean_at_value_anchors, _ = evaluate_with_gradient(mean_func, popt, value_rows[:, 0])
+    _, mean_grad_at_grad_anchors = evaluate_with_gradient(
+        mean_func, popt, grad_rows[:, 0]
+    )
+    residual_value_anchors = np.column_stack(
+        [value_rows[:, 0], value_rows[:, 1] - mean_at_value_anchors, value_rows[:, 2]]
+    )
+    residual_grad_anchors = np.column_stack(
+        [
+            grad_rows[:, 0],
+            grad_rows[:, 1] - mean_grad_at_grad_anchors,
+            grad_rows[:, 2],
+        ]
+    )
 
     residual = cy / scale - mean_at_data
     residual_err = cerr / scale
-    resid = fit_residual(cx, residual, residual_err, x_star, **anchor_kwargs)
+    resid = fit_residual(
+        cx,
+        residual,
+        residual_err,
+        x_star,
+        residual_value_anchors,
+        residual_grad_anchors,
+    )
     if resid is None:
         return _no_fit(STATUS_FAILED)
 
@@ -343,8 +283,12 @@ def _fit_slice(task: SliceTask) -> SliceResult:
         Both variables' fits for the slice.
     """
     x = _resolve_fit_coordinate(task)
-    te = _fit_variable(x, task.te_y, task.te_err, task.x_star, task.min_points, "te")
-    ne = _fit_variable(x, task.ne_y, task.ne_err, task.x_star, task.min_points, "ne")
+    te = _fit_variable(
+        x, task.te_y, task.te_err, task.x_star, task.min_points, "te", task.te_anchors
+    )
+    ne = _fit_variable(
+        x, task.ne_y, task.ne_err, task.x_star, task.min_points, "ne", task.ne_anchors
+    )
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)
 
 

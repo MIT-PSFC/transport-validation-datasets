@@ -14,8 +14,10 @@ from transport_validation_datasets.gp_fitting.worker_akho import (
     _resolve_fit_coordinate,
 )
 from transport_validation_datasets.gp_fitting.worker_base import SliceTask
+from transport_validation_datasets.workflow import DeviceSettings, _fit_anchors
 
 _DEFAULT_BOUNDS = FitBounds()
+_ANCHORS = _fit_anchors(DeviceSettings())
 
 
 def _task(fit_coordinate="rho", psi_norm=None, qpsi=None) -> SliceTask:
@@ -32,6 +34,8 @@ def _task(fit_coordinate="rho", psi_norm=None, qpsi=None) -> SliceTask:
         scale_per_slice=True,
         te_bounds=_DEFAULT_BOUNDS,
         ne_bounds=_DEFAULT_BOUNDS,
+        te_anchors=_ANCHORS["te"],
+        ne_anchors=_ANCHORS["ne"],
         psi_norm=psi_norm,
         qpsi=qpsi,
         fit_coordinate=fit_coordinate,
@@ -104,6 +108,8 @@ def test_synthetic_anchor_channels_keep_nominal_positions():
         scale_per_slice=True,
         te_bounds=_DEFAULT_BOUNDS,
         ne_bounds=_DEFAULT_BOUNDS,
+        te_anchors=_ANCHORS["te"],
+        ne_anchors=_ANCHORS["ne"],
         psi_norm=np.array([0.02, 0.3, 0.85, np.nan, np.nan]),
         qpsi=np.linspace(1.0, 4.0, 65),
         fit_coordinate="sqrt_phi_norm",
@@ -134,6 +140,8 @@ def test_sol_channels_beyond_lcfs_stay_distinct():
         scale_per_slice=True,
         te_bounds=_DEFAULT_BOUNDS,
         ne_bounds=_DEFAULT_BOUNDS,
+        te_anchors=_ANCHORS["te"],
+        ne_anchors=_ANCHORS["ne"],
         psi_norm=psi_norm,
         qpsi=qpsi,
         fit_coordinate="sqrt_phi_norm",
