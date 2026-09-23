@@ -26,7 +26,7 @@ from transport_validation_datasets.machine.generic import (
     efit_cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
-    map_ts_channels_to_flux_coordinates,
+    map_ts_channels_to_rho,
     snap_to_grid,
     ts_channel_fit_rows,
 )
@@ -548,7 +548,7 @@ class MASTDataWorkflow(DataWorkflow):
             The fit input, or None when the shot has nothing fittable.
         """
         ds_shot = _equilibrium_at_ts_times(ds.squeeze("shot", drop=True))
-        ts_times, rho, psi_norm = map_ts_channels_to_flux_coordinates(ds_shot)
+        ts_times, rho = map_ts_channels_to_rho(ds_shot)
         if ts_times.size == 0:
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None
@@ -557,26 +557,9 @@ class MASTDataWorkflow(DataWorkflow):
 
         with np.errstate(invalid="ignore"):
             rho = np.where((rho >= 0.0) & (rho <= MAX_FIT_RHO), rho, np.nan)
-        # psi_norm follows the same channel-validity decision as rho above
-        # (inboard/out-of-range channels are excluded from the fit
-        # regardless of which coordinate it is run in).
-        psi_norm = np.where(np.isfinite(rho), psi_norm, np.nan)
-
-        qpsi = None
-        if "qpsi" in ds_shot:
-            ts_mask = np.isin(ds_shot["time"].values, ts_times)
-            qpsi_values = ds_shot["qpsi"].transpose("time", "psi_idx").values
-            qpsi = np.asarray(qpsi_values, dtype=float)[ts_mask]
 
         fit_input = ShotFitInput(
-            x=rho,
-            te_y=te_y,
-            te_err=te_err,
-            ne_y=ne_y,
-            ne_err=ne_err,
-            time=ts_times,
-            psi_norm=psi_norm,
-            qpsi=qpsi,
+            x=rho, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err, time=ts_times
         )
         if not fit_input.has_fittable_points():
             logger.warning(f"Shot {shot}: no finite (rho, te, ne) channel data to fit")

@@ -214,8 +214,6 @@ def restrict_to_windows(fit_input: ShotFitInput, windows) -> ShotFitInput | None
         time=fit_input.time[keep],
         windows=bounds,
         window_index=member[keep].argmax(axis=1),
-        psi_norm=None if fit_input.psi_norm is None else fit_input.psi_norm[keep],
-        qpsi=None if fit_input.qpsi is None else fit_input.qpsi[keep],
     )
 
 
@@ -276,17 +274,6 @@ def pool_windows(fit_input: ShotFitInput, windows, shot: int) -> ShotFitInput:
         else:
             logger.info(message)
 
-    # qpsi is per time slice, not per channel: a pooled window's row gets the
-    # mean q profile of its member samples (windows are chosen steady, so the
-    # equilibrium barely moves inside one) -- unlike the channel arrays, whose
-    # pooled row keeps every sample's own per-channel values side by side.
-    qpsi = None
-    if fit_input.qpsi is not None:
-        qpsi = np.full((bounds.shape[0], fit_input.qpsi.shape[1]), np.nan)
-        for w, samples in enumerate(rows):
-            if samples.size:
-                qpsi[w] = np.nanmean(fit_input.qpsi[samples], axis=0)
-
     return ShotFitInput(
         x=x,
         te_y=pooled(fit_input.te_y),
@@ -296,6 +283,4 @@ def pool_windows(fit_input: ShotFitInput, windows, shot: int) -> ShotFitInput:
         time=window_centers(bounds),
         windows=bounds,
         window_index=np.arange(bounds.shape[0]),
-        psi_norm=None if fit_input.psi_norm is None else pooled(fit_input.psi_norm),
-        qpsi=qpsi,
     )

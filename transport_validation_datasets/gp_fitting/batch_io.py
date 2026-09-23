@@ -103,24 +103,6 @@ class ShotFitInput:
     the (n_t,) window each row belongs to (see transport_validation_datasets.windows).
     A shot staged without windows has an empty windows array and -1 in every window_index.
     In a pooled row a channel appears once per Thomson sample, so n_ch is then samples x channels.
-
-    psi_norm and qpsi are optional alternate-coordinate staging for methods
-    that support fitting in a coordinate other than rho (currently only
-    worker_akho.py's optional coordinate-substitution step, see its module
-    docstring; see gp_fitting/coordinates.py for the transform math). A
-    method/shot that does not use them leaves both None, and they are not
-    written to the npz file in that case.
-
-    psi_norm: (n_t, n_ch) channel positions in normalized poloidal flux, the
-        pivot gp_fitting.coordinates.coordinates_from_psi_norm transforms
-        from -- parallel to x, same validity convention (NaN = invalid).
-    qpsi: (n_t, n_psi) safety factor on the equilibrium's uniform psi_norm
-        grid, this shot's time slices (see machine/generic.py's
-        `make_geqdsk_dataset`, dim `psi_idx`). Only needed to reach
-        phi_norm/sqrt(phi_norm); psi_norm/sqrt(psi_norm) do not use it. A
-        slice with qpsi missing/NaN (e.g. MAST's best-effort qpsi, see
-        `machine/mast/mast_dataset.py`'s `_equilibrium_qpsi`) degrades
-        gracefully -- see `coordinates_from_psi_norm`'s docstring.
     """
 
     x: np.ndarray
@@ -131,8 +113,6 @@ class ShotFitInput:
     time: np.ndarray
     windows: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
     window_index: np.ndarray | None = None
-    psi_norm: np.ndarray | None = None
-    qpsi: np.ndarray | None = None
 
     def __post_init__(self):
         if self.window_index is None:
@@ -159,20 +139,12 @@ class FitBatch:
 
     Attributes:
         shot_inputs: Per-shot channel data, keyed by shot number.
-        x_star: (n_x,) target grid the profiles are fit on, in
-            `fit_coordinate` units.
+        x_star: (n_x,) target rho grid the profiles are fit on.
         min_points: Minimum valid channels per slice to attempt a fit.
         scale_per_slice: Normalize each slice by its max before fitting.
         bounds: Per-variable fit bound knobs, keyed by FIT_VARIABLES.
         anchors: Per-variable virtual observations, keyed by FIT_VARIABLES.
         fit_mode: One of the FIT_MODE_* values, how the rows were built.
-        fit_coordinate: Which radial coordinate to fit in -- "rho" (default,
-            every method supports it), or one of "psi_norm", "sqrt_psi_norm",
-            "phi_norm", "sqrt_phi_norm" for methods that support the
-            substitution (currently only worker_akho.py; see its module
-            docstring). A coordinate other than "rho" requires the shot
-            inputs' `psi_norm` (and, for the phi_norm pair, `qpsi`) to be
-            staged -- see `ShotFitInput`.
     """
 
     shot_inputs: dict[int, ShotFitInput]
@@ -182,7 +154,6 @@ class FitBatch:
     bounds: dict[str, FitBounds]
     anchors: dict[str, FitAnchors]
     fit_mode: str = FIT_MODE_SAMPLE
-    fit_coordinate: str = "rho"
 
 
 @dataclass
@@ -252,7 +223,6 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         "min_points": np.int64(batch.min_points),
         "scale_per_slice": np.bool_(batch.scale_per_slice),
         "fit_mode": np.str_(batch.fit_mode),
-        "fit_coordinate": np.str_(batch.fit_coordinate),
     }
     for var in FIT_VARIABLES:
         for f in fields(FitBounds):
@@ -274,10 +244,6 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         arrays[f"{shot}:ne_err"] = np.asarray(si.ne_err, dtype=np.float32)
         arrays[f"{shot}:windows"] = np.asarray(si.windows, dtype=np.float64)
         arrays[f"{shot}:window_index"] = np.asarray(si.window_index, dtype=np.int64)
-        if si.psi_norm is not None:
-            arrays[f"{shot}:psi_norm"] = np.asarray(si.psi_norm, dtype=np.float32)
-        if si.qpsi is not None:
-            arrays[f"{shot}:qpsi"] = np.asarray(si.qpsi, dtype=np.float32)
     _atomic_savez(path, arrays)
 
 
@@ -313,10 +279,6 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
                 time=data[f"{shot}:time"],
                 windows=data[f"{shot}:windows"],
                 window_index=data[f"{shot}:window_index"],
-                psi_norm=data[key]
-                if (key := f"{shot}:psi_norm") in data.files
-                else None,
-                qpsi=data[key] if (key := f"{shot}:qpsi") in data.files else None,
             )
             for shot in data["shots"].tolist()
         }
@@ -328,9 +290,6 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
             bounds=bounds,
             anchors=anchors,
             fit_mode=str(data["fit_mode"].item()),
-            fit_coordinate=(
-                str(data["fit_coordinate"]) if "fit_coordinate" in data.files else "rho"
-            ),
         )
 
 
@@ -404,22 +363,6 @@ def read_batch_fit_mode(path: Path | str) -> str:
     """
     with np.load(path) as data:
         return str(data["fit_mode"].item())
-
-
-def read_batch_fit_coordinate(path: Path | str) -> str:
-    """Read only the fit coordinate from a batch input npz (cheap).
-
-    Args:
-        path: Batch input npz path.
-
-    Returns:
-        The batch's `FitBatch.fit_coordinate`; "rho" for a batch packed
-        before the field existed.
-    """
-    with np.load(path) as data:
-        if "fit_coordinate" not in data.files:
-            return "rho"
-        return str(data["fit_coordinate"])
 
 
 def pack_fit_results(
