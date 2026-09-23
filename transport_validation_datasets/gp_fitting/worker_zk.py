@@ -31,6 +31,7 @@ from transport_validation_datasets.gp_fitting.batch_io import (  # noqa: E402
     STATUS_OK,
     STATUS_REPAIRED,
     STATUS_SKIPPED,
+    FitAnchors,
     FitBatch,
     FitBounds,
     ShotFitOutput,
@@ -80,7 +81,9 @@ def _no_fit(status: int) -> VariableFit:
     )
 
 
-def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0, seed_salt=0):
+def _attempt_fit(
+    x, y, err, x_star, scale_per_slice, bounds, anchors, pin_x0, seed_salt=0
+):
     """Clean, fit, and rescale one variable of one slice, once.
 
     Args:
@@ -90,6 +93,7 @@ def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0, seed_salt=0
         x_star: Target rho grid.
         scale_per_slice: Normalize by the cleaned slice max before fitting.
         bounds: The variable's staged bound knobs.
+        anchors: The variable's anchors, in the data's own units.
         pin_x0: Hold the pedestal location at this value, or None.
         seed_salt: Restart seed offset for a reseeded retry (see run_gp).
 
@@ -98,11 +102,13 @@ def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0, seed_salt=0
         cleaning left nothing usable or the GP fit failed. Gradients are not
         clamped: negative slopes are physical.
     """
-    cleaned = clean_channels(x, y, err, bounds, scale_per_slice)
+    cleaned = clean_channels(x, y, err, bounds, anchors, scale_per_slice)
     if cleaned is None:
         return None
-    cx, cy, cerr, scale = cleaned
-    pf = fit_profile(cx, cy, cerr, x_star, bounds, pin_x0=pin_x0, seed_salt=seed_salt)
+    cx, cy, cerr, scale, scaled_anchors = cleaned
+    pf = fit_profile(
+        cx, cy, cerr, x_star, bounds, scaled_anchors, pin_x0=pin_x0, seed_salt=seed_salt
+    )
     if pf is None:
         return None
     return (
@@ -142,6 +148,7 @@ def _fit_variable(
     min_points: int,
     scale_per_slice: bool,
     bounds: FitBounds,
+    anchors: FitAnchors,
     pin_x0: float | None,
 ) -> VariableFit:
     """Fit one variable of one time slice, with up to three repairs.
@@ -175,6 +182,7 @@ def _fit_variable(
         min_points: Minimum valid channels to attempt a fit.
         scale_per_slice: Normalize by the cleaned slice max before fitting.
         bounds: The variable's staged bound knobs.
+        anchors: The variable's anchors, in the data's own units.
         pin_x0: Hold the pedestal location at this value, or None.
 
     Returns:
@@ -203,7 +211,15 @@ def _fit_variable(
     last_flagged = None
     for n_attempt, (pin, seed_salt, attempt_bounds) in enumerate(attempts):
         result = _attempt_fit(
-            x, y, err, x_star, scale_per_slice, attempt_bounds, pin, seed_salt=seed_salt
+            x,
+            y,
+            err,
+            x_star,
+            scale_per_slice,
+            attempt_bounds,
+            anchors,
+            pin,
+            seed_salt=seed_salt,
         )
         if result is None:
             continue
@@ -227,7 +243,7 @@ def _fit_variable(
     still_valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
     if int(still_valid.sum()) < min_points:
         return _no_fit(STATUS_CULLED)
-    result = _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, None)
+    result = _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, anchors, None)
     if result is None:
         return _no_fit(STATUS_CULLED)
     peak, biased = _fit_problems(result[0], x_star, x, y, err)
@@ -257,6 +273,7 @@ def _fit_slice(task: SliceTask) -> SliceResult:
         task.min_points,
         task.scale_per_slice,
         task.ne_bounds,
+        task.ne_anchors,
         pin_x0=None,
     )
     ne_x0 = None if ne.hyps is None else float(ne.hyps[4])
@@ -273,6 +290,7 @@ def _fit_slice(task: SliceTask) -> SliceResult:
         task.min_points,
         task.scale_per_slice,
         task.te_bounds,
+        task.te_anchors,
         pin_x0=pin_x0,
     )
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)

@@ -18,8 +18,8 @@ the profile's own peak instead of the spike it is).
 
 import numpy as np
 
-from transport_validation_datasets.gp_fitting.batch_io import FitBounds
-from transport_validation_datasets.gp_fitting.zk.gp import VALUE_BC, run_gp
+from transport_validation_datasets.gp_fitting.batch_io import FitAnchors, FitBounds
+from transport_validation_datasets.gp_fitting.zk.gp import run_gp
 from transport_validation_datasets.gp_fitting.zk.kernel import build_kernel
 
 # An isolated channel whose error bar is many times its rho-neighbors' poisons
@@ -44,8 +44,9 @@ def clean_channels(
     y: np.ndarray,
     err: np.ndarray,
     fit_bounds: FitBounds,
+    anchors: FitAnchors,
     scale_per_slice: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, FitAnchors] | None:
     """Clean one slice's channels and normalize them for fitting.
 
     Runs the screens in the fixed order described in the module docstring.
@@ -55,13 +56,14 @@ def clean_channels(
         y: Channel values, NaN where invalid.
         err: Channel errors.
         fit_bounds: The variable's staged bound knobs (for the rough fit).
+        anchors: The variable's anchors, in the data's own units.
         scale_per_slice: Normalize by the cleaned slice max before fitting, to
             prevent amplitude collapse when channels do not cover the full
             radial range.
 
     Returns:
-        (x, y, err, scale) with y and err divided by scale, or None when no
-        valid data remains or the scale is degenerate.
+        (x, y, err, scale, anchors) with y, err, and the anchors divided by scale,
+        or None when no valid data remains or the scale is degenerate.
     """
     valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
     if not valid.any():
@@ -81,9 +83,12 @@ def clean_channels(
     err = np.asarray(err, dtype=float) / scale
     x = np.asarray(x, dtype=float)
 
-    rough_hyps = _rough_hyperparameters(x, y, err, fit_bounds)
-    x, y, err = _remove_loo_outliers(x, y, err, ref_hyperparams=rough_hyps)
-    return x, y, err, scale
+    anchors = anchors.scaled(scale)
+    rough_hyps = _rough_hyperparameters(x, y, err, fit_bounds, anchors)
+    x, y, err = _remove_loo_outliers(
+        x, y, err, anchors.value, ref_hyperparams=rough_hyps
+    )
+    return x, y, err, scale, anchors
 
 
 def _remove_local_outliers(x, y, err, sigma_neighbor=2.0, sigma_local=3.0):
@@ -176,7 +181,9 @@ def _remove_error_outliers(x, y, err):
     return x[keep], y[keep], err[keep]
 
 
-def _rough_hyperparameters(x, y, err, fit_bounds: FitBounds) -> np.ndarray | None:
+def _rough_hyperparameters(
+    x, y, err, fit_bounds: FitBounds, anchors: FitAnchors
+) -> np.ndarray | None:
     """Run one reduced optimize pass on (possibly still contaminated) data.
 
     Used only to get a locally-representative reference for the LOO outlier
@@ -187,17 +194,22 @@ def _rough_hyperparameters(x, y, err, fit_bounds: FitBounds) -> np.ndarray | Non
         y: Channel values (normalized).
         err: Channel errors (normalized).
         fit_bounds: The variable's staged bound knobs.
+        anchors: The variable's anchors (normalized).
 
     Returns:
         Fitted [var, l1, l2, lw, x0], or None if the fit failed.
     """
-    gp = run_gp(x, y, err, x, fit_bounds, nrestarts=_ROUGH_NRESTARTS, hyp_retries=0)
+    gp = run_gp(
+        x, y, err, x, fit_bounds, anchors, nrestarts=_ROUGH_NRESTARTS, hyp_retries=0
+    )
     if gp is None:
         return None
     return np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
 
 
-def _loo_standardized_residuals(x, y, err, hyperparams) -> np.ndarray | None:
+def _loo_standardized_residuals(
+    x, y, err, value_anchors, hyperparams
+) -> np.ndarray | None:
     """Compute the leave-one-out standardized residual at every data point.
 
     Uses the closed-form GP LOO identities (Rasmussen and Williams 5.12): for
@@ -207,7 +219,7 @@ def _loo_standardized_residuals(x, y, err, hyperparams) -> np.ndarray | None:
     from all the others (never from itself) in a single matrix solve, with no
     per-point or reference GP fit.
 
-    The edge value BCs (VALUE_BC) are appended as fixed training points so
+    The value anchors are appended as fixed training points so
     edge channels are judged against the same "pull to zero past the
     separatrix" constraint the real fit sees; residuals are returned for the
     real data points only.
@@ -216,6 +228,7 @@ def _loo_standardized_residuals(x, y, err, hyperparams) -> np.ndarray | None:
         x: Channel rho positions.
         y: Channel values.
         err: Channel errors.
+        value_anchors: (n_a, 3) value anchor rows (normalized).
         hyperparams: Kernel hyperparameters (length scales etc.); None uses
             the generic start values.
 
@@ -223,9 +236,9 @@ def _loo_standardized_residuals(x, y, err, hyperparams) -> np.ndarray | None:
         (n,) standardized residuals, or None if the covariance solve fails or
         is not positive definite.
     """
-    xx = np.concatenate([x, VALUE_BC[:, 0]])
-    yy = np.concatenate([y, VALUE_BC[:, 1]])
-    ee = np.concatenate([err, VALUE_BC[:, 2]])
+    xx = np.concatenate([x, value_anchors[:, 0]])
+    yy = np.concatenate([y, value_anchors[:, 1]])
+    ee = np.concatenate([err, value_anchors[:, 2]])
 
     kernel = build_kernel(hyperparams)
     try:
@@ -278,7 +291,14 @@ def _locally_corroborated(x, y, err, i, sigma_corr) -> bool:
 
 
 def _remove_loo_outliers(
-    x, y, err, sigma=3.0, sigma_corr=2.0, max_drop_frac=0.3, ref_hyperparams=None
+    x,
+    y,
+    err,
+    value_anchors,
+    sigma=3.0,
+    sigma_corr=2.0,
+    max_drop_frac=0.3,
+    ref_hyperparams=None,
 ):
     """Drop uncorroborated LOO outliers, worst first, one at a time.
 
@@ -302,6 +322,7 @@ def _remove_loo_outliers(
         x: Channel rho positions.
         y: Channel values.
         err: Channel errors.
+        value_anchors: (n_a, 3) value anchor rows (normalized).
         sigma: LOO residual threshold; 3.0 (rather than a stricter 2.0)
             tolerates reference/data mismatch on genuinely steep slices.
         sigma_corr: Combined-sigma window for neighbor corroboration.
@@ -324,7 +345,7 @@ def _remove_loo_outliers(
     max_drop = max(1, round(max_drop_frac * n0))
     n_dropped = 0
     while x.size > 3 and n_dropped < max_drop:
-        z = _loo_standardized_residuals(x, y, err, ref_hyperparams)
+        z = _loo_standardized_residuals(x, y, err, value_anchors, ref_hyperparams)
         if z is None:
             break
         to_drop = None

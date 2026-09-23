@@ -18,7 +18,7 @@ off-axis is suspect. Two triggers:
     channel the profile is near zero, so the relative margin divides one
     near-zero number by another and flags harmless sub-percent SOL ringing
     (MAST 28956 t=0.179, fit 0.006e20 vs envelope 0.004e20 at rho 1.1) that
-    the monotonic-edge constraint and the value BCs already govern.
+    the monotonic-edge constraint and the value anchors already govern.
     Data-supported off-axis humps (hollow ramp-up ne) pass.
 A flagged slice is repaired by refitting without the channels under the peak
 (see the worker's _fit_variable; a pinned te fit is first retried unpinned),
@@ -48,7 +48,7 @@ _FIT_BIAS_CORE_SIGMA = 2.5
 
 # Monotonic-edge constraint (virtual zero-slope observations). Te and ne fall
 # monotonically toward the edge, but the GP can ring up into a bump around
-# rho ~1.0, between the outermost channel and the value BCs at 1.1+, where
+# rho ~1.0, between the outermost channel and the value anchors at 1.1+, where
 # the short edge length scale wiggles freely. nonphysical_peak only catches
 # bumps beating the whole interior by _EDGE_MARGIN, so this one passes it.
 # fit_profile checks the posterior gradient on MONO_CHECK_RHO and, wherever
