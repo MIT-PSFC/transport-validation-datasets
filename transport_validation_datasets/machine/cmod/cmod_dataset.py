@@ -18,7 +18,7 @@ from transport_validation_datasets.machine.cmod.dispy_methods import (
 )
 from transport_validation_datasets.machine.generic import (
     make_uniform_1kHz_timebase,
-    map_ts_channels_to_flux_coordinates,
+    map_ts_channels_to_rho,
     snap_to_grid,
     ts_channel_fit_rows,
 )
@@ -263,16 +263,10 @@ class CModDataWorkflow(DataWorkflow):
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
         """Build GP fit inputs for one shot from its unprocessed dataset.
 
-        1: Maps the TS channels onto rho (and psi_norm) through magnetics-only EFIT
+        1: Maps the TS channels onto rho through magnetics-only EFIT
         2: convert to the fit units (Te [keV], ne [1e20 m^-3])
-        3: C-Mod channel quality screens and error floors, calibrated in rho
+        3: C-Mod channel quality screens and error floors, calibrated in those units
         4: TODO: optionally correct density with interferometry
-
-        psi_norm and qpsi are also staged (unused unless a batch is fit with
-        FitBatch.fit_coordinate != "rho", see worker_akho.py's module
-        docstring); the rho-based quality screens/error floors below are
-        unaffected either way -- they run once here, before any per-method
-        coordinate choice.
 
         Args:
             shot: Shot number being staged.
@@ -281,19 +275,13 @@ class CModDataWorkflow(DataWorkflow):
         Returns:
             The fit input, or None when the shot has nothing fittable.
         """
-        ts_times, rho, psi_norm = map_ts_channels_to_flux_coordinates(ds)
+        ts_times, rho = map_ts_channels_to_rho(ds)
         if ts_times.size == 0:
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None
 
         ds_shot = ds.squeeze("shot", drop=True)
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
-
-        qpsi = None
-        if "qpsi" in ds_shot:
-            ts_mask = np.isin(ds_shot["time"].values, ts_times)
-            qpsi_values = ds_shot["qpsi"].transpose("time", "psi_idx").values
-            qpsi = np.asarray(qpsi_values, dtype=float)[ts_mask]
 
         # Drop density channels too uncertain to constrain the fit
         # (error > 1e20 m^-3). These are typically bad edge/SOL channels.
@@ -328,14 +316,7 @@ class CModDataWorkflow(DataWorkflow):
         ne_y = _drop_broken_channels("ne", rho, ne_y, ne_err)
 
         fit_input = ShotFitInput(
-            x=rho,
-            te_y=te_y,
-            te_err=te_err,
-            ne_y=ne_y,
-            ne_err=ne_err,
-            time=ts_times,
-            psi_norm=psi_norm,
-            qpsi=qpsi,
+            x=rho, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err, time=ts_times
         )
         if not fit_input.has_fittable_points():
             logger.warning(f"Shot {shot}: no finite (rho, te, ne) channel data to fit")
