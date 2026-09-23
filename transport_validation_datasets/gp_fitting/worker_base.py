@@ -12,9 +12,8 @@ map_slices implements the per-(shot, time slice) fan-out for workers whose
 method fits slices independently. A worker with a different structure can
 ignore it and implement fit_batch directly.
 
-Diagnostics use print (not loguru) on purpose: workers run on the cluster
-where sbatch --output captures stdout, and the minimal cluster venv has no
-loguru (see batch_io module docstring).
+Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
+(diagnostics use print instead of loguru)
 """
 
 import argparse

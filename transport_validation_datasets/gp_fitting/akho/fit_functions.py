@@ -11,9 +11,7 @@ two-point-model Te-separatrix shift, which needs an external per-shot
 calibration target that `FitBatch`/`ShotFitInput` do not carry (see
 worker_akho.py's module docstring) -- unused here, so not vendored.
 
-Pure numpy/scipy: this module sits on the worker's `python -m` import path
-into a minimal cluster venv (stdlib + numpy + mkgp only, see batch_io.py's
-module docstring) and must stay importable there.
+Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
 """
 
 import numpy as np

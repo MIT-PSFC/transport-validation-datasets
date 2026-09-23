@@ -7,9 +7,7 @@ the target rho grid, and the per-variable fit bound knobs and anchors.
 Workers read a batch, fit it, and write a result file whose rows stay aligned with the input rows
 A slice that was skipped or culled is an all-NaN row, never a dropped one.
 
-This module must stay importable with only stdlib + numpy
-It ships to the cluster alongside the workers, where the venv holds nothing else
-(see bootstrap_remote.sh for how that gets set up)
+Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
 """
 
 import os
