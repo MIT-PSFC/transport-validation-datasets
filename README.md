@@ -154,6 +154,18 @@ te_grad_anchors = [[0.0, 0.0, 0.008], [1.1, 0.0, 0.08], [1.2, 0.0, 0.08], [1.3, 
 The anchors are staged into the fit batches, so changing them needs
 `--clean_fit_state` or a new `--ds_name`.
 
+Both device tables also take `sol_extension`, how the Thomson channels outside the LCFS are placed in rho_tor_norm.
+Inside the LCFS the normalized toroidal flux Phi_N is the integral of q over psi_N.
+q is undefined outside it, so Phi_N continues linearly in psi_N,
+with the slope from psi_N 0.95 to 1 (`"secant"`, the default) or the slope at the LCFS (`"tangent"`).
+The staged positions depend on it, so it is checked like the anchors,
+and it is recorded as the `sol_extension` attribute of the fit files and the stores.
+
+```toml
+[cmod]
+sol_extension = "tangent"
+```
+
 # Shotlists and time windows
 
 `--shotlist_file` takes one of two formats:

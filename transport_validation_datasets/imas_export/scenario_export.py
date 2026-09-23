@@ -61,11 +61,11 @@ import imas
 import numpy as np
 import xarray as xr
 from freeqdsk import geqdsk as freeqdsk_geqdsk
-from scipy.integrate import cumulative_simpson
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import minimize
 
 from transport_validation_datasets.imas_export.geqdsk_writer import write_geqdsk
+from transport_validation_datasets.machine.generic import cumulative_q_integral
 
 
 def _latest_dd_version() -> str:
@@ -320,20 +320,12 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     ts.profiles_1d.q = qpsi
 
     bcentr = float(eqi.bcentre)
-    # dphi/dpsi = sigma_Bp * sigma_rho_theta_phi * q in the e_Bp=1 (11-18)
-    # conventions, and both IMAS targets (11, 17) have
-    # sigma_rho_theta_phi = +1, so phi = sigma_bp * integral(q dpsi), which
-    # lands phi on the sign of B0 (its physical direction) for either field
-    # polarity under either target.
-    # cumulative_simpson needs strictly increasing x, and whether psi rises
-    # or falls axis-to-boundary depends on sign(Ip) (in COCOS 17 it falls
-    # for Ip > 0), so integrate along direction*psi and fold the direction
-    # back into the result: integral(q dpsi) = direction * integral(q d(direction*psi)).
-    phi = np.zeros_like(psi)
-    if len(psi) > 2:
-        direction = 1.0 if psi[-1] >= psi[0] else -1.0
-        integral = cumulative_simpson(y=qpsi, x=direction * psi)
-        phi[1:] = sigma_bp * direction * integral[: len(psi) - 1]
+    # dphi/dpsi = sigma_Bp * sigma_rho_theta_phi * q in the e_Bp=1 (11-18) conventions,
+    # and both IMAS targets (11, 17) have sigma_rho_theta_phi = +1,
+    # so phi = sigma_bp * integral(q dpsi).
+    # That lands phi on the sign of B0, its physical direction, for either field polarity under either target.
+    q_integral = cumulative_q_integral(qpsi)
+    phi = sigma_bp * (psi_boundary - psi_axis) * q_integral
     # rho_tor needs a reference field to carry units of meters; phi and
     # bcentr share a sign, so the ratio is positive. A zero vacuum field is
     # nonphysical, but fall back to the dimensionless sqrt(psi_norm) rather

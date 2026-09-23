@@ -30,7 +30,7 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     default_fit_bounds,
     pack_fit_batch,
     read_batch_anchors,
-    read_batch_fit_mode,
+    read_batch_setting,
     read_batch_shots,
     read_batch_windows,
     unpack_fit_batch,
@@ -41,6 +41,7 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
     plan_batches,
 )
 from transport_validation_datasets.machine.generic import (
+    SOL_EXTENSIONS,
     efit_cocos_from_signs,
     standardize_signal_attrs,
 )
@@ -75,7 +76,8 @@ LOCAL_SHOTS_PER_BATCH = 1
 
 # The radial coordinate every profile is fit on.
 RHO_DEFINITION = (
-    "Normalized outboard midplane minor radius: 0 at the magnetic axis, 1 at the LCFS."
+    "Normalized toroidal flux coordinate rho_tor_norm = sqrt(Phi_N): 0 at the magnetic axis, 1 at the LCFS. "
+    "Outside the LCFS Phi_N continues linearly in psi_N, see the sol_extension attribute."
 )
 
 # Per-slice fit statuses that count as a usable profile, see gp_fitting.batch_io.
@@ -165,12 +167,14 @@ class DeviceSettings:
     The defaults are the same as those in Chilenski 2016.
 
     Attributes:
+        sol_extension: How the Thomson channel mapping continues Phi_N outside the LCFS
         te_value_anchors: Rows of [rho, Te, error].
         te_grad_anchors: Rows of [rho, dTe/drho, error].
         ne_value_anchors: Rows of [rho, ne, error].
         ne_grad_anchors: Rows of [rho, dne/drho, error].
     """
 
+    sol_extension: str = "secant"
     te_value_anchors: list = field(
         default_factory=lambda: [
             [1.1, 0.0, 0.01],
@@ -207,6 +211,10 @@ class DeviceSettings:
     )
 
     def __post_init__(self):
+        if self.sol_extension not in SOL_EXTENSIONS:
+            raise ValueError(
+                f"sol_extension must be one of {SOL_EXTENSIONS}, got {self.sol_extension!r}"
+            )
         for name in (
             "te_value_anchors",
             "te_grad_anchors",
@@ -979,6 +987,7 @@ class DataWorkflow(ABC):
                     scale_per_slice=self.fit_scale_per_slice,
                     bounds=self.fit_bounds,
                     anchors=self.fit_anchors,
+                    sol_extension=self.settings.sol_extension,
                     fit_mode=self.fit_mode,
                 ),
             )
@@ -1021,15 +1030,18 @@ class DataWorkflow(ABC):
             )
 
     def _check_batch(self, in_path: Path, batch_id: str):
-        """Refuse a staged batch built with another fit mode or other anchors than this run's.
+        """Refuse a staged batch built with another fit mode, SOL extension, or anchors than this run's.
 
         Args:
             in_path: The batch input npz.
             batch_id: The batch id, for the message.
         """
         where = f"Batch {batch_id}"
-        staged_mode = read_batch_fit_mode(in_path)
+        staged_mode = read_batch_setting(in_path, "fit_mode")
         self._check_run_setting("fit mode", staged_mode, self.fit_mode, where)
+        staged_extension = read_batch_setting(in_path, "sol_extension")
+        run_extension = self.settings.sol_extension
+        self._check_run_setting("SOL extension", staged_extension, run_extension, where)
         staged_anchors = read_batch_anchors(in_path)
         staged_anchors_json = _anchors_json(staged_anchors)
         run_anchors_json = _anchors_json(self.fit_anchors)
@@ -1040,10 +1052,10 @@ class DataWorkflow(ABC):
 
         Every batch input in fit_batches_dir is checked,
         because write_fit_results and the stack stage sweep them all:
-        its fit mode and anchors must be this run's,
+        its fit mode, SOL extension, and anchors must be this run's,
         and in a windowed run every shot must have the same windows it was staged with.
         An edited shotlist stops here, before any fit runs or any result is written.
-        A batch in another mode, with other anchors or windows,
+        A batch in another mode, with another SOL extension, other anchors or windows,
         or holding a shot the shotlist no longer lists raises ValueError
         (_check_batch, _check_windows_match).
         """
@@ -1325,6 +1337,7 @@ class DataWorkflow(ABC):
         attrs = {
             "fit_method": self.fit_method,
             "fit_mode": self.fit_mode,
+            "sol_extension": self.settings.sol_extension,
             "rho_definition": RHO_DEFINITION,
             "dataset_name": self.ds_name,
         }
@@ -1648,8 +1661,8 @@ class DataWorkflow(ABC):
         so this stays cheap no matter how many shots the dataset has.
         Also the place every fit file is checked against this run, up front,
         since an error raised while a shot is being stacked would only skip that shot:
-        its fit mode must be this run's and, in a windowed run, its windows the
-        shotlist's, else ValueError (_check_run_setting, _check_windows_match).
+        its fit mode and SOL extension must be this run's and, in a windowed run,
+        its windows the shotlist's, else ValueError (_check_run_setting, _check_windows_match).
 
         Args:
             shots: Shots that will go into the internal dataset.
@@ -1667,6 +1680,12 @@ class DataWorkflow(ABC):
                     "fit mode",
                     ds_fit.attrs["fit_mode"],
                     self.fit_mode,
+                    f"The fit result file of shot {shot}",
+                )
+                self._check_run_setting(
+                    "SOL extension",
+                    ds_fit.attrs["sol_extension"],
+                    self.settings.sol_extension,
                     f"The fit result file of shot {shot}",
                 )
                 windows = _fit_windows(ds_fit)
@@ -1948,6 +1967,7 @@ class DataWorkflow(ABC):
             "dataset_name": self.ds_name,
             "fit_method": self.fit_method,
             "fit_mode": fit_mode,
+            "sol_extension": ds_fit.attrs["sol_extension"],
             "rho_definition": RHO_DEFINITION,
             "time_definition": time_definition,
         }
