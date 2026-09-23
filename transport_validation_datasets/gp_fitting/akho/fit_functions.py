@@ -1,15 +1,4 @@
-"""Vendored analytic mtanh/cubic pre-fit stage of the akho method.
-
-Vendored (a second time) from `cmod_to_imas/profile_fit_vendored.py`, which
-itself was vendored from the small `tokamak_profile_fitting` slice
-`fit_cmod.py` actually needed (`fit.py`, `profiles/fit_functions.py`,
-`utils.py`) -- that package is not pip-installable and only reachable via a
-`sys.path` hack into a sibling repo, so vendoring avoids that fragile
-dependency entirely (see `profile_fit_vendored.py`'s own docstring for the
-original provenance). `apply_2pt_shift` was dropped: it implements the
-two-point-model Te-separatrix shift, which needs an external per-shot
-calibration target that `FitBatch`/`ShotFitInput` do not carry (see
-worker_akho.py's module docstring) -- unused here, so not vendored.
+"""Analytic mtanh and cubic pre-fit of the akho method.
 
 Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
 """
@@ -65,17 +54,14 @@ def Osborne_Tanh_cubic(x, c0, c1, c2, c3, c4, c5, c6):
 def Osborne_Tanh_cubic_zero_axis_slope(x, c0, c1, c2, c3, c5, c6):
     """Osborne tanh (cubic inboard, flat SOL) with zero slope at the axis.
 
-    Same family as Osborne_Tanh_cubic, but the linear inboard term c4 is not
-    free: it is eliminated in closed form so that df/dx == 0 holds exactly at
-    x=0 -- the magnetic axis boundary condition CubicZeroAxisSlope enforces
-    for the cubic fallback. Setting the axis derivative to zero at
-    z0 = 2*c0/c1 gives a condition linear in c4,
+    Osborne_Tanh_cubic with the linear inboard term c4 solved for rather than fit,
+    so that df/dx = 0 exactly at the axis, as CubicZeroAxisSlope also holds.
+    With z0 = 2*c0/c1 and u = exp(-2*z0) the condition is linear in c4:
 
-        P1'(z0)*(1+u) + (2*P1(z0) + 2)*u = 0,    u = exp(-2*z0),
+        P1'(z0)*(1+u) + (2*P1(z0) + 2)*u = 0
 
-    solved for c4 below. For realistic pedestal parameters u is ~1e-6 or
-    smaller, so this is effectively P1'(z0) = 0 (the inboard polynomial's
-    slope in z vanishes at the axis).
+    For realistic pedestals u is ~1e-6 or smaller,
+    so this is effectively P1'(z0) = 0.
 
     c0: pedestal centre, c1: full width, c2: top, c3: bottom,
     c5: quadratic, c6: cubic inboard terms.
@@ -93,11 +79,9 @@ def Osborne_Tanh_cubic_zero_axis_slope(x, c0, c1, c2, c3, c5, c6):
 
 
 def CubicZeroAxisSlope(x, c0, c2, c3):
-    """Cubic polynomial with its linear term dropped.
+    """Cubic polynomial with no linear term, so its slope at the axis is exactly zero.
 
-    f'(0) == 0 identically for any c2/c3, enforcing zero profile gradient
-    at the magnetic axis (x=0) exactly, without a bounded/constrained
-    optimizer.
+    c0: axis value, c2: quadratic, c3: cubic term.
 
     Returns:
         The polynomial evaluated at `x`.
@@ -138,19 +122,13 @@ def Osborne_linear_initial_guesses(rho_edge, values_edge, n_params=7):
 
 
 def evaluate_with_gradient(fit_func, popt, x, h=1.0e-4):
-    """Evaluate a vendored fit function and its central-difference derivative.
+    """Evaluate an analytic fit function and its central-difference derivative.
 
-    Used to reconstruct the analytic mean fit's own contribution to the total
-    profile gradient/value: the mkgp GP stage (gp.py) only fits the
-    *residual* against this mean, so its own posterior mean/derivative do not
-    include the mean's own value/slope -- worker_akho.py's `_fit_variable`
-    stacks this on top of the GP-residual result. No closed-form derivative
-    is used (rather than deriving one per fit function) since both functions
-    `fit_analytic_profile` can pick between need one and a single
-    finite-difference helper covers them.
+    worker_akho.py adds both back onto the GP residual fit, which never saw the analytic mean.
+    One finite-difference helper covers both candidate functions.
 
     Args:
-        fit_func: One of this module's Osborne_Tanh_*/CubicZeroAxisSlope functions.
+        fit_func: Osborne_Tanh_cubic_zero_axis_slope or CubicZeroAxisSlope.
         popt: Its fitted parameters (from fit_analytic_profile).
         x: Points to evaluate at.
         h: Central-difference step.
@@ -232,7 +210,7 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
             ],
         ]
     guesses = [np.array(g) for g in hardcoded]
-    # The edge-based guess sees the value anchors too, like the original's SOL zeros
+    # The edge-based guess sees the value anchors too
     try:
         edge_sel = rho > edge_thresh
         auto = Osborne_linear_initial_guesses(rho[edge_sel], values[edge_sel], n_params)

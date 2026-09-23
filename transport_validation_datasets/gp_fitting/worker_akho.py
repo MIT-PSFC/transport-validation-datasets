@@ -1,49 +1,14 @@
-"""GP profile fitting: analytic mtanh/cubic pre-fit + mkgp GP-residual correction.
+"""GP profile fitting: an analytic mtanh or cubic pre-fit, then a GP on the residual.
 
-Each (shot, time slice) is fit independently, te and ne each on their own
-(unlike worker_zk.py, this method does not tie the Te pedestal location to
-ne's -- see below). Each variable's fit runs the akho.fit_functions analytic
-pre-fit (an Osborne-tanh/cubic curve_fit, picking whichever gets the
-better chi-squared), then GP-fits the residual between the data and that analytic
-curve with a rational-quadratic kernel (akho.gp), and stacks the two back
-together for both the fitted value and its derivative (see `_fit_variable`).
+Each (shot, time slice) is fit independently, and Te and ne are independelty fit as well.
+A variable's fit runs the analytic pre-fit (akho/fit_functions.py),
+fits the residual between the data and that curve with a rational-quadratic GP (akho/gp.py),
+and adds the two back together, value and derivative (see _fit_variable).
+This method never repairs or culls a slice.
 
-Ported from `cmod_to_imas/fit_cmod.py`'s `pre_fit_te`/`pre_fit_ne` (this
-project's cmod_to_imas directory), adapted to consume/produce this package's
-`SliceTask`/`VariableFit` instead of raw MDSplus-shaped inputs -- the raw
-Thomson data fetch/staging those functions also did is not ported, since
-`transport_validation_datasets.machine.cmod.cmod_dataset` already does that
-job (via disruption_py) independently.
-
-Two things `fit_cmod.py`'s original algorithm did are intentionally left out,
-since they need external per-shot calibration data that `FitBatch`/
-`ShotFitInput` do not carry today: the two-point-model Te-separatrix shift
-(`apply_2pt_shift`, which also ties ne's x-shift to Te's -- the reason te/ne
-fit fully independently here, unlike in fit_cmod.py) and TCI-based ne
-recalibration (`tci_calibration.scale_core_ne_to_tci`). Both would need a
-`FitBatch`/`FitBounds` schema extension to carry the calibration targets, not
-implemented here.
-
-STATUS_REPAIRED/STATUS_CULLED (worker_zk.py's nonphysical-peak repair
-heuristics, see zk/quality.py) have no counterpart in fit_cmod.py's original
-algorithm and are unused by this method -- batch_io.py's status vocabulary is
-explicitly method-defined, so this is a deliberate choice, not a gap.
-
-Optional coordinate substitution: `FitBatch.fit_coordinate` (default "rho")
-lets a batch be fit in `psi_norm`, `sqrt_psi_norm`, `phi_norm`, or
-`sqrt_phi_norm` instead -- see `_resolve_fit_coordinate`, called once per
-slice at the top of `_fit_slice`, before either variable's analytic pre-fit/
-GP-residual stages run. Unlike worker_zk.py's rho-tuned pipeline, this
-method's analytic bounds/initial guesses/edge_thresh in fit_functions.py were
-themselves ported from `fit_cmod.py` already tuned against psi_norm, not
-rho (see fit_functions.py's own history) -- so no bound recalibration is
-needed for that coordinate specifically; the other three are not recalibrated
-either, by explicit direction, since psi_norm was already the intended one.
-`x_star` is not re-derived here: it is staged directly in `fit_coordinate`'s
-units (a batch fit in psi_norm stages an x_star grid of psi_norm values, not
-a per-slice transform of a shared rho grid, since the rho<->other-coordinate
-mapping is equilibrium/time-slice dependent and there is no single shared
-grid across slices to transform).
+FitBatch.fit_coordinate can substitute psi_norm, sqrt_psi_norm, phi_norm or sqrt_phi_norm for rho
+(see _resolve_fit_coordinate).
+x_star is staged in the fit coordinate's units.
 
 Runs standalone on the cluster like so:
 `python -m transport_validation_datasets.gp_fitting.worker_akho input.npz output.npz --num-workers N`
@@ -66,7 +31,9 @@ from transport_validation_datasets.gp_fitting.akho.fit_functions import (  # noq
     evaluate_with_gradient,
     fit_analytic_profile,
 )
-from transport_validation_datasets.gp_fitting.akho.gp import (  # noqa: F401 -- re-exported: workflow.py reads it off this module; noqa: E402
+
+# HYP_NAMES is re-exported, workflow.py reads it off the worker module
+from transport_validation_datasets.gp_fitting.akho.gp import (  # noqa: E402, F401
     HYP_NAMES,
     fit_residual,
 )
@@ -95,50 +62,28 @@ from transport_validation_datasets.gp_fitting.worker_base import (  # noqa: E402
 # The GP stage sees them at full weight.
 _PREFIT_ANCHOR_ERR_FACTOR = 5.0
 
-# fit_coordinate values coordinates_from_psi_norm can resolve, beyond the
-# "rho" default (task.x, staged separately -- see batch_io.ShotFitInput.x).
+# fit_coordinate values other than "rho" that coordinates_from_psi_norm resolves
 _ALT_COORDINATES = SUBSTITUTABLE_COORDINATES
 
 
 def _resolve_fit_coordinate(task: SliceTask) -> np.ndarray:
-    """Optional top-of-method step: substitute the channel radial coordinate.
+    """Get the slice's channel positions in the batch's fit coordinate.
 
-    Default (`task.fit_coordinate == "rho"`) is a no-op returning `task.x`
-    unchanged -- the calibrated default path. Any other coordinate pivots
-    through `task.psi_norm` (see `ShotFitInput`/`SliceTask`) via
-    `gp_fitting.coordinates.substitute_channel_positions`, the shared
-    implementation the fit plots also draw the channel data with, so what
-    is fit and what is plotted cannot drift apart.
-
-    A slice with `task.qpsi` missing/NaN (phi_norm/sqrt_phi_norm only, e.g.
-    MAST's best-effort qpsi) is not special-cased here: `coordinates_from_psi_norm`
-    already returns an all-NaN column for it, which `_fit_variable`'s
-    existing `min_points` gate naturally turns into STATUS_SKIPPED for that
-    slice -- the same graceful-degradation path a slice with too few valid
-    rho channels already takes.
-
-    A channel with a finite `task.x` but NaN `task.psi_norm` keeps its
-    nominal `task.x` position instead: real channels always carry psi_norm
-    wherever they carry a finite x (rho is derived from it at staging), so
-    this is exactly the synthetic boundary-condition channels injected in
-    fit-coordinate units (C-Mod's SOL anchors at 1.05/1.08, see
-    cmod_dataset.py's `_append_sol_anchor_points`) -- their positions mean
-    "just outside the LCFS" in whatever coordinate the fit runs in, and
-    keeping them nominal also keeps fit_functions.py's Te pedestal gate
-    (which identifies the anchors by their exact position) working
-    unchanged in every coordinate.
+    "rho" returns task.x unchanged.
+    Any other coordinate pivots through task.psi_norm
+    with coordinates.substitute_channel_positions, which the fit plots also use.
+    A phi coordinate on a slice without finite qpsi gives NaN positions,
+    and the min_points gate skips the slice.
 
     Args:
         task: The slice's fit task.
 
     Returns:
-        (n_ch,) channel positions in `task.fit_coordinate`'s units.
+        (n_ch,) channel positions in task.fit_coordinate's units.
 
     Raises:
-        ValueError: `fit_coordinate` is not "rho" and `task.psi_norm` was
-            never staged (a batch/method configuration mismatch, not a
-            per-slice data gap -- see `batch_io.FitBatch.fit_coordinate`),
-            or `fit_coordinate` is not a name this method recognizes.
+        ValueError: If task.psi_norm was never staged for a coordinate other than "rho",
+            or the coordinate is unknown.
     """  # noqa: DOC502 -- the ValueError propagates from substitute_channel_positions
     return substitute_channel_positions(
         task.x, task.psi_norm, task.qpsi, task.fit_coordinate
@@ -171,21 +116,17 @@ def _fit_variable(
     """Fit one variable of one time slice: analytic pre-fit + GP-residual correction.
 
     Args:
-        x: Channel positions, in whatever coordinate the slice is being fit
-            in (rho by default; see `_resolve_fit_coordinate` for the
-            optional substitution).
+        x: Channel positions in the fit coordinate.
         y: Channel values, NaN where invalid.
         err: Channel errors.
         x_star: Target grid, same coordinate as `x`.
         min_points: Minimum valid channels to attempt a fit.
-        variable: 'te' or 'ne' (selects the pre-fit bounds, initial guesses,
-            and the Te mtanh width cap).
+        variable: 'te' or 'ne', which selects the pre-fit bounds and initial guesses.
         anchors: The variable's anchors, in the data's own units.
 
     Returns:
-        The variable's fit with its STATUS_* code; arrays are None for
-        skipped and failed slices (this method never repairs/culls, see
-        module docstring).
+        The variable's fit and its STATUS_* code.
+        The arrays are None for a skipped or failed slice.
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -250,12 +191,8 @@ def _fit_variable(
     if resid is None:
         return _no_fit(STATUS_FAILED)
 
-    # Stack the GP-residual fit back onto the analytic mean for both the
-    # value and its derivative. The GP only ever saw the residual, so its own
-    # posterior mean/derivative do not include the analytic mean's own
-    # value/slope. The error terms are the GP-residual's alone: the analytic
-    # mean's own parameter uncertainty (from curve_fit's covariance) is
-    # treated as zero for now, per explicit direction.
+    # The GP saw only the residual, so the analytic mean goes back onto its value and derivative.
+    # The errors are the GP's alone, the analytic mean's parameter uncertainty is treated as zero.
     fit = scale * (mean_x_star + resid.fit)
     std = scale * resid.std
     grad = scale * (mean_grad_x_star + resid.grad)
@@ -273,9 +210,7 @@ def _fit_variable(
 def _fit_slice(task: SliceTask) -> SliceResult:
     """Fit Te and ne for one (shot, time slice), independently.
 
-    Resolves the fit coordinate once (te and ne share the same channel
-    positions) via `_resolve_fit_coordinate`, then fits both variables
-    against it.
+    Te and ne share the channel positions, so the fit coordinate is resolved once.
 
     Args:
         task: The slice's channel data and fit settings.
@@ -301,16 +236,14 @@ def fit_batch(
 ) -> dict[int, ShotFitOutput]:
     """Fit every (shot, time slice) in the batch with the akho method.
 
-    Slices are fit serially (num_workers <= 1) or across worker processes;
-    both fit stages (curve_fit and mkgp) are single-threaded, so parallelism
-    comes only from the slice-level pool (BLAS threads are pinned at module
-    top).
+    Slices are fit serially (num_workers <= 1) or across worker processes.
+    curve_fit and mkgp are single-threaded,
+    so the slice pool is the only parallelism (BLAS threads are pinned at module top).
 
     Args:
         batch: Staged batch inputs (see batch_io.FitBatch).
         num_workers: Slice-level worker processes.
-        max_slices_per_shot: If set, only fit the first N time slices of each
-            shot (debug aid).
+        max_slices_per_shot: If set, fit only the first N time slices of each shot, for debugging.
 
     Returns:
         Fitted profiles keyed by shot number.
@@ -327,7 +260,7 @@ def main(argv: list[str] | None = None):
     """Run the akho worker CLI: input.npz output.npz --num-workers N.
 
     Args:
-        argv: Command-line arguments; None uses sys.argv.
+        argv: Command-line arguments, None uses sys.argv.
     """
     run_worker_cli(fit_batch, prog="worker_akho", argv=argv)
 

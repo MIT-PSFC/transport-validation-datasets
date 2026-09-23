@@ -156,10 +156,9 @@ class CmodEfitMethods:
         z_grid = np.atleast_2d(
             params.mds_conn.get_data(r"\efit_g_eqdsk:zgrid", tree_name="_efit_tree")
         )[0]
-        # RCENTR: the fixed device radius the vacuum toroidal field (bcentr)
-        # is quoted at (~0.66 m for C-Mod) -- a real machine constant, not
-        # the midpoint of the computational R grid. Stored in the tree under
-        # the name RZERO; static like the grid arrays, collapse to a scalar.
+        # RCENTR is the radius bcentr is quoted at (~0.66 m on C-Mod), stored in the tree as RZERO.
+        # It is a machine constant, not the midpoint of the R grid.
+        # Static like the grid arrays, so collapse it to a scalar.
         rcentr = float(
             np.atleast_1d(
                 params.mds_conn.get_data(r"\efit_g_eqdsk:rzero", tree_name="_efit_tree")

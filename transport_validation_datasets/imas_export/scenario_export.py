@@ -119,10 +119,8 @@ def _sigma_bp(cocos: int) -> int:
     return -1 if cocos % 10 in (3, 4, 7, 8) else 1
 
 
-# core_profiles' one ion species (see build_core_profiles): deuterium, with
-# the same nominal mass number (2.0, not 2.014) and nuclear charge
-# fusio.utils.plasma_tools.define_ion_species("D") used to supply, so the
-# written output is unchanged.
+# core_profiles' one ion species (see build_core_profiles):
+# deuterium, with the nominal mass number 2.0 rather than 2.014.
 _MAIN_ION_NAME = "D"
 _MAIN_ION_A = 2.0
 _MAIN_ION_Z_N = 1
@@ -257,9 +255,7 @@ def _diverted(eqi):
 
 
 # ---------------------------------------------------------------------------
-# equilibrium IDS (ported from export_scenario_to_imas.py's
-# _build_equilibrium, split into a per-time-slice populate step so a
-# multi-time-slice equilibrium IDS can be built by looping it)
+# equilibrium IDS, populated one time slice at a time
 # ---------------------------------------------------------------------------
 
 
