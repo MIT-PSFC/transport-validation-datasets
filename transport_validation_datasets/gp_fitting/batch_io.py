@@ -95,9 +95,10 @@ class FitAnchors:
 class ShotFitInput:
     """Cleaned Thomson channel data for one shot, ready for GP fitting.
 
-    All channel arrays are (n_t, n_ch). x is the radial coordinate of each
-    channel (normalized minor radius rho), shared between te and ne since both
-    come from the same channels. Invalid points are NaN.
+    All channel arrays are (n_t, n_ch).
+    x is the radial coordinate of each channel (rho_tor_norm),
+    shared between te and ne since both come from the same channels.
+    Invalid points are NaN.
 
     windows is the shot's (n_w, 2) time window bounds [s] and window_index
     the (n_t,) window each row belongs to (see transport_validation_datasets.windows).
@@ -144,6 +145,8 @@ class FitBatch:
         scale_per_slice: Normalize each slice by its max before fitting.
         bounds: Per-variable fit bound knobs, keyed by FIT_VARIABLES.
         anchors: Per-variable virtual observations, keyed by FIT_VARIABLES.
+        sol_extension: How the staged positions continue outside the LCFS (machine.generic.SOL_EXTENSIONS).
+            Workers never read it, it only keeps a resumed run from mixing extensions.
         fit_mode: One of the FIT_MODE_* values, how the rows were built.
     """
 
@@ -153,6 +156,7 @@ class FitBatch:
     scale_per_slice: bool
     bounds: dict[str, FitBounds]
     anchors: dict[str, FitAnchors]
+    sol_extension: str
     fit_mode: str = FIT_MODE_SAMPLE
 
 
@@ -223,6 +227,7 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         "min_points": np.int64(batch.min_points),
         "scale_per_slice": np.bool_(batch.scale_per_slice),
         "fit_mode": np.str_(batch.fit_mode),
+        "sol_extension": np.str_(batch.sol_extension),
     }
     for var in FIT_VARIABLES:
         for f in fields(FitBounds):
@@ -289,6 +294,7 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
             scale_per_slice=bool(data["scale_per_slice"]),
             bounds=bounds,
             anchors=anchors,
+            sol_extension=str(data["sol_extension"].item()),
             fit_mode=str(data["fit_mode"].item()),
         )
 
@@ -352,17 +358,18 @@ def read_batch_windows(path: Path | str) -> dict[int, np.ndarray]:
         return {shot: data[f"{shot}:windows"] for shot in data["shots"].tolist()}
 
 
-def read_batch_fit_mode(path: Path | str) -> str:
-    """Read only the fit mode from a batch input npz (cheap).
+def read_batch_setting(path: Path | str, name: str) -> str:
+    """Read only one string setting from a batch input npz (cheap).
 
     Args:
         path: Batch input npz path.
+        name: The FitBatch field, "fit_mode" or "sol_extension".
 
     Returns:
-        One of the FIT_MODE_* values.
+        The setting's value.
     """
     with np.load(path) as data:
-        return str(data["fit_mode"].item())
+        return str(data[name].item())
 
 
 def pack_fit_results(

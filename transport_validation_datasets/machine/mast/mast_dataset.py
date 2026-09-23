@@ -26,7 +26,7 @@ from transport_validation_datasets.machine.generic import (
     efit_cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
-    map_ts_channels_to_rho,
+    map_ts_channels_to_rho_tor_norm,
     snap_to_grid,
     ts_channel_fit_rows,
 )
@@ -67,19 +67,9 @@ SHOT_WINDOW_MIN_IP = 100e3
 # Samples of the causal boxcar smoothing dIp/dt in the ohmic power calculation
 OHMIC_SMOOTHING_SAMPLES = 10
 
-# Channels this far outside the separatrix sit in the far SOL, where mapping
-# through a magnetics-only reconstruction is not trustworthy.
-MAX_FIT_RHO = 1.05
-
-# Equilibrium fields the TS channel mapping reads, see _equilibrium_at_ts_times.
-TS_MAPPING_EQUILIBRIUM_FIELDS = ("psirz", "simagx", "sibdry", "zmagx", "rmagx")
-
-# How far a TS slice may reach for the reconstruction it is mapped through [s].
-# EFIT runs on a 5 ms grid and the Thomson laser fires every ~4.2 ms, so the two
-# almost never land on the same grid time: the offset is up to half an EFIT step
-# plus the half millisecond the 1 kHz snap can add. MAST equilibria move slowly
-# enough over 3 ms that selecting the nearest reconstruction is good enough.
-TS_EQUILIBRIUM_TIME_TOL = 3e-3
+# Channels this far outside the separatrix sit in the far SOL,
+# where mapping through a magnetics-only reconstruction is not trustworthy.
+MAX_FIT_RHO = 1.2
 
 # level 2 equilibrium signal -> standardized name.
 # All 0D, interpolated onto the 1 kHz timebase.
@@ -446,9 +436,8 @@ class MASTDataWorkflow(DataWorkflow):
         interpolated. The equilibrium is written as a full GEQDSK, so only the
         ~1 grid time in 5 that carries an EFIT slice has one (the rest are NaN,
         as are the trailing slots of the NaN-padded boundary contour).
-        Thomson slices land on their own ~4.2 ms laser cadence, which is why
-        the fit staging has to reach for a nearby reconstruction
-        (see _equilibrium_at_ts_times).
+        Thomson slices land on their own ~4.2 ms laser cadence,
+        so the fit staging maps each through the nearest reconstruction.
 
         Args:
             shot: Shot number to read.
@@ -525,10 +514,9 @@ class MASTDataWorkflow(DataWorkflow):
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
         """Build GP fit inputs for one shot from its unprocessed dataset.
 
-        1: Give every TS slice the nearest reconstruction to map through
-        2: Map the TS channels onto rho through that flux map
-        3: Convert to the fit units (Te [keV], ne [1e20 m^-3])
-        4: Drop the channels outside the fittable rho range
+        1: Map the TS channels onto rho_tor_norm through the nearest reconstruction
+        2: Convert to the fit units (Te [keV], ne [1e20 m^-3])
+        3: Drop the channels outside the fittable range
 
         BOTH sides of the chord are fit. The inboard side maps onto the same
         rho through the reconstruction's interior flux, which a magnetics-only
@@ -547,8 +535,10 @@ class MASTDataWorkflow(DataWorkflow):
         Returns:
             The fit input, or None when the shot has nothing fittable.
         """
-        ds_shot = _equilibrium_at_ts_times(ds.squeeze("shot", drop=True))
-        ts_times, rho = map_ts_channels_to_rho(ds_shot)
+        ds_shot = ds.squeeze("shot", drop=True)
+        ts_times, rho = map_ts_channels_to_rho_tor_norm(
+            ds_shot, self.settings.sol_extension
+        )
         if ts_times.size == 0:
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None
@@ -556,7 +546,7 @@ class MASTDataWorkflow(DataWorkflow):
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
 
         with np.errstate(invalid="ignore"):
-            rho = np.where((rho >= 0.0) & (rho <= MAX_FIT_RHO), rho, np.nan)
+            rho = np.where(rho <= MAX_FIT_RHO, rho, np.nan)
 
         fit_input = ShotFitInput(
             x=rho, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err, time=ts_times
@@ -565,38 +555,6 @@ class MASTDataWorkflow(DataWorkflow):
             logger.warning(f"Shot {shot}: no finite (rho, te, ne) channel data to fit")
             return None
         return fit_input
-
-
-def _equilibrium_at_ts_times(ds_shot: xr.Dataset) -> xr.Dataset:
-    """Put the nearest EFIT reconstruction on every grid time, for the mapping.
-
-    The unprocessed dataset carries each reconstruction only at the grid time it
-    was reconstructed on, which is the honest way to store it, but it leaves the
-    Thomson slices with nothing to map through: EFIT is on a 5 ms grid and the
-    laser fires every ~4.2 ms (see TS_EQUILIBRIUM_TIME_TOL). This copies the
-    fields the mapping reads onto every grid time within that window of a real
-    reconstruction, and only for the mapping, the stored dataset is untouched.
-
-    Args:
-        ds_shot: One shot's unprocessed dataset, with the shot dim squeezed out.
-
-    Returns:
-        The same dataset with the mapping's equilibrium fields nearest-filled,
-        still NaN at grid times with no reconstruction inside the window.
-    """
-    has_equilibrium = np.isfinite(np.asarray(ds_shot["simagx"].values, dtype=float))
-    if not has_equilibrium.any():
-        return ds_shot
-
-    grid_times = ds_shot["time"].values
-    nearest = (
-        ds_shot[list(TS_MAPPING_EQUILIBRIUM_FIELDS)]
-        .isel(time=has_equilibrium)
-        .reindex(time=grid_times, method="nearest", tolerance=TS_EQUILIBRIUM_TIME_TOL)
-    )
-    return ds_shot.assign(
-        {name: nearest[name] for name in TS_MAPPING_EQUILIBRIUM_FIELDS}
-    )
 
 
 def _s3():

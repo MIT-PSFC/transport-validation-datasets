@@ -18,7 +18,7 @@ from transport_validation_datasets.machine.cmod.dispy_methods import (
 )
 from transport_validation_datasets.machine.generic import (
     make_uniform_1kHz_timebase,
-    map_ts_channels_to_rho,
+    map_ts_channels_to_rho_tor_norm,
     snap_to_grid,
     ts_channel_fit_rows,
 )
@@ -263,7 +263,7 @@ class CModDataWorkflow(DataWorkflow):
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
         """Build GP fit inputs for one shot from its unprocessed dataset.
 
-        1: Maps the TS channels onto rho through magnetics-only EFIT
+        1: Maps the TS channels onto rho_tor_norm through magnetics-only EFIT
         2: convert to the fit units (Te [keV], ne [1e20 m^-3])
         3: C-Mod channel quality screens and error floors, calibrated in those units
         4: TODO: optionally correct density with interferometry
@@ -275,7 +275,7 @@ class CModDataWorkflow(DataWorkflow):
         Returns:
             The fit input, or None when the shot has nothing fittable.
         """
-        ts_times, rho = map_ts_channels_to_rho(ds)
+        ts_times, rho = map_ts_channels_to_rho_tor_norm(ds, self.settings.sol_extension)
         if ts_times.size == 0:
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None

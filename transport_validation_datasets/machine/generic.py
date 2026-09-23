@@ -3,6 +3,7 @@ import re
 import numpy as np
 import xarray as xr
 from loguru import logger
+from scipy.integrate import cumulative_simpson
 from scipy.interpolate import RegularGridInterpolator
 
 IMAS_DOCS_URL = "https://imas-data-dictionary.readthedocs.io/en/latest/generated/ids"
@@ -175,6 +176,12 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
 # Above 1 to tolerate clock jitter, low enough that nothing is borrowed across a real gap.
 # The mapping counterpart of workflow.MAX_HOLD_PERIODS, separate to avoid a circular import.
 EQ_MATCH_MAX_PERIODS = 1.5
+
+# How Phi_N continues past the LCFS, see rho_tor_norm_from_psi_n.
+SOL_EXTENSIONS = ("secant", "tangent")
+
+# The secant SOL extension takes its slope over psi_N from here to the LCFS.
+SECANT_PSI_N = 0.95
 
 
 def make_uniform_1kHz_timebase(max_time: float) -> np.ndarray:
@@ -373,94 +380,90 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     )
 
 
-def _lcfs_crossing_radius(
-    r_from_axis: np.ndarray, psi_n_from_axis: np.ndarray
-) -> float:
-    """Find the midplane radius where psi_n first crosses 1, walking outward.
+def cumulative_q_integral(qpsi: np.ndarray) -> np.ndarray:
+    """Integrate the safety factor over normalized poloidal flux, outward from the axis.
 
-    Both arrays must be ordered starting at the axis and moving outward.
-
-    Args:
-        r_from_axis: Midplane radii, axis outward [m].
-        psi_n_from_axis: Normalized poloidal flux at those radii.
-
-    Returns:
-        The linearly interpolated crossing radius [m], or NaN if psi_n never reaches 1.
-    """
-    above = psi_n_from_axis >= 1.0
-    if not above.any():
-        return np.nan
-    idx = int(np.argmax(above))
-    if idx == 0:
-        return float(r_from_axis[0])
-    r0, r1 = float(r_from_axis[idx - 1]), float(r_from_axis[idx])
-    p0, p1 = float(psi_n_from_axis[idx - 1]), float(psi_n_from_axis[idx])
-    if p1 == p0:
-        return r1
-    r_cross = r0 + (1.0 - p0) * (r1 - r0) / (p1 - p0)
-    return r_cross
-
-
-def _refine_axis_radius(
-    r_grid: np.ndarray, psi_n_mid: np.ndarray, i_axis: int
-) -> float:
-    """Refine the magnetic axis radius from the midplane psi_n minimum.
-
-    When defining rho = (r - r_axis) / (r_lcfs - r_axis), must know where the axis is.
-    EFIT grid can be coarse (a few cm), so may get rho errors ~ 5% (worst in the core).
-    Here, use a simple 3-point parabola fit to refine the axis radius.
+    The toroidal flux is phi = integral q dpsi,
+    so this is phi in units of (psi_boundary - psi_axis),
+    and dividing it by its last value gives the normalized toroidal flux Phi_N.
 
     Args:
-        r_grid: Midplane radii [m].
-        psi_n_mid: Normalized poloidal flux along the midplane.
-        i_axis: Index of the psi_n_mid minimum.
+        qpsi: (..., n_psi) safety factor on the uniform psi_N grid from 0 to 1.
 
     Returns:
-        The refined axis radius [m].
+        (..., n_psi) integral of q dpsi_N from 0 to each grid point, starting at 0.
     """
-    r_axis = float(r_grid[i_axis])
-    if 0 < i_axis < len(r_grid) - 1:
-        p_m = psi_n_mid[i_axis - 1]
-        p_0 = psi_n_mid[i_axis]
-        p_p = psi_n_mid[i_axis + 1]
-        curv = p_m - 2 * p_0 + p_p
-        if curv > 0:
-            r_axis += (
-                0.5
-                * (p_m - p_p)
-                / curv
-                * float(r_grid[i_axis + 1] - r_grid[i_axis - 1])
-                / 2.0
-            )
-    return r_axis
+    psi_n_grid = np.linspace(0.0, 1.0, qpsi.shape[-1])
+    return cumulative_simpson(qpsi, x=psi_n_grid, initial=0.0)
 
 
-def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
-    """Map TS channel (R, Z) positions onto normalized minor radius per slice.
+def rho_tor_norm_from_psi_n(
+    psi_n: np.ndarray, qpsi: np.ndarray, sol_extension: str
+) -> np.ndarray:
+    """Map normalized poloidal flux onto rho_tor_norm through one equilibrium's q profile.
 
-    rho is the normalized minor radius (0 = axis, 1 = LCFS),
-    each channel's psi_n (bilinear interpolation of the equilibrium's psirz at the channel position)
-    is inverted through the midplane psi_n profile at the magnetic axis height to the outboard
-    midplane radius, then normalized by the axis-to-LCFS distance.
-    Choice to use outboard midplane is arbitrary, could use any line from magnetic axis to the LCFS.
-    This one is convenient though because it is one dimension (R) and increases with psi.
+    rho_tor_norm = sqrt(Phi_N), with Phi_N the q integral normalized to 1 at the LCFS.
+    Inside the LCFS Phi_N is interpolated on the qpsi grid.
+    q is undefined beyond it, so there Phi_N continues linearly in psi_N,
+    with the secant slope (1 - Phi_N(SECANT_PSI_N)) / (1 - SECANT_PSI_N)
+    or the tangent slope q(1) / integral_0^1 q dpsi_N.
+    psi_N below 0, which interpolation can give next to the axis, maps to 0.
+
+    Args:
+        psi_n: Normalized poloidal flux, any shape, NaN where unknown.
+        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
+        sol_extension: One of SOL_EXTENSIONS.
+
+    Returns:
+        rho_tor_norm shaped like psi_n, NaN where psi_n is.
+
+    Raises:
+        ValueError: If sol_extension is not one of SOL_EXTENSIONS.
+    """
+    q_integral = cumulative_q_integral(qpsi)
+    phi_n_grid = q_integral / q_integral[-1]
+    psi_n_grid = np.linspace(0.0, 1.0, qpsi.size)
+    if sol_extension == "secant":
+        phi_n_start = np.interp(SECANT_PSI_N, psi_n_grid, phi_n_grid)
+        sol_slope = (1.0 - phi_n_start) / (1.0 - SECANT_PSI_N)
+    elif sol_extension == "tangent":
+        sol_slope = qpsi[-1] / q_integral[-1]
+    else:
+        raise ValueError(
+            f"sol_extension must be one of {SOL_EXTENSIONS}, got {sol_extension!r}"
+        )
+    psi_n_clipped = np.maximum(psi_n, 0.0)
+    phi_n_inside = np.interp(psi_n_clipped, psi_n_grid, phi_n_grid)
+    phi_n_outside = 1.0 + sol_slope * (psi_n_clipped - 1.0)
+    with np.errstate(invalid="ignore"):
+        phi_n = np.where(psi_n_clipped <= 1.0, phi_n_inside, phi_n_outside)
+    return np.sqrt(phi_n)
+
+
+def map_ts_channels_to_rho_tor_norm(
+    ds_shot: xr.Dataset, sol_extension: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map TS channel (R, Z) positions onto rho_tor_norm per slice.
+
+    Each channel's psi_N is a bilinear interpolation of the equilibrium's psirz at the channel position,
+    which rho_tor_norm_from_psi_n maps through that equilibrium's qpsi.
 
     Only times with at least one finite TS value are mapped.
     The equilibrium is not necessarily reconstructed at each of those times
     (EFIT21 on C-Mod is native 1 kHz, but ANALYSIS runs on a ~20 ms clock),
     so each TS slice maps through the reconstruction nearest in time,
     accepted within EQ_MATCH_MAX_PERIODS of that reconstruction's sampling period.
-    A slice with no reconstruction in reach, or a degenerate one, keeps a NaN rho row,
-    and the fit-staging min-points gate then skips it.
+    A slice with no reconstruction in reach, or one without a usable flux map or qpsi,
+    keeps a NaN row, and the fit-staging min-points gate then skips it.
 
     Args:
         ds_shot: One shot's unprocessed dataset with standardized names
-            (ts_channel_r/z, ts_channel_t_e/n_e, psirz, simagx, sibdry, zmagx,
-            r_grid, z_grid).
+            (ts_channel_r/z, ts_channel_t_e/n_e, psirz, simagx, sibdry, qpsi, r_grid, z_grid).
+        sol_extension: How Phi_N continues outside the LCFS, one of SOL_EXTENSIONS.
 
     Returns:
-        (ts_times, rho): the (n_t,) times of the TS slices [s] and the
-        (n_t, n_ch) channel rho positions, NaN where the mapping failed.
+        (ts_times, rho_tor_norm): the (n_t,) times of the TS slices [s] and the
+        (n_t, n_ch) channel rho_tor_norm positions, NaN where the mapping failed.
     """
     if "shot" in ds_shot.dims:
         ds_shot = ds_shot.squeeze("shot", drop=True)
@@ -474,7 +477,7 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     psirz = ds_shot["psirz"].transpose("time", "r_grid", "z_grid").values
     simagx = ds_shot["simagx"].transpose("time").values
     sibdry = ds_shot["sibdry"].transpose("time").values
-    zmagx = ds_shot["zmagx"].transpose("time").values
+    qpsi = ds_shot["qpsi"].transpose("time", "psi_idx").values
     ts_r = ds_shot["ts_channel_r"].transpose("time", "ts_channel").values
     ts_z = ds_shot["ts_channel_z"].transpose("time", "ts_channel").values
     r_grid = ds_shot["r_grid"].values
@@ -494,7 +497,7 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
         eq_period = 0.0
     eq_tol = EQ_MATCH_MAX_PERIODS * eq_period
 
-    rho = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
+    rho_tor_norm = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
     n_no_equilibrium = 0
     for i, ts_idx in enumerate(ts_idxs):
         if eq_rows.size == 0:
@@ -506,14 +509,14 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
             continue
         eq_idx = int(eq_rows[nearest])
 
-        # get psi_n for the reconstruction this timeslice maps through
         psi_range = sibdry[eq_idx] - simagx[eq_idx]
         psi_slice = psirz[eq_idx]
+        qpsi_slice = qpsi[eq_idx]
         if (
             not np.isfinite(psi_range)  # psi range NaN or inf
             or np.abs(psi_range) < 1e-10  # psi range too small to be physical
-            or not np.isfinite(zmagx[eq_idx])  # Z magnetic axis NaN or inf
             or not np.all(np.isfinite(psi_slice))  # psi slice has NaN or inf
+            or not np.all(np.isfinite(qpsi_slice))  # no q profile to integrate
         ):
             n_no_equilibrium += 1
             continue
@@ -526,42 +529,15 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
         )
         with np.errstate(invalid="ignore"):
             psi_n_ch = interp(np.column_stack([ts_r[ts_idx], ts_z[ts_idx]]))
-
-        # psi_n along the midplane (z = magnetic axis height)
-        psi_n_mid = np.array(
-            [
-                np.interp(zmagx[eq_idx], z_grid, psi_n_grid[j, :])
-                for j in range(len(r_grid))
-            ]
+        rho_tor_norm[i, :] = rho_tor_norm_from_psi_n(
+            psi_n_ch, qpsi_slice, sol_extension
         )
-        i_axis = int(np.argmin(psi_n_mid))
-        r_axis = _refine_axis_radius(r_grid, psi_n_mid, i_axis)
-        r_lcfs_outboard = _lcfs_crossing_radius(r_grid[i_axis:], psi_n_mid[i_axis:])
-        if not np.isfinite(r_lcfs_outboard) or r_lcfs_outboard <= r_axis:
-            n_no_equilibrium += 1
-            continue
-
-        # Map each channel's psi_n to the outboard midplane radius, then normalize to rho.
-        # Anchor the table on the refined axis, where psi_n is 0 by definition, and keep
-        # only the grid nodes outboard of it (otherwise might get negative rho)
-        outboard = r_grid[i_axis:] > r_axis
-        psi_outboard = np.concatenate([[0.0], psi_n_mid[i_axis:][outboard]])
-        r_outboard = np.concatenate([[r_axis], r_grid[i_axis:][outboard]])
-        if r_outboard.size < 2:
-            n_no_equilibrium += 1
-            continue
-        keep = psi_outboard == np.maximum.accumulate(
-            psi_outboard
-        )  # Ensure monotonicity for interp
-        r_mid_ch = np.interp(psi_n_ch, psi_outboard[keep], r_outboard[keep])
-        with np.errstate(invalid="ignore"):
-            rho[i, :] = (r_mid_ch - r_axis) / (r_lcfs_outboard - r_axis)
 
     if n_no_equilibrium:
         logger.debug(
             f"No usable equilibrium at {n_no_equilibrium} of {ts_idxs.size} TS slices"
         )
-    return ts_times, rho
+    return ts_times, rho_tor_norm
 
 
 def channel_rows_at_times(data: xr.DataArray, ts_times: np.ndarray) -> np.ndarray:
@@ -569,7 +545,7 @@ def channel_rows_at_times(data: xr.DataArray, ts_times: np.ndarray) -> np.ndarra
 
     Args:
         data: Channel variable carrying a "time" coordinate.
-        ts_times: TS slice times [s], as returned by map_ts_channels_to_rho.
+        ts_times: TS slice times [s], as returned by map_ts_channels_to_rho_tor_norm.
 
     Returns:
         The (n_t, n_ch) rows at those times.

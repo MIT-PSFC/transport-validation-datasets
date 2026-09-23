@@ -23,7 +23,7 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     STATUS_OK,
     STATUS_SKIPPED,
     ShotFitInput,
-    read_batch_fit_mode,
+    read_batch_setting,
     unpack_fit_batch,
 )
 from transport_validation_datasets.machine.generic import (
@@ -268,7 +268,7 @@ class TestStageFitBatches:
         assert np.allclose(si.time, [0.11, 0.13, 0.15, 0.17, 0.19])
         assert (si.window_index == 0).all()
         assert np.array_equal(si.windows, [[0.1, 0.2]])
-        assert read_batch_fit_mode(workflow._batch_in_path(batch_id)) == (
+        assert read_batch_setting(workflow._batch_in_path(batch_id), "fit_mode") == (
             FIT_MODE_WINDOW_SAMPLE
         )
 
