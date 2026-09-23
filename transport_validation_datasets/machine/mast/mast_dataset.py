@@ -3,16 +3,17 @@
 Most of it comes out of the level 2 store: https://s3.echo.stfc.ac.uk/mast/level2/shots/{shot}.zarr
 the 0D summary and equilibrium signals and the full GEQDSK reconstruction, whose flux map also places
 the Thomson channels in rho.
-Two things come from the level 1 store instead: the GEQDSK safety factor, which only level 1
-publishes as a flux function (see _equilibrium_qpsi), and the Thomson profiles, which level 2
-only carries interpolated onto a uniform (R, t) grid and without uncertainties
-(see _thomson_dataset). No MDSplus is involved,
-so this workflow runs anywhere with internet access.
+Two things come from the level 1 store instead:
+the GEQDSK safety factor, which only level 1 publishes as a flux function (see _equilibrium_qpsi),
+and the Thomson profiles, which level 2 only carries interpolated onto a uniform (R, t) grid and without uncertainties (see _thomson_dataset).
 
+No MDSplus is involved, so this workflow runs anywhere with internet access.
 Reads are slow, so staging runs in a thread pool of prepare_workers threads.
-One shot costs ~60-90 s of round trips, which puts the
-packaged 1101-shot list at a few hours on the default 8 threads.
+One shot costs ~60-90 s of round trips,
+which puts the packaged 1101-shot list at a few hours on the default 8 threads.
 """
+
+from dataclasses import dataclass
 
 import numpy as np
 import xarray as xr
@@ -29,7 +30,7 @@ from transport_validation_datasets.machine.generic import (
     snap_to_grid,
     ts_channel_fit_rows,
 )
-from transport_validation_datasets.workflow import DataWorkflow
+from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 
 # Public MAST open data, no credentials needed
 S3_ENDPOINT = "https://s3.echo.stfc.ac.uk"
@@ -333,9 +334,15 @@ SIGNAL_ATTRS = {
 }
 
 
+@dataclass(frozen=True)
+class MASTSettings(DeviceSettings):
+    """MAST settings, the [mast] table of the config file."""
+
+
 class MASTDataWorkflow(DataWorkflow):
     """MAST specific data workflow for creating and processing datasets."""
 
+    settings_cls = MASTSettings
     signal_attrs = SIGNAL_ATTRS
 
     min_pulse_length = 0.2

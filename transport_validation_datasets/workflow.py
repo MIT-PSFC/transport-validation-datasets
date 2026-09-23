@@ -3,7 +3,7 @@ import os
 import shutil
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -19,14 +19,17 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     FIT_MODE_SAMPLE,
     FIT_MODE_WINDOW_AVERAGE,
     FIT_MODE_WINDOW_SAMPLE,
+    FIT_VARIABLES,
     STATUS_NAMES,
     STATUS_OK,
     STATUS_REPAIRED,
+    FitAnchors,
     FitBatch,
     ShotFitInput,
     ShotFitOutput,
     default_fit_bounds,
     pack_fit_batch,
+    read_batch_anchors,
     read_batch_fit_coordinate,
     read_batch_fit_mode,
     read_batch_shots,
@@ -181,11 +184,69 @@ RAW_TS_CHANNEL_SIGNALS = (
 class DeviceSettings:
     """Device-specific settings of a workflow, the [<device>] table of the config file.
 
-    The base has no fields. A device with settings of its own subclasses this
-    with one field per setting, defaults included, and points its workflow's
-    settings_cls at the subclass (see CModSettings). config.py builds the
-    instance from the TOML table by field name.
+    A device subclasses this to add settings or change defaults,
+    and points its workflow's settings_cls at the subclass.
+    config.py builds the instance from the TOML table by field name.
+
+    The anchors are virtual observations every fit method adds to every slice,
+    in the fit units (Te [keV], ne [1e20 m^-3]), gradients per unit rho.
+    The defaults are the same as those in Chilenski 2016.
+
+    Attributes:
+        te_value_anchors: Rows of [rho, Te, error].
+        te_grad_anchors: Rows of [rho, dTe/drho, error].
+        ne_value_anchors: Rows of [rho, ne, error].
+        ne_grad_anchors: Rows of [rho, dne/drho, error].
     """
+
+    te_value_anchors: list = field(
+        default_factory=lambda: [
+            [1.1, 0.0, 0.01],
+            [1.2, 0.0, 0.01],
+            [1.3, 0.0, 0.01],
+            [1.4, 0.0, 0.01],
+        ]
+    )
+    te_grad_anchors: list = field(
+        default_factory=lambda: [
+            [0.0, 0.0, 0.0],
+            [1.1, 0.0, 0.1],
+            [1.2, 0.0, 0.1],
+            [1.3, 0.0, 0.1],
+            [1.4, 0.0, 0.1],
+        ]
+    )
+    ne_value_anchors: list = field(
+        default_factory=lambda: [
+            [1.1, 0.0, 0.01],
+            [1.2, 0.0, 0.01],
+            [1.3, 0.0, 0.01],
+            [1.4, 0.0, 0.01],
+        ]
+    )
+    ne_grad_anchors: list = field(
+        default_factory=lambda: [
+            [0.0, 0.0, 0.0],
+            [1.1, 0.0, 0.1],
+            [1.2, 0.0, 0.1],
+            [1.3, 0.0, 0.1],
+            [1.4, 0.0, 0.1],
+        ]
+    )
+
+    def __post_init__(self):
+        for name in (
+            "te_value_anchors",
+            "te_grad_anchors",
+            "ne_value_anchors",
+            "ne_grad_anchors",
+        ):
+            raw_rows = getattr(self, name)
+            rows = np.asarray(raw_rows, dtype=float)
+            if rows.size and (rows.ndim != 2 or rows.shape[1] != 3):
+                raise ValueError(
+                    f"{name} must be rows of [rho, value, error], got {raw_rows!r}"
+                )
 
 
 class DataWorkflow(ABC):
@@ -385,6 +446,7 @@ class DataWorkflow(ABC):
                 f"{type(self).__name__} takes {self.settings_cls.__name__} settings, "
                 f"got {type(self.settings).__name__}"
             )
+        self.fit_anchors = _fit_anchors(self.settings)
 
         # Set up subdirectories for unprocessed data, fit staging, and the datasets
         self.unprocessed_data_dir = self.data_assembly_dir / "01_unprocessed"
@@ -802,26 +864,6 @@ class DataWorkflow(ABC):
             caller records it as failed).
         """
 
-    def condition_staged_fit_input(
-        self, shot: int, fit_input: ShotFitInput
-    ) -> ShotFitInput:
-        """Condition one shot's fit input after windowing, before staging.
-
-        Runs on the rows exactly as they will be fit: per-sample rows, or
-        one pooled row per time window in averaging mode. The base leaves
-        the input untouched; a device overrides this for conditioning that
-        must see the pooled window rather than the individual samples (see
-        CModDataWorkflow).
-
-        Args:
-            shot: Shot number being staged.
-            fit_input: The shot's fit input as _apply_windows staged it.
-
-        Returns:
-            The conditioned fit input.
-        """
-        return fit_input
-
     def unprocessed_shots(self) -> list[int]:
         """List the shots that have unprocessed data files.
 
@@ -946,10 +988,7 @@ class DataWorkflow(ABC):
         for batch_id, batch_shots in sorted(planned.items()):
             in_path = self._batch_in_path(batch_id)
             if in_path.exists():
-                self._check_fit_mode(read_batch_fit_mode(in_path), f"Batch {batch_id}")
-                self._check_fit_coordinate(
-                    read_batch_fit_coordinate(in_path), f"Batch {batch_id}"
-                )
+                self._check_batch(in_path, batch_id)
                 batches[batch_id] = batch_shots
                 continue
             shot_inputs = {}
@@ -962,7 +1001,7 @@ class DataWorkflow(ABC):
                 fit_input = self._apply_windows(shot, fit_input)
                 if fit_input is None:
                     continue
-                shot_inputs[shot] = self.condition_staged_fit_input(shot, fit_input)
+                shot_inputs[shot] = fit_input
             if not shot_inputs:
                 continue
             pack_fit_batch(
@@ -973,6 +1012,7 @@ class DataWorkflow(ABC):
                     min_points=self.fit_min_points,
                     scale_per_slice=self.fit_scale_per_slice,
                     bounds=self.fit_bounds,
+                    anchors=self.fit_anchors,
                     fit_mode=self.fit_mode,
                     fit_coordinate=self.fit_coordinate,
                 ),
@@ -996,22 +1036,41 @@ class DataWorkflow(ABC):
             return self.ds_name
         return f"{self.ds_name}:{self.fit_mode}"
 
-    def _check_fit_mode(self, found: str, where: str):
-        """Refuse something on disk built in another fit mode than this run's.
+    def _check_run_setting(self, name: str, found: str, expected: str, where: str):
+        """Refuse something on disk built with another setting than this run's.
 
         Args:
-            found: The fit mode it records.
+            name: The setting, for the message.
+            found: The value it records.
+            expected: This run's value.
             where: What is being checked, for the message.
 
         Raises:
-            ValueError: If the modes differ.
+            ValueError: If the values differ.
         """
-        if found != self.fit_mode:
+        if found != expected:
             raise ValueError(
-                f"{where} was built in fit mode '{found}', this run is in "
-                f"'{self.fit_mode}'. Rerun with --clean_fit_state to rebuild it, or "
-                f"build the dataset under another ds_name."
+                f"{where} was built with {name} {found}, this run has {expected}. "
+                "Rerun with --clean_fit_state to rebuild it, "
+                "or build the dataset under another ds_name."
             )
+
+    def _check_batch(self, in_path: Path, batch_id: str):
+        """Refuse a staged batch built with another fit mode or other anchors than this run's.
+
+        Args:
+            in_path: The batch input npz.
+            batch_id: The batch id, for the message.
+        """
+        where = f"Batch {batch_id}"
+        staged_mode = read_batch_fit_mode(in_path)
+        self._check_run_setting("fit mode", staged_mode, self.fit_mode, where)
+        staged_anchors = read_batch_anchors(in_path)
+        staged_anchors_json = _anchors_json(staged_anchors)
+        run_anchors_json = _anchors_json(self.fit_anchors)
+        self._check_run_setting("anchors", staged_anchors_json, run_anchors_json, where)
+        staged_coordinate = read_batch_fit_coordinate(in_path)
+        self._check_fit_coordinate(staged_coordinate, where)
 
     def _check_fit_coordinate(self, found: str, where: str):
         """Refuse something on disk staged in another fit coordinate than this run's.
@@ -1036,20 +1095,18 @@ class DataWorkflow(ABC):
 
         Every batch input in fit_batches_dir is checked,
         because write_fit_results and the stack stage sweep them all:
-        its fit mode must be this run's, and in a windowed run every shot must have the same windows it was staged with.
+        its fit mode and anchors must be this run's,
+        and in a windowed run every shot must have the same windows it was staged with.
         An edited shotlist stops here, before any fit runs or any result is written.
-        A batch in another mode, with other windows,
+        A batch in another mode, with other anchors or windows,
         or holding a shot the shotlist no longer lists raises ValueError
-        (_check_fit_mode, _check_windows_match).
+        (_check_batch, _check_windows_match).
         """
         for in_path in sorted(self.fit_batches_dir.glob("batch_*.npz")):
             if "_out_" in in_path.name:
                 continue
             batch_id = in_path.stem.removeprefix("batch_")
-            self._check_fit_mode(read_batch_fit_mode(in_path), f"Batch {batch_id}")
-            self._check_fit_coordinate(
-                read_batch_fit_coordinate(in_path), f"Batch {batch_id}"
-            )
+            self._check_batch(in_path, batch_id)
             if self.shot_windows is None:
                 continue
             for shot, staged in read_batch_windows(in_path).items():
@@ -1673,7 +1730,7 @@ class DataWorkflow(ABC):
         Also the place every fit file is checked against this run, up front,
         since an error raised while a shot is being stacked would only skip that shot:
         its fit mode must be this run's and, in a windowed run, its windows the
-        shotlist's, else ValueError (_check_fit_mode, _check_windows_match).
+        shotlist's, else ValueError (_check_run_setting, _check_windows_match).
 
         Args:
             shots: Shots that will go into the internal dataset.
@@ -1687,8 +1744,11 @@ class DataWorkflow(ABC):
             # The fit results only set the profile dimensions, their slices are
             # placed on the unprocessed timebase rather than kept as one
             with xr.open_dataset(self.fit_shots_dir / f"{shot}.nc") as ds_fit:
-                self._check_fit_mode(
-                    ds_fit.attrs["fit_mode"], f"The fit result file of shot {shot}"
+                self._check_run_setting(
+                    "fit mode",
+                    ds_fit.attrs["fit_mode"],
+                    self.fit_mode,
+                    f"The fit result file of shot {shot}",
                 )
                 windows = _fit_windows(ds_fit)
                 if self.shot_windows is not None:
@@ -2316,17 +2376,48 @@ def _place_windows_on_grid(
     return sample_index, fresh
 
 
+def _fit_anchors(settings: DeviceSettings) -> dict[str, FitAnchors]:
+    """Build the per-variable fit anchors from a device's settings.
+
+    Args:
+        settings: The device's settings.
+
+    Returns:
+        FitAnchors keyed by variable name.
+    """
+    anchors = {}
+    for var in FIT_VARIABLES:
+        value_rows = getattr(settings, f"{var}_value_anchors")
+        grad_rows = getattr(settings, f"{var}_grad_anchors")
+        value = np.asarray(value_rows, dtype=float).reshape(-1, 3)
+        grad = np.asarray(grad_rows, dtype=float).reshape(-1, 3)
+        anchors[var] = FitAnchors(value=value, grad=grad)
+    return anchors
+
+
+def _anchors_json(anchors: dict[str, FitAnchors]) -> str:
+    """Serialize fit anchors for comparison and messages.
+
+    Args:
+        anchors: FitAnchors keyed by variable name.
+
+    Returns:
+        The anchors as a JSON string.
+    """
+    return json.dumps(
+        {
+            var: {"value": a.value.tolist(), "grad": a.grad.tolist()}
+            for var, a in anchors.items()
+        }
+    )
+
+
 def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
     """Stretch per-channel plot masks over pooled rows.
 
-    A pooled row holds every channel once per Thomson sample, so a (n_ch,)
-    mask is tiled up to the row width. A row can also end in extra columns
-    that are no device channel at all (the synthetic SOL anchor points a
-    device's staging may append, see CModDataWorkflow), so the tiling goes
-    to the last whole repeat and the remainder is padded False; the columns
-    no group claims are then gathered into one catch-all group so their
-    points still show. Masks already as wide as the row, (n_t, n_ch) masks,
-    and None pass through.
+    A pooled row holds every channel once per Thomson sample,
+    so a (n_ch,) mask is tiled up to the row width.
+    Masks already as wide as the row, (n_t, n_ch) masks, and None pass through.
 
     Args:
         groups: (mask, color, label) triples from fit_plot_channel_groups.
@@ -2340,17 +2431,9 @@ def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
     tiled = []
     for mask, color, label in groups:
         mask = np.asarray(mask)
-        if mask.ndim == 1 and mask.size != n_columns and mask.size <= n_columns:
-            reps = n_columns // mask.size
-            mask = np.concatenate(
-                [np.tile(mask, reps), np.zeros(n_columns - reps * mask.size, bool)]
-            )
+        if mask.ndim == 1 and mask.size != n_columns and n_columns % mask.size == 0:
+            mask = np.tile(mask, n_columns // mask.size)
         tiled.append((mask, color, label))
-    flat = [m for m, _, _ in tiled if m.ndim == 1 and m.size == n_columns]
-    if flat and len(flat) == len(tiled):
-        unclaimed = ~np.logical_or.reduce(flat)
-        if unclaimed.any():
-            tiled.append((unclaimed, "tab:gray", "other points"))
     return tiled
 
 
