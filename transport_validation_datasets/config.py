@@ -6,19 +6,18 @@ earlier one, so a shared file (configs/orcd.toml) carries the cluster and the
 device settings, and a per-user file (configs/<user>.user.toml, gitignored)
 carries the user-specific paths. The tables:
 
-    [cluster]   SLURM dispatch of the fit stage, the fields of
-                gp_fitting.dispatcher.ClusterFitConfig. Absent means the
-                fits run locally in this process.
-    [<device>]  Settings of that device's workflow ([cmod], [mast]), the
-                fields of the workflow's settings_cls. Absent means the
-                defaults. One file may hold the tables of several devices,
+    [cluster]   SLURM dispatch of the fit stage, fields of gp_fitting.dispatcher.ClusterFitConfig.
+                If this section is absent, the fits run locally.
+    [<device>]  Settings of a device's workflow ([cmod], [mast]),
+                to modify the fields of the workflow's settings_cls.
+                If this section is absent, the device's workflow uses its defaults.
+                One file may hold the tables of several devices,
                 only the table of the device being built is read.
 
 Keys are the dataclass field names, so those dataclasses are the reference
-for what each table takes and what the defaults are. A key the dataclass has
-no field for, a required key that is missing, or a table that is neither
-cluster nor a device is an error, so a typo cannot silently fall back to a
-default.
+for what each table takes and what the defaults are.
+A key the dataclass has no field for, a required key that is missing,
+or an unexpected table raises an error, so a typo cannot silently fall back to a default.
 
     [cluster]
     ssh_host = "orcd-login"

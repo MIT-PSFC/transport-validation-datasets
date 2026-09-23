@@ -11,6 +11,9 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     pack_fit_batch,
     unpack_fit_batch,
 )
+from transport_validation_datasets.workflow import DeviceSettings, _fit_anchors
+
+_ANCHORS = _fit_anchors(DeviceSettings())
 
 
 def _shot_input(with_alt_coords: bool) -> ShotFitInput:
@@ -41,6 +44,7 @@ def test_fit_batch_defaults_to_rho():
         min_points=3,
         scale_per_slice=True,
         bounds=default_fit_bounds(),
+        anchors=_ANCHORS,
     )
     assert batch.fit_coordinate == "rho"
 
@@ -54,6 +58,7 @@ def test_pack_unpack_round_trips_alt_coordinates(tmp_path):
         min_points=3,
         scale_per_slice=True,
         bounds=default_fit_bounds(),
+        anchors=_ANCHORS,
         fit_coordinate="psi_norm",
     )
     path = tmp_path / "batch.npz"
@@ -76,6 +81,7 @@ def test_unpack_missing_fit_coordinate_key_defaults_to_rho(tmp_path):
         min_points=3,
         scale_per_slice=True,
         bounds=default_fit_bounds(),
+        anchors=_ANCHORS,
     )
     path = tmp_path / "batch.npz"
     pack_fit_batch(path, batch)

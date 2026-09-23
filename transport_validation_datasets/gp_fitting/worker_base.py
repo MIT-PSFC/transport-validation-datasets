@@ -29,6 +29,7 @@ import numpy as np
 from transport_validation_datasets.gp_fitting.batch_io import (
     STATUS_CULLED,
     STATUS_REPAIRED,
+    FitAnchors,
     FitBatch,
     FitBounds,
     ShotFitOutput,
@@ -63,6 +64,8 @@ class SliceTask:
     scale_per_slice: bool
     te_bounds: FitBounds
     ne_bounds: FitBounds
+    te_anchors: FitAnchors
+    ne_anchors: FitAnchors
     psi_norm: np.ndarray | None = None
     qpsi: np.ndarray | None = None
     fit_coordinate: str = "rho"
@@ -141,6 +144,8 @@ def map_slices(
                 scale_per_slice=batch.scale_per_slice,
                 te_bounds=batch.bounds["te"],
                 ne_bounds=batch.bounds["ne"],
+                te_anchors=batch.anchors["te"],
+                ne_anchors=batch.anchors["ne"],
                 psi_norm=si.psi_norm[i_time, :] if si.psi_norm is not None else None,
                 qpsi=si.qpsi[i_time, :] if si.qpsi is not None else None,
                 fit_coordinate=batch.fit_coordinate,

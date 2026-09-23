@@ -3,7 +3,7 @@
 One staged batch file serves every fitting method:
 it carries the cleaned Thomson channel data in fit units: Te [keV], ne [1e20 m^-3]
 (with the device-specific error floors already baked in at staging),
-the target rho grid, and the per-variable fit bound knobs.
+the target rho grid, and the per-variable fit bound knobs and anchors.
 Workers read a batch, fit it, and write a result file whose rows stay aligned with the input rows
 A slice that was skipped or culled is an all-NaN row, never a dropped one.
 
@@ -63,6 +63,34 @@ def default_fit_bounds() -> dict[str, FitBounds]:
         Default FitBounds keyed by variable name.
     """
     return {var: FitBounds() for var in FIT_VARIABLES}
+
+
+@dataclass(frozen=True)
+class FitAnchors:
+    """Virtual observations one variable is fit with, carried in the batch file.
+
+    Rows are in fit units (Te [keV], ne [1e20 m^-3]), set per device (see workflow.DeviceSettings).
+    Every method adds them to every slice.
+
+    Attributes:
+        value: (n, 3) rows of (rho, value, error).
+        grad: (n, 3) rows of (rho, d/drho, error), per unit rho.
+    """
+
+    value: np.ndarray
+    grad: np.ndarray
+
+    def scaled(self, scale: float) -> "FitAnchors":
+        """Divide the values and errors by scale, keeping the positions.
+
+        Args:
+            scale: The slice normalization the channel data was divided by.
+
+        Returns:
+            The anchors in the normalized units.
+        """
+        factor = np.array([1.0, 1.0 / scale, 1.0 / scale])
+        return FitAnchors(value=self.value * factor, grad=self.grad * factor)
 
 
 @dataclass
@@ -138,6 +166,7 @@ class FitBatch:
         min_points: Minimum valid channels per slice to attempt a fit.
         scale_per_slice: Normalize each slice by its max before fitting.
         bounds: Per-variable fit bound knobs, keyed by FIT_VARIABLES.
+        anchors: Per-variable virtual observations, keyed by FIT_VARIABLES.
         fit_mode: One of the FIT_MODE_* values, how the rows were built.
         fit_coordinate: Which radial coordinate to fit in -- "rho" (default,
             every method supports it), or one of "psi_norm", "sqrt_psi_norm",
@@ -153,6 +182,7 @@ class FitBatch:
     min_points: int
     scale_per_slice: bool
     bounds: dict[str, FitBounds]
+    anchors: dict[str, FitAnchors]
     fit_mode: str = FIT_MODE_SAMPLE
     fit_coordinate: str = "rho"
 
@@ -231,6 +261,12 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
             arrays[f"bounds:{var}:{f.name}"] = np.float64(
                 getattr(batch.bounds[var], f.name)
             )
+        arrays[f"anchors:{var}:value"] = np.asarray(
+            batch.anchors[var].value, dtype=np.float64
+        )
+        arrays[f"anchors:{var}:grad"] = np.asarray(
+            batch.anchors[var].grad, dtype=np.float64
+        )
     for shot, si in batch.shot_inputs.items():
         arrays[f"{shot}:time"] = np.asarray(si.time, dtype=np.float32)
         arrays[f"{shot}:x"] = np.asarray(si.x, dtype=np.float32)
@@ -268,6 +304,7 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
             )
             for var in FIT_VARIABLES
         }
+        anchors = _unpack_anchors(data)
         shot_inputs = {
             shot: ShotFitInput(
                 x=data[f"{shot}:x"],
@@ -291,11 +328,42 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
             min_points=int(data["min_points"]),
             scale_per_slice=bool(data["scale_per_slice"]),
             bounds=bounds,
+            anchors=anchors,
             fit_mode=str(data["fit_mode"].item()),
             fit_coordinate=(
                 str(data["fit_coordinate"]) if "fit_coordinate" in data.files else "rho"
             ),
         )
+
+
+def _unpack_anchors(data) -> dict[str, FitAnchors]:
+    """Read the per-variable anchors out of an open batch npz.
+
+    Args:
+        data: The open npz file.
+
+    Returns:
+        FitAnchors keyed by variable name.
+    """
+    return {
+        var: FitAnchors(
+            value=data[f"anchors:{var}:value"], grad=data[f"anchors:{var}:grad"]
+        )
+        for var in FIT_VARIABLES
+    }
+
+
+def read_batch_anchors(path: Path | str) -> dict[str, FitAnchors]:
+    """Read only the anchors from a batch input npz (cheap).
+
+    Args:
+        path: Batch input npz path.
+
+    Returns:
+        FitAnchors keyed by variable name.
+    """
+    with np.load(path) as data:
+        return _unpack_anchors(data)
 
 
 def read_batch_shots(path: Path | str) -> list[int]:
