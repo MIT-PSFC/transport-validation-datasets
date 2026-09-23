@@ -175,11 +175,10 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-# How far a TS slice may sit from the equilibrium reconstruction it maps
-# through (map_ts_channels_to_rho), in periods of the reconstruction's own
-# sampling. The mapping-time mirror of workflow.MAX_HOLD_PERIODS (its own
-# constant to avoid a circular import): above 1 to tolerate clock jitter,
-# low enough that nothing is borrowed across a real gap.
+# How far a TS slice may sit from the reconstruction it maps through,
+# in periods of the reconstruction's own sampling.
+# Above 1 to tolerate clock jitter, low enough that nothing is borrowed across a real gap.
+# The mapping counterpart of workflow.MAX_HOLD_PERIODS, separate to avoid a circular import.
 EQ_MATCH_MAX_PERIODS = 1.5
 
 
@@ -233,10 +232,8 @@ def make_geqdsk_dataset(
     Args:
         shot_id: Shot number, repeated along 'idx' as the 'shot' coordinate.
         times: (n_t,) times of the reconstruction slices [s].
-        r_grid: (n_r,) major radii of the psi grid columns [m]; also sets
-            rleft and rdim.
-        z_grid: (n_z,) heights of the psi grid rows [m]; also sets zmid
-            and zdim.
+        r_grid: (n_r,) major radii of the psi grid columns [m], which also set rleft and rdim.
+        z_grid: (n_z,) heights of the psi grid rows [m], which also set zmid and zdim.
         rmagx: (n_t,) major radius of the magnetic axis [m].
         zmagx: (n_t,) height of the magnetic axis [m].
         simagx: (n_t,) poloidal flux at the magnetic axis [Wb/rad].
@@ -254,15 +251,12 @@ def make_geqdsk_dataset(
         zbdry: (n_t, n_bdry) heights of the boundary contour [m].
         cocos_input: COCOS convention the inputs follow, stored as the
             dataset's 'cocos' attribute.
-        rcentr: The fixed reference radius the vacuum toroidal field
-            (bcentr) is quoted at [m] -- a real machine/reconstruction
-            constant, not derivable from the grid geometry. Unlike
-            rleft/rdim/zmid/zdim below, which genuinely are the grid's own
-            bounding box, callers must supply the device's real value.
-        rlim: (n_lim,) major radii of the limiter contour [m]; static, and
-            only stored when both rlim and zlim are given.
-        zlim: (n_lim,) heights of the limiter contour [m]; static, and only
-            stored when both rlim and zlim are given.
+        rcentr: Reference radius bcentr is quoted at [m].
+            A machine or reconstruction constant that the grid does not determine.
+        rlim: (n_lim,) major radii of the limiter contour [m].
+            Static, and stored only when zlim is given too.
+        zlim: (n_lim,) heights of the limiter contour [m].
+            Static, and stored only when rlim is given too.
 
     Returns:
         Dataset with all GEQDSK signals on dim 'idx', with 'time'/'shot' coords.
@@ -460,9 +454,9 @@ def map_ts_channels_to_flux_coordinates(
     r_grid = ds_shot["r_grid"].values
     z_grid = ds_shot["z_grid"].values
 
-    # Reconstruction times, for the nearest-in-time equilibrium match. A
-    # single reconstruction has no period of its own, so the grid step
-    # stands in (mirroring workflow._hold_onto_grid's lone-sample fallback).
+    # Each TS slice maps through the reconstruction nearest in time.
+    # A lone reconstruction has no period of its own, so the grid step stands in,
+    # as in workflow._hold_onto_grid.
     all_times = ds_shot["time"].values
     eq_rows = np.flatnonzero(np.isfinite(simagx))
     eq_times = all_times[eq_rows]

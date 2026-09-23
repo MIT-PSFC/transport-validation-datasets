@@ -927,12 +927,9 @@ def _equilibrium_dataset(
     psirz = equilibrium["psi"].transpose("time", "major_radius", "z").values
     current = np.asarray(equilibrium["ip"].values, dtype=float)
     r_grid = np.asarray(equilibrium["major_radius"].values, dtype=float)
-    # MAST has no separate RCENTR reconstruction; use the grid midpoint as
-    # a conventional reference radius. GEQDSK pairs bcentr with rcentr: a
-    # reader reconstructing the vacuum field as bcentr*rcentr/R has to land
-    # on fpol at the boundary. So scale the published vacuum field (given at
-    # the magnetic axis) by 1/R onto the same rcentr passed to
-    # make_geqdsk_dataset below.
+    # MAST publishes no RCENTR, so the grid midpoint serves as the reference radius.
+    # A reader rebuilds the vacuum field as bcentr*rcentr/R, which has to land on fpol at the boundary.
+    # So the published vacuum field, given at the magnetic axis, is rescaled by 1/R onto rcentr.
     rcentr = r_grid[len(r_grid) // 2]
     bcentr = (
         np.asarray(equilibrium["bvac_rmag"].values, dtype=float)

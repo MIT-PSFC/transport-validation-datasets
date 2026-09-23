@@ -89,8 +89,7 @@ class CModDataWorkflow(DataWorkflow):
     end_margin = 0.02
     shot_blacklist = []
 
-    # GP fit staging knobs (values ported from the transport_study C-Mod
-    # config, with their calibration notes).
+    # GP fit staging knobs
     fit_rho = np.linspace(0.0, 1.1, 56)
     # Minimum valid (rho, value) pairs required per timestep to run the GP fit,
     # compared against the channel count AFTER the per-shot quality screens (_drop_broken_channels).
@@ -164,16 +163,12 @@ class CModDataWorkflow(DataWorkflow):
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         """Read one shot from MDSplus, through disruption-py, into standardized signals.
 
-        Four retrievals rather than one, because their native timebases
-        differ: the fast diagnostics (Ip, B0, density, powers) are sampled
-        at the uniform 1 kHz grid times from their own faster-than-grid
-        native data; the EFIT-derived 0D signals (stored energy, shaping)
-        stay on the EFIT tree's native timebase; the EFIT reconstruction
-        stays on its native timebase; Thomson scattering is native ~20 Hz.
-        The EFIT and Thomson retrievals are snapped onto the uniform grid
-        without interpolation, so grid times between real samples hold NaN,
-        never fabricated values (exact relabeling for EFIT21, which is
-        native 1 kHz).
+        Four retrievals rather than one, because their native timebases differ.
+        The fast diagnostics (Ip, B0, density, powers) are sampled at the 1 kHz grid times from their own faster native data.
+        The EFIT 0D signals (stored energy, shaping), the EFIT reconstruction,
+        and Thomson scattering (native ~20 Hz) are snapped onto the grid without interpolation,
+        so grid times between their real samples hold NaN.
+        For EFIT21, which is native 1 kHz, the snap is an exact relabeling.
 
         Args:
             shot: Shot number to read.
@@ -438,14 +433,13 @@ def _is_empty_result(result: xr.Dataset) -> bool:
 def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     """Retrieve the fast-diagnostic 0D signals on the uniform 1 kHz grid.
 
-    Only signals whose native timebase is at least as fast as the grid
-    belong here (magnetics, TCI, bolometry, RF power): sampling them at the
-    1 kHz grid times only ever discards surplus resolution, it never
-    fabricates values between real measurements. Every EFIT-derived 0D
-    signal lives in _get_efit0d_dataset instead, on the EFIT tree's own
-    timebase. p_oh stays here: its information rate is set by the fast loop
-    voltage and Ip, and its EFIT-li inductance correction is exact at the
-    ms-aligned EFIT21 slice times and NaN outside the EFIT range.
+    Only signals sampled at least as fast as the grid belong here
+    (magnetics, TCI, bolometry, RF power),
+    so sampling them at the grid times only discards resolution.
+    The EFIT-derived 0D signals are in _get_efit0d_dataset instead.
+    p_oh stays here because the fast loop voltage and Ip set its time resolution.
+    Its EFIT li inductance correction is exact at the EFIT21 slice times
+    and NaN outside the EFIT time range.
 
     Args:
         shot: Shot number to retrieve data for.
@@ -489,13 +483,10 @@ def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
 def _get_efit0d_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     """Retrieve the EFIT-derived 0D signals on the native EFIT timebase.
 
-    time_setting="efit" makes params.times the EFIT tree's own timebase, so
-    the stock disruption-py methods' final interp1 onto params.times is an
-    identity: no values are fabricated between reconstructions. The result
-    is then snapped onto the uniform 1 kHz grid like the equilibrium and
-    Thomson retrievals (nearest grid point, no interpolation, NaN where the
-    tree has no slice) -- an exact relabeling for EFIT21 (native 1 kHz),
-    and honest NaN gaps for any sparser tree.
+    time_setting="efit" makes params.times the EFIT tree's own timebase,
+    so the final interp1 in the disruption-py methods is an identity.
+    The result is snapped onto the 1 kHz grid like the equilibrium and Thomson,
+    with NaN where the tree has no slice.
 
     Args:
         shot: Shot number to retrieve data for.

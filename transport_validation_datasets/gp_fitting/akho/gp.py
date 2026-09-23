@@ -1,17 +1,10 @@
-"""GP-residual-correction stage of the akho method.
+"""GP residual stage of the akho method.
 
-The two-stage strategy fits `data - analytic_mean` with a GP (rational-
-quadratic kernel), rather than GP-fitting the raw data directly: the analytic
-mtanh/cubic fit (fit_functions.py) supplies the dominant pedestal/core shape
-and a well-behaved derivative in sparse regions, and the GP picks up whatever
-shape that fit misses. worker_akho.py's `_fit_variable` stacks this residual
-fit back on top of the analytic mean (both value and derivative) to get the
-final profile.
-
-Ported from `cmod_to_imas/fit_cmod.py`'s `setup_gpr1d_fit_subtracted_mean`/
-`perform_gpr1d_fit`/`save_gpr1d_data`, stripped of their plotting/netCDF side
-effects (standalone-script diagnostics, not needed inside a cluster worker)
-and reduced to a single call returning arrays.
+A rational-quadratic GP fits the data minus the analytic mean (fit_functions.py).
+The analytic fit supplies the pedestal and core shape,
+and a well-behaved derivative where channels are sparse.
+The GP picks up the shape that the analytic fit misses.
+worker_akho.py's _fit_variable adds the two back together, value and derivative.
 """
 
 import contextlib
@@ -22,9 +15,8 @@ import numpy as np
 from mkgp.core.kernels import RQ_Kernel
 from mkgp.core.routines import GaussianProcess
 
-# Kernel start point and hyperparameter bounds: [amplitude, length scale, RQ
-# order] rows (lower, upper). Matches fit_cmod.py's
-# setup_gpr1d_fit_subtracted_mean exactly.
+# Kernel start points and hyperparameter bounds, each over [amplitude, length scale, RQ order].
+# The bounds rows are (lower, upper).
 _KERNEL_START = (1.0e0, 3.0e-1, 1.0e1)
 _KERNEL_BOUNDS = np.atleast_2d([[1.0e-1, 1.0e-1, 1.0e0], [1.0e1, 1.0e0, 5.0e1]])
 _ERROR_KERNEL_START = (1.0e0, 3.0e-1, 1.0e1)
@@ -33,20 +25,15 @@ _ERROR_NRESTARTS = 5
 _NRESTARTS = 5
 _IMAX = 1000
 
-# Main-kernel regularization (mkgp regpar: multiplies the kernel-complexity
-# penalty in the hyperparameter search). fit_cmod.py used 2.0; set to 1.5
-# per explicit direction (after a stint at mkgp's default of 1.0).
+# Main-kernel regularization, mkgp's weight on the kernel-complexity penalty in the hyperparameter search.
 _REGPAR = 1.5
 
-# Error-kernel regularization (mkgp regpar: multiplies the kernel-complexity
-# penalty in the error-kernel hyperparameter search). fit_cmod.py used 3.0;
-# lowered per explicit direction. Note the direction of the knob, measured on
-# shot 1030516024 / 0.7-0.9s: LOWER values free the heteroscedastic error
-# kernel to absorb more of the residual as noise, further shrinking the GP
-# posterior mean's contribution to the stacked fit (te GP-mean rms 0.008 at
-# 3.0, 0.003 at 1.5, ~0.0005 at 1.0, vs residual rms 0.042) and slightly
-# widening the predictive std; ne is largely insensitive. Raise it instead to
-# push residual structure into the GP mean.
+# Error-kernel regularization, the same penalty weight in the error-kernel search.
+# Lower values let the error kernel absorb more of the residual as noise,
+# which shrinks the GP mean's share of the fit and slightly widens the predictive std.
+# Higher values push residual structure into the GP mean.
+# On shot 1030516024 at 0.7-0.9 s, the Te GP-mean rms was 0.008 at 3.0, 0.003 at 1.5 and ~0.0005 at 1.0,
+# against a residual rms of 0.042. ne is largely insensitive.
 _ERROR_REGPAR = 1.5
 
 # Columns of this method's hyps diagnostic arrays.
@@ -121,7 +108,7 @@ def fit_residual(
     )
 
     try:
-        # mkgp prints optimizer status to stdout; keep worker logs clean.
+        # mkgp prints optimizer status to stdout, which would clutter the worker logs
         with contextlib.redirect_stdout(io.StringIO()):
             gp.GPRFit(
                 np.asarray(x_star, dtype=float), hsgp_flag=True, nrestarts=_NRESTARTS
