@@ -133,12 +133,26 @@ venv_path = "/path/on/cluster/.venv"
 
 Keys are dataclass field names: `ClusterFitConfig` in `gp_fitting/dispatcher.py`
 for `[cluster]`, the device workflow's `settings_cls` for `[cmod]` and `[mast]`
-(`CModSettings` in `machine/cmod/cmod_dataset.py`; MAST has no settings yet).
-A key left out keeps its default. A key the dataclass does not have, or a table
-that is neither `cluster` nor a device, is an error. Without a `[cluster]` table
-the fits run locally in the calling process, and without `--config` everything
-keeps its default. Run-specific choices (`--ds_name`, `--shotlist_file`,
-`--stage`, `--method`, ...) stay command line flags.
+(`CModSettings` in `machine/cmod/cmod_dataset.py`, `MASTSettings` in `machine/mast/mast_dataset.py`).
+A key left out keeps its default.
+A key the dataclass does not have, or a table that is neither `cluster` nor a device, is an error.
+Without a `[cluster]` table the fits run locally in the calling process, 
+and without `--config` everything keeps its default.
+Run-specific choices (`--ds_name`, `--shotlist_file`, `--stage`, `--method`, ...) stay command line flags.
+
+Both device tables take the fit anchors, the virtual observations every fit method adds to every Thomson slice.
+Each is a list of `[rho, value, error]` rows in the fit units, Te in keV and ne in 1e20 m^-3, gradients per unit rho.
+The defaults pin each profile to zero value and gradient at rho 1.1 to 1.4, and zero gradient at the axis.
+
+```toml
+[mast]
+te_value_anchors = [[1.1, 0.0, 0.008], [1.2, 0.0, 0.008], [1.3, 0.0, 0.008], [1.4, 0.0, 0.008]]
+te_grad_anchors = [[0.0, 0.0, 0.008], [1.1, 0.0, 0.08], [1.2, 0.0, 0.08], [1.3, 0.0, 0.08], [1.4, 0.0, 0.08]]
+# ne_value_anchors, ne_grad_anchors likewise
+```
+
+The anchors are staged into the fit batches, so changing them needs
+`--clean_fit_state` or a new `--ds_name`.
 
 # Shotlists and time windows
 
