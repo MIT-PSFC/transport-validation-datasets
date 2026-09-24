@@ -177,6 +177,8 @@ class DeviceSettings:
 
     Attributes:
         sol_extension: How the Thomson channel mapping continues Phi_N outside the LCFS
+        pedestal_rho_tor_norm: Pedestal location, fixed for every slice of Te and ne.
+            zk places its kernel's length-scale transition there, akho its mtanh.
         te_value_anchors: Rows of [rho_tor_norm, Te, error].
         te_grad_anchors: Rows of [rho_tor_norm, dTe/drho_tor_norm, error].
         ne_value_anchors: Rows of [rho_tor_norm, ne, error].
@@ -184,6 +186,7 @@ class DeviceSettings:
     """
 
     sol_extension: str = "secant"
+    pedestal_rho_tor_norm: float = 0.95
     te_value_anchors: list = field(
         default_factory=lambda: [
             [1.3, 0.0, 0.01],
@@ -1007,6 +1010,7 @@ class DataWorkflow(ABC):
                     scale_per_slice=self.fit_scale_per_slice,
                     bounds=self.fit_bounds,
                     anchors=self.fit_anchors,
+                    pedestal_rho_tor_norm=self.settings.pedestal_rho_tor_norm,
                     sol_extension=self.settings.sol_extension,
                     fit_mode=self.fit_mode,
                 ),
@@ -1050,7 +1054,7 @@ class DataWorkflow(ABC):
             )
 
     def _check_batch(self, in_path: Path, batch_id: str):
-        """Refuse a staged batch built with another fit mode, SOL extension, or anchors than this run's.
+        """Refuse a staged batch built with another fit mode, SOL extension, pedestal location, or anchors than this run's.
 
         Args:
             in_path: The batch input npz.
@@ -1062,6 +1066,13 @@ class DataWorkflow(ABC):
         staged_extension = read_batch_setting(in_path, "sol_extension")
         run_extension = self.settings.sol_extension
         self._check_run_setting("SOL extension", staged_extension, run_extension, where)
+        # As floats, so a TOML integer matches the float the batch stores
+        staged_pedestal_raw = read_batch_setting(in_path, "pedestal_rho_tor_norm")
+        staged_pedestal = str(float(staged_pedestal_raw))
+        run_pedestal = str(float(self.settings.pedestal_rho_tor_norm))
+        self._check_run_setting(
+            "pedestal location", staged_pedestal, run_pedestal, where
+        )
         staged_anchors = read_batch_anchors(in_path)
         staged_anchors_json = _anchors_json(staged_anchors)
         run_anchors_json = _anchors_json(self.fit_anchors)
@@ -1072,10 +1083,10 @@ class DataWorkflow(ABC):
 
         Every batch input in fit_batches_dir is checked,
         because write_fit_results and the stack stage sweep them all:
-        its fit mode, SOL extension, and anchors must be this run's,
+        its fit mode, SOL extension, pedestal location, and anchors must be this run's,
         and in a windowed run every shot must have the same windows it was staged with.
         An edited shotlist stops here, before any fit runs or any result is written.
-        A batch in another mode, with another SOL extension, other anchors or windows,
+        A batch in another mode, with another SOL extension, pedestal location, other anchors or windows,
         or holding a shot the shotlist no longer lists raises ValueError
         (_check_batch, _check_windows_match).
         """

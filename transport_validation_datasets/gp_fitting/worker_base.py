@@ -60,6 +60,7 @@ class SliceTask:
     ne_bounds: FitBounds
     te_anchors: FitAnchors
     ne_anchors: FitAnchors
+    pedestal_rho_tor_norm: float
 
 
 @dataclass
@@ -137,6 +138,7 @@ def map_slices(
                 ne_bounds=batch.bounds["ne"],
                 te_anchors=batch.anchors["te"],
                 ne_anchors=batch.anchors["ne"],
+                pedestal_rho_tor_norm=batch.pedestal_rho_tor_norm,
             )
             for i_time in range(n_t)
         )

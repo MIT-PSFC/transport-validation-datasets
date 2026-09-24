@@ -31,6 +31,7 @@ def clean_channels(
     err: np.ndarray,
     fit_bounds: FitBounds,
     anchors: FitAnchors,
+    pedestal_rho: float,
     scale_per_slice: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, FitAnchors] | None:
     """Clean one slice's channels and normalize them for fitting.
@@ -43,6 +44,7 @@ def clean_channels(
         err: Channel errors.
         fit_bounds: The variable's staged bound knobs (for the rough fit).
         anchors: The variable's anchors, in the data's own units.
+        pedestal_rho: The kernel's length-scale transition center, for the rough fit and the leave-one-out.
         scale_per_slice: Normalize by the cleaned slice max before fitting, to
             prevent amplitude collapse when channels do not cover the full
             radial range.
@@ -67,15 +69,15 @@ def clean_channels(
     x = np.asarray(x, dtype=float)
 
     anchors = anchors.scaled(scale)
-    rough_hyps = _rough_hyperparameters(x, y, err, fit_bounds, anchors)
+    rough_hyps = _rough_hyperparameters(x, y, err, fit_bounds, anchors, pedestal_rho)
     x, y, err = _remove_loo_outliers(
-        x, y, err, anchors.value, ref_hyperparams=rough_hyps
+        x, y, err, anchors.value, pedestal_rho, ref_hyperparams=rough_hyps
     )
     return x, y, err, scale, anchors
 
 
 def _rough_hyperparameters(
-    x, y, err, fit_bounds: FitBounds, anchors: FitAnchors
+    x, y, err, fit_bounds: FitBounds, anchors: FitAnchors, pedestal_rho: float
 ) -> np.ndarray | None:
     """Run one reduced optimize pass on (possibly still contaminated) data.
 
@@ -88,20 +90,29 @@ def _rough_hyperparameters(
         err: Channel errors (normalized).
         fit_bounds: The variable's staged bound knobs.
         anchors: The variable's anchors (normalized).
+        pedestal_rho: The kernel's length-scale transition center.
 
     Returns:
-        Fitted [var, l1, l2, lw, x0], or None if the fit failed.
+        Fitted [var, l1, l2, lw], or None if the fit failed.
     """
     gp = run_gp(
-        x, y, err, x, fit_bounds, anchors, nrestarts=_ROUGH_NRESTARTS, hyp_retries=0
+        x,
+        y,
+        err,
+        x,
+        fit_bounds,
+        anchors,
+        pedestal_rho,
+        nrestarts=_ROUGH_NRESTARTS,
+        hyp_retries=0,
     )
     if gp is None:
         return None
-    return np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
+    return np.asarray(gp.get_gp_kernel().hyperparameters, dtype=float)
 
 
 def _loo_standardized_residuals(
-    x, y, err, value_anchors, hyperparams
+    x, y, err, value_anchors, pedestal_rho, hyperparams
 ) -> np.ndarray | None:
     """Compute the leave-one-out standardized residual at every data point.
 
@@ -122,6 +133,7 @@ def _loo_standardized_residuals(
         y: Channel values.
         err: Channel errors.
         value_anchors: (n_a, 3) value anchor rows (normalized).
+        pedestal_rho: The kernel's length-scale transition center.
         hyperparams: Kernel hyperparameters (length scales etc.); None uses
             the generic start values.
 
@@ -133,7 +145,7 @@ def _loo_standardized_residuals(
     yy = np.concatenate([y, value_anchors[:, 1]])
     ee = np.concatenate([err, value_anchors[:, 2]])
 
-    kernel = build_kernel(hyperparams)
+    kernel = build_kernel(pedestal_rho, hyperparams)
     try:
         K = np.asarray(kernel(xx, xx, der=0), dtype=float)
         K[np.diag_indices_from(K)] += ee**2
@@ -188,6 +200,7 @@ def _remove_loo_outliers(
     y,
     err,
     value_anchors,
+    pedestal_rho,
     sigma=3.0,
     sigma_corr=2.0,
     max_drop_frac=0.3,
@@ -216,6 +229,7 @@ def _remove_loo_outliers(
         y: Channel values.
         err: Channel errors.
         value_anchors: (n_a, 3) value anchor rows (normalized).
+        pedestal_rho: The kernel's length-scale transition center.
         sigma: LOO residual threshold; 3.0 (rather than a stricter 2.0)
             tolerates reference/data mismatch on genuinely steep slices.
         sigma_corr: Combined-sigma window for neighbor corroboration.
@@ -238,7 +252,9 @@ def _remove_loo_outliers(
     max_drop = max(1, round(max_drop_frac * n0))
     n_dropped = 0
     while x.size > 3 and n_dropped < max_drop:
-        z = _loo_standardized_residuals(x, y, err, value_anchors, ref_hyperparams)
+        z = _loo_standardized_residuals(
+            x, y, err, value_anchors, pedestal_rho, ref_hyperparams
+        )
         if z is None:
             break
         to_drop = None

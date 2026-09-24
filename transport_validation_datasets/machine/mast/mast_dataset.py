@@ -390,16 +390,14 @@ class MASTDataWorkflow(DataWorkflow):
     #   data inside rho ~0.4, and an l1 of 0.2 lets the fit collapse onto the
     #   zero prior there (core dives below the innermost channels, amplitude
     #   rails, fit_ignores_data culls the slice).
-    # - x0 down to 0.85: edge-peaked ne (ears) has its structure at rho 0.85-0.95,
-    #   out of reach of the short edge scale with the default 0.95 bound.
     # - var ceiling 5: on slices with an empty core the marginal likelihood
     #   rails the amplitude at the default ceiling of 20, which invents core
     #   values several times the slice max with a band to match.
     #   5 allows a prior amplitude of ~2x the slice max and
     #   leaves every data-covered region untouched.
     fit_bounds = {
-        "te": FitBounds(l1_min=0.4, x0_min=0.85, var_max=5.0),
-        "ne": FitBounds(l1_min=0.4, x0_min=0.85, var_max=5.0),
+        "te": FitBounds(l1_min=0.4, var_max=5.0),
+        "ne": FitBounds(l1_min=0.4, var_max=5.0),
     }
 
     # The public S3 store tolerates concurrent reads, and every read is a
