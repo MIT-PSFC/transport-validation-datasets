@@ -1,28 +1,10 @@
-"""Nonphysical-fit detection for the zk method.
+"""Nonphysical-fit checks for the zk method.
 
-Te and ne fall monotonically from the core, so a fitted slice that peaks
-off-axis is suspect. Two triggers:
-  Edge bump: the fit at rho >= _EDGE_RHO beats everything interior to it by
-    more than _EDGE_MARGIN. The margin spares flat profiles whose global max
-    lands in the edge by noise. It fires even when the scatter supports the
-    bump, since a data-backed edge bump above the whole interior means
-    miscalibrated edge channels (C-Mod edge-vs-core TS cross-calibration
-    blocks) and the repair drops them.
-  Data overshoot: the fit beats the local scatter envelope (data_envelope) by
-    more than _ENVELOPE_MARGIN, i.e. the GP ringing above its own data.
-    Checked only between the innermost and outermost finite channels: a hump
-    BETWEEN channels is interpolation (a blanket rho < 0.4 exemption once let
-    a pinned te fit invent a 6.4 keV peak at rho 0.26 between 4 keV channels,
-    C-Mod 1160503008 t=1.311), but a peaked profile may legitimately rise
-    toward the axis inside the innermost channel, and past the outermost
-    channel the profile is near zero, so the relative margin divides one
-    near-zero number by another and flags harmless sub-percent SOL ringing
-    (MAST 28956 t=0.179, fit 0.006e20 vs envelope 0.004e20 at rho 1.1) that
-    the monotonic-edge constraint and the value anchors already govern.
-    Data-supported off-axis humps (hollow ramp-up ne) pass.
-A flagged slice is repaired by refitting without the channels under the peak
-(see the worker's _fit_variable; a pinned te fit is first retried unpinned),
-and culled only once the repairs are exhausted.
+Te and ne fall from the core, so a fit that peaks off-axis is suspect.
+
+fit_ignores_data flags a fit that sits below its innermost channels.
+
+The worker retries a flagged fit and culls it once the repairs run out (worker_zk._fit_variable).
 """
 
 import numpy as np
@@ -30,70 +12,61 @@ import numpy as np
 _EDGE_RHO = 0.9
 _EDGE_MARGIN = 1.1
 _ENVELOPE_MARGIN = 1.2
+# Half-width of the envelope window, and of the channels the worker drops around a peak
 REPAIR_HALFWIDTH = 0.1
 
-# A fit whose innermost channels sit >= _FIT_BIAS_CORE_SIGMA above it is a
-# core amplitude collapse: LML can prefer a tiny variance that hugs the prior
-# below a sparse noisy core cluster
-# (C-Mod 1160503008 t=0.911, var=0.12 with the 2.5-2.8 keV core cluster 2.6 sigma above the fit)
-# One-sided on purpose: a fit riding ABOVE a garbage-low channel subset is the
-# fit doing its job, and that direction is nonphysical_peak's envelope check.
-# Core-only on purpose: a sliding-window version culled ~3% of healthy C-Mod
-# ne slices against 0.01-0.16% here (innermost-4 bias p99 is 1.1-1.7 per
-# device/var, the collapse class sits at 2.6+).
-# Pinned fits retry unpinned, otherwise the slice is culled: no channel subset
-# repairs a core the fit refuses to reach.
+# A fit whose innermost _FIT_BIAS_CORE_N channels sit on average more than _FIT_BIAS_CORE_SIGMA above it
+# is a core amplitude collapse,
+# where the likelihood prefers a small variance that hugs the prior below a sparse, noisy core.
+# Healthy fits stay below ~1.7 and collapses sit at 2.6 and above.
+# One-sided, since a fit above a low bad channel is doing its job,
+# and an overshoot is the envelope check's to judge.
+# Core-only, since the same test along the whole profile culls healthy fits.
+# No channel subset repairs a core the fit refuses to reach,
+# so a flagged fit gets the retries but never the channel drop.
 _FIT_BIAS_CORE_N = 4
 _FIT_BIAS_CORE_SIGMA = 2.5
 
-# Monotonic-edge constraint (virtual zero-slope observations). Te and ne fall
-# monotonically toward the edge, but the GP can ring up into a bump around
-# rho ~1.0, between the outermost channel and the value anchors at 1.1+, where
-# the short edge length scale wiggles freely. nonphysical_peak only catches
-# bumps beating the whole interior by _EDGE_MARGIN, so this one passes it.
-# fit_profile checks the posterior gradient on MONO_CHECK_RHO and, wherever
-# it exceeds MONO_GRAD_TOL, adds a virtual gradient observation
-# (rho, 0, MONO_GRAD_ERR) and refits at the same hyperparameters, up to
-# MONO_MAX_PASSES times (a refit can push the bump sideways).
-# Only rises the channel data does not corroborate are constrained
-# (rise_is_data_supported): hollow MAST ne genuinely rises through rho
-# 0.6-0.9, and constraining that flattened the valley and the off-axis peak
-# of every hollow profile (icddps2 audit 2026-07, e.g. shot 30097 t=0.245 s).
-# The constraint is soft (MONO_GRAD_ERR is the virtual observation's error
-# bar), so a sharp bump flattens toward a plateau, not to exactly zero slope.
+# Monotonic-edge constraint, applied by gp.fit_profile.
+# The GP can ring up into a bump past rho ~1.0,
+# between the outermost channel and the first value anchor (1.3 by default),
+# where the short edge length scale wiggles freely.
+# Such a bump rarely beats the whole interior by _EDGE_MARGIN, so nonphysical_peak misses it.
+# Wherever the fit's gradient on MONO_CHECK_RHO exceeds MONO_GRAD_TOL,
+# fit_profile adds a zero-gradient observation with error MONO_GRAD_ERR and refits at the same hyperparameters.
+# It repeats up to MONO_MAX_PASSES times, since a refit can push the bump sideways.
+# The constraint is soft, so a sharp bump flattens toward a plateau rather than to zero slope.
+# A rise the channels support is left alone (rise_is_data_supported),
+# since hollow ne genuinely rises through rho 0.6-0.9.
 # Tolerance and error are in scale_per_slice-normalized units.
 MONO_CHECK_RHO = np.concatenate([np.linspace(0.6, 0.85, 6), np.linspace(0.9, 1.09, 20)])
 MONO_GRAD_TOL = 0.01
 MONO_GRAD_ERR = 0.05
 MONO_MAX_PASSES = 3
-# Data-support gate for the mono constraint: window half-width, minimum
-# channels in the window, and the t-statistic the local weighted-least-squares
-# slope must beat for the rise to count as data-supported (and be left alone).
-# MIN_POINTS = 5 encodes the breadth distinction: a genuine hollow-profile
-# flank spans many channels (MAST has ~20 per window), while the narrow 2-3
-# channel pedestal-shoulder bump this constraint exists for cannot muster 5.
+# Data-support gate, see rise_is_data_supported.
+# Five channels separates the flank of a hollow profile, which spans many (~20 per window on MAST),
+# from the 2-3 channel pedestal-shoulder bump the constraint exists for.
 _MONO_SUPPORT_HALFWIDTH = 0.08
 _MONO_SUPPORT_MIN_POINTS = 5
 _MONO_SUPPORT_TSTAT = 1.0
 
 
 def rise_is_data_supported(data_x, data_y, err_y, rho) -> bool:
-    """Check whether the channel data around rho shows a significant rise.
+    """Check whether the channels around rho show a significant rise.
 
-    Weighted least-squares slope over channels within _MONO_SUPPORT_HALFWIDTH
-    of rho; the rise counts as data-supported when the slope is positive with
-    t-statistic above _MONO_SUPPORT_TSTAT. Fewer than _MONO_SUPPORT_MIN_POINTS
-    channels in the window means there is no data to support anything (the fit
-    is extrapolating or interpolating a gap), so the mono constraint applies.
+    Fits a weighted least-squares slope to the channels within _MONO_SUPPORT_HALFWIDTH of rho.
+    The rise is data-supported when the slope is positive with a t-statistic above _MONO_SUPPORT_TSTAT.
+    With fewer than _MONO_SUPPORT_MIN_POINTS channels the fit is extrapolating or bridging a gap,
+    so nothing supports the rise.
 
     Args:
         data_x: Channel rho positions.
         data_y: Channel values.
         err_y: Channel errors.
-        rho: Location of the fit's rising gradient.
+        rho: Where the fit rises.
 
     Returns:
-        True if the local data itself supports a positive slope at rho.
+        True if the channels support a positive slope at rho.
     """
     m = (
         np.isfinite(data_x)
@@ -116,12 +89,11 @@ def rise_is_data_supported(data_x, data_y, err_y, rho) -> bool:
 
 
 def fit_ignores_data(data_x, data_y, err_y, x_star, y_fit) -> bool:
-    """Check whether the fit sits systematically BELOW its innermost channels.
+    """Check whether the fit sits below its innermost channels.
 
-    One-sided test on the standardized residuals z = (y - fit) / err of the
-    innermost _FIT_BIAS_CORE_N channels (in rho order) against
-    _FIT_BIAS_CORE_SIGMA. See the block comment for why this is deliberately
-    core-only and one-sided.
+    Compares the mean of z = (y - fit) / err over the innermost
+    _FIT_BIAS_CORE_N channels with _FIT_BIAS_CORE_SIGMA.
+    See the block comment above _FIT_BIAS_CORE_N for why the test is one-sided and core-only.
 
     Args:
         data_x: Channel rho positions.
@@ -148,11 +120,11 @@ def fit_ignores_data(data_x, data_y, err_y, x_star, y_fit) -> bool:
 def data_envelope(data_x, data_y, data_err, rho0) -> float:
     """Compute the upper envelope of the channel scatter near rho0.
 
-    max(y + 2 err) over channels within REPAIR_HALFWIDTH of rho0, plus the
-    nearest finite channel on each side. Including the nearest neighbors keeps
-    interpolation across a data gap from reading as overshoot: a fit
-    descending a steep pedestal sits below its inner neighbor, which belongs
-    in the envelope even when it falls outside the fixed window.
+    The envelope is max(y + 2 err) over the channels within REPAIR_HALFWIDTH of rho0
+    and the nearest channel on each side.
+    The nearest channels keep a fit bridging a data gap from reading as overshoot,
+    since a fit descending a steep pedestal sits below its inner neighbor
+    even when that neighbor is outside the window.
 
     Args:
         data_x: Channel rho positions.
@@ -181,7 +153,20 @@ def data_envelope(data_x, data_y, data_err, rho0) -> float:
 def nonphysical_peak(y, x_star, data_x, data_y, data_err) -> float | None:
     """Locate the nonphysical off-axis peak of a fitted slice, if any.
 
-    See the trigger definitions in the module docstring.
+    Edge bump:
+    The fit at rho >= _EDGE_RHO beats the whole interior by more than _EDGE_MARGIN.
+    The margin spares flat profiles whose maximum lands in the edge by noise.
+    It fires even when channels support the bump,
+    since an edge above the whole interior means miscalibrated edge channels.
+
+    Data overshoot:
+    The fit beats the local data envelope (data_envelope) by more than _ENVELOPE_MARGIN,
+    which is the GP ringing above its own data.
+    It is checked from the innermost to the outermost channel, where the fit interpolates.
+    Inside the innermost channel a peaked profile may rightly keep rising toward the axis.
+    Past the outermost channel fit and envelope are both near zero,
+    so their ratio would flag harmless SOL ringing that the anchors and the monotonic-edge constraint govern.
+    Off-axis humps the data supports, such as hollow ne, pass.
 
     Args:
         y: Fitted profile on x_star.
