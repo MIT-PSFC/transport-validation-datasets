@@ -65,7 +65,10 @@ from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import minimize
 
 from transport_validation_datasets.imas_export.geqdsk_writer import write_geqdsk
-from transport_validation_datasets.machine.generic import cumulative_q_integral
+from transport_validation_datasets.machine.generic import (
+    cumulative_q_integral,
+    psi_n_from_rho_tor_norm,
+)
 
 
 def _latest_dd_version() -> str:
@@ -144,14 +147,13 @@ class ShotExportSlice:
 
     Attributes:
         time: Thomson slice time [s].
-        t_e: Electron temperature on `rho` [eV].
-        n_e: Electron density on `rho` [m^-3].
-        rho: Normalized rho grid t_e/n_e are given on.
+        t_e: Electron temperature on `rho_tor_norm` [eV].
+        n_e: Electron density on `rho_tor_norm` [m^-3].
+        rho_tor_norm: The fit grid t_e/n_e are given on.
         psi_axis: Matched equilibrium's psi at the magnetic axis (target COCOS).
         psi_boundary: Matched equilibrium's psi at the boundary (target COCOS).
-        psin_neo: `rho` mapped onto the matched equilibrium's psi_norm grid
-            (see `build_equilibrium`'s `derived_by_time`), for placing
-            `profiles_1d.grid.psi`.
+        psi_n: `rho_tor_norm` mapped back onto the matched equilibrium's normalized psi,
+            for placing `profiles_1d.grid.psi`.
         ip: Nearest-time plasma current [A].
         t_e_error: 1-sigma uncertainty of `t_e` [eV], or None if the fit
             file carries none.
@@ -161,10 +163,10 @@ class ShotExportSlice:
     time: float
     t_e: np.ndarray
     n_e: np.ndarray
-    rho: np.ndarray
+    rho_tor_norm: np.ndarray
     psi_axis: float
     psi_boundary: float
-    psin_neo: np.ndarray
+    psi_n: np.ndarray
     ip: float
     t_e_error: np.ndarray | None = None
     n_e_error: np.ndarray | None = None
@@ -264,15 +266,11 @@ class _EquilibriumTimeDerived:
     """Per-equilibrium-time quantities returned by `_populate_equilibrium_time_slice`.
 
     These are needed alongside the IDS fields it writes directly into `ts`.
-    `rho_tor_norm`/`psi_norm` are this equilibrium time's own arrays (the
-    ones written to `ts.profiles_1d.rho_tor_norm`/`psi_norm`), reused
-    directly in `build_imas_from_shot` to map a Thomson rho onto this psi
-    grid (`ShotExportSlice.psin_neo`, for `core_profiles.profiles_1d.grid.
-    psi`'s placement).
+    `qpsi` is this equilibrium time's q profile.
+    build_imas_from_shot maps the fit grid back onto psi through it (`ShotExportSlice.psi_n`).
     """
 
-    rho_tor_norm: np.ndarray
-    psi_norm: np.ndarray
+    qpsi: np.ndarray
     bcentr: float
     psi_axis: float
     psi_boundary: float
@@ -303,7 +301,7 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
 
     Returns:
         An `_EquilibriumTimeDerived` with this equilibrium time's
-        `rho_tor_norm`/`psi_norm`/`bcentr`/`psi_axis`/`psi_boundary`.
+        `qpsi`/`bcentr`/`psi_axis`/`psi_boundary`.
     """
     psi_axis = float(eqi.psimag)
     psi_boundary = float(eqi.psibdry)
@@ -358,8 +356,7 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     p2d.psi = np.asarray(eqi.psi, dtype=float)
 
     return _EquilibriumTimeDerived(
-        rho_tor_norm=np.asarray(ts.profiles_1d.rho_tor_norm, dtype=float),
-        psi_norm=np.asarray(ts.profiles_1d.psi_norm, dtype=float),
+        qpsi=qpsi,
         bcentr=bcentr,
         psi_axis=psi_axis,
         psi_boundary=psi_boundary,
@@ -480,8 +477,8 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
     for i, s in enumerate(slices):
         p1d = cp.profiles_1d[i]
         p1d.time = float(s.time)
-        p1d.grid.rho_tor_norm = s.rho
-        p1d.grid.psi = s.psin_neo * (s.psi_boundary - s.psi_axis) + s.psi_axis
+        p1d.grid.rho_tor_norm = s.rho_tor_norm
+        p1d.grid.psi = s.psi_n * (s.psi_boundary - s.psi_axis) + s.psi_axis
         p1d.electrons.density = s.n_e
         p1d.electrons.density_thermal = s.n_e
         p1d.electrons.temperature = s.t_e
@@ -493,7 +490,7 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
         if s.n_e_error is not None:
             p1d.electrons.density_error_upper = s.n_e_error
             p1d.electrons.density_thermal_error_upper = s.n_e_error
-        p1d.zeff = np.ones_like(s.rho, dtype=float)
+        p1d.zeff = np.ones_like(s.rho_tor_norm, dtype=float)
         # D is the only ion species, so T_i = T_e (as every species would be
         # assigned anyway) makes the density-weighted average exactly t_e.
         p1d.t_i_average = s.t_e
@@ -671,8 +668,8 @@ def build_imas_from_shot(
         shot: Shot number.
         fit_ds: `_shot_fit_dataset()`'s output for this shot
             (`fit_shots_dir/<shot>.nc`) -- `t_e`/`n_e`/`t_e_fit_status`/
-            `n_e_fit_status` on `(shot, TIME_DIM, rho)`, real slice times in
-            `TIME_COORD`.
+            `n_e_fit_status` on `(shot, TIME_DIM, rho_tor_norm)`, real slice times in
+            `TIME_COORD`, and the `sol_extension` attribute the channels were staged with.
         unprocessed_ds: This shot's unprocessed data
             (`01_unprocessed/<shot>.nc`) -- needs `ip` and
             `workflow.DATASET_EQUILIBRIUM_SIGNALS`, all on the shot's common
@@ -733,7 +730,8 @@ def build_imas_from_shot(
     ).squeeze("shot", drop=True)
     fit_ds = fit_ds.squeeze("shot", drop=True).isel({TIME_DIM: usable.values})
     ts_times = fit_ds[TIME_COORD].to_numpy().astype(float)
-    rho = fit_ds["rho"].to_numpy().astype(float)
+    rho_tor_norm = fit_ds["rho_tor_norm"].to_numpy().astype(float)
+    sol_extension = fit_ds.attrs["sol_extension"]
     te_arr = fit_ds["t_e"].to_numpy().astype(float)
     ne_arr = fit_ds["n_e"].to_numpy().astype(float)
     te_err_arr = (
@@ -761,22 +759,19 @@ def build_imas_from_shot(
         derived = derived_by_time[eq_t]
         idx0d = int(np.argmin(np.abs(unprocessed_time - t)))
 
-        # Maps Thomson's rho (RHO_DEFINITION: normalized outboard-midplane
-        # minor radius) onto this equilibrium's own psi_norm grid via its
-        # own rho_tor_norm -- both are standard "rho" definitions that agree
-        # closely for weakly-shaped equilibria and differ mainly by shaping
-        # corrections, an accepted approximation here.
-        psin_neo = np.interp(rho, derived.rho_tor_norm, derived.psi_norm)
+        # The inverse of the map the channels were staged with, SOL extension included,
+        # so the grid past the LCFS lands at psi_N > 1 rather than piling up at the boundary
+        psi_n = psi_n_from_rho_tor_norm(rho_tor_norm, derived.qpsi, sol_extension)
 
         slices.append(
             ShotExportSlice(
                 time=float(t),
                 t_e=te_arr[i],
                 n_e=ne_arr[i],
-                rho=rho,
+                rho_tor_norm=rho_tor_norm,
                 psi_axis=derived.psi_axis,
                 psi_boundary=derived.psi_boundary,
-                psin_neo=psin_neo,
+                psi_n=psi_n,
                 ip=signal_0d["ip"][idx0d],
                 t_e_error=None if te_err_arr is None else te_err_arr[i],
                 n_e_error=None if ne_err_arr is None else ne_err_arr[i],

@@ -3,7 +3,7 @@
 One staged batch file serves every fitting method:
 it carries the cleaned Thomson channel data in fit units: Te [keV], ne [1e20 m^-3]
 (with the device-specific error floors already baked in at staging),
-the target rho grid, and the per-variable fit bound knobs and anchors.
+the target rho_tor_norm grid, and the per-variable fit bound knobs and anchors.
 Workers read a batch, fit it, and write a result file whose rows stay aligned with the input rows
 A slice that was skipped or culled is an all-NaN row, never a dropped one.
 
@@ -71,8 +71,8 @@ class FitAnchors:
     Every method adds them to every slice.
 
     Attributes:
-        value: (n, 3) rows of (rho, value, error).
-        grad: (n, 3) rows of (rho, d/drho, error), per unit rho.
+        value: (n, 3) rows of (rho_tor_norm, value, error).
+        grad: (n, 3) rows of (rho_tor_norm, d/drho_tor_norm, error), per unit rho_tor_norm.
     """
 
     value: np.ndarray
@@ -140,7 +140,7 @@ class FitBatch:
 
     Attributes:
         shot_inputs: Per-shot channel data, keyed by shot number.
-        x_star: (n_x,) target rho grid the profiles are fit on.
+        x_star: (n_x,) target rho_tor_norm grid the profiles are fit on.
         min_points: Minimum valid channels per slice to attempt a fit.
         scale_per_slice: Normalize each slice by its max before fitting.
         bounds: Per-variable fit bound knobs, keyed by FIT_VARIABLES.
@@ -166,8 +166,8 @@ class ShotFitOutput:
 
     The fit/std/grad/grad_std arrays are (n_t, n_x), row-aligned with the
     input slices. A slice that was not fit is an all-NaN row.
-    The gradients are the GP posterior derivative d/drho (mean and latent std)
-    in the profile's units per unit rho.
+    The gradients are the GP posterior derivative d/drho_tor_norm (mean and latent std)
+    in the profile's units per unit rho_tor_norm.
     The status arrays are (n_t,) int8 STATUS_* codes.
     The hyps arrays are optional method diagnostics ((n_t, n_hyp), NaN where a slice
     was not fit at optimized hyperparameters) workers that have none leave them as None.
@@ -193,7 +193,7 @@ class ShotFitOutput:
 
         Args:
             n_t: Number of time slices.
-            n_x: Number of rho grid points.
+            n_x: Number of rho_tor_norm grid points.
             time: (n_t,) slice times [s], echoed from the input.
 
         Returns:
@@ -380,7 +380,7 @@ def pack_fit_results(
     Args:
         path: Destination npz path.
         outputs: Per-shot fit outputs, keyed by shot number.
-        x_star: (n_x,) rho grid the profiles were fit on.
+        x_star: (n_x,) rho_tor_norm grid the profiles were fit on.
     """
     arrays = {
         "shots": np.array(sorted(outputs), dtype=np.int64),

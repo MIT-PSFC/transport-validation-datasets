@@ -206,7 +206,7 @@ class TestMakeUnprocessedDataFiles:
 
 @pytest.mark.slow
 class TestPrepareFitInput:
-    def test_channels_are_mapped_onto_rho_in_the_fit_units(self, tmp_path):
+    def test_channels_mapped_on_rho_tor_norm_in_fit_units(self, tmp_path):
         skip_without_store()
         workflow = mast_workflow(tmp_path, shotlist=[TEST_SHOT])
         workflow.make_unprocessed_data_files()
@@ -218,10 +218,9 @@ class TestPrepareFitInput:
         assert fit_input.has_fittable_points()
         assert fit_input.x.shape == fit_input.te_y.shape == fit_input.ne_y.shape
         assert fit_input.time.size == fit_input.te_y.shape[0]
-        # Only the outboard side inside the separatrix neighbourhood is fit
-        finite_rho = fit_input.x[np.isfinite(fit_input.x)]
-        assert finite_rho.size > 0
-        assert finite_rho.min() >= 0.0
+        finite_rho_tor_norm = fit_input.x[np.isfinite(fit_input.x)]
+        assert finite_rho_tor_norm.size > 0
+        assert finite_rho_tor_norm.min() >= 0.0
         # Te [keV] and ne [1e20 m^-3], not the SI values in the stored file
         assert np.nanmax(fit_input.te_y) < 100.0
         assert np.nanmax(fit_input.ne_y) < 100.0
