@@ -66,8 +66,8 @@ def fit_residual(
 
     Args:
         x: Channel rho positions (NaN-free).
-        residual: Channel residual values (data - analytic mean), normalized.
-        err: Channel errors, normalized the same way as residual.
+        residual: Channel residual values (data - analytic mean), normalized when the batch scales per slice.
+        err: Channel errors, in the same units as residual.
         x_star: Target rho grid.
         value_anchors: (n, 3) rows of (rho, residual, error), in residual space.
         grad_anchors: (n, 3) rows of (rho, residual gradient, error), in residual space.
