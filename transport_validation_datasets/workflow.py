@@ -186,7 +186,7 @@ class DeviceSettings:
     """
 
     sol_extension: str = "secant"
-    pedestal_rho_tor_norm: float = 0.95
+    pedestal_rho_tor_norm: float = 1.0
     te_value_anchors: list = field(
         default_factory=lambda: [
             [1.3, 0.0, 0.01],

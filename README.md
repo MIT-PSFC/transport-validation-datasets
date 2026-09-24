@@ -159,7 +159,7 @@ te_grad_anchors = [[0.0, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1], [1.5, 0.0,
 The anchors are staged into the fit batches, so changing them needs
 `--clean_fit_state` or a new `--ds_name`.
 
-Both device tables also take `pedestal_rho_tor_norm`, the pedestal location every fit uses, 0.95 by default.
+Both device tables also take `pedestal_rho_tor_norm`, the pedestal location every fit uses, 1.0 by default.
 zk places its kernel's length-scale transition there, and akho centers its mtanh there.
 One value for both Te and ne. It is staged and checked like the anchors.
 
