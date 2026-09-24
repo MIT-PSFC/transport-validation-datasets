@@ -143,7 +143,7 @@ def evaluate_with_gradient(fit_func, popt, x, h=1.0e-4):
 
 
 def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thresh):
-    """Fit the zero-axis-slope mtanh and cubic to one normalized profile, keep the better.
+    """Fit the zero-axis-slope mtanh and cubic to one profile, keep the one that fits better.
 
     The candidates compete on reduced chi-squared inside the separatrix.
     An mtanh needs three measured channels inside its pedestal width,
@@ -151,8 +151,8 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
 
     Args:
         rho: (n,) point positions, measured channels and value anchors.
-        values: (n,) values normalized by the slice maximum.
-        errors: (n,) errors, normalized the same way.
+        values: (n,) values, normalized by the slice maximum when the batch scales per slice.
+        errors: (n,) errors, in the same units as values.
         is_channel: (n,) True for measured channels, False for anchors.
         profile_type: 'te' or 'ne', selects the bounds and initial guesses.
         edge_thresh: rho above which points seed the edge-based initial guess.
@@ -218,7 +218,7 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
     except Exception:
         pass
 
-    # Clamp the guesses to the bounds, the hard-coded pedestal tops sit far above normalized data
+    # Clamp the guesses to the bounds, the hard-coded pedestal tops can sit far above the data
     lb_arr = np.array(lb)
     ub_arr = np.array(ub)
     guesses = [np.clip(g, lb_arr, ub_arr) for g in guesses]

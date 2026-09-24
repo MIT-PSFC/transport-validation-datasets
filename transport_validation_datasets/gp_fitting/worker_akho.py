@@ -77,8 +77,12 @@ def _fit_variable(
     min_points: int,
     variable: str,
     anchors: FitAnchors,
+    scale_per_slice: bool,
 ) -> VariableFit:
     """Fit one variable of one time slice: analytic pre-fit + GP-residual correction.
+
+    The channel data arrive already cleaned at staging (transport_validation_datasets.cleaning),
+    so the scale is the maximum of what the fit sees.
 
     Args:
         x: Channel rho positions.
@@ -88,6 +92,8 @@ def _fit_variable(
         min_points: Minimum valid channels to attempt a fit.
         variable: 'te' or 'ne', which selects the pre-fit bounds and initial guesses.
         anchors: The variable's anchors, in the data's own units.
+        scale_per_slice: Normalize by the slice maximum before fitting.
+            The residual GP's kernel bounds are calibrated on normalized data.
 
     Returns:
         The variable's fit and its STATUS_* code.
@@ -102,7 +108,7 @@ def _fit_variable(
         return _no_fit(STATUS_SKIPPED)
     cx, cy, cerr = x[valid], y[valid], err[valid]
 
-    scale = float(np.nanmax(cy))
+    scale = float(np.max(cy)) if scale_per_slice else 1.0
     if not np.isfinite(scale) or scale <= 0.0:
         return _no_fit(STATUS_FAILED)
 
@@ -189,6 +195,7 @@ def _fit_slice(task: SliceTask) -> SliceResult:
         task.min_points,
         "te",
         task.te_anchors,
+        task.scale_per_slice,
     )
     ne = _fit_variable(
         task.x,
@@ -198,6 +205,7 @@ def _fit_slice(task: SliceTask) -> SliceResult:
         task.min_points,
         "ne",
         task.ne_anchors,
+        task.scale_per_slice,
     )
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)
 
