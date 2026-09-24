@@ -1,14 +1,15 @@
 """End-to-end tests of the DataWorkflow stages on a synthetic device.
 
-DummyWorkflow fakes the source: a shot is a flat current on the 1 kHz grid
-with a Thomson sample every SAMPLE_PERIOD_MS, whose channels sit at known
-rho_tor_norm and carry a parabolic profile scaled per shot. The fits go through the
-linear interpolation method in linear_worker.py, registered as "linear" for
-these tests, so every stage runs in well under a second and the fitted
-profiles are predictable.
+DummyWorkflow fakes the source:
+a shot is a flat current on the 1 kHz grid with a Thomson sample every SAMPLE_PERIOD_MS.
+Its channels sit at known rho_tor_norm and carry a synthetic shape scaled per shot.
+The fits go through the linear interpolation method in linear_worker.py,
+registered as "linear" for these tests,
+so every stage runs in well under a second and the fitted profiles are predictable.
 """
 
 import json
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -36,14 +37,33 @@ from transport_validation_datasets.workflow import DataWorkflow
 DURATION = 0.3  # s of source data per shot
 SAMPLE_PERIOD_MS = 20
 FIRST_SAMPLE_MS = 10
-N_CH = 8
-RHO_TOR_NORM_CH = np.linspace(0.05, 0.95, N_CH)
 TE_AXIS = 1000.0  # eV
 NE_AXIS = 1.0e20  # m^-3
+# Dense enough to resolve the pedestal, and reaching into the SOL
+RHO_TOR_NORM_CH = np.linspace(0.05, 1.1, 24)
+# Where make_source_dataset injects the bad readings
+MISFIRED_TE_CHANNEL = 3  # rho_tor_norm 0.19
+NOISY_NE_CHANNEL = 7  # rho_tor_norm 0.37
 
+# Dummy shot numbers used throughout the tests
 BLACKLISTED_SHOT = 9
 UNREADABLE_SHOT = 5  # the source returns None, a transient failure
 SHORT_SHOT = 7  # too short to pass the filters
+
+
+# Synthetic shapes, each 1 on the axis and positive on every channel
+
+
+def parabola(rho_tor_norm: np.ndarray) -> np.ndarray:
+    # Zero at 1.2, past the outermost channel
+    return 1.0 - (rho_tor_norm / 1.2) ** 2
+
+
+def pedestal(rho_tor_norm: np.ndarray) -> np.ndarray:
+    # A broad core and a steep tanh pedestal at 0.95, as in H-mode
+    core = 1.0 - 0.3 * rho_tor_norm**2
+    tanh_edge = np.tanh((rho_tor_norm - 0.95) / 0.02)
+    return core * 0.5 * (1.0 - tanh_edge)
 
 
 def shot_scale(shot: int) -> float:
@@ -51,26 +71,40 @@ def shot_scale(shot: int) -> float:
     return 1.0 + 0.1 * (shot % 10)
 
 
-def profile(rho_tor_norm: np.ndarray) -> np.ndarray:
-    return 1.0 - rho_tor_norm**2
-
-
 def make_source_dataset(
-    shot: int, duration: float = DURATION, broken_sample: int | None = None
+    shot: int,
+    shape: Callable[[np.ndarray], np.ndarray],
+    duration: float,
+    broken_sample: int | None,
+    bad_readings: bool,
 ) -> xr.Dataset:
     grid = make_uniform_1kHz_timebase(duration)
     n_t = grid.size
+    n_ch = RHO_TOR_NORM_CH.size
     is_sample = np.zeros(n_t, dtype=bool)
     is_sample[FIRST_SAMPLE_MS::SAMPLE_PERIOD_MS] = True
-    te = np.full((n_t, N_CH), np.nan)
-    te[is_sample] = TE_AXIS * profile(RHO_TOR_NORM_CH) * shot_scale(shot)
-    ne = np.full((n_t, N_CH), np.nan)
-    ne[is_sample] = NE_AXIS * profile(RHO_TOR_NORM_CH) * shot_scale(shot)
+    sample_rows = np.flatnonzero(is_sample)
+    shape_ch = shape(RHO_TOR_NORM_CH) * shot_scale(shot)
+    te = np.full((n_t, n_ch), np.nan)
+    te[is_sample] = TE_AXIS * shape_ch
+    ne = np.full((n_t, n_ch), np.nan)
+    ne[is_sample] = NE_AXIS * shape_ch
+    # Errors are 10% of the clean readings
+    te_error = 0.1 * te
+    ne_error = 0.1 * ne
     if broken_sample is not None:
         # All but two channels of one sample lost, below fit_min_points
-        row = np.flatnonzero(is_sample)[broken_sample]
+        row = sample_rows[broken_sample]
         te[row, 2:] = np.nan
         ne[row, 2:] = np.nan
+    if bad_readings:
+        # First sample: a Te reading at a tenth of its neighbours, and an ne error 20 times theirs
+        te[sample_rows[0], MISFIRED_TE_CHANNEL] *= 0.1
+        ne_error[sample_rows[0], NOISY_NE_CHANNEL] *= 20.0
+        # Second sample: every channel inside rho_tor_norm 0.3 lost
+        lost_in_core = RHO_TOR_NORM_CH < 0.3
+        te[sample_rows[1], lost_in_core] = np.nan
+        ne[sample_rows[1], lost_in_core] = np.nan
 
     def channel(values):
         return ((EPISODE_DIM, TIME_COORD, "ts_channel"), values[None])
@@ -80,13 +114,13 @@ def make_source_dataset(
             "ip": ((EPISODE_DIM, TIME_COORD), np.full((1, n_t), 1.0e6)),
             # rho_tor_norm stands in for R, see DummyWorkflow.prepare_fit_input
             "ts_channel_r": channel(np.tile(RHO_TOR_NORM_CH, (n_t, 1))),
-            "ts_channel_z": channel(np.zeros((n_t, N_CH))),
+            "ts_channel_z": channel(np.zeros((n_t, n_ch))),
             "ts_channel_t_e": channel(te),
-            "ts_channel_t_e_error": channel(0.1 * te),
+            "ts_channel_t_e_error": channel(te_error),
             "ts_channel_n_e": channel(ne),
-            "ts_channel_n_e_error": channel(0.1 * ne),
+            "ts_channel_n_e_error": channel(ne_error),
         },
-        coords={EPISODE_DIM: [shot], TIME_COORD: grid, "ts_channel": np.arange(N_CH)},
+        coords={EPISODE_DIM: [shot], TIME_COORD: grid, "ts_channel": np.arange(n_ch)},
     )
 
 
@@ -103,7 +137,9 @@ class DummyWorkflow(DataWorkflow):
 
     def __init__(self, *args, **kwargs):
         self.source_reads: list[int] = []
+        self.shape = parabola
         self.broken_samples: dict[int, int] = {}
+        self.bad_readings = False
         super().__init__(*args, **kwargs)
 
     def get_shotlist_from_source(self) -> list[int]:
@@ -114,7 +150,13 @@ class DummyWorkflow(DataWorkflow):
         if shot == UNREADABLE_SHOT:
             return None
         duration = 0.05 if shot == SHORT_SHOT else DURATION
-        return make_source_dataset(shot, duration, self.broken_samples.get(shot))
+        return make_source_dataset(
+            shot,
+            self.shape,
+            duration,
+            broken_sample=self.broken_samples.get(shot),
+            bad_readings=self.bad_readings,
+        )
 
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
         ds_shot = ds.squeeze(EPISODE_DIM, drop=True)
@@ -177,7 +219,7 @@ def shot_times(store: xr.Dataset, shot: int) -> tuple[int, np.ndarray]:
 
 
 def expected_te(shot: int, rho_tor_norm: np.ndarray) -> np.ndarray:
-    return TE_AXIS * profile(rho_tor_norm) * shot_scale(shot)
+    return TE_AXIS * parabola(rho_tor_norm) * shot_scale(shot)
 
 
 @pytest.fixture(autouse=True)
@@ -258,9 +300,31 @@ class TestStageFitBatches:
         assert np.allclose(si.x, RHO_TOR_NORM_CH)
         # Staged in the fit units: keV and 1e20 m^-3
         assert np.allclose(si.te_y[0], expected_te(1, RHO_TOR_NORM_CH) * 1e-3)
-        assert np.allclose(si.ne_y[0], profile(RHO_TOR_NORM_CH) * shot_scale(1))
+        assert np.allclose(si.ne_y[0], parabola(RHO_TOR_NORM_CH) * shot_scale(1))
         assert si.windows.shape == (0, 2)
         assert (si.window_index == -1).all()
+
+    def test_bad_readings_drop_both_variables_and_pedestal_survives(self, tmp_path):
+        workflow = make_workflow(tmp_path, shots=[1])
+        workflow.shape = pedestal
+        workflow.bad_readings = True
+        workflow.make_unprocessed_data_files()
+
+        batches = workflow.stage_fit_batches([1])
+
+        (batch_id,) = batches
+        si = unpack_fit_batch(workflow._batch_in_path(batch_id)).shot_inputs[1]
+        # The misfired Te and the noisy ne each take the other variable's reading along,
+        # and nothing else in the sample goes, the steep pedestal included
+        for y in (si.te_y[0], si.ne_y[0]):
+            dropped = np.flatnonzero(np.isnan(y))
+            assert dropped.tolist() == [MISFIRED_TE_CHANNEL, NOISY_NE_CHANNEL]
+        # A sample with no channel in the core is not fit at all
+        assert np.isnan(si.te_y[1]).all()
+        assert np.isnan(si.ne_y[1]).all()
+        pedestal_ch = pedestal(RHO_TOR_NORM_CH)
+        pedestal_te_keV = TE_AXIS * 1e-3 * pedestal_ch * shot_scale(1)
+        assert np.allclose(si.te_y[2:], pedestal_te_keV)
 
     def test_windowed_mode_keeps_only_samples_inside_windows(self, tmp_path):
         workflow = make_workflow(tmp_path, windows={1: [(0.1, 0.2)]})
@@ -301,10 +365,11 @@ class TestStageFitBatches:
         assert batch.fit_mode == FIT_MODE_WINDOW_AVERAGE
         assert np.allclose(si.time, [0.15, 0.24])
         # Five samples in the first window, four in the second, padded to five
-        assert si.x.shape == (2, 5 * N_CH)
+        n_ch = RHO_TOR_NORM_CH.size
+        assert si.x.shape == (2, 5 * n_ch)
         assert np.isfinite(si.x[0]).all()
-        assert np.isfinite(si.x[1, : 4 * N_CH]).all()
-        assert np.isnan(si.x[1, 4 * N_CH :]).all()
+        assert np.isfinite(si.x[1, : 4 * n_ch]).all()
+        assert np.isnan(si.x[1, 4 * n_ch :]).all()
         assert si.window_index.tolist() == [0, 1]
 
     def test_shot_with_no_sample_in_windows_skipped(self, tmp_path):
@@ -352,7 +417,7 @@ class TestRunGpFitting:
                 inside = (rho_tor_norm >= RHO_TOR_NORM_CH[0]) & (
                     rho_tor_norm <= RHO_TOR_NORM_CH[-1]
                 )
-                # Linear interpolation of a parabola between 8 channels
+                # Linear interpolation of a parabola between the channels
                 assert np.allclose(
                     ds["t_e"].values[0][:, inside],
                     expected_te(shot, rho_tor_norm[inside]),
