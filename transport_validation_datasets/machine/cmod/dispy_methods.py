@@ -165,8 +165,8 @@ class CmodEfitMethods:
             )[0]
         )
 
-        # No per-node fallback: every one of these is needed to build a GEQDSK,
-        # so a missing node fails the shot, which the workflow records and skips.
+        # Every one of these is needed to build a GEQDSK.
+        # A missing node raises here, and disruption-py fills this method's columns with NaN.
         geqdsk_data = {
             param: params.mds_conn.get_data(path, tree_name="_efit_tree")
             for param, path in CmodEfitMethods.geqdsk_cols.items()

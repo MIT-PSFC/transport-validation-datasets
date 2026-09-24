@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import xarray as xr
+from disruption_py.core.utils.math import interp1
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.settings.output_setting import DatasetOutputSetting
@@ -40,31 +41,32 @@ SIGNAL_ATTRS = {
     },
 }
 
+# An EFIT tree whose reconstructions sit further apart than this is slow [s].
+# Snapping its 0D signals would leave most of the 1 kHz grid NaN, so they are interpolated instead.
+# EFIT21 reconstructs every 1 ms, ANALYSIS every ~20 ms.
+SLOW_EFIT_PERIOD = 1.5e-3
+
 
 @dataclass(frozen=True)
 class CModSettings(DeviceSettings):
     """C-Mod settings, the [cmod] table of the config file.
 
     Attributes:
-        efit_nickname_below: Shot-number threshold -> EFIT tree overrides,
-            resolved before efit_nickname: a shot uses the tree of the
-            smallest threshold it falls below, so multiple entries split
-            the shot range into eras. Empty by default (no overrides):
-            EFIT21 was verified to exist at full 1 kHz cadence for every
-            pre-2004 shot in the scenario list (2026-09-14 MDSplus audit),
-            so nothing is routed to the sparse ANALYSIS tree anymore. In
-            TOML: [cmod.efit_nickname_below] with entries like
-            "1050204013" = "analysis" (keys are strings, TOML tables
-            require it).
-        efit_nickname: EFIT tree the equilibrium, the geometry signals, and
-            the shot's 1 kHz timebase are read from, and so the one the
-            Thomson channels are mapped onto rho_tor_norm with. A tree name (EFIT21,
-            EFIT18, ...), or one of disruption-py's keys: "analysis" for the
-            ANALYSIS tree, "disruption" for the disruption EFIT.
+        efit_trees: EFIT trees to read a shot from, in order of preference.
+            The equilibrium, the geometry signals and the shot's 1 kHz timebase all come from one tree,
+            and so does the rho_tor_norm mapping of the Thomson channels.
+            A shot takes the first tree that serves every retrieval (see get_source_dataset).
     """
 
-    efit_nickname: str = "EFIT21"
-    efit_nickname_below: dict[str, str] = field(default_factory=dict)
+    efit_trees: list[str] = field(default_factory=lambda: ["EFIT21", "ANALYSIS"])
+
+    def __post_init__(self):
+        super().__post_init__()
+        # A bare string would be read as a list of one-letter trees
+        if isinstance(self.efit_trees, str) or not self.efit_trees:
+            raise ValueError(
+                f"efit_trees must be a non-empty list of tree names, got {self.efit_trees!r}"
+            )
 
 
 class CModDataWorkflow(DataWorkflow):
@@ -142,32 +144,25 @@ class CModDataWorkflow(DataWorkflow):
         shotlist = [shot for shot in shotlist if shot // 1000 in blessed_days]
         return shotlist
 
-    def _efit_nickname(self, shot: int) -> str:
-        """Resolve the EFIT tree one shot's retrievals read from.
-
-        Args:
-            shot: Shot number being retrieved.
-
-        Returns:
-            The tree of the smallest efit_nickname_below threshold the shot
-            falls below, or efit_nickname when it falls below none.
-        """
-        best: tuple[int, str] | None = None
-        for threshold, tree in self.settings.efit_nickname_below.items():
-            limit = int(threshold)
-            if shot < limit and (best is None or limit < best[0]):
-                best = (limit, tree)
-        return best[1] if best is not None else self.settings.efit_nickname
-
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         """Read one shot from MDSplus, through disruption-py, into standardized signals.
 
         Four retrievals rather than one, because their native timebases differ.
         The fast diagnostics (Ip, B0, density, powers) are sampled at the 1 kHz grid times from their own faster native data.
-        The EFIT 0D signals (stored energy, shaping), the EFIT reconstruction,
-        and Thomson scattering (native ~20 Hz) are snapped onto the grid without interpolation,
+        The EFIT reconstruction and Thomson scattering (native ~20 Hz) are snapped onto the grid without interpolation,
         so grid times between their real samples hold NaN.
-        For EFIT21, which is native 1 kHz, the snap is an exact relabeling.
+        The EFIT 0D signals (stored energy, shaping) are snapped too from a 1 kHz tree, where the snap is an exact relabeling,
+        and interpolated from a slow one (see _get_efit0d_dataset).
+        fresh_equilibrium in the stores marks the grid times a reconstruction landed on either way.
+
+        All four open the EFIT tree, at least for their timebase,
+        so a shot reads everything from one tree.
+        The trees of efit_trees are tried in order, and the first that serves all four is kept
+        and recorded as the efit_tree attribute.
+        A tree fails when a retrieval comes back empty (a missing tree fails disruption-py's setup)
+        or the reconstruction has no cocos attribute (a missing node, see CmodEfitMethods.get_geqdsk_parameters).
+        A shot the later checks or the unprocessed filter reject does not try another tree,
+        since those rejections have causes the tree does not change.
 
         Args:
             shot: Shot number to read.
@@ -175,26 +170,30 @@ class CModDataWorkflow(DataWorkflow):
         Returns:
             The standardized dataset, or None when the shot cannot be built.
         """
-        datasets = []
-        for name, getter in (
-            ("fast", _get_fast_dataset),
-            ("efit0d", _get_efit0d_dataset),
-            ("efit", _get_efit_dataset),
-            ("thomson", _get_thomson_dataset),
-        ):
-            ds = getter(shot, self._efit_nickname(shot))
-            if ds is None:
-                reason = f"Missing retrievable {name} data."
-                logger.warning(f"Shot {shot} is {reason.lower()} Skipping.")
-                self.record_failed_shot(shot, reason)
-                return None
-            datasets.append(ds)
+        efit_trees = self.settings.efit_trees
+        tree_failures = []
+        for i_tree, efit_tree in enumerate(efit_trees):
+            datasets, reason = _read_with_efit_tree(shot, efit_tree)
+            if reason is None:
+                break
+            tree_failures.append(f"{efit_tree}: {reason}")
+            if i_tree + 1 < len(efit_trees):
+                logger.warning(
+                    f"Shot {shot}: EFIT tree {efit_tree} failed ({reason}), "
+                    f"trying {efit_trees[i_tree + 1]}"
+                )
+        else:
+            failure = "No usable EFIT tree. " + " ".join(tree_failures)
+            logger.warning(f"Shot {shot}: {failure} Skipping.")
+            self.record_failed_shot(shot, failure)
+            return None
 
         ds_merged = xr.merge(datasets, compat="no_conflicts", join="outer")
         # merge keeps the first dataset's attributes only, and COCOS is in the EFIT one
         for ds in datasets:
             if "cocos" in ds.attrs:
                 ds_merged.attrs["cocos"] = ds.attrs["cocos"]
+        ds_merged.attrs["efit_tree"] = efit_tree
         ds_standardized = self.standardize_signal_names(ds_merged)
         if ds_standardized is None:
             logger.warning(f"Shot {shot} is missing critical signals. Skipping.")
@@ -419,7 +418,39 @@ def _is_empty_result(result: xr.Dataset) -> bool:
     return "shot" not in result or "time" not in result or result["time"].size == 0
 
 
-def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
+def _read_with_efit_tree(
+    shot: int, efit_tree: str
+) -> tuple[list[xr.Dataset], str | None]:
+    """Run the four retrievals of one shot against one EFIT tree.
+
+    Stops at the first retrieval that fails, the rest would read the same tree.
+
+    Args:
+        shot: Shot number to read.
+        efit_tree: EFIT tree to read, see CModSettings.efit_trees.
+
+    Returns:
+        (datasets, reason): the fast, EFIT 0D, EFIT and Thomson datasets and None,
+        or no datasets and why the tree failed.
+    """
+    datasets = []
+    for name, getter in (
+        ("fast", _get_fast_dataset),
+        ("efit0d", _get_efit0d_dataset),
+        ("efit", _get_efit_dataset),
+        ("thomson", _get_thomson_dataset),
+    ):
+        ds = getter(shot, efit_tree)
+        if ds is None:
+            return [], f"missing retrievable {name} data."
+        # A missing GEQDSK node leaves NaN columns and no COCOS number
+        if name == "efit" and "cocos" not in ds.attrs:
+            return [], "no GEQDSK reconstruction."
+        datasets.append(ds)
+    return datasets, None
+
+
+def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     """Retrieve the fast-diagnostic 0D signals on the uniform 1 kHz grid.
 
     Only signals sampled at least as fast as the grid belong here
@@ -432,7 +463,7 @@ def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
 
     Args:
         shot: Shot number to retrieve data for.
-        efit_nickname: EFIT tree to read, see CModSettings.
+        efit_tree: EFIT tree to read, see CModSettings.efit_trees.
 
     Returns:
         Dataset with the fast 0D signals for the given shot, or None if
@@ -452,7 +483,7 @@ def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     retrieval_settings = RetrievalSettings(
         run_columns=fast_signals,
         time_setting=UniformTimeSetting(),
-        efit_nickname_setting=efit_nickname,
+        efit_nickname_setting=efit_tree,
         only_requested_columns=True,
     )
     result = get_shots_data(
@@ -469,17 +500,19 @@ def _get_fast_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     return result
 
 
-def _get_efit0d_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
-    """Retrieve the EFIT-derived 0D signals on the native EFIT timebase.
+def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
+    """Retrieve the EFIT-derived 0D signals and place them on the 1 kHz grid.
 
     time_setting="efit" makes params.times the EFIT tree's own timebase,
     so the final interp1 in the disruption-py methods is an identity.
-    The result is snapped onto the 1 kHz grid like the equilibrium and Thomson,
-    with NaN where the tree has no slice.
+    A tree on the grid's cadence is snapped onto it like the equilibrium and Thomson.
+    A slow tree (see SLOW_EFIT_PERIOD) is interpolated linearly, as MAST's 0D equilibrium signals are,
+    so the valid filter sees a signal at every grid time.
+    Grid times outside the tree's time range hold NaN either way.
 
     Args:
         shot: Shot number to retrieve data for.
-        efit_nickname: EFIT tree to read, see CModSettings.
+        efit_tree: EFIT tree to read, see CModSettings.efit_trees.
 
     Returns:
         Dataset with the EFIT 0D signals for the given shot, or None if
@@ -498,7 +531,7 @@ def _get_efit0d_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     retrieval_settings = RetrievalSettings(
         run_columns=efit0d_signals,
         time_setting="efit",
-        efit_nickname_setting=efit_nickname,
+        efit_nickname_setting=efit_tree,
         only_requested_columns=True,
         custom_physics_methods=[CmodGeometryMethods.get_geometric_major_radius],
     )
@@ -512,27 +545,57 @@ def _get_efit0d_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     )
     if _is_empty_result(result):
         return None
-    # Native EFIT samples onto the uniform 1 kHz grid, no interpolation.
-    timebase = make_uniform_1kHz_timebase(float(result["time"].values.max()))
-    result = snap_to_grid(result, timebase)
+    efit_times = result["time"].values
+    timebase = make_uniform_1kHz_timebase(float(efit_times.max()))
+    slow_tree = (
+        efit_times.size > 1 and float(np.median(np.diff(efit_times))) > SLOW_EFIT_PERIOD
+    )
+    if slow_tree:
+        result = _interpolate_onto_grid(result, timebase)
+    else:
+        result = snap_to_grid(result, timebase)
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
 
-def _get_efit_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
+def _interpolate_onto_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
+    """Interpolate a retrieval (dim 'idx', 'time'/'shot' coords) linearly onto grid_times.
+
+    Args:
+        ds: Retrieval with dim 'idx' and 'time'/'shot' coords, 1D signals only.
+        grid_times: Uniform timebase to interpolate onto [s].
+
+    Returns:
+        The signals on grid_times, laid out like snap_to_grid's output,
+        NaN outside the retrieval's time range.
+    """
+    source_times = ds["time"].values
+    shot_id = ds["shot"].values[0]
+    data_vars = {}
+    for name, variable in ds.data_vars.items():
+        values_on_grid = interp1(source_times, variable.values, grid_times)
+        data_vars[name] = ("idx", values_on_grid, variable.attrs)
+    coords = {
+        "time": ("idx", grid_times),
+        "shot": ("idx", np.repeat(shot_id, grid_times.size)),
+    }
+    return xr.Dataset(data_vars, coords=coords, attrs=ds.attrs)
+
+
+def _get_efit_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     """Retrieve EFIT dataset for the given shot.
 
     Args:
         shot: Shot number to retrieve data for.
-        efit_nickname: EFIT tree to read, see CModSettings.
+        efit_tree: EFIT tree to read, see CModSettings.efit_trees.
 
     Returns:
-        Dataset with GEQDSK signals for the given shot, or None if retrieval
-        returned no data.
+        Dataset with GEQDSK signals for the given shot,
+        or None if retrieval returned no data.
     """
     settings = RetrievalSettings(
         run_methods=["get_geqdsk_parameters"],
-        efit_nickname_setting=efit_nickname,
+        efit_nickname_setting=efit_tree,
         time_setting=UniformTimeSetting(),
         custom_physics_methods=[CmodEfitMethods.get_geqdsk_parameters],
     )
@@ -550,12 +613,12 @@ def _get_efit_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     return result
 
 
-def _get_thomson_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
+def _get_thomson_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     """Retrieve Thomson scattering data for the given shot.
 
     Args:
         shot: Shot number to retrieve data for.
-        efit_nickname: EFIT tree to read, see CModSettings.
+        efit_tree: EFIT tree to read, see CModSettings.efit_trees.
 
     Returns:
         Dataset with Thomson channel signals snapped to the uniform 1 kHz grid,
@@ -563,7 +626,7 @@ def _get_thomson_dataset(shot: int, efit_nickname: str) -> xr.Dataset | None:
     """
     retrieval_settings = RetrievalSettings(
         run_methods=["get_thomson_channels"],
-        efit_nickname_setting=efit_nickname,
+        efit_nickname_setting=efit_tree,
         only_requested_columns=False,
         custom_physics_methods=[CmodThomsonMethods.get_thomson_channels],
     )
