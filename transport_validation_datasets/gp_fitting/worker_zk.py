@@ -6,7 +6,7 @@ both profiles place the high-gradient region at the same rho
 (density is the cleaner pedestal indicator in C-Mod H-mode).
 Each variable's fit runs the cleaning pipeline (cleaning.py),
 the GP fit with edge boundary conditions and monotonic-edge repair (gp.py),
-and the nonphysical-fit checks with up to two repairs (quality.py, see _fit_variable).
+and the nonphysical-fit checks with up to four repairs (quality.py, see _fit_variable).
 
 Runs standalone on the cluster like so:
 `python -m transport_validation_datasets.gp_fitting.worker_zk input.npz output.npz --num-workers N`
@@ -152,7 +152,7 @@ def _fit_variable(
     anchors: FitAnchors,
     pin_x0: float | None,
 ) -> VariableFit:
-    """Fit one variable of one time slice, with up to three repairs.
+    """Fit one variable of one time slice, with up to four repairs.
 
     1: Attempt to fit the variable
     2: If nonphysical and the pedestal was pinned, retry unpinned
