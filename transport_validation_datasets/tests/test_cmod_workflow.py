@@ -9,7 +9,10 @@ import xarray as xr
 
 from transport_validation_datasets import PACKAGE_ROOT
 from transport_validation_datasets.gp_fitting.dispatcher import ClusterFitConfig
-from transport_validation_datasets.machine.cmod.cmod_dataset import CModDataWorkflow
+from transport_validation_datasets.machine.cmod.cmod_dataset import (
+    CModDataWorkflow,
+    CModSettings,
+)
 
 pytestmark = pytest.mark.skipif(
     not Path("/usr/local/mfe/ml_data_dump").exists(),
@@ -79,7 +82,7 @@ class TestMakeUnprocessedDataFiles:
         shotlist_missing = [
             1160503006,  # Missing TS data
             1160503011,  # Missing EFIT data
-            1160503015,  # No EFIT21 tree at all
+            1160503015,  # No EFIT21 tree, the default reads no other
         ]
         shotlist_present = [
             1160503007,  # Should be present
@@ -100,6 +103,23 @@ class TestMakeUnprocessedDataFiles:
             assert not file_path.exists(), (
                 f"Unprocessed data file for shot {shot} should not exist"
             )
+
+    def test_efit_tree_fallback(self):
+        # A missing first tree falls through to ANALYSIS, which reconstructs every ~20 ms.
+        # Its EFIT 0D signals are interpolated onto the grid, so the shot still passes the filter,
+        # while the reconstruction itself stays on its own grid times.
+        test_dir = self.test_dir / "test_efit_tree_fallback"
+        shot = 1160712015
+        settings = CModSettings(efit_trees=["NOTATREE", "ANALYSIS"])
+        workflow = cmod_workflow(test_dir, shotlist=[shot], settings=settings)
+
+        workflow.make_unprocessed_data_files()
+
+        with xr.open_dataset(workflow.unprocessed_data_dir / f"{shot}.nc") as ds:
+            assert ds.attrs["efit_tree"] == "ANALYSIS"
+            n_energy = int(ds["energy_mhd"].notnull().sum())
+            n_reconstructions = int(ds["simagx"].notnull().sum())
+        assert n_energy > 10 * n_reconstructions
 
 
 def _trim_to_three_ts_slices(nc_path: Path):

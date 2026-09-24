@@ -25,8 +25,9 @@ or an unexpected table raises an error, so a typo cannot silently fall back to a
     remote_workdir = "/path/on/cluster"
     venv_path = "/path/on/cluster/.venv"
 
+    # Opt in to C-Mod's ANALYSIS fallback, the default reads EFIT21 only
     [cmod]
-    efit_nickname = "EFIT21"
+    efit_trees = ["EFIT21", "ANALYSIS"]
 """
 
 import dataclasses

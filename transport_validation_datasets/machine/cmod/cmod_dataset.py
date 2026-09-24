@@ -58,7 +58,7 @@ class CModSettings(DeviceSettings):
             A shot takes the first tree that serves every retrieval (see get_source_dataset).
     """
 
-    efit_trees: list[str] = field(default_factory=lambda: ["EFIT21", "ANALYSIS"])
+    efit_trees: list[str] = field(default_factory=lambda: ["EFIT21"])
 
     def __post_init__(self):
         super().__post_init__()

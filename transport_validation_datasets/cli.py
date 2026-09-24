@@ -44,10 +44,11 @@ class DatasetCLI:
     passed through --config, comma separated and layered (a later file
     overrides an earlier one key by key, see config.py). The [cluster] table
     dispatches the fit stage to a SLURM cluster, the [cmod] or [mast] table
-    sets that device's workflow settings, e.g. the EFIT tree C-Mod reads:
+    sets that device's workflow settings, e.g. turning on C-Mod's fallback
+    to the ANALYSIS tree for shots EFIT21 fails on (the default reads EFIT21 only):
 
         [cmod]
-        efit_nickname = "EFIT21"
+        efit_trees = ["EFIT21", "ANALYSIS"]
 
     configs/orcd.toml is the shared file; the per-user cluster paths go in a
     second, gitignored file:

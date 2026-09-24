@@ -28,4 +28,5 @@ pending_timeout_s = 1800.0
 [cmod]
 # EFIT trees the equilibrium, geometry signals, and timebase are read from, in order of preference
 # A shot takes the first one that works for all required signals.
-efit_trees = ["EFIT21", "ANALYSIS"]
+# Use ["EFIT21", "ANALYSIS"] to also pull the shots EFIT21 fails on from the ~20 ms ANALYSIS tree.
+efit_trees = ["EFIT21"]

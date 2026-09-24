@@ -126,7 +126,7 @@ partitions = "sched_mit_psfc_r8@11:00:00"
 max_concurrent_jobs = 20
 
 [cmod]
-efit_nickname = "EFIT21"
+efit_trees = ["EFIT21"]
 
 # configs/<user>.user.toml
 [cluster]
@@ -170,6 +170,23 @@ The IMAS export maps the fit grid back onto psi through the same extension.
 ```toml
 [cmod]
 sol_extension = "tangent"
+```
+
+The `[cmod]` table also takes `efit_trees`, the EFIT trees a shot is read from, in order of preference.
+The default is only EFIT21, so a shot EFIT21 fails on is skipped.
+Adding ANALYSIS after it turns on pulling those shots from the ANALYSIS tree instead.
+Every retrieval reads the EFIT tree at least for its timebase, so a shot takes the first tree that serves all of them.
+A tree fails when it is missing or its reconstruction is missing a node,
+and the unprocessed file records the tree it used as its `efit_tree` attribute.
+A tree slower than the 1 kHz grid (ANALYSIS reconstructs every ~20 ms) has its EFIT 0D signals interpolated onto the grid,
+and `fresh_equilibrium` marks grid times where the reconstruction exists.
+Shots already recorded in `01_unprocessed/failed_shots/` are not retried,
+so their records need deleting for a rebuild to try another tree.
+
+```toml
+# Opt in to the ANALYSIS fallback
+[cmod]
+efit_trees = ["EFIT21", "ANALYSIS"]
 ```
 
 # Shotlists and time windows
@@ -220,7 +237,7 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 
 | Device | Source | Shotlist | Notes |
 | ------ | ------ | -------- | ----- |
-| C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access |
+| C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. |
 | MAST | Level 2 Zarr store at https://s3.echo.stfc.ac.uk/mast/level2/shots, plus two level 1 groups: EFM for the GEQDSK safety factor and AYC for the Thomson profiles | 1101 shots from the M8 and M9 campaigns, shipped with the package | Public, anonymous, read in a thread pool (`--prepare_workers`) |
 | DIII-D | | | |
 | TCV | | | |
