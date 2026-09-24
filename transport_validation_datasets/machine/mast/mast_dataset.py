@@ -2,7 +2,7 @@
 
 Most of it comes out of the level 2 store: https://s3.echo.stfc.ac.uk/mast/level2/shots/{shot}.zarr
 the 0D summary and equilibrium signals and the full GEQDSK reconstruction, whose flux map also places
-the Thomson channels in rho.
+the Thomson channels in rho_tor_norm.
 Two things come from the level 1 store instead:
 the GEQDSK safety factor, which only level 1 publishes as a flux function (see _equilibrium_qpsi),
 and the Thomson profiles, which level 2 only carries interpolated onto a uniform (R, t) grid and without uncertainties (see _thomson_dataset).
@@ -69,7 +69,7 @@ OHMIC_SMOOTHING_SAMPLES = 10
 
 # Channels this far outside the separatrix sit in the far SOL,
 # where mapping through a magnetics-only reconstruction is not trustworthy.
-MAX_FIT_RHO = 1.2
+MAX_FIT_RHO_TOR_NORM = 1.1
 
 # level 2 equilibrium signal -> standardized name.
 # All 0D, interpolated onto the 1 kHz timebase.
@@ -380,9 +380,9 @@ class MASTDataWorkflow(DataWorkflow):
         30318,
     ]
 
-    # GP fit staging knobs. rho_max extends past the separatrix so the grid
-    # covers the fit's edge value boundary conditions.
-    fit_rho = np.linspace(0.0, 1.1, 64)
+    # GP fit staging knobs.
+    # A 1/60 step puts 1.0 and 1.1 on the grid.
+    fit_rho_tor_norm = np.linspace(0.0, 1.6, 97)
     fit_min_points = 10
     fit_scale_per_slice = True
     # Both variables share the same bounds on MAST:
@@ -519,7 +519,7 @@ class MASTDataWorkflow(DataWorkflow):
         3: Drop the channels outside the fittable range
 
         BOTH sides of the chord are fit. The inboard side maps onto the same
-        rho through the reconstruction's interior flux, which a magnetics-only
+        rho_tor_norm through the reconstruction's interior flux, which a magnetics-only
         reconstruction does not pin precisely, and on a spherical tokamak Te
         is not strictly a flux function (poloidal asymmetries can be real).
 
@@ -536,7 +536,7 @@ class MASTDataWorkflow(DataWorkflow):
             The fit input, or None when the shot has nothing fittable.
         """
         ds_shot = ds.squeeze("shot", drop=True)
-        ts_times, rho = map_ts_channels_to_rho_tor_norm(
+        ts_times, rho_tor_norm = map_ts_channels_to_rho_tor_norm(
             ds_shot, self.settings.sol_extension
         )
         if ts_times.size == 0:
@@ -546,13 +546,22 @@ class MASTDataWorkflow(DataWorkflow):
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
 
         with np.errstate(invalid="ignore"):
-            rho = np.where(rho <= MAX_FIT_RHO, rho, np.nan)
+            rho_tor_norm = np.where(
+                rho_tor_norm <= MAX_FIT_RHO_TOR_NORM, rho_tor_norm, np.nan
+            )
 
         fit_input = ShotFitInput(
-            x=rho, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err, time=ts_times
+            x=rho_tor_norm,
+            te_y=te_y,
+            te_err=te_err,
+            ne_y=ne_y,
+            ne_err=ne_err,
+            time=ts_times,
         )
         if not fit_input.has_fittable_points():
-            logger.warning(f"Shot {shot}: no finite (rho, te, ne) channel data to fit")
+            logger.warning(
+                f"Shot {shot}: no finite (rho_tor_norm, te, ne) channel data to fit"
+            )
             return None
         return fit_input
 

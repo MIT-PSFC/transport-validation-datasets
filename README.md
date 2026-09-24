@@ -64,9 +64,12 @@ shot had no Thomson sample there.
 | ------ | ------ | ------ |
 | 0D | ip, b0, energy_mhd, beta_tor_norm, n_e_line_average, minor_radius, geometric_axis_r, elongation, triangularity_upper/lower, power_ohm/radiated/nbi/ic/lh | (shot, time_idx) |
 | Time | time, fresh_profile, fresh_equilibrium | (shot, time_idx) |
-| Fitted profiles | t_e, n_e, their _error, _gradient, _gradient_error, _fit_status | (shot, time_idx, rho) |
+| Fitted profiles | t_e, n_e, their _error, _gradient, _gradient_error, _fit_status | (shot, time_idx, rho_tor_norm) |
 | Equilibrium | the full GEQDSK block: psirz, fpol, pres, ffprime, pprime, qpsi, rbdry, zbdry, rlim, zlim, rmagx, zmagx, simagx, sibdry, bcentr, current, rcentr, rleft, rdim, zmid, zdim | (shot, time_idx, grid) |
 | Raw Thomson channels (internal store only) | ts_channel_r, ts_channel_z, ts_channel_t_e, ts_channel_n_e, their _error | (shot, time_idx, ts_channel) |
+
+The profiles are fit on rho_tor_norm from 0 to 1.6, so every fit anchor is on the fit grid and in the fit plots.
+The fit files, the stores and the IMAS export keep them out to rho_tor_norm 1.1.
 
 A signal the device does not have comes through as NaN, so the devices share
 one schema. Everything is float32, flags included, because the padding between
@@ -141,13 +144,15 @@ and without `--config` everything keeps its default.
 Run-specific choices (`--ds_name`, `--shotlist_file`, `--stage`, `--method`, ...) stay command line flags.
 
 Both device tables take the fit anchors, the virtual observations every fit method adds to every Thomson slice.
-Each is a list of `[rho, value, error]` rows in the fit units, Te in keV and ne in 1e20 m^-3, gradients per unit rho.
-The defaults pin each profile to zero value and gradient at rho 1.1 to 1.4, and zero gradient at the axis.
+Each is a list of `[rho_tor_norm, value, error]` rows in the fit units, Te in keV and ne in 1e20 m^-3, gradients per unit rho_tor_norm.
+The defaults pin each profile to zero value and gradient at rho_tor_norm 1.3 to 1.6, and zero gradient at the axis.
+They sit past the SOL channels, which rho_tor_norm stretches out to ~1.25.
+Moving an anchor past 1.6 needs a device fit grid that reaches it.
 
 ```toml
 [mast]
-te_value_anchors = [[1.1, 0.0, 0.008], [1.2, 0.0, 0.008], [1.3, 0.0, 0.008], [1.4, 0.0, 0.008]]
-te_grad_anchors = [[0.0, 0.0, 0.008], [1.1, 0.0, 0.08], [1.2, 0.0, 0.08], [1.3, 0.0, 0.08], [1.4, 0.0, 0.08]]
+te_value_anchors = [[1.3, 0.0, 0.01], [1.4, 0.0, 0.01], [1.5, 0.0, 0.01], [1.6, 0.0, 0.01]]
+te_grad_anchors = [[0.0, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1], [1.5, 0.0, 0.1], [1.6, 0.0, 0.1]]
 # ne_value_anchors, ne_grad_anchors likewise
 ```
 
@@ -160,6 +165,7 @@ q is undefined outside it, so Phi_N continues linearly in psi_N,
 with the slope from psi_N 0.95 to 1 (`"secant"`, the default) or the slope at the LCFS (`"tangent"`).
 The staged positions depend on it, so it is checked like the anchors,
 and it is recorded as the `sol_extension` attribute of the fit files and the stores.
+The IMAS export maps the fit grid back onto psi through the same extension.
 
 ```toml
 [cmod]

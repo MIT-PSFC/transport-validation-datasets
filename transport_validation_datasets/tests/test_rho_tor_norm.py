@@ -27,6 +27,7 @@ from transport_validation_datasets.machine.generic import (
     SECANT_PSI_N,
     cumulative_q_integral,
     map_ts_channels_to_rho_tor_norm,
+    psi_n_from_rho_tor_norm,
     rho_tor_norm_from_psi_n,
 )
 
@@ -136,6 +137,16 @@ class TestToroidalFlux:
 
         assert np.isnan(rho_tor_norm[0])
         assert rho_tor_norm[1] == 0.0
+
+    @pytest.mark.parametrize("sol_extension", ["secant", "tangent"])
+    def test_inverse_round_trips_across_the_lcfs(self, sol_extension):
+        # The IMAS export places the fit grid on psi through the inverse
+        psi_n = np.array([0.0, 0.03, 0.4, 0.97, 1.0, 1.05, 1.4, np.nan])
+
+        rho_tor_norm = rho_tor_norm_from_psi_n(psi_n, QPSI, sol_extension)
+        psi_n_back = psi_n_from_rho_tor_norm(rho_tor_norm, QPSI, sol_extension)
+
+        np.testing.assert_allclose(psi_n_back, psi_n, atol=1e-12)
 
 
 class TestMapChannels:

@@ -58,7 +58,7 @@ class CModSettings(DeviceSettings):
             require it).
         efit_nickname: EFIT tree the equilibrium, the geometry signals, and
             the shot's 1 kHz timebase are read from, and so the one the
-            Thomson channels are mapped onto rho with. A tree name (EFIT21,
+            Thomson channels are mapped onto rho_tor_norm with. A tree name (EFIT21,
             EFIT18, ...), or one of disruption-py's keys: "analysis" for the
             ANALYSIS tree, "disruption" for the disruption EFIT.
     """
@@ -90,8 +90,7 @@ class CModDataWorkflow(DataWorkflow):
     shot_blacklist = []
 
     # GP fit staging knobs
-    fit_rho = np.linspace(0.0, 1.1, 56)
-    # Minimum valid (rho, value) pairs required per timestep to run the GP fit,
+    # Minimum valid (rho_tor_norm, value) pairs required per timestep to run the GP fit,
     # compared against the channel count AFTER the per-shot quality screens (_drop_broken_channels).
     # Many C-Mod shots carry exactly 10 channels, so tolerate one bad channel.
     fit_min_points = 9
@@ -275,7 +274,9 @@ class CModDataWorkflow(DataWorkflow):
         Returns:
             The fit input, or None when the shot has nothing fittable.
         """
-        ts_times, rho = map_ts_channels_to_rho_tor_norm(ds, self.settings.sol_extension)
+        ts_times, rho_tor_norm = map_ts_channels_to_rho_tor_norm(
+            ds, self.settings.sol_extension
+        )
         if ts_times.size == 0:
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None
@@ -288,9 +289,9 @@ class CModDataWorkflow(DataWorkflow):
         # Seen on shot 1160609014: a ne~4, err~2 channel past the separatrix
         # (rho~1.05) drove a spike to ne~19 at rho=1.0.
         ne_y = np.where(ne_err > 1.0, np.nan, ne_y)
-        # Drop density points past the separatrix (rho>1.0) reading > 0.9e20:
+        # Drop density points past the separatrix (rho_tor_norm>1.0) reading > 0.9e20:
         # SOL density is low out there, so such a point is a bad channel
-        ne_y = np.where((rho > 1.0) & (ne_y > 0.9), np.nan, ne_y)
+        ne_y = np.where((rho_tor_norm > 1.0) & (ne_y > 0.9), np.nan, ne_y)
 
         # If data or error bar is incredibly small, set to NaN since it is
         # probably bad data. At this point ne is in 1e20 m^-3 and Te in keV.
@@ -300,7 +301,7 @@ class CModDataWorkflow(DataWorkflow):
         ne_err = np.where(ne_err < 0.001, np.nan, ne_err)
 
         # Near the magnetic axis, Te this low is not physically real
-        core_problem = (rho >= 0.0) & (rho < 0.4) & (te_y < 0.4)
+        core_problem = (rho_tor_norm >= 0.0) & (rho_tor_norm < 0.4) & (te_y < 0.4)
         te_y = np.where(core_problem, np.nan, te_y)
 
         # Error floors. Sometimes C-Mod TS has extremely tiny error bars
@@ -312,14 +313,21 @@ class CModDataWorkflow(DataWorkflow):
 
         # After the floors: the persistence screen must see the same errors
         # the fit will (its thresholds are calibrated on them).
-        te_y = _drop_broken_channels("te", rho, te_y, te_err)
-        ne_y = _drop_broken_channels("ne", rho, ne_y, ne_err)
+        te_y = _drop_broken_channels("te", rho_tor_norm, te_y, te_err)
+        ne_y = _drop_broken_channels("ne", rho_tor_norm, ne_y, ne_err)
 
         fit_input = ShotFitInput(
-            x=rho, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err, time=ts_times
+            x=rho_tor_norm,
+            te_y=te_y,
+            te_err=te_err,
+            ne_y=ne_y,
+            ne_err=ne_err,
+            time=ts_times,
         )
         if not fit_input.has_fittable_points():
-            logger.warning(f"Shot {shot}: no finite (rho, te, ne) channel data to fit")
+            logger.warning(
+                f"Shot {shot}: no finite (rho_tor_norm, te, ne) channel data to fit"
+            )
             return None
         return fit_input
 
@@ -353,13 +361,13 @@ def _drop_broken_channels(
     (Note that slight biasing is expected because profiles are monatonic-ish,
     this just looks for consitently extreme cases like [4, 1, 3], [9, 2, 7], etc.)
 
-    Per slice, each channel with both rho-neighbors finite gets
+    Per slice, each channel with both rho_tor_norm neighbors finite gets
     z = (y - neighbor_mean) / combined sigma, and a channel is dropped when
     |median z| >= 3.5 with >= 90 percent of slices on the same side, over >= 10 slices.
 
     Args:
         var_name: Variable name for the log line.
-        data_x: (n_t, n_ch) channel rho positions.
+        data_x: (n_t, n_ch) channel rho_tor_norm positions.
         data_y: (n_t, n_ch) channel values.
         err_y: (n_t, n_ch) channel errors, with the fit's floors applied.
 

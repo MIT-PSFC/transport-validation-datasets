@@ -221,7 +221,7 @@ def pool_windows(fit_input: ShotFitInput, windows, shot: int) -> ShotFitInput:
     """Pool the Thomson samples of each window into one row, to be fit as one profile.
 
     The row of a window is its sample rows laid end to end, so a channel
-    appears once per sample, at that sample's rho. Rows are NaN padded to the
+    appears once per sample, at that sample's rho_tor_norm. Rows are NaN padded to the
     widest window in whole samples, so a per-channel mask still tiles onto
     them. The row's time is the window center. A window with no sample keeps
     an all-NaN row, which the worker skips, so the rows stay aligned with the
@@ -262,7 +262,7 @@ def pool_windows(fit_input: ShotFitInput, windows, shot: int) -> ShotFitInput:
         n_points = int(np.isfinite(x[w]).sum())
         message = (
             f"Shot {shot}: window [{start:.3f}, {end:.3f}] s pools {samples.size} "
-            f"Thomson samples, {n_points} points with a finite rho"
+            f"Thomson samples, {n_points} points with a finite rho_tor_norm"
         )
         if n_points > POOLED_POINTS_WARN:
             logger.critical(

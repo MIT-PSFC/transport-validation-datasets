@@ -309,8 +309,8 @@ def _fit_mean_ylim(fit_mean: np.ndarray, fallback: float, pad: float = 1.05) -> 
 # Panel labels for the TS fit diagnostic, keyed by the fit_output variable
 # prefix: (prefix, profile label, gradient label, fallback y-limit).
 _TS_FIT_PANELS = (
-    ("te", "Te [keV]", "dTe/drho [keV]", 5.0),
-    ("ne", "ne [1e20 m^-3]", "dne/drho [1e20 m^-3]", 1.8),
+    ("te", "Te [keV]", "dTe/drho_tor_norm [keV]", 5.0),
+    ("ne", "ne [1e20 m^-3]", "dne/drho_tor_norm [1e20 m^-3]", 1.8),
 )
 
 
@@ -319,7 +319,7 @@ def _plot_fit_band(ax, x: np.ndarray, y: np.ndarray, err: np.ndarray, label: str
 
     Args:
         ax: Axes to plot on.
-        x: rho grid.
+        x: rho_tor_norm grid.
         y: Fit mean.
         err: 1-sigma band half-width.
         label: Legend label of the mean line.
@@ -346,7 +346,7 @@ def _style_ts_panel(ax, ylabel: str, title: str):
         ylabel: Y-axis label.
         title: Panel title.
     """
-    ax.set_xlabel("rho")
+    ax.set_xlabel("rho_tor_norm")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(alpha=0.3)
@@ -358,10 +358,10 @@ def plot_ts_fits(
     pdf_path: Path | str,
     shot: int,
     ts_time: np.ndarray,
-    rho_ch: np.ndarray,
+    rho_tor_norm_ch: np.ndarray,
     channel_data: dict[str, tuple[np.ndarray, np.ndarray]],
     fit_output,
-    rho_fit: np.ndarray,
+    rho_tor_norm_fit: np.ndarray,
     channel_groups: list[tuple[np.ndarray, str, str]] | None = None,
     max_pages: int | None = None,
     window_bounds: np.ndarray | None = None,
@@ -370,7 +370,7 @@ def plot_ts_fits(
 
     One page per sampled measurement time, 2x2 panels: Te (top left) and ne
     (top right) with the channel data, GP fit mean and +-1 sigma predictive
-    band, then the GP gradients d/drho with their +-1 sigma bands below.
+    band, then the GP gradients d/drho_tor_norm with their +-1 sigma bands below.
     Fitted hyperparameters are annotated on the profile panels when the
     method provides them.
 
@@ -378,11 +378,11 @@ def plot_ts_fits(
         pdf_path: Destination PDF path.
         shot: Shot number, for the page titles.
         ts_time: (n_t,) measurement times [s].
-        rho_ch: (n_t, n_ch) channel rho locations, NaN where invalid.
+        rho_tor_norm_ch: (n_t, n_ch) channel rho_tor_norm locations, NaN where invalid.
         channel_data: {"te": (y, err), "ne": (y, err)}, each (n_t, n_ch), in
             the same units the fit consumed (Te [keV], ne [1e20 m^-3]).
         fit_output: ShotFitOutput whose rows align with ts_time.
-        rho_fit: (n_x,) rho grid the fits were predicted on.
+        rho_tor_norm_fit: (n_x,) rho_tor_norm grid the fits were predicted on.
         channel_groups: Optional (mask, color, label) triples to split the
             channels by diagnostic; one blue "raw TS" group when None. A mask
             is (n_ch,) for a fixed split (C-Mod core vs edge Thomson) or
@@ -416,7 +416,7 @@ def plot_ts_fits(
             np.unique(np.linspace(0, live.size - 1, max_pages).round()).astype(int)
         ]
 
-    n_ch = rho_ch.shape[1]
+    n_ch = rho_tor_norm_ch.shape[1]
     groups = (
         channel_groups
         if channel_groups is not None
@@ -437,20 +437,20 @@ def plot_ts_fits(
                 title = f"shot {shot}  t={start:.3f}-{end:.3f} s (window average)"
             for i_var, (var, label, grad_label, _) in enumerate(_TS_FIT_PANELS):
                 data_y, err_y = (arr[i_time, :] for arr in channel_data[var])
-                rho_at_t = rho_ch[i_time, :]
+                rho_tor_norm_at_t = rho_tor_norm_ch[i_time, :]
 
                 ax = axes[0, i_var]
                 for mask, color, name in groups:
                     mask_at_t = mask[i_time, :] if mask.ndim == 2 else mask
                     valid = (
                         mask_at_t
-                        & np.isfinite(rho_at_t)
+                        & np.isfinite(rho_tor_norm_at_t)
                         & np.isfinite(data_y)
                         & np.isfinite(err_y)
                     )
                     if valid.any():
                         ax.errorbar(
-                            rho_at_t[valid],
+                            rho_tor_norm_at_t[valid],
                             data_y[valid],
                             yerr=err_y[valid],
                             fmt="o",
@@ -461,7 +461,7 @@ def plot_ts_fits(
                         )
                 _plot_fit_band(
                     ax,
-                    rho_fit,
+                    rho_tor_norm_fit,
                     getattr(fit_output, f"{var}_fit")[i_time, :],
                     getattr(fit_output, f"{var}_std")[i_time, :],
                     "GP fit",
@@ -492,7 +492,7 @@ def plot_ts_fits(
                 ax = axes[1, i_var]
                 _plot_fit_band(
                     ax,
-                    rho_fit,
+                    rho_tor_norm_fit,
                     getattr(fit_output, f"{var}_grad")[i_time, :],
                     getattr(fit_output, f"{var}_grad_std")[i_time, :],
                     "GP gradient",

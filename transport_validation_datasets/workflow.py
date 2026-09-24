@@ -75,10 +75,14 @@ TRANSIENT_SMOOTHING_WINDOW = 5e-3
 LOCAL_SHOTS_PER_BATCH = 1
 
 # The radial coordinate every profile is fit on.
-RHO_DEFINITION = (
+RHO_TOR_NORM_DEFINITION = (
     "Normalized toroidal flux coordinate rho_tor_norm = sqrt(Phi_N): 0 at the magnetic axis, 1 at the LCFS. "
     "Outside the LCFS Phi_N continues linearly in psi_N, see the sol_extension attribute."
 )
+
+# The fit grid runs past this so every anchor is fit and plotted.
+# The fit files, the stores and the IMAS export keep only the grid up to here.
+STORED_RHO_TOR_NORM_MAX = 1.1
 
 # Per-slice fit statuses that count as a usable profile, see gp_fitting.batch_io.
 USABLE_FIT_STATUSES = (STATUS_OK, STATUS_REPAIRED)
@@ -163,50 +167,51 @@ class DeviceSettings:
     config.py builds the instance from the TOML table by field name.
 
     The anchors are virtual observations every fit method adds to every slice,
-    in the fit units (Te [keV], ne [1e20 m^-3]), gradients per unit rho.
-    The defaults are the same as those in Chilenski 2016.
+    in the fit units (Te [keV], ne [1e20 m^-3]), gradients per unit rho_tor_norm.
+    The outer anchors sit at 1.3 to 1.6, past the SOL channels,
+    which rho_tor_norm stretches out to ~1.25.
 
     Attributes:
         sol_extension: How the Thomson channel mapping continues Phi_N outside the LCFS
-        te_value_anchors: Rows of [rho, Te, error].
-        te_grad_anchors: Rows of [rho, dTe/drho, error].
-        ne_value_anchors: Rows of [rho, ne, error].
-        ne_grad_anchors: Rows of [rho, dne/drho, error].
+        te_value_anchors: Rows of [rho_tor_norm, Te, error].
+        te_grad_anchors: Rows of [rho_tor_norm, dTe/drho_tor_norm, error].
+        ne_value_anchors: Rows of [rho_tor_norm, ne, error].
+        ne_grad_anchors: Rows of [rho_tor_norm, dne/drho_tor_norm, error].
     """
 
     sol_extension: str = "secant"
     te_value_anchors: list = field(
         default_factory=lambda: [
-            [1.1, 0.0, 0.01],
-            [1.2, 0.0, 0.01],
             [1.3, 0.0, 0.01],
             [1.4, 0.0, 0.01],
+            [1.5, 0.0, 0.01],
+            [1.6, 0.0, 0.01],
         ]
     )
     te_grad_anchors: list = field(
         default_factory=lambda: [
             [0.0, 0.0, 0.0],
-            [1.1, 0.0, 0.1],
-            [1.2, 0.0, 0.1],
             [1.3, 0.0, 0.1],
             [1.4, 0.0, 0.1],
+            [1.5, 0.0, 0.1],
+            [1.6, 0.0, 0.1],
         ]
     )
     ne_value_anchors: list = field(
         default_factory=lambda: [
-            [1.1, 0.0, 0.01],
-            [1.2, 0.0, 0.01],
             [1.3, 0.0, 0.01],
             [1.4, 0.0, 0.01],
+            [1.5, 0.0, 0.01],
+            [1.6, 0.0, 0.01],
         ]
     )
     ne_grad_anchors: list = field(
         default_factory=lambda: [
             [0.0, 0.0, 0.0],
-            [1.1, 0.0, 0.1],
-            [1.2, 0.0, 0.1],
             [1.3, 0.0, 0.1],
             [1.4, 0.0, 0.1],
+            [1.5, 0.0, 0.1],
+            [1.6, 0.0, 0.1],
         ]
     )
 
@@ -225,7 +230,7 @@ class DeviceSettings:
             rows = np.asarray(raw_rows, dtype=float)
             if rows.size and (rows.ndim != 2 or rows.shape[1] != 3):
                 raise ValueError(
-                    f"{name} must be rows of [rho, value, error], got {raw_rows!r}"
+                    f"{name} must be rows of [rho_tor_norm, value, error], got {raw_rows!r}"
                 )
 
 
@@ -237,7 +242,7 @@ class DataWorkflow(ABC):
       filter it down to the regions of validity (filter_and_plot),
       and write one netCDF plus one plot per shot.
     2. run_gp_fitting:
-      map the Thomson channels onto rho (prepare_fit_input),
+      map the Thomson channels onto rho_tor_norm (prepare_fit_input),
       stage method-agnostic batches,
       fit them here or on a cluster,
       and write one netCDF of fitted profiles per shot.
@@ -354,7 +359,7 @@ class DataWorkflow(ABC):
     _log_sink_id = None
 
     # GP fit staging knobs
-    fit_rho = np.linspace(0.0, 1.0, 51)
+    fit_rho_tor_norm = np.linspace(0.0, 1.6, 81)
     fit_min_points = 10
     fit_scale_per_slice = False
     fit_bounds = default_fit_bounds()
@@ -825,7 +830,7 @@ class DataWorkflow(ABC):
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
         """Build GP fit inputs for one shot from its unprocessed dataset.
 
-        Subclasses map the TS channels onto rho, convert to the fit units
+        Subclasses map the TS channels onto rho_tor_norm, convert to the fit units
         (Te [keV], ne [1e20 m^-3]), and apply their device-specific channel
         quality screens and error floors.
 
@@ -850,7 +855,7 @@ class DataWorkflow(ABC):
         """Run GP profile fitting on the unprocessed data files.
 
         The stages, each skipping work that already exists on disk:
-        1. Stage: map TS channels onto rho, apply device cleaning
+        1. Stage: map TS channels onto rho_tor_norm, apply device cleaning
            (prepare_fit_input), restrict or pool the Thomson samples to the shotlist's
            time windows if it has any, and pack batch npz files into
            fit_staging_dir/batches. The staged batches are method-agnostic.
@@ -982,7 +987,7 @@ class DataWorkflow(ABC):
                 in_path,
                 FitBatch(
                     shot_inputs=shot_inputs,
-                    x_star=self.fit_rho,
+                    x_star=self.fit_rho_tor_norm,
                     min_points=self.fit_min_points,
                     scale_per_slice=self.fit_scale_per_slice,
                     bounds=self.fit_bounds,
@@ -1161,7 +1166,8 @@ class DataWorkflow(ABC):
         atomically. Nothing is ever held across batches, so this stays flat in
         memory no matter how many shots the dataset has.
         Profiles are converted back from the fit units to SI (Te [eV], ne [m^-3])
-        to match the unprocessed files' conventions, gradients are per unit rho.
+        to match the unprocessed files' conventions, gradients are per unit rho_tor_norm.
+        Only the grid up to STORED_RHO_TOR_NORM_MAX is written.
         Batches without a result file yet are skipped with a warning, so a
         partially fit dataset still writes.
         A shot whose file is already newer than its batch result is left alone,
@@ -1170,7 +1176,7 @@ class DataWorkflow(ABC):
         windows and the window of every row.
 
         Raises:
-            ValueError: If batches were fit on different rho grids, the
+            ValueError: If batches were fit on different rho_tor_norm grids, the
                 staging directory does not match this run
                 (_check_staged_batches), or a batch's result rows do not
                 align with its staged input.
@@ -1198,7 +1204,7 @@ class DataWorkflow(ABC):
                 x_star = batch_x_star
             elif not np.array_equal(x_star, batch_x_star):
                 raise ValueError(
-                    f"Batch {batch_id} was fit on a different rho grid; re-stage and refit"
+                    f"Batch {batch_id} was fit on a different rho_tor_norm grid, re-stage and refit"
                 )
             n_shots += len(batch_shots)
 
@@ -1260,11 +1266,12 @@ class DataWorkflow(ABC):
         The shot's window list rides along as a JSON attribute and each row's
         window as a coordinate (empty and -1 without windows),
         so the stack stage can place the rows by window.
+        The profiles are cut at STORED_RHO_TOR_NORM_MAX.
 
         Args:
             shot: Shot number.
             so: The shot's ShotFitOutput.
-            x_star: (n_x,) rho grid the profiles were fit on.
+            x_star: (n_x,) rho_tor_norm grid the profiles were fit on.
             hyp_names: Names of the method's hyperparameters, None if it has none.
             windows: (n_w, 2) time windows the shot was staged with [s].
             window_index: (n_t,) window of each row, -1 without windows.
@@ -1276,6 +1283,10 @@ class DataWorkflow(ABC):
             "description": "Per-slice fit status",
             "codes": ", ".join(f"{k}={v}" for k, v in STATUS_NAMES.items()),
         }
+        # isclose keeps a grid point that float round-off puts just past the cut
+        stored = (x_star <= STORED_RHO_TOR_NORM_MAX) | np.isclose(
+            x_star, STORED_RHO_TOR_NORM_MAX
+        )
         data_vars = {}
         has_hyps = False
         for var, si_factor, name, unit, desc in (
@@ -1285,17 +1296,22 @@ class DataWorkflow(ABC):
             for suffix, out_suffix, extra in (
                 ("fit", "", ""),
                 ("std", "_error", "1-sigma predictive uncertainty of the "),
-                ("grad", "_gradient", "d/drho gradient of the "),
+                ("grad", "_gradient", "d/drho_tor_norm gradient of the "),
                 (
                     "grad_std",
                     "_gradient_error",
-                    "1-sigma uncertainty of the d/drho gradient of the ",
+                    "1-sigma uncertainty of the d/drho_tor_norm gradient of the ",
                 ),
             ):
-                grad_unit = unit if suffix in ("fit", "std") else f"{unit} per unit rho"
-                profile = getattr(so, f"{var}_{suffix}")[None] * si_factor
+                grad_unit = (
+                    unit
+                    if suffix in ("fit", "std")
+                    else f"{unit} per unit rho_tor_norm"
+                )
+                fit_rows = getattr(so, f"{var}_{suffix}")
+                profile = fit_rows[None, :, stored] * si_factor
                 data_vars[f"{name}{out_suffix}"] = (
-                    ("shot", TIME_DIM, "rho"),
+                    ("shot", TIME_DIM, "rho_tor_norm"),
                     profile.astype(np.float32),
                     {
                         "description": f"{extra}GP-fitted {desc} profile",
@@ -1325,7 +1341,11 @@ class DataWorkflow(ABC):
             "shot": [shot],
             # Slice ordinal, not a physical coordinate
             TIME_DIM: np.arange(so.time.size),
-            "rho": ("rho", x_star, {"description": RHO_DEFINITION}),
+            "rho_tor_norm": (
+                "rho_tor_norm",
+                x_star[stored],
+                {"description": RHO_TOR_NORM_DEFINITION},
+            ),
             TIME_COORD: (
                 ("shot", TIME_DIM),
                 np.asarray(so.time, dtype=np.float32)[None],
@@ -1338,7 +1358,7 @@ class DataWorkflow(ABC):
             "fit_method": self.fit_method,
             "fit_mode": self.fit_mode,
             "sol_extension": self.settings.sol_extension,
-            "rho_definition": RHO_DEFINITION,
+            "rho_tor_norm_definition": RHO_TOR_NORM_DEFINITION,
             "dataset_name": self.ds_name,
         }
         attrs["windows"] = json.dumps(window_bounds(windows).tolist())
@@ -1373,6 +1393,7 @@ class DataWorkflow(ABC):
 
         Plots the exact (cleaned, floored) channel data the fit consumed,
         straight from the staged batch files.
+        The fits are drawn over the whole fit grid, past STORED_RHO_TOR_NORM_MAX, so the anchors show.
         Skips shots whose PDF already exists.
         A window-averaged fit gets one page per window, with every pooled point on it.
 
@@ -1410,13 +1431,13 @@ class DataWorkflow(ABC):
                     pdf_path,
                     shot,
                     ts_time=si.time,
-                    rho_ch=si.x,
+                    rho_tor_norm_ch=si.x,
                     channel_data={
                         "te": (si.te_y, si.te_err),
                         "ne": (si.ne_y, si.ne_err),
                     },
                     fit_output=so,
-                    rho_fit=batch.x_star,
+                    rho_tor_norm_fit=batch.x_star,
                     channel_groups=_tile_channel_groups(
                         self.fit_plot_channel_groups(shot), si.x.shape[1]
                     ),
@@ -1968,7 +1989,7 @@ class DataWorkflow(ABC):
             "fit_method": self.fit_method,
             "fit_mode": fit_mode,
             "sol_extension": ds_fit.attrs["sol_extension"],
-            "rho_definition": RHO_DEFINITION,
+            "rho_tor_norm_definition": RHO_TOR_NORM_DEFINITION,
             "time_definition": time_definition,
         }
         return ds_stacked
@@ -2012,8 +2033,8 @@ class DataWorkflow(ABC):
         Returns:
             device_settings (the settings_cls instance), filters (every
             threshold the unprocessed stage applied), and fit_settings (the
-            staging knobs the fits were made with; the rho grid is the store's
-            rho coordinate).
+            staging knobs the fits were made with,
+            including the full fit grid the store's rho_tor_norm coordinate is cut from).
         """
         return {
             "device_settings": to_json(self.settings),
@@ -2031,6 +2052,7 @@ class DataWorkflow(ABC):
             ),
             "fit_settings": to_json(
                 {
+                    "rho_tor_norm_grid": self.fit_rho_tor_norm,
                     "min_points": self.fit_min_points,
                     "scale_per_slice": self.fit_scale_per_slice,
                     "bounds": self.fit_bounds,

@@ -2,7 +2,7 @@
 
 DummyWorkflow fakes the source: a shot is a flat current on the 1 kHz grid
 with a Thomson sample every SAMPLE_PERIOD_MS, whose channels sit at known
-rho and carry a parabolic profile scaled per shot. The fits go through the
+rho_tor_norm and carry a parabolic profile scaled per shot. The fits go through the
 linear interpolation method in linear_worker.py, registered as "linear" for
 these tests, so every stage runs in well under a second and the fitted
 profiles are predictable.
@@ -37,7 +37,7 @@ DURATION = 0.3  # s of source data per shot
 SAMPLE_PERIOD_MS = 20
 FIRST_SAMPLE_MS = 10
 N_CH = 8
-RHO_CH = np.linspace(0.05, 0.95, N_CH)
+RHO_TOR_NORM_CH = np.linspace(0.05, 0.95, N_CH)
 TE_AXIS = 1000.0  # eV
 NE_AXIS = 1.0e20  # m^-3
 
@@ -51,8 +51,8 @@ def shot_scale(shot: int) -> float:
     return 1.0 + 0.1 * (shot % 10)
 
 
-def profile(rho: np.ndarray) -> np.ndarray:
-    return 1.0 - rho**2
+def profile(rho_tor_norm: np.ndarray) -> np.ndarray:
+    return 1.0 - rho_tor_norm**2
 
 
 def make_source_dataset(
@@ -63,9 +63,9 @@ def make_source_dataset(
     is_sample = np.zeros(n_t, dtype=bool)
     is_sample[FIRST_SAMPLE_MS::SAMPLE_PERIOD_MS] = True
     te = np.full((n_t, N_CH), np.nan)
-    te[is_sample] = TE_AXIS * profile(RHO_CH) * shot_scale(shot)
+    te[is_sample] = TE_AXIS * profile(RHO_TOR_NORM_CH) * shot_scale(shot)
     ne = np.full((n_t, N_CH), np.nan)
-    ne[is_sample] = NE_AXIS * profile(RHO_CH) * shot_scale(shot)
+    ne[is_sample] = NE_AXIS * profile(RHO_TOR_NORM_CH) * shot_scale(shot)
     if broken_sample is not None:
         # All but two channels of one sample lost, below fit_min_points
         row = np.flatnonzero(is_sample)[broken_sample]
@@ -78,8 +78,8 @@ def make_source_dataset(
     return xr.Dataset(
         {
             "ip": ((EPISODE_DIM, TIME_COORD), np.full((1, n_t), 1.0e6)),
-            # rho stands in for R, see DummyWorkflow.prepare_fit_input
-            "ts_channel_r": channel(np.tile(RHO_CH, (n_t, 1))),
+            # rho_tor_norm stands in for R, see DummyWorkflow.prepare_fit_input
+            "ts_channel_r": channel(np.tile(RHO_TOR_NORM_CH, (n_t, 1))),
             "ts_channel_z": channel(np.zeros((n_t, N_CH))),
             "ts_channel_t_e": channel(te),
             "ts_channel_t_e_error": channel(0.1 * te),
@@ -98,7 +98,7 @@ class DummyWorkflow(DataWorkflow):
     min_usable_time = 0.05
     min_segment_length = 0.01
     shot_blacklist = [BLACKLISTED_SHOT]
-    fit_rho = np.linspace(0.0, 1.0, 21)
+    fit_rho_tor_norm = np.linspace(0.0, 1.4, 29)
     fit_min_points = 3
 
     def __init__(self, *args, **kwargs):
@@ -128,12 +128,17 @@ class DummyWorkflow(DataWorkflow):
         ts_times = ds_shot[TIME_COORD].values[has_sample]
         if ts_times.size == 0:
             return None
-        # The synthetic source stores each channel's rho in ts_channel_r,
+        # The synthetic source stores each channel's rho_tor_norm in ts_channel_r,
         # so there is no equilibrium to map through
-        rho = channel_rows_at_times(ds_shot["ts_channel_r"], ts_times)
+        rho_tor_norm = channel_rows_at_times(ds_shot["ts_channel_r"], ts_times)
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
         return ShotFitInput(
-            x=rho, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err, time=ts_times
+            x=rho_tor_norm,
+            te_y=te_y,
+            te_err=te_err,
+            ne_y=ne_y,
+            ne_err=ne_err,
+            time=ts_times,
         )
 
 
@@ -171,8 +176,8 @@ def shot_times(store: xr.Dataset, shot: int) -> tuple[int, np.ndarray]:
     return i, times[np.isfinite(times)]
 
 
-def expected_te(shot: int, rho: np.ndarray) -> np.ndarray:
-    return TE_AXIS * profile(rho) * shot_scale(shot)
+def expected_te(shot: int, rho_tor_norm: np.ndarray) -> np.ndarray:
+    return TE_AXIS * profile(rho_tor_norm) * shot_scale(shot)
 
 
 @pytest.fixture(autouse=True)
@@ -250,10 +255,10 @@ class TestStageFitBatches:
         si = batch.shot_inputs[1]
         assert batch.fit_mode == FIT_MODE_SAMPLE
         assert si.time.size == 15
-        assert np.allclose(si.x, RHO_CH)
+        assert np.allclose(si.x, RHO_TOR_NORM_CH)
         # Staged in the fit units: keV and 1e20 m^-3
-        assert np.allclose(si.te_y[0], expected_te(1, RHO_CH) * 1e-3)
-        assert np.allclose(si.ne_y[0], profile(RHO_CH) * shot_scale(1))
+        assert np.allclose(si.te_y[0], expected_te(1, RHO_TOR_NORM_CH) * 1e-3)
+        assert np.allclose(si.ne_y[0], profile(RHO_TOR_NORM_CH) * shot_scale(1))
         assert si.windows.shape == (0, 2)
         assert (si.window_index == -1).all()
 
@@ -334,19 +339,23 @@ class TestRunGpFitting:
 
         for shot in (1, 2):
             with xr.open_dataset(workflow.fit_shots_dir / f"{shot}.nc") as ds:
-                assert ds.sizes == {EPISODE_DIM: 1, TIME_DIM: 15, "rho": 21}
+                # The fit grid runs to 1.4 and is cut at 1.1 when written
+                assert ds.sizes == {EPISODE_DIM: 1, TIME_DIM: 15, "rho_tor_norm": 23}
+                assert np.isclose(ds["rho_tor_norm"].values[-1], 1.1)
                 assert (ds["t_e_fit_status"].values == STATUS_OK).all()
                 assert (ds["n_e_fit_status"].values == STATUS_OK).all()
                 assert ds.attrs["fit_method"] == "linear"
                 assert ds.attrs["fit_mode"] == FIT_MODE_SAMPLE
                 assert json.loads(ds.attrs["windows"]) == []
                 assert (ds["window_index"].values == -1).all()
-                rho = ds["rho"].values
-                inside = (rho >= RHO_CH[0]) & (rho <= RHO_CH[-1])
+                rho_tor_norm = ds["rho_tor_norm"].values
+                inside = (rho_tor_norm >= RHO_TOR_NORM_CH[0]) & (
+                    rho_tor_norm <= RHO_TOR_NORM_CH[-1]
+                )
                 # Linear interpolation of a parabola between 8 channels
                 assert np.allclose(
                     ds["t_e"].values[0][:, inside],
-                    expected_te(shot, rho[inside]),
+                    expected_te(shot, rho_tor_norm[inside]),
                     atol=0.01 * TE_AXIS,
                 )
 
@@ -407,10 +416,14 @@ class TestStackInternalDataset:
             # Every sample is held to the next one, so the profile is there
             # from the first sample to the end of the grid
             assert np.isfinite(te).any(axis=-1).tolist() == (times >= 0.01).tolist()
-            rho = store["rho"].values
-            inside = (rho >= RHO_CH[0]) & (rho <= RHO_CH[-1])
+            rho_tor_norm = store["rho_tor_norm"].values
+            inside = (rho_tor_norm >= RHO_TOR_NORM_CH[0]) & (
+                rho_tor_norm <= RHO_TOR_NORM_CH[-1]
+            )
             assert np.allclose(
-                te[-1, inside], expected_te(shot, rho[inside]), atol=0.01 * TE_AXIS
+                te[-1, inside],
+                expected_te(shot, rho_tor_norm[inside]),
+                atol=0.01 * TE_AXIS,
             )
         assert (store["fresh_equilibrium"].values == 0).all()
 
@@ -452,10 +465,12 @@ class TestStackInternalDataset:
         assert (te == te[0]).all()
         fresh = store["fresh_profile"].values[i, : times.size]
         assert np.allclose(times[fresh > 0], [0.15])
-        rho = store["rho"].values
-        inside = (rho >= RHO_CH[0]) & (rho <= RHO_CH[-1])
+        rho_tor_norm = store["rho_tor_norm"].values
+        inside = (rho_tor_norm >= RHO_TOR_NORM_CH[0]) & (
+            rho_tor_norm <= RHO_TOR_NORM_CH[-1]
+        )
         assert np.allclose(
-            te[0, inside], expected_te(1, rho[inside]), atol=0.01 * TE_AXIS
+            te[0, inside], expected_te(1, rho_tor_norm[inside]), atol=0.01 * TE_AXIS
         )
         assert "center" in store["fresh_profile"].attrs["description"]
 

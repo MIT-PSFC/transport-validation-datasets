@@ -177,7 +177,7 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
 # The mapping counterpart of workflow.MAX_HOLD_PERIODS, separate to avoid a circular import.
 EQ_MATCH_MAX_PERIODS = 1.5
 
-# How Phi_N continues past the LCFS, see rho_tor_norm_from_psi_n.
+# How Phi_N continues past the LCFS, see _phi_n_table.
 SOL_EXTENSIONS = ("secant", "tangent")
 
 # The secant SOL extension takes its slope over psi_N from here to the LCFS.
@@ -397,25 +397,23 @@ def cumulative_q_integral(qpsi: np.ndarray) -> np.ndarray:
     return cumulative_simpson(qpsi, x=psi_n_grid, initial=0.0)
 
 
-def rho_tor_norm_from_psi_n(
-    psi_n: np.ndarray, qpsi: np.ndarray, sol_extension: str
-) -> np.ndarray:
-    """Map normalized poloidal flux onto rho_tor_norm through one equilibrium's q profile.
+def _phi_n_table(
+    qpsi: np.ndarray, sol_extension: str
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Tabulate Phi_N on the qpsi grid, and the slope it continues with past the LCFS.
 
-    rho_tor_norm = sqrt(Phi_N), with Phi_N the q integral normalized to 1 at the LCFS.
-    Inside the LCFS Phi_N is interpolated on the qpsi grid.
+    Phi_N is the q integral normalized to 1 at the LCFS.
     q is undefined beyond it, so there Phi_N continues linearly in psi_N,
     with the secant slope (1 - Phi_N(SECANT_PSI_N)) / (1 - SECANT_PSI_N)
     or the tangent slope q(1) / integral_0^1 q dpsi_N.
-    psi_N below 0, which interpolation can give next to the axis, maps to 0.
 
     Args:
-        psi_n: Normalized poloidal flux, any shape, NaN where unknown.
         qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
         sol_extension: One of SOL_EXTENSIONS.
 
     Returns:
-        rho_tor_norm shaped like psi_n, NaN where psi_n is.
+        (psi_n_grid, phi_n_grid, sol_slope): the (n_psi,) psi_N grid, Phi_N on it,
+        and dPhi_N/dpsi_N outside the LCFS.
 
     Raises:
         ValueError: If sol_extension is not one of SOL_EXTENSIONS.
@@ -432,12 +430,60 @@ def rho_tor_norm_from_psi_n(
         raise ValueError(
             f"sol_extension must be one of {SOL_EXTENSIONS}, got {sol_extension!r}"
         )
+    return psi_n_grid, phi_n_grid, float(sol_slope)
+
+
+def rho_tor_norm_from_psi_n(
+    psi_n: np.ndarray, qpsi: np.ndarray, sol_extension: str
+) -> np.ndarray:
+    """Map normalized poloidal flux onto rho_tor_norm through one equilibrium's q profile.
+
+    rho_tor_norm = sqrt(Phi_N), with Phi_N from _phi_n_table.
+    Inside the LCFS Phi_N is interpolated on the qpsi grid,
+    outside it Phi_N continues linearly in psi_N.
+    psi_N below 0, which interpolation can give next to the axis, maps to 0.
+
+    Args:
+        psi_n: Normalized poloidal flux, any shape, NaN where unknown.
+        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
+        sol_extension: One of SOL_EXTENSIONS.
+
+    Returns:
+        rho_tor_norm shaped like psi_n, NaN where psi_n is.
+    """
+    psi_n_grid, phi_n_grid, sol_slope = _phi_n_table(qpsi, sol_extension)
     psi_n_clipped = np.maximum(psi_n, 0.0)
     phi_n_inside = np.interp(psi_n_clipped, psi_n_grid, phi_n_grid)
     phi_n_outside = 1.0 + sol_slope * (psi_n_clipped - 1.0)
     with np.errstate(invalid="ignore"):
         phi_n = np.where(psi_n_clipped <= 1.0, phi_n_inside, phi_n_outside)
     return np.sqrt(phi_n)
+
+
+def psi_n_from_rho_tor_norm(
+    rho_tor_norm: np.ndarray, qpsi: np.ndarray, sol_extension: str
+) -> np.ndarray:
+    """Map rho_tor_norm back onto normalized poloidal flux, the inverse of rho_tor_norm_from_psi_n.
+
+    Phi_N = rho_tor_norm^2 is inverted by interpolation on the qpsi grid inside the LCFS
+    and through the linear continuation outside it.
+    Phi_N rises monotonically with psi_N while q keeps one sign, so the inverse is single valued.
+
+    Args:
+        rho_tor_norm: Any shape, NaN where unknown.
+        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
+        sol_extension: One of SOL_EXTENSIONS.
+
+    Returns:
+        psi_N shaped like rho_tor_norm, NaN where rho_tor_norm is.
+    """
+    psi_n_grid, phi_n_grid, sol_slope = _phi_n_table(qpsi, sol_extension)
+    phi_n = np.square(rho_tor_norm)
+    psi_n_inside = np.interp(phi_n, phi_n_grid, psi_n_grid)
+    psi_n_outside = 1.0 + (phi_n - 1.0) / sol_slope
+    with np.errstate(invalid="ignore"):
+        psi_n = np.where(phi_n <= 1.0, psi_n_inside, psi_n_outside)
+    return psi_n
 
 
 def map_ts_channels_to_rho_tor_norm(
