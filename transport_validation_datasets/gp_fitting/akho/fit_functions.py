@@ -89,14 +89,14 @@ def CubicZeroAxisSlope(x, c0, c2, c3):
     return c0 + c2 * x**2 + c3 * x**3
 
 
-def Osborne_linear_initial_guesses(rho_edge, values_edge, n_params=7):
-    """Rough initial guesses for an Osborne tanh fit based on edge-only data.
+def Osborne_linear_initial_guesses(rho_edge, values_edge, n_params):
+    """Rough initial guesses for an Osborne tanh fit at a fixed centre, from edge-only data.
 
     Returns:
-        A list of length n_params with trailing zeros for polynomial terms.
+        [width, top, bottom], then zeros for the remaining polynomial terms up to n_params.
     """
     if len(values_edge) < 4:
-        return [1.0, 0.04, float(np.nanmax(values_edge)), 0.0] + [0.0] * (n_params - 4)
+        return [0.04, float(np.nanmax(values_edge)), 0.0] + [0.0] * (n_params - 3)
 
     avg = np.nanmean(values_edge)
     bottom = avg * 0.3
@@ -116,9 +116,8 @@ def Osborne_linear_initial_guesses(rho_edge, values_edge, n_params=7):
     width = max_r - min_r
     if width <= 0:
         width = abs(rho_edge[-3] - rho_edge[-5]) if len(rho_edge) > 5 else 0.05
-    centre = (max_r + min_r) / 2.0
 
-    return [centre, width, top, bottom] + [0.0] * (n_params - 4)
+    return [width, top, bottom] + [0.0] * (n_params - 3)
 
 
 def evaluate_with_gradient(fit_func, popt, x, h=1.0e-4):
@@ -128,8 +127,8 @@ def evaluate_with_gradient(fit_func, popt, x, h=1.0e-4):
     One finite-difference helper covers both candidate functions.
 
     Args:
-        fit_func: Osborne_Tanh_cubic_zero_axis_slope or CubicZeroAxisSlope.
-        popt: Its fitted parameters (from fit_analytic_profile).
+        fit_func: The winning candidate from fit_analytic_profile.
+        popt: Its fitted parameters.
         x: Points to evaluate at.
         h: Central-difference step.
 
@@ -142,9 +141,13 @@ def evaluate_with_gradient(fit_func, popt, x, h=1.0e-4):
     return mean, dmean_dx
 
 
-def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thresh):
+def fit_analytic_profile(
+    rho, values, errors, is_channel, profile_type, edge_thresh, pedestal_rho
+):
     """Fit the zero-axis-slope mtanh and cubic to one profile, keep the one that fits better.
 
+    The mtanh is centred on pedestal_rho, so its free parameters are
+    the width, top, bottom, and inboard quadratic and cubic terms.
     The candidates compete on reduced chi-squared inside the separatrix.
     An mtanh needs three measured channels inside its pedestal width,
     and a Te mtanh wider than _TE_MTANH_MAX_WIDTH is rejected.
@@ -156,29 +159,33 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
         is_channel: (n,) True for measured channels, False for anchors.
         profile_type: 'te' or 'ne', selects the bounds and initial guesses.
         edge_thresh: rho above which points seed the edge-based initial guess.
+        pedestal_rho: The mtanh centre.
 
     Returns:
         (fit_func, popt) of the winning candidate, or None if both fail.
     """
     is_ne = profile_type == "ne"
     max_val = max(values)
-    # Osborne_Tanh_cubic_zero_axis_slope's c0, c1, c2, c3, c5, c6
-    n_params = 6
 
-    # Bounds on [centre, width, top, bottom] + inboard polynomial terms
+    def mtanh_at_pedestal(x, c1, c2, c3, c5, c6):
+        return Osborne_Tanh_cubic_zero_axis_slope(x, pedestal_rho, c1, c2, c3, c5, c6)
+
+    # c1, c2, c3, c5, c6
+    n_params = 5
+
+    # Bounds on [width, top, bottom] + inboard polynomial terms
     if is_ne:
-        lb = [0.85, 0.01, 0.0, -0.001] + [-np.inf] * (n_params - 4)
-        ub = [1.1, 0.25, max_val, np.inf] + [np.inf] * (n_params - 4)
+        lb = [0.01, 0.0, -0.001] + [-np.inf] * (n_params - 3)
+        ub = [0.25, max_val, np.inf] + [np.inf] * (n_params - 3)
     else:
-        lb = [0.85, 0.01, 0.0, -0.001] + [-np.inf] * (n_params - 4)
-        ub = [1.1, 0.15, max_val, max_val] + [np.inf] * (n_params - 4)
+        lb = [0.01, 0.0, -0.001] + [-np.inf] * (n_params - 3)
+        ub = [0.15, max_val, max_val] + [np.inf] * (n_params - 3)
 
-    # Hard-coded initial guesses, [c0, c1, c2, c3, c5, c6]
+    # Hard-coded initial guesses, [c1, c2, c3, c5, c6]
     if is_ne:
         hardcoded = [
             # 650 kA C-Mod
             [
-                1.00604712,
                 3.7400836e-02,
                 2.10662412,
                 1.68897974e-02,
@@ -187,7 +194,6 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
             ],
             # 1 MA C-Mod
             [
-                1.02123755e00,
                 5.02744526e-02,
                 2.54219267e00,
                 -9.99999694e-04,
@@ -195,13 +201,12 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
                 4.20279037e-05,
             ],
             # D3D
-            [0.99, 0.04, 1.0, 0.05, 0.0, 0.0],
-            [0.99, 0.04, 0.3, 0.05, 0.0, 0.0],
+            [0.04, 1.0, 0.05, 0.0, 0.0],
+            [0.04, 0.3, 0.05, 0.0, 0.0],
         ]
     else:
         hardcoded = [
             [
-                9.92614859e-01,
                 4.01791101e-02,
                 2.55550908e02,
                 1.28542623e01,
@@ -224,19 +229,18 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
     guesses = [np.clip(g, lb_arr, ub_arr) for g in guesses]
 
     # Data-adaptive guesses with the pedestal top near the data maximum go first
-    for c0_guess, c1_guess in [(0.99, 0.04), (0.98, 0.04), (0.99, 0.05), (1.00, 0.03)]:
+    for width_guess in (0.04, 0.05, 0.03):
         g = np.zeros(n_params)
-        g[0] = c0_guess
-        g[1] = c1_guess
-        g[2] = 0.85 * max_val
-        g[3] = 0.02 * max_val
+        g[0] = width_guess
+        g[1] = 0.85 * max_val
+        g[2] = 0.02 * max_val
         guesses.insert(0, g)
 
     params_mtanh = chi_mtanh = None
     for guess in guesses:
         try:
             params_mtanh, _ = curve_fit(
-                Osborne_Tanh_cubic_zero_axis_slope,
+                mtanh_at_pedestal,
                 rho,
                 values,
                 p0=guess,
@@ -245,7 +249,7 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
                 maxfev=2000,
                 bounds=(lb, ub),
             )
-            mtanh_at_data = Osborne_Tanh_cubic_zero_axis_slope(rho, *params_mtanh)
+            mtanh_at_data = mtanh_at_pedestal(rho, *params_mtanh)
             chi_mtanh = reduced_chi_squared_inside_separatrix(
                 rho, values, mtanh_at_data, errors, n_params
             )
@@ -280,8 +284,8 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
         params_cubic = chi_cubic = None
 
     if params_mtanh is not None:
-        lo = params_mtanh[0] - params_mtanh[1]
-        hi = params_mtanh[0] + params_mtanh[1]
+        lo = pedestal_rho - params_mtanh[0]
+        hi = pedestal_rho + params_mtanh[0]
         in_pedestal = is_channel & (rho > lo) & (rho < hi)
         if np.count_nonzero(in_pedestal) < 3:
             params_mtanh = chi_mtanh = None
@@ -289,13 +293,13 @@ def fit_analytic_profile(rho, values, errors, is_channel, profile_type, edge_thr
     if (
         profile_type == "te"
         and params_mtanh is not None
-        and params_mtanh[1] > _TE_MTANH_MAX_WIDTH
+        and params_mtanh[0] > _TE_MTANH_MAX_WIDTH
     ):
         params_mtanh = chi_mtanh = None
 
     # Lowest reduced chi-squared wins, the mtanh on a tie
     candidates = [
-        (chi_mtanh, Osborne_Tanh_cubic_zero_axis_slope, params_mtanh),
+        (chi_mtanh, mtanh_at_pedestal, params_mtanh),
         (chi_cubic, CubicZeroAxisSlope, params_cubic),
     ]
     viable = [c for c in candidates if c[0] is not None]

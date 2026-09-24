@@ -468,20 +468,19 @@ def plot_ts_fits(
                 )
                 ax.set_ylim(bottom=0, top=ylims[var])
                 _style_ts_panel(ax, label, title)
-                # The annotation layout is mkgp-specific (5 hyperparameters);
+                # The annotation layout is the zk method's (4 hyperparameters),
                 # other methods' diagnostics are skipped here.
                 hyps_all = getattr(fit_output, f"{var}_hyps")
                 if (
                     hyps_all is not None
-                    and hyps_all.shape[1] == 5
+                    and hyps_all.shape[1] == 4
                     and np.isfinite(hyps_all[i_time]).all()
                 ):
-                    var_h, l1, l2, lw, x0 = hyps_all[i_time]
+                    var_h, l1, l2, lw = hyps_all[i_time]
                     ax.text(
                         0.98,
                         0.98,
-                        f"var={var_h:.2f}  l1={l1:.2f}  l2={l2:.2f}\n"
-                        f"lw={lw:.2f}  x0={x0:.2f}",
+                        f"var={var_h:.2f}  l1={l1:.2f}\nl2={l2:.2f}  lw={lw:.2f}",
                         transform=ax.transAxes,
                         ha="right",
                         va="top",

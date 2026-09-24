@@ -77,6 +77,7 @@ def _fit_variable(
     min_points: int,
     variable: str,
     anchors: FitAnchors,
+    pedestal_rho: float,
     scale_per_slice: bool,
 ) -> VariableFit:
     """Fit one variable of one time slice: analytic pre-fit + GP-residual correction.
@@ -92,6 +93,7 @@ def _fit_variable(
         min_points: Minimum valid channels to attempt a fit.
         variable: 'te' or 'ne', which selects the pre-fit bounds and initial guesses.
         anchors: The variable's anchors, in the data's own units.
+        pedestal_rho: The mtanh centre.
         scale_per_slice: Normalize by the slice maximum before fitting.
             The residual GP's kernel bounds are calibrated on normalized data.
 
@@ -123,7 +125,13 @@ def _fit_variable(
     pre_err = np.concatenate([cerr / scale, prefit_anchor_err])
     is_channel = np.arange(pre_x.size) < cx.size
     analytic = fit_analytic_profile(
-        pre_x, pre_y, pre_err, is_channel, variable, edge_thresh=0.93
+        pre_x,
+        pre_y,
+        pre_err,
+        is_channel,
+        variable,
+        edge_thresh=0.93,
+        pedestal_rho=pedestal_rho,
     )
     if analytic is None:
         return _no_fit(STATUS_FAILED)
@@ -195,6 +203,7 @@ def _fit_slice(task: SliceTask) -> SliceResult:
         task.min_points,
         "te",
         task.te_anchors,
+        task.pedestal_rho_tor_norm,
         task.scale_per_slice,
     )
     ne = _fit_variable(
@@ -205,6 +214,7 @@ def _fit_slice(task: SliceTask) -> SliceResult:
         task.min_points,
         "ne",
         task.ne_anchors,
+        task.pedestal_rho_tor_norm,
         task.scale_per_slice,
     )
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)

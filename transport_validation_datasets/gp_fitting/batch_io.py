@@ -50,7 +50,6 @@ class FitBounds:
     """
 
     l1_min: float = 0.4
-    x0_min: float = 0.95
     var_max: float = 20.0
 
 
@@ -145,6 +144,8 @@ class FitBatch:
         scale_per_slice: Normalize each slice by its max before fitting.
         bounds: Per-variable fit bound knobs, keyed by FIT_VARIABLES.
         anchors: Per-variable virtual observations, keyed by FIT_VARIABLES.
+        pedestal_rho_tor_norm: Pedestal location for the methods whose model has one
+            (zk's length-scale transition, akho's mtanh centre).
         sol_extension: How the staged positions continue outside the LCFS (machine.generic.SOL_EXTENSIONS).
             Workers never read it, it only keeps a resumed run from mixing extensions.
         fit_mode: One of the FIT_MODE_* values, how the rows were built.
@@ -156,6 +157,7 @@ class FitBatch:
     scale_per_slice: bool
     bounds: dict[str, FitBounds]
     anchors: dict[str, FitAnchors]
+    pedestal_rho_tor_norm: float
     sol_extension: str
     fit_mode: str = FIT_MODE_SAMPLE
 
@@ -226,6 +228,7 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         "x_star": np.asarray(batch.x_star, dtype=np.float64),
         "min_points": np.int64(batch.min_points),
         "scale_per_slice": np.bool_(batch.scale_per_slice),
+        "pedestal_rho_tor_norm": np.float64(batch.pedestal_rho_tor_norm),
         "fit_mode": np.str_(batch.fit_mode),
         "sol_extension": np.str_(batch.sol_extension),
     }
@@ -294,6 +297,7 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
             scale_per_slice=bool(data["scale_per_slice"]),
             bounds=bounds,
             anchors=anchors,
+            pedestal_rho_tor_norm=float(data["pedestal_rho_tor_norm"]),
             sol_extension=str(data["sol_extension"].item()),
             fit_mode=str(data["fit_mode"].item()),
         )
@@ -359,14 +363,14 @@ def read_batch_windows(path: Path | str) -> dict[int, np.ndarray]:
 
 
 def read_batch_setting(path: Path | str, name: str) -> str:
-    """Read only one string setting from a batch input npz (cheap).
+    """Read only one scalar setting from a batch input npz (cheap).
 
     Args:
         path: Batch input npz path.
-        name: The FitBatch field, "fit_mode" or "sol_extension".
+        name: The FitBatch field, "fit_mode", "sol_extension" or "pedestal_rho_tor_norm".
 
     Returns:
-        The setting's value.
+        The setting's value, as a string.
     """
     with np.load(path) as data:
         return str(data[name].item())
