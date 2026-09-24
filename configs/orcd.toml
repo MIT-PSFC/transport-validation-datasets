@@ -26,6 +26,6 @@ pending_timeout_s = 1800.0
 # venv_path = the venv bootstrap_remote.sh built there
 
 [cmod]
-# EFIT tree the equilibrium, geometry signals, and timebase are read from:
-# a tree name (EFIT21, EFIT18, ...) or "analysis" for the ANALYSIS tree.
-efit_nickname = "EFIT21"
+# EFIT trees the equilibrium, geometry signals, and timebase are read from, in order of preference
+# A shot takes the first one that works for all required signals.
+efit_trees = ["EFIT21", "ANALYSIS"]
