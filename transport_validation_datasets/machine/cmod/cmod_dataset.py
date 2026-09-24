@@ -9,6 +9,7 @@ from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 
+from transport_validation_datasets.cleaning import drop_in_both
 from transport_validation_datasets.dispy_utils import passive_log_settings, summary
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.cmod.dispy_methods import (
@@ -263,7 +264,8 @@ class CModDataWorkflow(DataWorkflow):
 
         1: Maps the TS channels onto rho_tor_norm through magnetics-only EFIT
         2: convert to the fit units (Te [keV], ne [1e20 m^-3])
-        3: C-Mod channel quality screens and error floors, calibrated in those units
+        3: C-Mod channel quality screens and error floors, calibrated in those units.
+           A reading a screen drops in Te or ne takes the other's reading of that channel with it (cleaning.drop_in_both).
         4: TODO: optionally correct density with interferometry
 
         Args:
@@ -282,6 +284,9 @@ class CModDataWorkflow(DataWorkflow):
 
         ds_shot = ds.squeeze("shot", drop=True)
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
+        # What each variable offers before the screens, so what they drop can be coupled
+        te_valid_raw = np.isfinite(te_y) & np.isfinite(te_err)
+        ne_valid_raw = np.isfinite(ne_y) & np.isfinite(ne_err)
 
         # Drop density channels too uncertain to constrain the fit
         # (error > 1e20 m^-3). These are typically bad edge/SOL channels.
@@ -303,17 +308,28 @@ class CModDataWorkflow(DataWorkflow):
         core_problem = (rho_tor_norm >= 0.0) & (rho_tor_norm < 0.4) & (te_y < 0.4)
         te_y = np.where(core_problem, np.nan, te_y)
 
-        # Error floors. Sometimes C-Mod TS has extremely tiny error bars
-        # which I don't think are real. This increases them where needed.
+        # Error floors.
+        # Sometimes C-Mod TS has extremely tiny error bars which I don't think are real.
         # Te: absolute 0.1 keV
-        # ne: Multiply 'measured' error 1.5x and floor at 10 percent of the value with a 1e18/m3 absolute floor.
+        # ne: Floor at 10 percent of the value with a 1e18/m3 absolute floor.
         te_err = np.where(te_err < 0.1, 0.1, te_err)
-        ne_err = np.maximum(1.5 * ne_err, np.maximum(0.10 * np.abs(ne_y), 0.01))
+        ne_err = np.maximum(ne_err, np.maximum(0.10 * np.abs(ne_y), 0.01))
 
         # After the floors: the persistence screen must see the same errors
         # the fit will (its thresholds are calibrated on them).
         te_y = _drop_broken_channels("te", rho_tor_norm, te_y, te_err)
         ne_y = _drop_broken_channels("ne", rho_tor_norm, ne_y, ne_err)
+
+        te_valid = np.isfinite(te_y) & np.isfinite(te_err)
+        ne_valid = np.isfinite(ne_y) & np.isfinite(ne_err)
+        te_y, ne_y, n_te_taken, n_ne_taken = drop_in_both(
+            te_y, ne_y, te_valid_raw & ~te_valid, ne_valid_raw & ~ne_valid
+        )
+        if n_te_taken or n_ne_taken:
+            logger.info(
+                f"Shot {shot}: the C-Mod screens took {n_te_taken} te and {n_ne_taken} ne "
+                "readings along with the other variable's drops"
+            )
 
         fit_input = ShotFitInput(
             x=rho_tor_norm,

@@ -13,6 +13,10 @@ import zarr
 from loguru import logger
 
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_validation_datasets.cleaning import (
+    clean_fit_rows,
+    drop_rows_without_core,
+)
 from transport_validation_datasets.dataset_utils import build_tensorized_dataset
 from transport_validation_datasets.gp_fitting import registry
 from transport_validation_datasets.gp_fitting.batch_io import (
@@ -856,7 +860,8 @@ class DataWorkflow(ABC):
 
         The stages, each skipping work that already exists on disk:
         1. Stage: map TS channels onto rho_tor_norm, apply device cleaning
-           (prepare_fit_input), restrict or pool the Thomson samples to the shotlist's
+           (prepare_fit_input) and the shared screens every method sees (cleaning.clean_fit_rows),
+           restrict or pool the Thomson samples to the shotlist's
            time windows if it has any, and pack batch npz files into
            fit_staging_dir/batches. The staged batches are method-agnostic.
         2. Fit each batch with self.fit_method's worker: single-threaded in
@@ -945,7 +950,10 @@ class DataWorkflow(ABC):
         and run_gp_fitting refuses the whole staging directory when any of it
         disagrees with this run (_check_staged_batches),
         so an edited shotlist never quietly reuses fits made for other windows.
-        A shot whose prepare_fit_input returns None is recorded as failed and skipped on later runs.
+        Every shot's per-sample rows go through cleaning.clean_fit_rows before any window pools them,
+        and its staged rows through cleaning.drop_rows_without_core after.
+        A shot whose prepare_fit_input returns None, or that cleaning leaves nothing fittable,
+        is recorded as failed and skipped on later runs.
         A shot with no Thomson sample inside its windows is only logged, the windows may be different next run.
 
         Args:
@@ -977,10 +985,17 @@ class DataWorkflow(ABC):
                 if fit_input is None:
                     self.record_failed_fit(shot, "No fittable Thomson channel data.")
                     continue
+                # Per sample, before any window pools the samples, see cleaning.py
+                fit_input = clean_fit_rows(fit_input, shot)
+                if not fit_input.has_fittable_points():
+                    self.record_failed_fit(
+                        shot, "No fittable Thomson channel data after cleaning."
+                    )
+                    continue
                 fit_input = self._apply_windows(shot, fit_input)
                 if fit_input is None:
                     continue
-                shot_inputs[shot] = fit_input
+                shot_inputs[shot] = drop_rows_without_core(fit_input, shot)
             if not shot_inputs:
                 continue
             pack_fit_batch(
