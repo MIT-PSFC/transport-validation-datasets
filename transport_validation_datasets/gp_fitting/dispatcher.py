@@ -3,7 +3,7 @@
 The dispatcher uploads staged batch input files (one npz per batch of shots,
 to avoid many-small-file transfers on clusters like Engaging) plus the
 gp_fitting worker package, submits one CPU job per batch, polls until
-completion, and pulls the result files back.
+completion, and pulls the result files and the job logs back.
 Staging and result collection are the workflow's job (see DataWorkflow.run_gp_fitting),
 the dispatcher only ships, executes, and pulls.
 
@@ -568,7 +568,12 @@ class ClusterFitDispatcher:
     """Run staged GP fitting batches on a SLURM cluster."""
 
     def __init__(
-        self, config: ClusterFitConfig, ds_name: str, batches_dir: Path, method: str
+        self,
+        config: ClusterFitConfig,
+        ds_name: str,
+        batches_dir: Path,
+        method: str,
+        logs_dir: Path,
     ):
         """Set up the dispatcher for one dataset and fitting method.
 
@@ -579,6 +584,8 @@ class ClusterFitDispatcher:
             method: Fitting method name; part of job names and output
                 filenames so two methods' runs never adopt each other's jobs
                 or outputs.
+            logs_dir: Local directory the job logs are pulled back into,
+                once per attempt when it ends.
         """
         self.config = config
         self.ds_name = ds_name
@@ -586,6 +593,7 @@ class ClusterFitDispatcher:
         self.worker_module = registry.worker_module(method)
         self.batches_dir = Path(batches_dir)
         self.batches_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir = Path(logs_dir)
         # Everything this dataset puts on the cluster (batch files, worker
         # package, job scripts, logs) lives in its own subdirectory, so
         # datasets sharing a remote_workdir never touch each other's files.
@@ -963,13 +971,16 @@ class ClusterFitDispatcher:
             remote_out = f"{self.remote_workdir}/{state.output_path.name}"
             if self.backend.pull_file(remote_out, self.batches_dir):
                 state.done = True
+                local_log = self._pull_job_log(state)
                 logger.info(
-                    f"Batch {state.batch_id}: job {state.job_id} finished, results pulled back"
+                    f"Batch {state.batch_id}: job {state.job_id} finished, results pulled back, log in {local_log}"
                 )
             elif slurm_state in _TERMINAL_FAILURE_STATES:
+                local_log = self._pull_job_log(state)
                 self._handle_failure(
                     state,
-                    f"job {state.job_id} ended in state {slurm_state} without producing {remote_out}",
+                    f"job {state.job_id} ended in state {slurm_state} without producing {remote_out}, "
+                    f"log in {local_log}",
                 )
             elif slurm_state == "COMPLETED":
                 # The job claims success, so the output may exist but be
@@ -977,10 +988,11 @@ class ClusterFitDispatcher:
                 # flight. Keep trying for a few polls before giving up.
                 state.output_pull_polls += 1
                 if state.output_pull_polls >= _MAX_OUTPUT_PULL_POLLS:
+                    local_log = self._pull_job_log(state)
                     self._handle_failure(
                         state,
                         f"job {state.job_id} COMPLETED but {remote_out} could "
-                        f"not be pulled after {state.output_pull_polls} polls",
+                        f"not be pulled after {state.output_pull_polls} polls, log in {local_log}",
                     )
                 else:
                     logger.warning(
@@ -993,15 +1005,35 @@ class ClusterFitDispatcher:
                 # few polls, then treat the attempt as failed
                 state.unknown_polls += 1
                 if state.unknown_polls >= _MAX_UNKNOWN_POLLS:
+                    local_log = self._pull_job_log(state)
                     self._handle_failure(
                         state,
                         f"job {state.job_id} in state {slurm_state} for "
-                        f"{state.unknown_polls} polls with no output",
+                        f"{state.unknown_polls} polls with no output, log in {local_log}",
                     )
                 else:
                     logger.warning(
                         f"Batch {state.batch_id}: job {state.job_id} state {slurm_state}, no output yet"
                     )
+
+    def _pull_job_log(self, state: BatchState) -> Path | None:
+        """Pull the SLURM log of a batch's current attempt into logs_dir.
+
+        Called once the attempt has ended, so the log is complete.
+        The name matches the --output pattern of _render_script.
+
+        Args:
+            state: Batch whose attempt ended.
+
+        Returns:
+            The local log path, or None when the cluster has no log for it.
+        """
+        log_name = f"{state.job_name}_{state.job_id}.log"
+        remote_log = f"{self.remote_workdir}/logs/{log_name}"
+        if not self.backend.pull_file(remote_log, self.logs_dir):
+            logger.warning(f"Batch {state.batch_id}: no job log at {remote_log}")
+            return None
+        return self.logs_dir / log_name
 
     def _check_pending_timeout(self, state: BatchState):
         """Cancel a job stuck PENDING too long and hop to the next partition.
