@@ -4,13 +4,13 @@ Most of it comes out of the level 2 store: https://s3.echo.stfc.ac.uk/mast/level
 the 0D summary and equilibrium signals and the full GEQDSK reconstruction, whose flux map also places
 the Thomson channels in rho_tor_norm.
 Two things come from the level 1 store instead:
-the GEQDSK safety factor, which only level 1 publishes as a flux function (see _equilibrium_qpsi),
+the GEQDSK safety factor, which only level 1 publishes as a flux function (see equilibrium_qpsi),
 and the Thomson profiles, which level 2 only carries interpolated onto a uniform (R, t) grid and without uncertainties (see _thomson_dataset).
 
 No MDSplus is involved, so this workflow runs anywhere with internet access.
 Reads are slow, so staging runs in a thread pool of prepare_workers threads.
-One shot costs ~60-90 s of round trips,
-which puts the packaged 1101-shot list at a few hours on the default 8 threads.
+One shot costs ~30-40 s of round trips.
+The packaged shotlist is built by machine/mast/shotlist.py
 """
 
 from dataclasses import dataclass
@@ -36,9 +36,9 @@ from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 S3_ENDPOINT = "https://s3.echo.stfc.ac.uk"
 LEVEL2_PATH = "mast/level2/shots"
 
-# The raw diagnostic output. Two groups are read: EFM for the one GEQDSK field
-# the level 2 store does not carry as a flux function (qpsi, see
-# _equilibrium_qpsi), and AYC for the Thomson profiles (see _thomson_dataset).
+# The raw diagnostic output. Two groups are read:
+# EFM for the one GEQDSK field the level 2 store does not carry as a flux function (qpsi, see equilibrium_qpsi)
+# AYC for the Thomson profiles (see _thomson_dataset)
 LEVEL1_PATH = "mast/level1/shots"
 LEVEL1_EFM_GROUP = "efm"
 LEVEL1_TS_GROUP = "ayc"
@@ -52,8 +52,8 @@ REQUIRED_TS_VARIABLES = ("radius", "te", "te_error", "ne", "ne_error")
 # grid), so level 1 rows are matched to level 2 times, never interpolated [s].
 EQUILIBRIUM_TIME_TOL = 1e-4
 
-# Shotlist for M8 and M9 campaigns
-DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "machine" / "mast" / "mast_shotlist_M8_M9"
+# Shotlist for the M7-M9 campaigns, built by shotlist.py
+DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "machine" / "mast" / "mast_shotlist_M7_M9"
 
 # The core Thomson system (AYC) views along a horizontal chord at the midplane,
 # so every channel is at the same height and only its major radius varies.
@@ -92,7 +92,6 @@ SUMMARY_SIGNALS = {
 # GEQDSK 1D flux-function profiles: freeqdsk name -> level 2 equilibrium name.
 # All are published on the uniform psi_norm grid the GEQDSK block wants.
 # qpsi is absent here on purpose, level 2 only has q along the midplane
-# (see _equilibrium_qpsi).
 GEQDSK_PROFILES = {
     "fpol": "f",
     "pres": "pressure",
@@ -100,24 +99,25 @@ GEQDSK_PROFILES = {
     "pprime": "dpressure_dpsi",
 }
 
-# Store paths a shot must carry to be worth staging. Everything else is derived.
+# Level 2 groups and the signals in them a shot must carry to be worth staging.
+# Everything else is derived.
 # summary/power_nbi is required rather than zero filled: nothing in the archive
 # can tell a shot whose beams were off from one whose beam record is missing.
-REQUIRED_LEVEL2_PATHS = (
-    "summary/ip",
-    "summary/power_nbi",
-    "equilibrium/psi",
-    "equilibrium/psi_axis",
-    "equilibrium/psi_boundary",
-    "equilibrium/magnetic_axis_r",
-    "equilibrium/magnetic_axis_z",
-    "equilibrium/ip",
-    "equilibrium/bvac_rmag",
-    "equilibrium/li",
-    "equilibrium/vloop_dynamic",
-    *(f"summary/{name}" for name in SUMMARY_SIGNALS),
-    *(f"equilibrium/{name}" for name in EQUILIBRIUM_SIGNALS),
-)
+REQUIRED_LEVEL2_SIGNALS = {
+    "summary": ("ip", "power_nbi", *SUMMARY_SIGNALS),
+    "equilibrium": (
+        "psi",
+        "psi_axis",
+        "psi_boundary",
+        "magnetic_axis_r",
+        "magnetic_axis_z",
+        "ip",
+        "bvac_rmag",
+        "li",
+        "vloop_dynamic",
+        *EQUILIBRIUM_SIGNALS,
+    ),
+}
 
 # Per-variable attributes, IMAS data dictionary path under "ref"
 SIGNAL_ATTRS = {
@@ -329,6 +329,31 @@ class MASTSettings(DeviceSettings):
     """MAST settings, the [mast] table of the config file."""
 
 
+class MissingSourceError(Exception):
+    """A shot lacks data the workflow reads, so a retry will not help.
+
+    The message says what is missing.
+    """
+
+
+@dataclass(frozen=True)
+class ShotSources:
+    """One shot's stores, checked for everything get_source_dataset reads.
+
+    Attributes:
+        summary: The level 2 summary group.
+        equilibrium: The level 2 equilibrium group.
+        ds_thomson: The usable Thomson slices inside the shot window,
+            on their own timebase (see _thomson_dataset).
+        timebase: The shot's uniform 1 kHz timebase [s].
+    """
+
+    summary: xr.Dataset
+    equilibrium: xr.Dataset
+    ds_thomson: xr.Dataset
+    timebase: np.ndarray
+
+
 class MASTDataWorkflow(DataWorkflow):
     """MAST specific data workflow for creating and processing datasets."""
 
@@ -443,61 +468,25 @@ class MASTDataWorkflow(DataWorkflow):
         Returns:
             The standardized dataset, or None when the shot cannot be built.
         """
-        data_tree = _open_level2(shot)
-        if data_tree is None:
-            if not _store_path_exists(f"{LEVEL2_PATH}/{shot}.zarr"):
-                self.record_failed_shot(shot, "No level 2 store for this shot.")
+        try:
+            sources = open_shot_sources(shot)
+        except MissingSourceError as e:
+            logger.warning(f"Shot {shot}: {e} Skipping.")
+            self.record_failed_shot(shot, str(e))
+            return None
+        if sources is None:
             return None
 
-        missing = [p for p in REQUIRED_LEVEL2_PATHS if not _has_path(data_tree, p)]
-        if missing:
-            reason = f"Missing level 2 signals: {', '.join(missing)}."
-            logger.warning(f"Shot {shot}: {reason} Skipping.")
-            self.record_failed_shot(shot, reason)
+        limiter = _open_store_group(LEVEL2_PATH, shot, "wall")
+        if limiter is None and _store_path_exists(f"{LEVEL2_PATH}/{shot}.zarr/wall"):
             return None
 
-        summary = data_tree["summary"].ds
-        equilibrium = data_tree["equilibrium"].ds
-
-        summary_time = summary["time"].values
-        ip = np.asarray(summary["ip"].values, dtype=float)
-        in_shot = np.abs(ip) > SHOT_WINDOW_MIN_IP
-        if in_shot.sum() < 2:
-            reason = f"No plasma current above {SHOT_WINDOW_MIN_IP:.0f} A."
-            logger.warning(f"Shot {shot}: {reason} Skipping.")
-            self.record_failed_shot(shot, reason)
-            return None
-        timebase = make_uniform_1kHz_timebase(float(summary_time[in_shot][-1]))
-
-        thomson = _open_level1_group(shot, LEVEL1_TS_GROUP)
-        if thomson is None:
-            if not _store_path_exists(f"{LEVEL1_PATH}/{shot}.zarr/{LEVEL1_TS_GROUP}"):
-                self.record_failed_shot(
-                    shot, f"No level 1 {LEVEL1_TS_GROUP} Thomson group for this shot."
-                )
-            return None
-        missing_ts = [v for v in REQUIRED_TS_VARIABLES if v not in thomson]
-        if missing_ts:
-            reason = (
-                f"Missing level 1 {LEVEL1_TS_GROUP} signals: {', '.join(missing_ts)}."
-            )
-            logger.warning(f"Shot {shot}: {reason} Skipping.")
-            self.record_failed_shot(shot, reason)
-            return None
-
-        ds_thomson = _thomson_dataset(shot, thomson, timebase)
-        if ds_thomson.sizes["idx"] == 0:
-            reason = "No Thomson slices with usable data within the shot window."
-            logger.warning(f"Shot {shot}: {reason} Skipping.")
-            self.record_failed_shot(shot, reason)
-            return None
-
-        limiter = data_tree["wall"].ds if "wall" in data_tree else None
-        ds_0d = _zero_d_dataset(shot, summary, equilibrium, timebase)
+        timebase = sources.timebase
+        ds_0d = _zero_d_dataset(shot, sources.summary, sources.equilibrium, timebase)
         ds_equilibrium = snap_to_grid(
-            _equilibrium_dataset(shot, equilibrium, limiter), timebase
+            _equilibrium_dataset(shot, sources.equilibrium, limiter), timebase
         )
-        ds_thomson = snap_to_grid(ds_thomson, timebase)
+        ds_thomson = snap_to_grid(sources.ds_thomson, timebase)
 
         ds = xr.merge(
             [ds_0d, ds_equilibrium, ds_thomson], compat="no_conflicts", join="outer"
@@ -524,7 +513,8 @@ class MASTDataWorkflow(DataWorkflow):
         NOTE: The Thomson chord runs along z = TS_CHANNEL_Z while the MAST
         equilibria may put the magnetic axis 0.15-0.25 m lower, so the chord
         passes above the axis and never crosses the innermost flux surfaces.
-        This may lead to extrapolation in the core.
+        This will lead to extrapolation and extremely poor fits in the core.
+        The packaged shotlist keeps only shots whose chord passes near the axis.
 
         Args:
             shot: Shot number being staged.
@@ -564,6 +554,72 @@ class MASTDataWorkflow(DataWorkflow):
         return fit_input
 
 
+def open_shot_sources(shot: int) -> ShotSources | None:
+    """Open one shot's stores and check they carry everything get_source_dataset reads.
+
+    The shot window ends at the last plasma current above SHOT_WINDOW_MIN_IP.
+
+    The Thomson group is checked first, it is the cheapest to open
+    and shots from before AYC was installed have none.
+
+    Args:
+        shot: Shot number to open.
+
+    Returns:
+        The opened sources, or None when a store could not be reached,
+        which is worth retrying on the next run.
+
+    Raises:
+        MissingSourceError: If the shot has no store, a required signal,
+            plasma current, or usable Thomson slice.
+    """
+    thomson = _open_store_group(LEVEL1_PATH, shot, LEVEL1_TS_GROUP)
+    if thomson is None:
+        if _store_path_exists(f"{LEVEL1_PATH}/{shot}.zarr/{LEVEL1_TS_GROUP}"):
+            return None
+        raise MissingSourceError(
+            f"No level 1 {LEVEL1_TS_GROUP} Thomson group for this shot."
+        )
+    missing_ts = [v for v in REQUIRED_TS_VARIABLES if v not in thomson]
+    if missing_ts:
+        raise MissingSourceError(
+            f"Missing level 1 {LEVEL1_TS_GROUP} signals: {', '.join(missing_ts)}."
+        )
+
+    level2 = {}
+    missing = []
+    for group, names in REQUIRED_LEVEL2_SIGNALS.items():
+        ds_group = _open_store_group(LEVEL2_PATH, shot, group)
+        if ds_group is None:
+            if _store_path_exists(f"{LEVEL2_PATH}/{shot}.zarr/{group}"):
+                return None
+            raise MissingSourceError(f"No level 2 {group} group for this shot.")
+        missing += [f"{group}/{name}" for name in names if name not in ds_group]
+        level2[group] = ds_group
+    if missing:
+        raise MissingSourceError(f"Missing level 2 signals: {', '.join(missing)}.")
+
+    summary = level2["summary"]
+    summary_time = summary["time"].values
+    ip = np.asarray(summary["ip"].values, dtype=float)
+    in_shot = np.abs(ip) > SHOT_WINDOW_MIN_IP
+    if in_shot.sum() < 2:
+        raise MissingSourceError(f"No plasma current above {SHOT_WINDOW_MIN_IP:.0f} A.")
+    timebase = make_uniform_1kHz_timebase(float(summary_time[in_shot][-1]))
+
+    ds_thomson = _thomson_dataset(shot, thomson, timebase)
+    if ds_thomson.sizes["idx"] == 0:
+        raise MissingSourceError(
+            "No Thomson slices with usable data within the shot window."
+        )
+    return ShotSources(
+        summary=summary,
+        equilibrium=level2["equilibrium"],
+        ds_thomson=ds_thomson,
+        timebase=timebase,
+    )
+
+
 def _s3():
     """Open the anonymous filesystem the MAST stores are published on.
 
@@ -595,73 +651,41 @@ def _store_path_exists(path: str) -> bool:
         return False
 
 
-def _open_level2(shot: int) -> xr.DataTree | None:
-    """Open one shot's level 2 Zarr store.
+def _open_store_group(store_path: str, shot: int, group: str) -> xr.Dataset | None:
+    """Open one group of one shot's level 1 or level 2 Zarr store.
+
+    Groups are opened one at a time because opening a store loads the coordinates of every group in it.
+    A whole level 2 store takes ~65 s that way, its summary and equilibrium groups ~8 s.
+    Level 2 is Zarr v3 with its consolidated metadata only at the root, so its groups open through the root.
+    Level 1 is Zarr v2 with consolidated metadata in every group, so its groups open from their own path.
+    Through the root some level 1 groups do not open at all (every group of shot 24448, for one).
 
     Args:
+        store_path: LEVEL1_PATH or LEVEL2_PATH.
         shot: Shot number to open.
+        group: Group name, e.g. "equilibrium" or "ayc".
 
     Returns:
-        The store's data tree, or None if it could not be opened.
+        The group, or None if it could not be opened.
+        A group the shot never had and an S3 hiccup both land here,
+        _store_path_exists tells them apart.
     """
     import s3fs
 
-    try:
-        return xr.open_datatree(
-            s3fs.S3Map(f"{LEVEL2_PATH}/{shot}.zarr", s3=_s3()),
-            engine="zarr",
-            chunks=None,
-            consolidated=True,
-        )
-    except Exception as e:
-        logger.warning(f"Shot {shot}: failed to open the level 2 store: {e}")
-        logger.opt(exception=True).debug(e)
-        return None
-
-
-def _open_level1_group(shot: int, group: str) -> xr.Dataset | None:
-    """Open one group of one shot's level 1 Zarr store.
-
-    Args:
-        shot: Shot number to open.
-        group: Level 1 group name, e.g. "efm" or "ayc".
-
-    Returns:
-        The group, or None if it could not be opened. A group the shot never
-        had and an S3 hiccup both land here, _store_path_exists tells them
-        apart. Roughly 3% of the packaged shotlist has no ayc group, all of
-        them shots the level 2 store also publishes no Thomson for.
-    """
-    import s3fs
-
+    if store_path == LEVEL1_PATH:
+        mapper = s3fs.S3Map(f"{store_path}/{shot}.zarr/{group}", s3=_s3())
+        group_in_mapper = None
+    else:
+        mapper = s3fs.S3Map(f"{store_path}/{shot}.zarr", s3=_s3())
+        group_in_mapper = group
     try:
         return xr.open_zarr(
-            s3fs.S3Map(f"{LEVEL1_PATH}/{shot}.zarr", s3=_s3()),
-            group=group,
-            chunks=None,
-            consolidated=True,
+            mapper, group=group_in_mapper, chunks=None, consolidated=True
         )
     except Exception as e:
-        logger.warning(f"Shot {shot}: failed to open level 1 {group}: {e}")
+        logger.warning(f"Shot {shot}: failed to open {store_path} {group}: {e}")
         logger.opt(exception=True).debug(e)
         return None
-
-
-def _has_path(data_tree: xr.DataTree, path: str) -> bool:
-    """Check whether a variable path exists in the store.
-
-    Args:
-        data_tree: Data tree of one shot's store.
-        path: Group-qualified variable path, e.g. "summary/ip".
-
-    Returns:
-        True if the path resolves to a variable.
-    """
-    try:
-        data_tree[path]
-    except KeyError:
-        return False
-    return True
 
 
 def _ohmic_power(
@@ -809,7 +833,7 @@ def _optional_rows(
     return _time_first(source[name])
 
 
-def _equilibrium_qpsi(shot: int, eq_time: np.ndarray, n_psi: int) -> np.ndarray:
+def equilibrium_qpsi(shot: int, eq_time: np.ndarray, n_psi: int) -> np.ndarray:
     """Read the safety factor profile from the level 1 EFM reconstruction.
 
     The level 2 store's own "q" is q(R) along the midplane (its own label says
@@ -829,7 +853,7 @@ def _equilibrium_qpsi(shot: int, eq_time: np.ndarray, n_psi: int) -> np.ndarray:
         The (n_time, n_psi) safety factor, NaN where level 1 has no slice.
     """
     qpsi = np.full((eq_time.size, n_psi), np.nan)
-    efm = _open_level1_group(shot, LEVEL1_EFM_GROUP)
+    efm = _open_store_group(LEVEL1_PATH, shot, LEVEL1_EFM_GROUP)
     if efm is None or "qpsi_c" not in efm:
         logger.warning(f"Shot {shot}: no level 1 qpsi_c, staging qpsi as NaN")
         return qpsi
@@ -855,7 +879,7 @@ def _equilibrium_dataset(
     """Build the full GEQDSK reconstruction, on the EFIT timebase.
 
     Everything comes from the level 2 equilibrium group except qpsi (see
-    _equilibrium_qpsi) and the limiter contour (the store's wall group).
+    equilibrium_qpsi) and the limiter contour (the store's wall group).
     Profiles the store is missing are staged as NaN rather than dropping the
     shot.
 
@@ -911,7 +935,7 @@ def _equilibrium_dataset(
         sibdry=np.asarray(equilibrium["psi_boundary"].values, dtype=float),
         bcentr=bcentr,
         current=current,
-        qpsi=_equilibrium_qpsi(shot, eq_time, n_psi),
+        qpsi=equilibrium_qpsi(shot, eq_time, n_psi),
         psirz=psirz,
         cocos_input=efit_cocos_from_signs(current, bcentr),
         rcentr=rcentr,
