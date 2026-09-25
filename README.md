@@ -210,7 +210,8 @@ efit_trees = ["EFIT21", "ANALYSIS"]
   is labeled.
 
 Without a shotlist file the device's own list is used (C-Mod queries its SQL
-summary table, MAST reads the list shipped with the package).
+summary table, MAST reads the list shipped with the package, which
+`machine/mast/shotlist.py` builds from the FAIR-MAST catalog).
 
 The unprocessed stage is the same in every case: the whole shot is read,
 filtered, and written, so the unprocessed files can be reused when the windows
@@ -247,6 +248,6 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 | Device | Source | Shotlist | Notes |
 | ------ | ------ | -------- | ----- |
 | C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. |
-| MAST | Level 2 Zarr store at https://s3.echo.stfc.ac.uk/mast/level2/shots, plus two level 1 groups: EFM for the GEQDSK safety factor and AYC for the Thomson profiles | 1101 shots from the M8 and M9 campaigns, shipped with the package | Public, anonymous, read in a thread pool (`--prepare_workers`) |
+| MAST | Level 2 Zarr store at https://s3.echo.stfc.ac.uk/mast/level2/shots, plus two level 1 groups: EFM for the GEQDSK safety factor and AYC for the Thomson profiles | 1693 shots from the M7-M9 campaigns, shipped with the package and built by `machine/mast/shotlist.py` | Public, anonymous, read in a thread pool (`--prepare_workers`) |
 | DIII-D | | | |
 | TCV | | | |

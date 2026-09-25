@@ -460,6 +460,8 @@ class DataWorkflow(ABC):
         # second one, which would write both datasets' logs into both files.
         self.logs_dir = self.data_assembly_dir / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        # The cluster fit jobs' SLURM logs, pulled back by the dispatcher
+        self.fit_job_logs_dir = self.logs_dir / "fit_jobs"
         launch_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.log_file = self.logs_dir / f"{ds_name}_{launch_time}.log"
         if DataWorkflow._log_sink_id is not None:
@@ -761,7 +763,7 @@ class DataWorkflow(ABC):
         time_mask = (
             valid_mask.any(dim="shot") if "shot" in valid_mask.dims else valid_mask
         )
-        kept_mask, dropped_lengths = _drop_short_segments(
+        kept_mask, dropped_lengths = drop_short_segments(
             time_mask.values, times, self.min_segment_length
         )
         if dropped_lengths:
@@ -786,14 +788,7 @@ class DataWorkflow(ABC):
         # and the non-nan segments within must sum to at least min_usable_time
         ip_valid_filtered = ds_filtered["ip"].notnull().any(dim="shot")
         ip_times = ds_filtered["time"].values[ip_valid_filtered.values]
-        if ip_times.size < 2:
-            pulse_length = 0.0
-            usable_time = 0.0
-        else:
-            pulse_length = float(ip_times[-1] - ip_times[0])
-            # Timebase is uniform 1 kHz, so any gap beyond 1.5 ms separates two segments
-            gaps = np.diff(ip_times)
-            usable_time = float(gaps[gaps < 1.5e-3].sum())
+        pulse_length, usable_time = pulse_and_usable_time(ip_times)
 
         if pulse_length < self.min_pulse_length or usable_time < self.min_usable_time:
             logger.warning(
@@ -909,7 +904,11 @@ class DataWorkflow(ABC):
             )
 
             dispatcher = ClusterFitDispatcher(
-                self.cluster_config, self.ds_name, self.fit_batches_dir, self.fit_method
+                self.cluster_config,
+                self.ds_name,
+                self.fit_batches_dir,
+                self.fit_method,
+                self.fit_job_logs_dir,
             )
             dispatcher.run(batches)
         self.write_fit_results()
@@ -933,7 +932,11 @@ class DataWorkflow(ABC):
             )
 
             dispatcher = ClusterFitDispatcher(
-                self.cluster_config, self.ds_name, self.fit_batches_dir, self.fit_method
+                self.cluster_config,
+                self.ds_name,
+                self.fit_batches_dir,
+                self.fit_method,
+                self.fit_job_logs_dir,
             )
             dispatcher.clean()
         elif self.fit_batches_dir.exists():
@@ -2162,7 +2165,7 @@ def _clip_powers(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-def _drop_short_segments(
+def drop_short_segments(
     keep: np.ndarray, times: np.ndarray, min_length: float
 ) -> tuple[np.ndarray, list[float]]:
     """Clear the runs of kept samples that are shorter than min_length.
@@ -2193,6 +2196,25 @@ def _drop_short_segments(
             keep[start : end + 1] = False
             dropped_lengths.append(length)
     return keep, dropped_lengths
+
+
+def pulse_and_usable_time(kept_times: np.ndarray) -> tuple[float, float]:
+    """Measure what the filters left of a shot, for the min_pulse_length and min_usable_time gates.
+
+    Args:
+        kept_times: The kept times on the uniform 1 kHz grid [s].
+
+    Returns:
+        (pulse_length, usable_time): the time from the first to the last kept sample,
+        and the summed length of the kept segments [s].
+    """
+    if kept_times.size < 2:
+        return 0.0, 0.0
+    pulse_length = float(kept_times[-1] - kept_times[0])
+    # Timebase is uniform 1 kHz, so any gap beyond 1.5 ms separates two segments
+    gaps = np.diff(kept_times)
+    usable_time = float(gaps[gaps < 1.5e-3].sum())
+    return pulse_length, usable_time
 
 
 def _hold_onto_grid(

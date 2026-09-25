@@ -11,9 +11,9 @@ import xarray as xr
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD
 from transport_validation_datasets.workflow import (
     MAX_HOLD_PERIODS,
-    _drop_short_segments,
     _hold_equilibrium,
     _hold_onto_grid,
+    drop_short_segments,
 )
 
 
@@ -29,7 +29,7 @@ class TestDropShortSegments:
             [False, False, True, True, True, False, False, False, False, False]
         )
 
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
+        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
 
         assert not kept.any()
         assert len(dropped) == 1
@@ -40,7 +40,7 @@ class TestDropShortSegments:
             [False, False, True, True, True, True, True, True, False, False]
         )
 
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
+        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
 
         assert np.array_equal(kept, keep)
         assert dropped == []
@@ -53,11 +53,11 @@ class TestDropShortSegments:
             [False, True, True, True, True, True, False, False, False, False]
         )
 
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.004)
+        kept, dropped = drop_short_segments(keep, times, min_length=0.004)
         assert np.array_equal(kept, keep)
         assert dropped == []
 
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
+        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
         assert not kept.any()
         assert dropped == [0.004]
 
@@ -68,7 +68,7 @@ class TestDropShortSegments:
             + [True, True, True, True, True, True, True]
         )
 
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
+        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
 
         assert np.array_equal(
             kept,
@@ -85,7 +85,7 @@ class TestDropShortSegments:
             [True, True, False, False, False, False, False, False, True, True]
         )
 
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
+        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
 
         assert not kept.any()
         assert len(dropped) == 2
@@ -93,7 +93,7 @@ class TestDropShortSegments:
     def test_empty_mask_drops_nothing(self):
         times = grid_ms(10)
 
-        kept, dropped = _drop_short_segments(np.zeros(10, dtype=bool), times, 0.005)
+        kept, dropped = drop_short_segments(np.zeros(10, dtype=bool), times, 0.005)
 
         assert not kept.any()
         assert dropped == []
@@ -105,7 +105,7 @@ class TestDropShortSegments:
         )
         original = keep.copy()
 
-        _drop_short_segments(keep, times, min_length=0.005)
+        drop_short_segments(keep, times, min_length=0.005)
 
         assert np.array_equal(keep, original)
 
