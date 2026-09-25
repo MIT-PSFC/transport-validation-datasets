@@ -319,6 +319,50 @@ class CmodThomsonMethods:
         return region
 
     @staticmethod
+    def _align_region(
+        params: PhysicsMethodParams, region: dict, time: np.ndarray
+    ) -> dict:
+        """Place one TS system's samples onto another system's timebase.
+
+        Both the edge and the core read the same laser pulses, but their clocks differ by up to ~20 us.
+        A system can also skip a pulse, as the edge does late in shot 1160909025.
+        The per-system time >= 0 cut can split the pulse at t ~ 0 between them, as in shot 1160913007.
+        Each sample goes to the nearest time of the other system (snap_to_grid),
+        so a slip costs only the samples it touches, never the whole system.
+        Times with no sample come back NaN, and samples with no partner time are dropped.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+            region: One system as _get_region_channels returns it.
+            time: Timebase to place it on [s].
+
+        Returns:
+            The region on time, with the same keys.
+        """
+        quants = ["ne", "ne_error", "te", "te_error"]
+        shot_ids = np.repeat(params.shot_id, region["time"].size)
+        ds_region = xr.Dataset(
+            {quant: (("idx", "ts_channel"), region[quant]) for quant in quants},
+            coords={"time": ("idx", region["time"]), "shot": ("idx", shot_ids)},
+        )
+        ds_aligned = snap_to_grid(ds_region, time)
+
+        region_aligned = {"z": region["z"], "time": time}
+        for quant in quants:
+            region_aligned[quant] = ds_aligned[quant].values
+        mask_data_before = np.isfinite(region["ne"]) | np.isfinite(region["te"])
+        mask_data_after = np.isfinite(region_aligned["ne"])
+        mask_data_after |= np.isfinite(region_aligned["te"])
+        n_samples_before = int(mask_data_before.any(axis=1).sum())
+        n_samples_after = int(mask_data_after.any(axis=1).sum())
+        n_lost = n_samples_before - n_samples_after
+        if n_lost > 0:
+            params.logger.warning(
+                f"{n_lost} TS samples with data had no partner time and were dropped."
+            )
+        return region_aligned
+
+    @staticmethod
     @physics_method(
         columns=[
             "ts_channel_r",
@@ -339,6 +383,9 @@ class CmodThomsonMethods:
         (same ts_array label "core" for both -- see legacy_core_nodes).
         Data stays on the native TS timebase
         (~20 Hz), not params.times.
+        The edge samples are placed on the core timebase sample by sample (_align_region).
+        An inconsistent core read raises (see _get_region_channels),
+        an edge read failure is logged and the edge skipped.
 
         Args:
             params: disruption-py physics method parameters for the shot.
@@ -346,10 +393,6 @@ class CmodThomsonMethods:
         Returns:
             Dataset with ne [m^-3] and te [eV] plus errors on (idx, ts_channel),
             channel positions ts_channel_r and ts_channel_z [m] on (ts_channel,).
-
-        Raises:
-            ValueError: If the core TS channels are inconsistent (propagated from
-                _get_region_channels). Edge TS failures are logged and skipped.
         """
         core = CmodThomsonMethods._get_region_channels(
             params, CmodThomsonMethods.core_nodes
@@ -386,15 +429,14 @@ class CmodThomsonMethods:
             edge = CmodThomsonMethods._get_region_channels(
                 params, CmodThomsonMethods.edge_nodes
             )
-            if not np.allclose(edge["time"], core["time"], atol=1e-4):
-                raise ValueError("Edge TS timebase does not match core TS timebase")
         except Exception as e:
             params.logger.warning(
                 "Edge Thomson scattering data not found, continuing with core only."
             )
             params.logger.warning(repr(e))
             params.logger.opt(exception=True).debug(e)
-            edge = None
+        if edge is not None:
+            edge = CmodThomsonMethods._align_region(params, edge, core["time"])
 
         regions = {"core": core} if edge is None else {"core": core, "edge": edge}
 
