@@ -121,6 +121,37 @@ class TestMakeUnprocessedDataFiles:
             n_reconstructions = int(ds["simagx"].notnull().sum())
         assert n_energy > 10 * n_reconstructions
 
+    def test_edge_ts_aligned(self):
+        # Edge TS whose timebase disagrees with the core's is placed on it sample by sample, never dropped whole.
+        # 1160913007: the per-system time >= 0 cut splits the pulse at t ~ 0, leaving the edge one sample longer.
+        # 1160909025: the edge clock skips a pulse at 1.67 s, after the plasma.
+        test_dir = self.test_dir / "test_edge_ts_aligned"
+        shotlist = [1160913007, 1160909025]
+        workflow = cmod_workflow(test_dir, shotlist=shotlist)
+
+        workflow.make_unprocessed_data_files()
+
+        for shot in shotlist:
+            with xr.open_dataset(workflow.unprocessed_data_dir / f"{shot}.nc") as ds:
+                ts_array = ds["ts_array"].values
+                te = (
+                    ds["ts_channel_t_e"]
+                    .squeeze("shot", drop=True)
+                    .transpose("time", "ts_channel")
+                    .values
+                )
+            mask_core = ts_array == "core"
+            mask_edge = ts_array == "edge"
+            assert mask_edge.sum() == 17, f"Shot {shot} lost its edge TS channels"
+            # Each TS pulse is seen by both systems, so the edge has data wherever the core does
+            mask_core_sample = np.isfinite(te[:, mask_core]).any(axis=1)
+            mask_edge_sample = np.isfinite(te[:, mask_edge]).any(axis=1)
+            n_core_samples = int(mask_core_sample.sum())
+            n_both_samples = int((mask_core_sample & mask_edge_sample).sum())
+            assert n_both_samples >= 0.95 * n_core_samples, (
+                f"Shot {shot}: edge Te on only {n_both_samples} of {n_core_samples} core TS samples"
+            )
+
 
 def _trim_to_three_ts_slices(nc_path: Path):
     # Keep only the first, middle, and last TS slices of an unprocessed data
