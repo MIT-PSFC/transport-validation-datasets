@@ -23,21 +23,13 @@ from transport_validation_datasets.gp_fitting.batch_io import FitBounds
 # and tanh transition width.
 HYP_START = np.array([2.0, 0.8, 0.4, 0.1])
 # Bounds define the optimizer's random-restart ranges (drawn uniform in log10)
-HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.2, 0.05], [2.0e1, 0.9, 0.5, 0.2]])
-
-# Error kernel (heteroscedastic noise model): a squared-exponential GP is fit
-# to the input error bars themselves (mkgp's HSGP path, make_HSGP_errors).
-# This does two things: the main fit sees smoothed error bars instead of raw
-# ones, and predictions get a rho-varying noise estimate, so the reported
-# predictive std widens where the data is genuinely noisy (sparse fat-error
-# core) and narrows across dense precise channels - instead of the constant
-# RMS-of-errors band mkgp falls back to without an error kernel.
-# Hyps: [amplitude, length scale] on scale_per_slice-normalized data (errors are O(0.01-0.3)).
-# Length scale floor 0.2 keeps the noise model a smooth radial
-# trend rather than chasing individual channels' error bars.
-ERR_HYP_START = np.array([0.1, 0.5])
-ERR_HYP_BOUNDS = np.array([[1.0e-3, 0.2], [1.0, 1.5]])
-ERR_NRESTARTS = 2
+# The likelihood keeps asking for longer length scales than the data support.
+# On C-Mod Te an l1 of 0.9 leaves the fit under a peaked core, with every channel inside rho 0.4 above it in 40 percent of slices.
+# The 0.7 ceiling is regularization, the fit rests on it in ~90 percent of slices.
+# The l2 floor of 0.05 lets the edge scale reach a pedestal width,
+# and removes the second (short-l2, small-amplitude) basin that slices flipped into and out of.
+# Calibrated on the fit-tuning probe shots (scratch/agent/tune_fitting/probes/findings.md).
+HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.05, 0.05], [2.0e1, 0.7, 0.5, 0.2]])
 
 
 class Tanh_WarpingFunction(_WarpingFunction):
@@ -141,6 +133,7 @@ def bounds_for(fit_bounds: FitBounds) -> np.ndarray:
         (2, 4) array of [lower, upper] hyperparameter bounds.
     """
     bounds = HYP_BOUNDS.astype(float).copy()
+    bounds[0, 0] = float(fit_bounds.var_min)
     bounds[1, 0] = float(fit_bounds.var_max)
     bounds[0, 1] = float(fit_bounds.l1_min)
     return bounds
@@ -156,9 +149,8 @@ def pinned_hyperparams(hyps: np.ndarray, kbounds: np.ndarray) -> bool:
     search ran out of room rather than converging, so run_gp retries from a
     different restart.
 
-    l2's ceiling is excluded, because a retry typically re-lands on it.
-    With the pedestal near the edge there is often no short-scale structure left beyond it,
-    so a long, smooth l2 is the right answer.
+    The length-scale ceilings are excluded, because a retry typically re-lands on them.
+    They are regularization (see HYP_BOUNDS), and most fits rest on them.
 
     The margin is measured in log10 space, matching how restarts are drawn.
     var and lw span 2-3 decades, so a fraction of the raw range is huge in log
@@ -176,7 +168,7 @@ def pinned_hyperparams(hyps: np.ndarray, kbounds: np.ndarray) -> bool:
     margin = 0.02 * (log_hi - log_lo)
     pinned_lo = log_hyps <= log_lo + margin
     pinned_hi = log_hyps >= log_hi - margin
-    pinned_hi[2] = False  # l2 ceiling
+    pinned_hi[1:] = False  # length-scale ceilings
     return bool((pinned_lo | pinned_hi).any())
 
 
