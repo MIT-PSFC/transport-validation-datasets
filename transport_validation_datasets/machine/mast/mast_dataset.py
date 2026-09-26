@@ -77,6 +77,13 @@ MAX_FIT_RHO_TOR_NORM = 1.1
 # If this ever happens, drop that point.
 MAX_RELATIVE_ERROR = 1.0
 
+# Past this rho the inboard branch departs from the outboard one systematically, not as scatter.
+# Over the 100 shots of tuning iteration 5 the inboard read high by a median of
+# 20 percent in Te and 7 percent in ne at rho 0.8-0.85, and 42 and 18 percent at 0.85-0.9,
+# while its own point-to-point scatter stayed below the outboard's.
+# It has 3-5 times the outboard's channels there and steered the edge fit, so it is dropped.
+MAX_INBOARD_RHO_TOR_NORM = 0.8
+
 # Kinetic profiles in spherical tokamaks are not necessarily flux functions,
 # and as such the inboard and outboard side can disagree.
 # Where they do, each channel's error gets half the local disagreement added,
@@ -85,21 +92,13 @@ MAX_RELATIVE_ERROR = 1.0
 # only between two channels of the other branch at most BRANCH_MAX_GAP apart.
 # Each channel takes the median |disagreement| of the channels of both branches within BRANCH_SMOOTH_HALFWIDTH
 # (at least BRANCH_MIN_CHANNELS of them), which keeps one spike from inflating its neighbours.
-# Pooling both branches inflates channels at the same rho alike.
-# Per branch, the sparse outboard edge (channels ~0.07 apart) had too few estimates and kept its raw errors,
-# while the dense inboard pedestal was inflated, which steered the fit onto the sparse branch (24403 t=0.342).
-# A channel past the overlap, with too few estimates in its window,
-# takes the disagreement of the nearest channel that has one, up to BRANCH_CARRY_DISTANCE away,
-# as a fraction of the value, scaled to its own value.
-# Otherwise the last channel of the longer branch keeps its raw error and pins the fit
-# (24403 t=0.342: outboard ne 0.19 +- 0.006 at rho 1.055, 0.087 past the last inboard channel,
-# held the fit 0.2 above the inboard pedestal).
-# Carried as an absolute value, a disagreement from the steep pedestal swamped the channels of its foot
-# (29632 t=0.212: 0.07 keV added to inboard Te of 2-55 eV, and the fit floated to 40 eV at the separatrix, against 3 eV).
+# Pooling both branches inflates channels at the same rho alike,
+# where per branch the sparser one could keep its raw errors and steer the fit (24403 t=0.342).
+# Channels outside the overlap keep their raw errors.
+# Past MAX_INBOARD_RHO_TOR_NORM only the outboard branch is left, with nothing to disagree with.
 BRANCH_MAX_GAP = 0.08
 BRANCH_SMOOTH_HALFWIDTH = 0.05
 BRANCH_MIN_CHANNELS = 3
-BRANCH_CARRY_DISTANCE = 0.15
 
 # level 2 equilibrium signal -> standardized name.
 # All 0D, interpolated onto the 1 kHz timebase.
@@ -532,13 +531,14 @@ class MASTDataWorkflow(DataWorkflow):
         1: Map the TS channels onto rho_tor_norm through the nearest reconstruction
         2: Convert to the fit units (Te [keV], ne [1e20 m^-3])
         3: Drop every channel whose Te or ne error exceeds MAX_RELATIVE_ERROR times its value
-        4: Inflate the errors where the inboard and outboard branches disagree (_branch_disagreement_errors)
-        5: Drop the channels outside the fittable range
+        4: Drop the inboard channels past MAX_INBOARD_RHO_TOR_NORM
+        5: Inflate the errors where the inboard and outboard branches disagree (_branch_disagreement_errors)
+        6: Drop the channels outside the fittable range
 
-        BOTH sides of the chord are fit. The inboard side maps onto the same
-        rho_tor_norm through the reconstruction's interior flux, which a magnetics-only
-        reconstruction does not pin precisely, and on a spherical tokamak Te
-        is not strictly a flux function (poloidal asymmetries can be real).
+        BOTH sides of the chord are fit, the inboard side only inside MAX_INBOARD_RHO_TOR_NORM.
+        The inboard side maps onto the same rho_tor_norm through the reconstruction's interior flux,
+        which a magnetics-only reconstruction does not pin precisely,
+        and on a spherical tokamak Te is not strictly a flux function (poloidal asymmetries can be real).
 
         NOTE: The Thomson chord runs along z = TS_CHANNEL_Z while the MAST
         equilibria may put the magnetic axis 0.15-0.25 m lower, so the chord
@@ -577,6 +577,15 @@ class MASTDataWorkflow(DataWorkflow):
 
         r_channel = channel_rows_at_times(ds_shot["ts_channel_r"], ts_times)
         inboard = _inboard_channels(rho_tor_norm, r_channel)
+        with np.errstate(invalid="ignore"):
+            inboard_edge = inboard & (rho_tor_norm > MAX_INBOARD_RHO_TOR_NORM)
+        n_inboard_edge = int((inboard_edge & np.isfinite(te_y)).sum())
+        te_y = np.where(inboard_edge, np.nan, te_y)
+        ne_y = np.where(inboard_edge, np.nan, ne_y)
+        logger.info(
+            f"Shot {shot}: dropped {n_inboard_edge} inboard channel readings past "
+            f"rho_tor_norm {MAX_INBOARD_RHO_TOR_NORM:g}"
+        )
         te_err = _branch_disagreement_errors(rho_tor_norm, te_y, te_err, inboard)
         ne_err = _branch_disagreement_errors(rho_tor_norm, ne_y, ne_err, inboard)
 
@@ -605,7 +614,7 @@ class MASTDataWorkflow(DataWorkflow):
     ) -> list | None:
         """Split the fit-plot channels into the inboard and outboard branches of the chord, row by row.
 
-        The rows split at their lowest-rho channel, as in the branch error inflation (_inboard_channels).
+        The rows split at their lowest-rho channel, as in prepare_fit_input (_inboard_channels).
         Each channel sits at its median major radius over the shot.
         That keeps the channels' order along the chord, and serves pooled window rows as well,
         whose columns repeat the channels once per pooled sample.
@@ -663,7 +672,7 @@ def _branch_disagreement_errors(
     """Inflate the errors by half the local disagreement between the inboard and outboard branches.
 
     See the BRANCH_* constants for the calibration.
-    A channel further than BRANCH_CARRY_DISTANCE from any disagreement estimate keeps its error.
+    A channel with fewer than BRANCH_MIN_CHANNELS estimates within BRANCH_SMOOTH_HALFWIDTH keeps its error.
 
     Args:
         rho_tor_norm: (n_t, n_ch) channel positions, NaN where unmapped.
@@ -703,19 +712,6 @@ def _branch_disagreement_errors(
             window = has_delta & near
             if window.sum() >= BRANCH_MIN_CHANNELS:
                 disagreement[k] = np.median(abs_delta[window])
-        # Channels past the overlap take the nearest estimate relative to the value,
-        # a carried value is never carried on
-        has_estimate = np.flatnonzero(np.isfinite(disagreement))
-        if has_estimate.size:
-            relative_disagreement = disagreement[has_estimate] / np.abs(
-                y[i_time][has_estimate]
-            )
-            for k in np.flatnonzero(valid & ~np.isfinite(disagreement)):
-                distance = np.abs(rho[has_estimate] - rho[k])
-                i_nearest = int(np.argmin(distance))
-                if distance[i_nearest] <= BRANCH_CARRY_DISTANCE:
-                    y_k = np.abs(y[i_time, k])
-                    disagreement[k] = relative_disagreement[i_nearest] * y_k
         inflate = np.isfinite(disagreement)
         err_out[i_time, inflate] = np.hypot(
             err[i_time, inflate], 0.5 * disagreement[inflate]
