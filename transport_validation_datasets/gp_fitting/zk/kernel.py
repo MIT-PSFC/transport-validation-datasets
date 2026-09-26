@@ -21,14 +21,11 @@ from transport_validation_datasets.gp_fitting.batch_io import FitBounds
 # core (small-rho) length scale,
 # edge (large-rho) length scale,
 # and tanh transition width.
+# The likelihood often has two basins: a long core scale and a short core scale
+# Ensure each basin is tried at least once to find the best.
 HYP_START = np.array([2.0, 0.8, 0.4, 0.1])
+HYP_START_SHORT_CORE = np.array([2.0, 0.3, 0.5, 0.2])
 # Bounds define the optimizer's random-restart ranges (drawn uniform in log10)
-# The likelihood keeps asking for longer length scales than the data support.
-# On C-Mod Te an l1 of 0.9 leaves the fit under a peaked core, with every channel inside rho 0.4 above it in 40 percent of slices.
-# The 0.7 ceiling is regularization, the fit rests on it in ~90 percent of slices.
-# The l2 floor of 0.05 lets the edge scale reach a pedestal width,
-# and removes the second (short-l2, small-amplitude) basin that slices flipped into and out of.
-# Calibrated on the fit-tuning probe shots (scratch/agent/tune_fitting/probes/findings.md).
 HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.05, 0.05], [2.0e1, 0.7, 0.5, 0.2]])
 
 
