@@ -153,6 +153,29 @@ class TestMakeUnprocessedDataFiles:
             )
 
 
+class TestPrepareFitInput:
+    test_dir = TEST_DIR / "test_prepare_fit_input"
+
+    def test_faulty_te_channel_dropped_ne_kept(self):
+        # A faulty channel's Te leaves the fit and reaches the plots through the dropped-reading hook,
+        # while its sound ne stays in the fit, not taken along by cleaning.drop_in_both.
+        shot = 1160503008
+        workflow = cmod_workflow(self.test_dir, shotlist=[shot])
+        workflow.make_unprocessed_data_files()
+
+        with xr.open_dataset(workflow.unprocessed_data_dir / f"{shot}.nc") as ds:
+            fit_input = workflow.prepare_fit_input(shot, ds)
+        dropped_time, _, dropped_by_var = workflow.fit_plot_dropped_readings(shot)
+
+        (channel,) = workflow.te_faulty_channels
+        te_dropped = np.isfinite(dropped_by_var["te"][0][:, 0])
+        ne_kept = np.isfinite(fit_input.ne_y[:, channel])
+        assert np.array_equal(dropped_time, fit_input.time)
+        assert np.isnan(fit_input.te_y[:, channel]).all()
+        assert te_dropped.sum() > 10
+        assert (ne_kept & te_dropped).sum() >= 0.9 * te_dropped.sum()
+
+
 def _trim_to_three_ts_slices(nc_path: Path):
     # Keep only the first, middle, and last TS slices of an unprocessed data
     # file (the serial GP fit takes ~80s per slice, a full shot has ~90)

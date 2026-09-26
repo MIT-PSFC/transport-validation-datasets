@@ -1420,11 +1420,29 @@ class DataWorkflow(ABC):
         """
         return None
 
+    def fit_plot_dropped_readings(self, shot: int) -> tuple | None:
+        """Get the readings a device drops from every fit, to mark on the fit plots.
+
+        A device that drops a faulty channel from every shot returns its readings here,
+        since the staged batch no longer holds them.
+        The base implementation drops none.
+
+        Args:
+            shot: Shot number being plotted.
+
+        Returns:
+            (times, rho_tor_norm, {var: (y, err)}) with the (n_samples,) Thomson sample times [s]
+            and (n_samples, n_dropped) arrays in the fit units, a variable absent when it has none,
+            or None.
+        """
+        return None
+
     def plot_fit_results(self, max_pages: int | None = None):
         """Plot the GP fits of every fitted shot, one PDF per shot.
 
         Plots the exact (cleaned, floored) channel data the fit consumed,
-        straight from the staged batch files.
+        straight from the staged batch files,
+        and in red the readings the device drops from every fit (fit_plot_dropped_readings).
         The fits are drawn over the whole fit grid, past STORED_RHO_TOR_NORM_MAX, so the anchors show.
         Skips shots whose PDF already exists.
         A window-averaged fit gets one page per window, with every pooled point on it.
@@ -1459,6 +1477,7 @@ class DataWorkflow(ABC):
                     if batch.fit_mode == FIT_MODE_WINDOW_AVERAGE
                     else None
                 )
+                dropped_readings = self.fit_plot_dropped_readings(shot)
                 n_pages = plot_ts_fits(
                     pdf_path,
                     shot,
@@ -1475,6 +1494,7 @@ class DataWorkflow(ABC):
                     ),
                     max_pages=max_pages,
                     window_bounds=window_bounds,
+                    dropped_readings=dropped_readings,
                 )
                 logger.info(f"Plotted {n_pages} fit pages for shot {shot}")
 

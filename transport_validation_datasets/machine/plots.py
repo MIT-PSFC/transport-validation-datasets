@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
+from transport_validation_datasets.windows import window_membership
+
 BACKGROUND_COLOR = "#2F2F2F"
 FACE_COLOR = "#1A1A1A"
 TEXT_COLOR = "white"
@@ -306,6 +308,44 @@ def _fit_mean_ylim(fit_mean: np.ndarray, fallback: float, pad: float = 1.05) -> 
     return hi * pad
 
 
+# Staged sample times are float32, so they match the unprocessed grid times only to rounding
+_SAMPLE_TIME_ATOL = 1.0e-6
+
+
+def _plot_dropped_readings(
+    ax, rho: np.ndarray, y: np.ndarray, err: np.ndarray, ylim_top: float
+):
+    """Plot readings the device dropped from the fit, in red.
+
+    The y-axis follows the fit, so a reading above it is marked by a red arrow at the top edge.
+
+    Args:
+        ax: Axes to plot on.
+        rho: rho_tor_norm of the readings.
+        y: The readings, shaped like rho.
+        err: Their errors, shaped like rho.
+        ylim_top: The panel's top y-limit.
+    """
+    valid = np.isfinite(rho) & np.isfinite(y)
+    if not valid.any():
+        return
+    ax.errorbar(
+        rho[valid],
+        y[valid],
+        yerr=err[valid],
+        fmt="o",
+        ms=4,
+        color="tab:red",
+        label="dropped channel",
+        zorder=3,
+    )
+    off_scale = valid & (y > ylim_top)
+    n_off_scale = int(off_scale.sum())
+    if n_off_scale:
+        arrow_y = np.full(n_off_scale, 0.97 * ylim_top)
+        ax.plot(rho[off_scale], arrow_y, "^", ms=7, color="tab:red", zorder=4)
+
+
 # Panel labels for the TS fit diagnostic, keyed by the fit_output variable
 # prefix: (prefix, profile label, gradient label, fallback y-limit).
 _TS_FIT_PANELS = (
@@ -365,6 +405,7 @@ def plot_ts_fits(
     channel_groups: list[tuple[np.ndarray, str, str]] | None = None,
     max_pages: int | None = None,
     window_bounds: np.ndarray | None = None,
+    dropped_readings: tuple | None = None,
 ) -> int:
     """Save a PDF comparing the GP fits to the raw TS measurements of one shot.
 
@@ -392,6 +433,9 @@ def plot_ts_fits(
         window_bounds: (n_t, 2) start and end [s] of the time window each
             row pools, for window-averaged fits. Titles the page with the
             window instead of a slice time. None for per-sample fits.
+        dropped_readings: (times, rho_tor_norm, {var: (y, err)}) of the readings the device
+            drops from every fit (DataWorkflow.fit_plot_dropped_readings), drawn in red.
+            A page shows those of its own sample, or of every sample in its window.
 
     Returns:
         The number of pages written; a shot with no fitted slice writes an
@@ -435,6 +479,15 @@ def plot_ts_fits(
             else:
                 start, end = window_bounds[i_time]
                 title = f"shot {shot}  t={start:.3f}-{end:.3f} s (window average)"
+            if dropped_readings is not None:
+                dropped_time, dropped_rho, dropped_by_var = dropped_readings
+                if window_bounds is None:
+                    on_page = np.isclose(
+                        dropped_time, ts_time[i_time], rtol=0.0, atol=_SAMPLE_TIME_ATOL
+                    )
+                else:
+                    page_window = window_bounds[i_time : i_time + 1]
+                    on_page = window_membership(dropped_time, page_window)[:, 0]
             for i_var, (var, label, grad_label, _) in enumerate(_TS_FIT_PANELS):
                 data_y, err_y = (arr[i_time, :] for arr in channel_data[var])
                 rho_tor_norm_at_t = rho_tor_norm_ch[i_time, :]
@@ -459,6 +512,15 @@ def plot_ts_fits(
                             label=name,
                             zorder=3,
                         )
+                if dropped_readings is not None and var in dropped_by_var:
+                    dropped_y, dropped_err = dropped_by_var[var]
+                    _plot_dropped_readings(
+                        ax,
+                        dropped_rho[on_page],
+                        dropped_y[on_page],
+                        dropped_err[on_page],
+                        ylims[var],
+                    )
                 _plot_fit_band(
                     ax,
                     rho_tor_norm_fit,
