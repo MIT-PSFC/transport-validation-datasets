@@ -93,10 +93,13 @@ class CModDataWorkflow(DataWorkflow):
     shot_blacklist = []
 
     # GP fit staging knobs
+    # TS channels whose Te is dropped from every shot, their ne is kept.
+    # Core channel 3 (Z = +0.082 m, rho ~0.29) reads Te 1.58x the ECE at the same rho,
+    # where every other core channel reads 1.02-1.17x (26 shots with low-field-side ECE).
+    te_faulty_channels = [3]
     # Minimum valid (rho_tor_norm, value) pairs required per timestep to run the GP fit,
     # compared against the channel count AFTER the per-shot quality screens (_drop_broken_channels).
-    # Many C-Mod shots carry exactly 10 channels, so tolerate one bad channel.
-    fit_min_points = 9
+    fit_min_points = 8  # Most have 10 active, but we're dropping one, so this tolerates one additional drop
     fit_scale_per_slice = True
     # Hyperparameter bounds for the GP fit, per variable.
     fit_bounds = {
@@ -266,6 +269,7 @@ class CModDataWorkflow(DataWorkflow):
         2: convert to the fit units (Te [keV], ne [1e20 m^-3])
         3: C-Mod channel quality screens and error floors, calibrated in those units.
            A reading a screen drops in Te or ne takes the other's reading of that channel with it (cleaning.drop_in_both).
+           The Te of te_faulty_channels is dropped before any screen, so their ne stays.
         4: TODO: optionally correct density with interferometry
 
         Args:
@@ -284,6 +288,8 @@ class CModDataWorkflow(DataWorkflow):
 
         ds_shot = ds.squeeze("shot", drop=True)
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
+        # Before the raw validity below, so drop_in_both never takes the sound ne of a faulty Te channel
+        te_y[:, self.te_faulty_channels] = np.nan
         # What each variable offers before the screens, so what they drop can be coupled
         te_valid_raw = np.isfinite(te_y) & np.isfinite(te_err)
         ne_valid_raw = np.isfinite(ne_y) & np.isfinite(ne_err)
@@ -366,6 +372,30 @@ class CModDataWorkflow(DataWorkflow):
             (ts_array == "core", "tab:blue", "core TS"),
             (ts_array == "edge", "tab:orange", "edge TS"),
         ]
+
+    def fit_plot_dropped_readings(self, shot: int) -> tuple | None:
+        """Read the Te of te_faulty_channels, which staging drops from every fit, for the fit plots.
+
+        They map onto rho_tor_norm as in prepare_fit_input, and keep their raw errors.
+
+        Args:
+            shot: Shot number being plotted.
+
+        Returns:
+            (times, rho_tor_norm, {"te": (y, err)}), see DataWorkflow.fit_plot_dropped_readings.
+        """
+        with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
+            ts_times, rho_tor_norm = map_ts_channels_to_rho_tor_norm(
+                ds, self.settings.sol_extension
+            )
+            ds_shot = ds.squeeze("shot", drop=True)
+            te_y, te_err, _, _ = ts_channel_fit_rows(ds_shot, ts_times)
+        faulty = self.te_faulty_channels
+        return (
+            ts_times,
+            rho_tor_norm[:, faulty],
+            {"te": (te_y[:, faulty], te_err[:, faulty])},
+        )
 
 
 def _drop_broken_channels(
