@@ -176,11 +176,11 @@ class TestThomsonDataset:
         assert np.allclose(ds["ts_channel_r"].values, radius)
 
 
-def two_branch_slice(inboard_offset: float = 0.0):
+def two_branch_slice(inboard_offset: float = 0.0, n_outboard: int = 60):
     # One slice of a chord through the axis at R = 0.85 m, with rho linear in |R - 0.85|.
-    # 60 channels per branch, the MAST core spacing, interleaved in rho.
+    # 60 inboard channels, the MAST core spacing, and n_outboard outboard ones, interleaved in rho.
     r_inboard = np.linspace(0.30, 0.845, 60)
-    r_outboard = np.linspace(0.852, 1.40, 60)
+    r_outboard = np.linspace(0.852, 1.40, n_outboard)
     r_channel = np.concatenate([r_inboard, r_outboard])[None, :]
     rho = np.abs(r_channel - 0.85) / 0.55
     profile = 1.0 - 0.8 * rho**2
@@ -201,6 +201,35 @@ class TestBranchDisagreementErrors:
         interior = (rho > 0.05) & (rho < 0.95)
         expected = np.hypot(0.01, 0.05)
         assert np.allclose(err_out[interior], expected, rtol=1e-2)
+
+    def test_sparse_branch_is_inflated_like_the_dense_one(self):
+        # 20 outboard channels ~0.05 apart in rho, like the MAST outboard edge,
+        # too few for a window of their own branch
+        rho, r_channel, y, err = two_branch_slice(inboard_offset=0.1, n_outboard=20)
+        inboard = _inboard_channels(rho, r_channel)
+
+        err_out = _branch_disagreement_errors(rho, y, err, inboard)
+
+        interior_outboard = ~inboard & (rho > 0.05) & (rho < 0.95)
+        expected = np.hypot(0.01, 0.05)
+        assert np.allclose(err_out[interior_outboard], expected, rtol=1e-2)
+
+    def test_channels_past_the_overlap_take_the_nearest_disagreement(self):
+        # The inboard branch stops at rho 0.7, the outboard one runs on to rho 1
+        rho, r_channel, y, err = two_branch_slice(inboard_offset=0.1)
+        inboard = _inboard_channels(rho, r_channel)
+        y[inboard & (rho > 0.7)] = np.nan
+
+        err_out = _branch_disagreement_errors(rho, y, err, inboard)
+
+        # They share the nearest estimate, so the added error is one fraction of each value
+        just_past = ~inboard & (rho > 0.75) & (rho < 0.85)
+        added = np.sqrt(err_out[just_past] ** 2 - 0.01**2)
+        added_over_value = added / y[just_past]
+        assert (added > 0.01).all()
+        assert np.allclose(added_over_value, added_over_value[0])
+        far_past = ~inboard & (rho > 0.95)
+        assert np.allclose(err_out[far_past], 0.01)
 
     def test_agreeing_branches_keep_their_errors(self):
         rho, r_channel, y, err = two_branch_slice()

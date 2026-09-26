@@ -83,11 +83,23 @@ MAX_RELATIVE_ERROR = 1.0
 # so both branches are consistent with a profile between them.
 # The disagreement at a channel is its value minus the other branch interpolated to its rho,
 # only between two channels of the other branch at most BRANCH_MAX_GAP apart.
-# A running median over the channels of the same branch within BRANCH_SMOOTH_HALFWIDTH
-# (at least BRANCH_MIN_CHANNELS of them) keeps one spike from inflating its neighbours.
+# Each channel takes the median |disagreement| of the channels of both branches within BRANCH_SMOOTH_HALFWIDTH
+# (at least BRANCH_MIN_CHANNELS of them), which keeps one spike from inflating its neighbours.
+# Pooling both branches inflates channels at the same rho alike.
+# Per branch, the sparse outboard edge (channels ~0.07 apart) had too few estimates and kept its raw errors,
+# while the dense inboard pedestal was inflated, which steered the fit onto the sparse branch (24403 t=0.342).
+# A channel past the overlap, with too few estimates in its window,
+# takes the disagreement of the nearest channel that has one, up to BRANCH_CARRY_DISTANCE away,
+# as a fraction of the value, scaled to its own value.
+# Otherwise the last channel of the longer branch keeps its raw error and pins the fit
+# (24403 t=0.342: outboard ne 0.19 +- 0.006 at rho 1.055, 0.087 past the last inboard channel,
+# held the fit 0.2 above the inboard pedestal).
+# Carried as an absolute value, a disagreement from the steep pedestal swamped the channels of its foot
+# (29632 t=0.212: 0.07 keV added to inboard Te of 2-55 eV, and the fit floated to 40 eV at the separatrix, against 3 eV).
 BRANCH_MAX_GAP = 0.08
 BRANCH_SMOOTH_HALFWIDTH = 0.05
 BRANCH_MIN_CHANNELS = 3
+BRANCH_CARRY_DISTANCE = 0.15
 
 # level 2 equilibrium signal -> standardized name.
 # All 0D, interpolated onto the 1 kHz timebase.
@@ -588,6 +600,42 @@ class MASTDataWorkflow(DataWorkflow):
             return None
         return fit_input
 
+    def fit_plot_channel_groups(
+        self, shot: int, fit_input: ShotFitInput
+    ) -> list | None:
+        """Split the fit-plot channels into the inboard and outboard branches of the chord, row by row.
+
+        The rows split at their lowest-rho channel, as in the branch error inflation (_inboard_channels).
+        Each channel sits at its median major radius over the shot.
+        That keeps the channels' order along the chord, and serves pooled window rows as well,
+        whose columns repeat the channels once per pooled sample.
+
+        Args:
+            shot: Shot number being plotted.
+            fit_input: The shot's staged fit input.
+
+        Returns:
+            (mask, color, label) triples, each mask (n_rows, n_columns).
+        """
+        with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
+            r_rows = (
+                ds["ts_channel_r"]
+                .squeeze("shot", drop=True)
+                .transpose("time", "ts_channel")
+                .values
+            )
+        has_r = np.isfinite(r_rows).any(axis=0)
+        r_channel = np.full(r_rows.shape[1], np.nan)
+        r_channel[has_r] = np.nanmedian(r_rows[:, has_r], axis=0)
+        n_rows, n_columns = fit_input.x.shape
+        r_tiled = np.tile(r_channel, (n_rows, n_columns // r_channel.size))
+        inboard = _inboard_channels(fit_input.x, r_tiled)
+        outboard = np.isfinite(fit_input.x) & ~inboard
+        return [
+            (inboard, "tab:blue", "inboard TS"),
+            (outboard, "tab:orange", "outboard TS"),
+        ]
+
 
 def _inboard_channels(rho_tor_norm: np.ndarray, r_channel: np.ndarray) -> np.ndarray:
     """Mark the channels on the inboard branch of the chord, slice by slice.
@@ -615,7 +663,7 @@ def _branch_disagreement_errors(
     """Inflate the errors by half the local disagreement between the inboard and outboard branches.
 
     See the BRANCH_* constants for the calibration.
-    A channel with no disagreement estimate in reach keeps its error.
+    A channel further than BRANCH_CARRY_DISTANCE from any disagreement estimate keeps its error.
 
     Args:
         rho_tor_norm: (n_t, n_ch) channel positions, NaN where unmapped.
@@ -647,15 +695,31 @@ def _branch_disagreement_errors(
             y_other_at_this = np.interp(rho[this], rho_other, y_other)
             delta_this = y[i_time][this] - y_other_at_this
             delta[this[bracketed]] = delta_this[bracketed]
-        # Channels just past the overlap take the disagreement of their branch neighbours too
-        has_delta = np.isfinite(delta)
+        abs_delta = np.abs(delta)
+        has_delta = np.isfinite(abs_delta)
+        disagreement = np.full(rho.shape, np.nan)
         for k in np.flatnonzero(valid):
             near = np.abs(rho - rho[k]) <= BRANCH_SMOOTH_HALFWIDTH
-            window = has_delta & (is_inboard == is_inboard[k]) & near
-            if window.sum() < BRANCH_MIN_CHANNELS:
-                continue
-            disagreement = np.median(delta[window])
-            err_out[i_time, k] = np.hypot(err[i_time, k], 0.5 * disagreement)
+            window = has_delta & near
+            if window.sum() >= BRANCH_MIN_CHANNELS:
+                disagreement[k] = np.median(abs_delta[window])
+        # Channels past the overlap take the nearest estimate relative to the value,
+        # a carried value is never carried on
+        has_estimate = np.flatnonzero(np.isfinite(disagreement))
+        if has_estimate.size:
+            relative_disagreement = disagreement[has_estimate] / np.abs(
+                y[i_time][has_estimate]
+            )
+            for k in np.flatnonzero(valid & ~np.isfinite(disagreement)):
+                distance = np.abs(rho[has_estimate] - rho[k])
+                i_nearest = int(np.argmin(distance))
+                if distance[i_nearest] <= BRANCH_CARRY_DISTANCE:
+                    y_k = np.abs(y[i_time, k])
+                    disagreement[k] = relative_disagreement[i_nearest] * y_k
+        inflate = np.isfinite(disagreement)
+        err_out[i_time, inflate] = np.hypot(
+            err[i_time, inflate], 0.5 * disagreement[inflate]
+        )
     return err_out
 
 
