@@ -21,8 +21,10 @@ from disruption_py.core.utils.math import causal_boxcar_smooth, interp1
 from loguru import logger
 
 from transport_validation_datasets import PACKAGE_ROOT
+from transport_validation_datasets.cleaning import drop_in_both
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
+    channel_rows_at_times,
     efit_cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
@@ -70,6 +72,22 @@ OHMIC_SMOOTHING_SAMPLES = 10
 # Channels this far outside the separatrix sit in the far SOL,
 # where mapping through a magnetics-only reconstruction is not trustworthy.
 MAX_FIT_RHO_TOR_NORM = 1.1
+
+# Sometimes MAST measurements have huge errors, way larger than their values.
+# If this ever happens, drop that point.
+MAX_RELATIVE_ERROR = 1.0
+
+# Kinetic profiles in spherical tokamaks are not necessarily flux functions,
+# and as such the inboard and outboard side can disagree.
+# Where they do, each channel's error gets half the local disagreement added,
+# so both branches are consistent with a profile between them.
+# The disagreement at a channel is its value minus the other branch interpolated to its rho,
+# only between two channels of the other branch at most BRANCH_MAX_GAP apart.
+# A running median over the channels of the same branch within BRANCH_SMOOTH_HALFWIDTH
+# (at least BRANCH_MIN_CHANNELS of them) keeps one spike from inflating its neighbours.
+BRANCH_MAX_GAP = 0.08
+BRANCH_SMOOTH_HALFWIDTH = 0.05
+BRANCH_MIN_CHANNELS = 3
 
 # level 2 equilibrium signal -> standardized name.
 # All 0D, interpolated onto the 1 kHz timebase.
@@ -411,18 +429,16 @@ class MASTDataWorkflow(DataWorkflow):
     fit_min_points = 10
     fit_scale_per_slice = True
     # Both variables share the same bounds on MAST:
-    # - l1 floor 0.4: the chord's tangency point leaves many slices with no
-    #   data inside rho ~0.4, and an l1 of 0.2 lets the fit collapse onto the
-    #   zero prior there (core dives below the innermost channels, amplitude
-    #   rails, fit_ignores_data culls the slice).
+    # - l1 floor 0.2: MAST cores carry structure a longer scale smooths away,
+    #   e.g. a hollow Te in the current ramp or a flat core with a knee at rho ~0.45
     # - var ceiling 5: on slices with an empty core the marginal likelihood
     #   rails the amplitude at the default ceiling of 20, which invents core
     #   values several times the slice max with a band to match.
     #   5 allows a prior amplitude of ~2x the slice max and
     #   leaves every data-covered region untouched.
     fit_bounds = {
-        "te": FitBounds(l1_min=0.4, var_max=5.0),
-        "ne": FitBounds(l1_min=0.4, var_max=5.0),
+        "te": FitBounds(l1_min=0.2, var_max=5.0),
+        "ne": FitBounds(l1_min=0.2, var_max=5.0),
     }
 
     # The public S3 store tolerates concurrent reads, and every read is a
@@ -503,7 +519,9 @@ class MASTDataWorkflow(DataWorkflow):
 
         1: Map the TS channels onto rho_tor_norm through the nearest reconstruction
         2: Convert to the fit units (Te [keV], ne [1e20 m^-3])
-        3: Drop the channels outside the fittable range
+        3: Drop every channel whose Te or ne error exceeds MAX_RELATIVE_ERROR times its value
+        4: Inflate the errors where the inboard and outboard branches disagree (_branch_disagreement_errors)
+        5: Drop the channels outside the fittable range
 
         BOTH sides of the chord are fit. The inboard side maps onto the same
         rho_tor_norm through the reconstruction's interior flux, which a magnetics-only
@@ -533,6 +551,23 @@ class MASTDataWorkflow(DataWorkflow):
 
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
 
+        # The read keeps only positive values with positive errors, see _thomson_dataset
+        with np.errstate(invalid="ignore"):
+            te_huge = te_err > MAX_RELATIVE_ERROR * te_y
+            ne_huge = ne_err > MAX_RELATIVE_ERROR * ne_y
+        te_y, ne_y, _, _ = drop_in_both(te_y, ne_y, te_huge, ne_huge)
+        n_huge = int((te_huge | ne_huge).sum())
+        if n_huge:
+            logger.info(
+                f"Shot {shot}: dropped {n_huge} channel readings with an error over "
+                f"{MAX_RELATIVE_ERROR:g}x the value"
+            )
+
+        r_channel = channel_rows_at_times(ds_shot["ts_channel_r"], ts_times)
+        inboard = _inboard_channels(rho_tor_norm, r_channel)
+        te_err = _branch_disagreement_errors(rho_tor_norm, te_y, te_err, inboard)
+        ne_err = _branch_disagreement_errors(rho_tor_norm, ne_y, ne_err, inboard)
+
         with np.errstate(invalid="ignore"):
             rho_tor_norm = np.where(
                 rho_tor_norm <= MAX_FIT_RHO_TOR_NORM, rho_tor_norm, np.nan
@@ -552,6 +587,76 @@ class MASTDataWorkflow(DataWorkflow):
             )
             return None
         return fit_input
+
+
+def _inboard_channels(rho_tor_norm: np.ndarray, r_channel: np.ndarray) -> np.ndarray:
+    """Mark the channels on the inboard branch of the chord, slice by slice.
+
+    The branches split at the channel of lowest rho_tor_norm,
+    where the chord passes closest to the magnetic axis of the same reconstruction the channels were mapped through.
+
+    Args:
+        rho_tor_norm: (n_t, n_ch) channel positions, NaN where unmapped.
+        r_channel: (n_t, n_ch) channel major radii [m].
+
+    Returns:
+        (n_t, n_ch) mask of the inboard channels, False in slices with no mapped channel.
+    """
+    mapped = np.isfinite(rho_tor_norm).any(axis=1)
+    rho_filled = np.where(np.isfinite(rho_tor_norm), rho_tor_norm, np.inf)
+    i_axis = np.argmin(rho_filled, axis=1)
+    r_axis = np.take_along_axis(r_channel, i_axis[:, None], axis=1)
+    return mapped[:, None] & (r_channel < r_axis)
+
+
+def _branch_disagreement_errors(
+    rho_tor_norm: np.ndarray, y: np.ndarray, err: np.ndarray, inboard: np.ndarray
+) -> np.ndarray:
+    """Inflate the errors by half the local disagreement between the inboard and outboard branches.
+
+    See the BRANCH_* constants for the calibration.
+    A channel with no disagreement estimate in reach keeps its error.
+
+    Args:
+        rho_tor_norm: (n_t, n_ch) channel positions, NaN where unmapped.
+        y: (n_t, n_ch) channel values, NaN where invalid.
+        err: (n_t, n_ch) channel errors.
+        inboard: (n_t, n_ch) inboard branch mask (_inboard_channels).
+
+    Returns:
+        The (n_t, n_ch) inflated errors.
+    """
+    err_out = np.array(err, dtype=float)
+    for i_time in range(y.shape[0]):
+        rho = rho_tor_norm[i_time]
+        valid = np.isfinite(rho) & np.isfinite(y[i_time])
+        is_inboard = inboard[i_time]
+        delta = np.full(rho.shape, np.nan)
+        for side in (True, False):
+            this = np.flatnonzero(valid & (is_inboard == side))
+            other = valid & (is_inboard != side)
+            if other.sum() < 2 or this.size == 0:
+                continue
+            order = np.argsort(rho[other])
+            rho_other = rho[other][order]
+            y_other = y[i_time][other][order]
+            right = np.searchsorted(rho_other, rho[this])
+            right_clipped = np.clip(right, 1, rho_other.size - 1)
+            gap = rho_other[right_clipped] - rho_other[right_clipped - 1]
+            bracketed = (right > 0) & (right < rho_other.size) & (gap <= BRANCH_MAX_GAP)
+            y_other_at_this = np.interp(rho[this], rho_other, y_other)
+            delta_this = y[i_time][this] - y_other_at_this
+            delta[this[bracketed]] = delta_this[bracketed]
+        # Channels just past the overlap take the disagreement of their branch neighbours too
+        has_delta = np.isfinite(delta)
+        for k in np.flatnonzero(valid):
+            near = np.abs(rho - rho[k]) <= BRANCH_SMOOTH_HALFWIDTH
+            window = has_delta & (is_inboard == is_inboard[k]) & near
+            if window.sum() < BRANCH_MIN_CHANNELS:
+                continue
+            disagreement = np.median(delta[window])
+            err_out[i_time, k] = np.hypot(err[i_time, k], 0.5 * disagreement)
+    return err_out
 
 
 def open_shot_sources(shot: int) -> ShotSources | None:

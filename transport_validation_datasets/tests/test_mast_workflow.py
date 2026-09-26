@@ -16,6 +16,8 @@ from transport_validation_datasets.machine.mast.mast_dataset import (
     LEVEL2_PATH,
     TS_CHANNEL_Z,
     MASTDataWorkflow,
+    _branch_disagreement_errors,
+    _inboard_channels,
     _ohmic_power,
     _store_path_exists,
     _thomson_dataset,
@@ -172,6 +174,53 @@ class TestThomsonDataset:
 
         assert (ds["ts_channel_z"].values == TS_CHANNEL_Z).all()
         assert np.allclose(ds["ts_channel_r"].values, radius)
+
+
+def two_branch_slice(inboard_offset: float = 0.0):
+    # One slice of a chord through the axis at R = 0.85 m, with rho linear in |R - 0.85|.
+    # 60 channels per branch, the MAST core spacing, interleaved in rho.
+    r_inboard = np.linspace(0.30, 0.845, 60)
+    r_outboard = np.linspace(0.852, 1.40, 60)
+    r_channel = np.concatenate([r_inboard, r_outboard])[None, :]
+    rho = np.abs(r_channel - 0.85) / 0.55
+    profile = 1.0 - 0.8 * rho**2
+    y = np.where(r_channel < 0.85, profile + inboard_offset, profile)
+    err = np.full(y.shape, 0.01)
+    return rho, r_channel, y, err
+
+
+class TestBranchDisagreementErrors:
+    def test_offset_branches_get_half_the_offset_in_quadrature(self):
+        rho, r_channel, y, err = two_branch_slice(inboard_offset=0.1)
+        inboard = _inboard_channels(rho, r_channel)
+
+        err_out = _branch_disagreement_errors(rho, y, err, inboard)
+
+        assert (inboard == (r_channel < 0.85)).all()
+        # The two ends of the overlap have fewer than BRANCH_MIN_CHANNELS estimates in reach
+        interior = (rho > 0.05) & (rho < 0.95)
+        expected = np.hypot(0.01, 0.05)
+        assert np.allclose(err_out[interior], expected, rtol=1e-2)
+
+    def test_agreeing_branches_keep_their_errors(self):
+        rho, r_channel, y, err = two_branch_slice()
+        inboard = _inboard_channels(rho, r_channel)
+
+        err_out = _branch_disagreement_errors(rho, y, err, inboard)
+
+        assert np.allclose(err_out, err, rtol=1e-2)
+
+    def test_one_spike_inflates_nothing(self):
+        # The running median outvotes the spike, on its own branch and on the other,
+        # and leaves it to the spike screen with its own error
+        rho, r_channel, y, err = two_branch_slice()
+        i_spike = 90
+        y[0, i_spike] += 0.5
+        inboard = _inboard_channels(rho, r_channel)
+
+        err_out = _branch_disagreement_errors(rho, y, err, inboard)
+
+        assert np.allclose(err_out, err, rtol=1e-2)
 
 
 @pytest.mark.slow  # reads the public S3 stores, ~60-90 s per shot

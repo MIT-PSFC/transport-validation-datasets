@@ -15,6 +15,7 @@ from mkgp.core.routines import GaussianProcess
 
 from transport_validation_datasets.gp_fitting.batch_io import FitAnchors, FitBounds
 from transport_validation_datasets.gp_fitting.zk.kernel import (
+    HYP_START_SHORT_CORE,
     bounds_for,
     build_kernel,
     deterministic_seed,
@@ -34,6 +35,13 @@ MAX_HYP_RETRIES = 2
 # Optimizer random restarts for a real fit.
 # The cleaning module's rough reference fit runs fewer (only an outlier-judging reference).
 NRESTARTS = 8
+# mkgp's default optimizer, gradient ascent in log10 space with a gain of 1e-5,
+# stops once a step changes the LML by under the 1e-2 tolerance.
+# Adam scales each step per hyperparameter, so every one moves ~eta decades a step.
+# On 60 sampled MAST probe slices it reached a higher LML on 44 and a lower one on 6,
+# at ~1.4x the fit time (scratch/agent/tune_fitting/optimizer_compare.py).
+OPTIMIZER_METHOD = "adam"
+OPTIMIZER_SPARS = [1.0e-2, 0.9, 0.999]  # eta, beta1, beta2
 
 
 @dataclass
@@ -72,18 +80,18 @@ def run_gp(
 ) -> GaussianProcess | None:
     """Set up the GP with the anchors and fit it.
 
-    With optimize=True and hyperparams=None the hyperparameters are tuned
-    (nrestarts random restarts, mkgp's native LML maximization). Otherwise the
-    GP predicts at the given (or default start) hyperparameters with no
-    optimization.
+    With optimize=True and hyperparams=None the hyperparameters are tuned by mkgp's LML maximization (OPTIMIZER_METHOD),
+    from HYP_START with nrestarts random restarts and once more from HYP_START_SHORT_CORE,
+    keeping the higher LML.
+    Otherwise the GP predicts at the given (or default start) hyperparameters with no optimization.
 
     The restarts are seeded from the fit's own input data (deterministic_seed),
     so the result only depends on (data_X, data_y, err_y),
     never on multiprocessing scheduling or slice processing order.
-    When optimizing, a fit that pins a hyperparameter at its bound
-    (pinned_hyperparams) is retried from a fresh, differently-seeded restart
-    set up to hyp_retries times. The attempt with the best log marginal
-    likelihood is kept even if every attempt stays pinned
+    When optimizing, a best fit that pins a hyperparameter at its bound
+    (pinned_hyperparams) is retried from HYP_START with a fresh,
+    differently-seeded restart set up to hyp_retries times.
+    The fit with the best log marginal likelihood is kept even if every attempt stays pinned
     (an unresolvable slice should still return its least-bad fit).
 
     Args:
@@ -117,63 +125,93 @@ def run_gp(
         else np.vstack([anchors.grad, extra_grad_bc])
     )
 
-    do_optimize = optimize and hyperparams is None
-    n_attempts = (1 + hyp_retries) if do_optimize else 1
+    data = (xdata, ydata, yerr, grad_bc, x_eval)
 
-    best_gp, best_lml = None, -np.inf
-    for attempt in range(n_attempts):
-        gp = GaussianProcess()
-        kernel = build_kernel(pedestal_rho, hyperparams)
-        gp.set_kernel(kernel=kernel, kbounds=kbounds, regpar=1.0)
-        gp.set_raw_data(
-            xdata=xdata,
-            ydata=ydata,
-            yerr=yerr,
-            dxdata=grad_bc[:, 0],
-            dydata=grad_bc[:, 1],
-            dyerr=grad_bc[:, 2],
+    if not (optimize and hyperparams is None):
+        return _fit_from_start(
+            data, kbounds, pedestal_rho, hyperparams, 0, optimize=False
         )
-        gp.set_search_parameters(epsilon=1.0e-2)
+
+    # The short-core start has no random restarts, so it runs once, outside the reseeded attempts
+    best_gp, best_lml = None, -np.inf
+    gp_short = _fit_from_start(data, kbounds, pedestal_rho, HYP_START_SHORT_CORE, 0)
+    lml_short = None if gp_short is None else gp_short.get_gp_lml()
+    if lml_short is not None:
+        best_gp, best_lml = gp_short, lml_short
+    for attempt in range(1 + hyp_retries):
         # Seed the random restarts from the fit's own inputs,
         # so the result never depends on process history (serial vs parallel workers).
         np.random.seed(
             deterministic_seed(data_X, data_y, err_y, salt=attempt + 17 * seed_salt)
         )
-        if do_optimize:
-            fit_restarts = nrestarts
-        else:
-            # predict-only at fixed hyperparameters
-            # The public maxiter clamps to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
-            gp._imax = 0
-            fit_restarts = 0
-        try:
-            # mkgp prints optimizer status to stdout; keep worker logs clean.
-            # No heteroscedastic error model (hsgp_flag), every channel is fit with its own error.
-            # mkgp's error kernel replaces the error bars with a smooth curve in rho.
-            # Where the errors vary channel to channel, as across a C-Mod pedestal,
-            # the curve is off by 0.5x to 4x either way, differently from slice to slice,
-            # so the fit chased some pedestals and ignored others (chi2 > 4 in 12 percent of probe slices, 1 percent without it).
-            # Under a flat error floor the curve equals the errors and the model is inert.
-            with contextlib.redirect_stdout(io.StringIO()):
-                gp.GPRFit(
-                    np.asarray(x_eval, dtype=float),
-                    hsgp_flag=False,
-                    nrestarts=fit_restarts,
-                )
-        except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        gp = _fit_from_start(data, kbounds, pedestal_rho, None, nrestarts)
+        if gp is None:
             continue
-
-        if not do_optimize:
-            return gp
-
-        hyps = np.asarray(gp.get_gp_kernel().hyperparameters, dtype=float)
         lml = gp.get_gp_lml()
         if lml is not None and lml > best_lml:
             best_gp, best_lml = gp, lml
-        if not pinned_hyperparams(hyps, kbounds):
-            return gp  # converged inside the physical range, no need to retry
+        if best_gp is None:
+            continue
+        hyps_best = np.asarray(best_gp.get_gp_kernel().hyperparameters, dtype=float)
+        if not pinned_hyperparams(hyps_best, kbounds):
+            return best_gp  # converged inside the physical range, no need to retry
 
     return best_gp
+
+
+def _fit_from_start(
+    data: tuple,
+    kbounds: np.ndarray,
+    pedestal_rho: float,
+    start: np.ndarray | None,
+    nrestarts: int,
+    optimize: bool = True,
+) -> GaussianProcess | None:
+    """Build the GP at one start and run mkgp's fit from it.
+
+    Args:
+        data: (xdata, ydata, yerr, grad_bc, x_eval), the data with the anchors appended and the points to predict at.
+        kbounds: (2, 4) hyperparameter bounds.
+        pedestal_rho: The kernel's length-scale transition center.
+        start: [var, l1, l2, lw] to start from, None for HYP_START.
+        nrestarts: mkgp random restarts on top of the start.
+        optimize: Tune the hyperparameters, else predict at the start.
+
+    Returns:
+        The fitted GaussianProcess, or None if mkgp raised.
+    """
+    xdata, ydata, yerr, grad_bc, x_eval = data
+    gp = GaussianProcess()
+    kernel = build_kernel(pedestal_rho, start)
+    gp.set_kernel(kernel=kernel, kbounds=kbounds, regpar=1.0)
+    gp.set_raw_data(
+        xdata=xdata,
+        ydata=ydata,
+        yerr=yerr,
+        dxdata=grad_bc[:, 0],
+        dydata=grad_bc[:, 1],
+        dyerr=grad_bc[:, 2],
+    )
+    gp.set_search_parameters(
+        epsilon=1.0e-2, method=OPTIMIZER_METHOD, spars=OPTIMIZER_SPARS
+    )
+    if not optimize:
+        # The public maxiter clamps to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
+        gp._imax = 0
+    x_eval_array = np.asarray(x_eval, dtype=float)
+    try:
+        # mkgp prints optimizer status to stdout; keep worker logs clean.
+        # No heteroscedastic error model (hsgp_flag), every channel is fit with its own error.
+        # mkgp's error kernel replaces the error bars with a smooth curve in rho.
+        # Where the errors vary channel to channel, as across a C-Mod pedestal,
+        # the curve is off by 0.5x to 4x either way, differently from slice to slice,
+        # so the fit chased some pedestals and ignored others (chi2 > 4 in 12 percent of probe slices, 1 percent without it).
+        # Under a flat error floor the curve equals the errors and the model is inert.
+        with contextlib.redirect_stdout(io.StringIO()):
+            gp.GPRFit(x_eval_array, hsgp_flag=False, nrestarts=nrestarts)
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        return None
+    return gp
 
 
 def fit_profile(
