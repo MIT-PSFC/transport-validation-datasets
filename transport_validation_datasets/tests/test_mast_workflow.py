@@ -214,22 +214,18 @@ class TestBranchDisagreementErrors:
         expected = np.hypot(0.01, 0.05)
         assert np.allclose(err_out[interior_outboard], expected, rtol=1e-2)
 
-    def test_channels_past_the_overlap_take_the_nearest_disagreement(self):
-        # The inboard branch stops at rho 0.7, the outboard one runs on to rho 1
+    def test_channels_past_the_overlap_keep_their_errors(self):
+        # The inboard branch stops at rho 0.7, as past MAX_INBOARD_RHO_TOR_NORM, the outboard one runs on to rho 1
         rho, r_channel, y, err = two_branch_slice(inboard_offset=0.1)
         inboard = _inboard_channels(rho, r_channel)
         y[inboard & (rho > 0.7)] = np.nan
 
         err_out = _branch_disagreement_errors(rho, y, err, inboard)
 
-        # They share the nearest estimate, so the added error is one fraction of each value
-        just_past = ~inboard & (rho > 0.75) & (rho < 0.85)
-        added = np.sqrt(err_out[just_past] ** 2 - 0.01**2)
-        added_over_value = added / y[just_past]
-        assert (added > 0.01).all()
-        assert np.allclose(added_over_value, added_over_value[0])
-        far_past = ~inboard & (rho > 0.95)
-        assert np.allclose(err_out[far_past], 0.01)
+        overlap = ~inboard & (rho > 0.05) & (rho < 0.65)
+        past = ~inboard & (rho > 0.8)
+        assert np.allclose(err_out[overlap], np.hypot(0.01, 0.05), rtol=1e-2)
+        assert np.allclose(err_out[past], 0.01)
 
     def test_agreeing_branches_keep_their_errors(self):
         rho, r_channel, y, err = two_branch_slice()
