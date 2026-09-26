@@ -11,14 +11,10 @@ import io
 from dataclasses import dataclass
 
 import numpy as np
-from mkgp.core.kernels import SE_Kernel
 from mkgp.core.routines import GaussianProcess
 
 from transport_validation_datasets.gp_fitting.batch_io import FitAnchors, FitBounds
 from transport_validation_datasets.gp_fitting.zk.kernel import (
-    ERR_HYP_BOUNDS,
-    ERR_HYP_START,
-    ERR_NRESTARTS,
     bounds_for,
     build_kernel,
     deterministic_seed,
@@ -46,8 +42,8 @@ class ProfileFit:
 
     Attributes:
         fit: (n_x,) posterior mean, clipped at 0.
-        std: (n_x,) predictive std (includes observation noise).
-        grad: (n_x,) posterior derivative d/drho.
+        std: (n_x,) predictive std, the latent std and the interpolated channel errors in quadrature.
+        grad: (n_x,) posterior derivative d/drho, 0 where fit is clipped.
         grad_std: (n_x,) latent derivative std.
         hyps: Fitted [var, l1, l2, lw].
     """
@@ -129,18 +125,6 @@ def run_gp(
         gp = GaussianProcess()
         kernel = build_kernel(pedestal_rho, hyperparams)
         gp.set_kernel(kernel=kernel, kbounds=kbounds, regpar=1.0)
-        # Heteroscedastic noise model: GP-fit the error bars with an SE kernel
-        # (mkgp HSGP path). The main fit then uses the smoothed errors and the
-        # predictive std picks up a rho-varying noise term (see ERR_HYP_START).
-        err_kernel = SE_Kernel(*ERR_HYP_START)
-        err_kernel.enforce_bounds(True)
-        gp.set_error_kernel(
-            kernel=err_kernel,
-            kbounds=ERR_HYP_BOUNDS,
-            regpar=1.0,
-            nrestarts=ERR_NRESTARTS,
-        )
-        gp.set_error_search_parameters(epsilon=1.0e-2)
         gp.set_raw_data(
             xdata=xdata,
             ydata=ydata,
@@ -150,9 +134,8 @@ def run_gp(
             dyerr=grad_bc[:, 2],
         )
         gp.set_search_parameters(epsilon=1.0e-2)
-        # Seed even on the predict-only path: the error-kernel fit inside
-        # GPRFit runs its own random restarts, so an unseeded RNG would make
-        # the result depend on process history (serial vs parallel workers).
+        # Seed the random restarts from the fit's own inputs,
+        # so the result never depends on process history (serial vs parallel workers).
         np.random.seed(
             deterministic_seed(data_X, data_y, err_y, salt=attempt + 17 * seed_salt)
         )
@@ -165,10 +148,16 @@ def run_gp(
             fit_restarts = 0
         try:
             # mkgp prints optimizer status to stdout; keep worker logs clean.
+            # No heteroscedastic error model (hsgp_flag), every channel is fit with its own error.
+            # mkgp's error kernel replaces the error bars with a smooth curve in rho.
+            # Where the errors vary channel to channel, as across a C-Mod pedestal,
+            # the curve is off by 0.5x to 4x either way, differently from slice to slice,
+            # so the fit chased some pedestals and ignored others (chi2 > 4 in 12 percent of probe slices, 1 percent without it).
+            # Under a flat error floor the curve equals the errors and the model is inert.
             with contextlib.redirect_stdout(io.StringIO()):
                 gp.GPRFit(
                     np.asarray(x_eval, dtype=float),
-                    hsgp_flag=True,
+                    hsgp_flag=False,
                     nrestarts=fit_restarts,
                 )
         except (ValueError, np.linalg.LinAlgError, FloatingPointError):
@@ -284,18 +273,28 @@ def fit_profile(
     # Gaussian with unbounded support, so the mean can dip slightly negative
     # past the separatrix where the value anchors pull it to zero.
     # Clip the mean at 0 (downstream should read the band as truncated at 0 likewise)
-    fit = np.maximum(np.asarray(gp.get_gp_mean(), dtype=float).ravel()[:n_out], 0.0)
+    mean = np.asarray(gp.get_gp_mean(), dtype=float).ravel()[:n_out]
+    fit = np.maximum(mean, 0.0)
     # Predictive std (includes observation noise), not the latent-function std.
     # With few, high-error core channels the latent band collapses to a
     # misleadingly tight interval - it conditions on the fitted amplitude
     # being exactly right and ignores the measurement scatter.
-    # noise_flag=True widens the band where the data is noisy.
-    # the noise term is rho-varying because run_gp fits an error kernel (HSGP),
-    # so the band tracks the local error bars instead of a constant RMS.
+    # The noise is the channel errors interpolated in rho, held flat past the first and last channel,
+    # so the band tracks the local error bars.
+    # mkgp's own noise term (noise_flag=True) is one RMS over every error when there is no error kernel,
+    # 3-10x the edge errors on C-Mod Te.
     # The derivative std stays latent (the gradient is never directly
     # observed, so folding in point noise there is not meaningful).
-    std = np.asarray(gp.get_gp_std(noise_flag=True), dtype=float).ravel()[:n_out]
-    grad = np.asarray(gp.get_gp_drv_mean(), dtype=float).ravel()[:n_out]
+    order = np.argsort(data_X)
+    noise = np.interp(x_out, data_X[order], err_y[order])
+    latent_std_eval = gp.get_gp_std(noise_flag=False)
+    latent_std = np.asarray(latent_std_eval, dtype=float).ravel()[:n_out]
+    std = np.sqrt(latent_std**2 + noise**2)
+    # The gradient of the clipped profile, 0 wherever the clip holds the mean at 0.
+    # The unclipped mean climbs back up from its dip to the anchors,
+    # and that rise would otherwise show as a positive gradient under a flat zero profile.
+    grad_mean = np.asarray(gp.get_gp_drv_mean(), dtype=float).ravel()[:n_out]
+    grad = np.where(mean > 0.0, grad_mean, 0.0)
     grad_std = np.asarray(gp.get_gp_drv_std(noise_flag=False), dtype=float).ravel()[
         :n_out
     ]

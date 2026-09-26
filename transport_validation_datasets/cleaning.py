@@ -23,7 +23,7 @@ from loguru import logger
 from transport_validation_datasets.gp_fitting.batch_io import ShotFitInput
 
 # An isolated channel whose error bar is many times its neighbours' poisons
-# a heteroscedastic noise model: zk's error kernel smooths error bars in rho_tor_norm,
+# a heteroscedastic noise model: akho's error kernel smooths error bars in rho_tor_norm,
 # so one huge-error channel inflates the effective noise of every channel near it
 # and the fit goes slack across that region.
 # The comparison is on ABSOLUTE errors: a relative-to-value rule flags low-value SOL

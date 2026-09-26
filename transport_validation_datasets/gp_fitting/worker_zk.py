@@ -4,7 +4,7 @@ Each (shot, time slice) is fit independently, Te and ne each on their own,
 with the kernel's length-scale transition at the configured pedestal location.
 Each variable's fit runs the cleaning pipeline (cleaning.py),
 the GP fit with edge boundary conditions and monotonic-edge repair (gp.py),
-and the nonphysical-fit checks with up to three repairs (quality.py, see _fit_variable).
+and the nonphysical-fit checks with up to four repairs (quality.py, see _fit_variable).
 
 Runs standalone on the cluster like so:
 `python -m transport_validation_datasets.gp_fitting.worker_zk input.npz output.npz --num-workers N`
@@ -58,9 +58,14 @@ from transport_validation_datasets.gp_fitting.zk.quality import (  # noqa: E402
 HYP_NAMES = ("var", "l1", "l2", "lw")
 
 # Core length-scale floor of the smooth-rescue attempt (see _fit_variable).
-# High enough to force the optimizer out of a short-l1 basin, below the 0.9
-# ceiling so the optimizer still has a range to search.
-SMOOTH_RESCUE_L1_MIN = 0.7
+# High enough to force the optimizer out of a short-l1 basin, below the 0.7
+# ceiling (kernel.HYP_BOUNDS) so the optimizer still has a range to search.
+SMOOTH_RESCUE_L1_MIN = 0.6
+
+# Amplitude floor of the amplitude-rescue attempt (see _fit_variable).
+# The data are normalized to a max of 1, so a prior amplitude of 1 matches their scale.
+# The collapsed C-Mod Te fits of tuning iteration 1 sat at var ~0.3 against ~3 for healthy ones.
+AMPLITUDE_RESCUE_VAR_MIN = 1.0
 
 
 def _no_fit(status: int) -> VariableFit:
@@ -95,8 +100,9 @@ def _attempt_fit(
 
     Returns:
         (fit, std, grad, grad_std, hyps) in the data's own units, or None when
-        cleaning left nothing usable or the GP fit failed. Gradients are not
-        clamped: negative slopes are physical.
+        cleaning left nothing usable or the GP fit failed.
+        Negative slopes are physical and kept.
+        The gradient is 0 only where the fit is clipped at 0 (see fit_profile).
     """
     cleaned = clean_channels(x, y, err, bounds, anchors, pedestal_rho, scale_per_slice)
     if cleaned is None:
@@ -147,7 +153,7 @@ def _fit_variable(
     anchors: FitAnchors,
     pedestal_rho: float,
 ) -> VariableFit:
-    """Fit one variable of one time slice, with up to three repairs.
+    """Fit one variable of one time slice, with up to four repairs.
 
     1: Fit the variable.
     2: If nonphysical or failed, retry from a fresh restart seed
@@ -157,9 +163,13 @@ def _fit_variable(
     (repair b: the LML can prefer a short-l1 basin that explains mid-profile wiggles
     by sacrificing the innermost channel cluster,
     and the floor forces the smooth basin, which the checks then judge like any other fit).
-    4: If still nonphysical with a peak over droppable channels, refit without them
-    (repair c: a stray point or a miscalibrated block).
-    5: A peak where there is no data to drop is extrapolation ringing,
+    4: If still nonphysical, retry with the amplitude floored at AMPLITUDE_RESCUE_VAR_MIN
+    (repair c: the LML can prefer a small amplitude that treats a sparse, noisy core as noise
+    and leaves the fit far below it,
+    and the floor forces an amplitude on the scale of the data).
+    5: If still nonphysical with a peak over droppable channels, refit without them
+    (repair d: a stray point or a miscalibrated block).
+    6: A peak where there is no data to drop is extrapolation ringing,
     and a biased fit with no peak has no channel subset that repairs it. Both get culled.
 
     Args:
@@ -186,11 +196,13 @@ def _fit_variable(
         return _no_fit(STATUS_SKIPPED)
 
     # The attempt ladder: as staged, then a fresh restart draw (repair a),
-    # then the smooth basin (repair b).
+    # then the smooth basin (repair b), then the amplitude floor (repair c).
     # The first clean fit returns, and the last flagged fit feeds the channel-drop repair below.
     attempts = [(0, bounds), (1, bounds)]
     if bounds.l1_min < SMOOTH_RESCUE_L1_MIN:
         attempts.append((1, replace(bounds, l1_min=SMOOTH_RESCUE_L1_MIN)))
+    if bounds.var_min < AMPLITUDE_RESCUE_VAR_MIN:
+        attempts.append((1, replace(bounds, var_min=AMPLITUDE_RESCUE_VAR_MIN)))
 
     last_flagged = None
     for n_attempt, (seed_salt, attempt_bounds) in enumerate(attempts):
@@ -217,7 +229,7 @@ def _fit_variable(
         return _no_fit(STATUS_FAILED)
     peak, biased = last_flagged
 
-    # Repair c: drop the channels under the nonphysical peak and refit once.
+    # Repair d: drop the channels under the nonphysical peak and refit once.
     if peak is None:
         return _no_fit(STATUS_CULLED)
     drop = valid & (np.abs(x - peak) <= REPAIR_HALFWIDTH)

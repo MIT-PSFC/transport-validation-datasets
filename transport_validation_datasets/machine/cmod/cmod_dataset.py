@@ -310,9 +310,11 @@ class CModDataWorkflow(DataWorkflow):
 
         # Error floors.
         # Sometimes C-Mod TS has extremely tiny error bars which I don't think are real.
-        # Te: absolute 0.1 keV
+        # Hughes et al., RSI 72, 1107 (2001) quote 10-20 percent systematic errors in Te and ne,
+        # and an edge Te range starting at 15 eV.
+        # Te: 15 percent of the value with a 15 eV absolute floor.
         # ne: Floor at 10 percent of the value with a 1e18/m3 absolute floor.
-        te_err = np.where(te_err < 0.1, 0.1, te_err)
+        te_err = np.maximum(te_err, np.maximum(0.15 * np.abs(te_y), 0.015))
         ne_err = np.maximum(ne_err, np.maximum(0.10 * np.abs(ne_y), 0.01))
 
         # After the floors: the persistence screen must see the same errors
