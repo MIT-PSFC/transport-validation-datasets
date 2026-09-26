@@ -1402,18 +1402,21 @@ class DataWorkflow(ABC):
 
         return xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs)
 
-    def fit_plot_channel_groups(self, shot: int) -> list | None:
+    def fit_plot_channel_groups(
+        self, shot: int, fit_input: ShotFitInput
+    ) -> list | None:
         """Get the channel grouping used to color the fit plots.
 
-        Subclasses can split channels by diagnostic
-        (e.g. C-Mod core vs edge Thomson).
+        Subclasses can split channels by diagnostic (C-Mod core vs edge Thomson)
+        or by position (MAST inboard vs outboard branch, which moves slice to slice).
         The base implementation plots them as one group.
 
         Args:
             shot: Shot number being plotted.
+            fit_input: The shot's staged fit input, whose rows the masks must match.
 
         Returns:
-            (mask, color, label) triples, or None for a single group.
+            (mask, color, label) triples, each mask (n_ch,) or (n_rows, n_columns), or None for a single group.
         """
         return None
 
@@ -1468,7 +1471,7 @@ class DataWorkflow(ABC):
                     fit_output=so,
                     rho_tor_norm_fit=batch.x_star,
                     channel_groups=_tile_channel_groups(
-                        self.fit_plot_channel_groups(shot), si.x.shape[1]
+                        self.fit_plot_channel_groups(shot, si), si.x.shape[1]
                     ),
                     max_pages=max_pages,
                     window_bounds=window_bounds,

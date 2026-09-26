@@ -42,6 +42,17 @@ NRESTARTS = 8
 # at ~1.4x the fit time (scratch/agent/tune_fitting/optimizer_compare.py).
 OPTIMIZER_METHOD = "adam"
 OPTIMIZER_SPARS = [1.0e-2, 0.9, 0.999]  # eta, beta1, beta2
+# Ascents from good starts converge in 30-60 adam steps.
+# Random restarts from poor ones crawl to mkgp's cap of 500 without reaching a better LML,
+# and set the fit time. A cap of 100 found the same hyperparameters on 4 MAST slices in a third of the time.
+OPTIMIZER_MAXITER = 100
+# mkgp blends data points closer than 0.005 in x into one (set_conditioner condnum),
+# and its merged error has a misplaced bracket, subtracting sum(y) / (n+1)^2 where (sum(y) / (n+1))^2 belongs.
+# A merged point then carries an error of 0.5-1x the data maximum, or NaN where the values are small.
+# The two MAST branches interleave in rho, so most core channels merge in pairs
+# (29169 t=0.171: 118 channels became 80 points, the core peak was erased and the Te fit culled).
+# A threshold far below any channel spacing turns the blending off.
+MKGP_BLEND_DX = 1.0e-9
 
 
 @dataclass
@@ -192,8 +203,12 @@ def _fit_from_start(
         dydata=grad_bc[:, 1],
         dyerr=grad_bc[:, 2],
     )
+    gp.set_conditioner(condnum=MKGP_BLEND_DX)
     gp.set_search_parameters(
-        epsilon=1.0e-2, method=OPTIMIZER_METHOD, spars=OPTIMIZER_SPARS
+        epsilon=1.0e-2,
+        method=OPTIMIZER_METHOD,
+        spars=OPTIMIZER_SPARS,
+        maxiter=OPTIMIZER_MAXITER,
     )
     if not optimize:
         # The public maxiter clamps to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.

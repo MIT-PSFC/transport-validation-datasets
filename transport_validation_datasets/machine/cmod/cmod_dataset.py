@@ -348,11 +348,14 @@ class CModDataWorkflow(DataWorkflow):
             return None
         return fit_input
 
-    def fit_plot_channel_groups(self, shot: int) -> list | None:
+    def fit_plot_channel_groups(
+        self, shot: int, fit_input: ShotFitInput
+    ) -> list | None:
         """Split the fit-plot channels into the core and edge TS systems.
 
         Args:
             shot: Shot number being plotted.
+            fit_input: The shot's staged fit input (unused, the split is fixed per channel).
 
         Returns:
             (mask, color, label) triples for the two Thomson arrays.
