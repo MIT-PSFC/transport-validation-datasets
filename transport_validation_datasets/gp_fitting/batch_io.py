@@ -49,6 +49,7 @@ class FitBounds:
     """
 
     l1_min: float = 0.4
+    l1_max: float = 0.7
     var_min: float = 1.0e-2
     var_max: float = 20.0
 

@@ -288,21 +288,28 @@ def plot_unprocessed_data(
     plt.close(fig)
 
 
-def _fit_mean_ylim(fit_mean: np.ndarray, fallback: float, pad: float = 1.05) -> float:
+def _panel_ylim(
+    fit_mean: np.ndarray, data_y: np.ndarray, fallback: float, pad: float = 1.05
+) -> float:
     """Compute the top y-limit for a TS fit panel.
 
-    A little over the largest GP fit mean, computed across the whole shot so
-    every page shares the same axis.
+    A little over the largest GP fit mean or channel reading of the plotted slices,
+    computed across the whole shot so every page shares the same axis.
+    The readings count so a fit that passes under its data shows as such.
+    They are the staged ones, already through the cleaning screens,
+    which in tuning iteration 7 raised the top over the fit's by at most 1.85x.
 
     Args:
-        fit_mean: (n_t, n_x) fitted profiles of the shot.
-        fallback: Limit to use when the fit is all-NaN or non-positive.
-        pad: Multiplicative headroom above the largest fit value.
+        fit_mean: (n_t, n_x) fitted profiles of the plotted slices.
+        data_y: (n_t, n_ch) channel readings of the plotted slices.
+        fallback: Limit to use when both are all-NaN or non-positive.
+        pad: Multiplicative headroom above the largest value.
 
     Returns:
         The top y-limit.
     """
-    hi = float(np.nanmax(fit_mean)) if np.isfinite(fit_mean).any() else np.nan
+    values = np.concatenate([np.ravel(fit_mean), np.ravel(data_y)])
+    hi = float(np.nanmax(values)) if np.isfinite(values).any() else np.nan
     if not np.isfinite(hi) or hi <= 0:
         return fallback
     return hi * pad
@@ -317,7 +324,8 @@ def _plot_dropped_readings(
 ):
     """Plot readings the device dropped from the fit, in red.
 
-    The y-axis follows the fit, so a reading above it is marked by a red arrow at the top edge.
+    The y-axis follows the fits and the fitted readings,
+    so a dropped reading above it is marked by a red arrow at the top edge.
 
     Args:
         ax: Axes to plot on.
@@ -466,10 +474,11 @@ def plot_ts_fits(
         if channel_groups is not None
         else [(np.ones(n_ch, dtype=bool), "tab:blue", "raw TS")]
     )
-    ylims = {
-        var: _fit_mean_ylim(getattr(fit_output, f"{var}_fit"), fallback=fallback)
-        for var, _, _, fallback in _TS_FIT_PANELS
-    }
+    ylims = {}
+    for var, _, _, fallback in _TS_FIT_PANELS:
+        fit_live = getattr(fit_output, f"{var}_fit")[live]
+        data_live = channel_data[var][0][live]
+        ylims[var] = _panel_ylim(fit_live, data_live, fallback=fallback)
 
     with PdfPages(pdf_path) as pdf:
         for i_time in live:
