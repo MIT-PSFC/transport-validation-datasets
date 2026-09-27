@@ -102,9 +102,16 @@ class CModDataWorkflow(DataWorkflow):
     fit_min_points = 8  # Most have 10 active, but we're dropping one, so this tolerates one additional drop
     fit_scale_per_slice = True
     # Hyperparameter bounds for the GP fit, per variable.
+    # Amplitude floor 1, the data scale since each slice is normalized to a max of 1.
+    # Below it the fits fell into a low-amplitude basin under peaked cores (median var 0.29 against 1.8),
+    # 53 Te slices of tuning iteration 7 with the axis under 0.7 of the core data.
+    # On the probe shots the floor took those 10 to 1, Te flicker 39 to 20, and ne double dips 53 to 31.
+    # ne core scale ceiling 1: a quarter of ne fits go past 0.7 given the room, and the ne double dips halve.
+    # Te keeps the 0.7 ceiling, and a 0.5 or 0.6 one changes nothing.
+    # Probe tables in scratch/agent/tune_fitting/probes/findings.md, "Hyperparameter ranges".
     fit_bounds = {
-        "te": FitBounds(l1_min=0.35),
-        "ne": FitBounds(l1_min=0.55),
+        "te": FitBounds(l1_min=0.35, var_min=1.0),
+        "ne": FitBounds(l1_min=0.55, l1_max=1.0, var_min=1.0),
     }
 
     def get_shotlist_from_source(self) -> list[int]:

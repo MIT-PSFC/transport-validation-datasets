@@ -26,6 +26,7 @@ from transport_validation_datasets.gp_fitting.batch_io import FitBounds
 HYP_START = np.array([2.0, 0.8, 0.4, 0.1])
 HYP_START_SHORT_CORE = np.array([2.0, 0.3, 0.5, 0.2])
 # Bounds define the optimizer's random-restart ranges (drawn uniform in log10)
+# bounds_for replaces the var bounds and the l1 bounds with the variable's FitBounds.
 HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.05, 0.05], [2.0e1, 0.7, 0.5, 0.2]])
 
 
@@ -133,6 +134,7 @@ def bounds_for(fit_bounds: FitBounds) -> np.ndarray:
     bounds[0, 0] = float(fit_bounds.var_min)
     bounds[1, 0] = float(fit_bounds.var_max)
     bounds[0, 1] = float(fit_bounds.l1_min)
+    bounds[1, 1] = float(fit_bounds.l1_max)
     return bounds
 
 
