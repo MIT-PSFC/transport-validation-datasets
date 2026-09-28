@@ -44,6 +44,13 @@ _SPIKE_SIGMA_LOCAL = 3.0
 # On a 97-shot MAST sample it skips ~half, since the chord passes above the axis.
 CORE_COVERAGE_RHO_TOR_NORM = 0.15
 
+# A reading under DIP_RATIO times both its rho neighbours is a dead or misfired channel
+# The spike screen above misses these, because it needs the neighbours to agree with each other,
+# which a pedestal never does, and a near-zero C-Mod Te reading on its 15 eV error floor
+# then outweighs its neighbours 10-50x and can pull the fitted pedestal to zero.
+DIP_RATIO = 0.35
+DIP_RHO_TOR_NORM_MAX = 0.97
+
 
 def clean_fit_rows(fit_input: ShotFitInput, shot: int) -> ShotFitInput:
     """Run the shared screens on every Thomson sample of one shot, for Te and ne.
@@ -206,6 +213,44 @@ def _error_outliers(x: np.ndarray, err: np.ndarray) -> np.ndarray:
         local_err = np.median(err[near])
         outlier[i] = err[i] > _ERR_OUTLIER_FACTOR * local_err
     return outlier
+
+
+def relative_dips(
+    x_rows: np.ndarray,
+    y_rows: np.ndarray,
+    ratio: float = DIP_RATIO,
+    rho_max: float = DIP_RHO_TOR_NORM_MAX,
+) -> np.ndarray:
+    """Find readings under ratio times both immediate rho neighbours, inside rho_max.
+
+    The innermost reading is judged against the next two and the outermost is never judged.
+    Scale-free and GP-free, so it runs on any units.
+
+    Args:
+        x_rows: (n_t, n_ch) channel rho_tor_norm positions.
+        y_rows: (n_t, n_ch) channel values, NaN where invalid.
+        ratio: A reading under this fraction of both neighbours is a dip.
+        rho_max: Readings at or past this are not judged.
+
+    Returns:
+        (n_t, n_ch) mask of the dips.
+    """
+    dips = np.zeros(y_rows.shape, dtype=bool)
+    for row in range(y_rows.shape[0]):
+        valid = np.isfinite(x_rows[row]) & np.isfinite(y_rows[row])
+        idx = np.flatnonzero(valid)
+        if idx.size < 3:
+            continue
+        order = idx[np.argsort(x_rows[row][idx])]
+        x = x_rows[row][order]
+        y = y_rows[row][order]
+        for k in range(order.size - 1):
+            if x[k] >= rho_max:
+                break
+            neighbours = (1, 2) if k == 0 else (k - 1, k + 1)
+            neighbour_min = min(y[j] for j in neighbours)
+            dips[row, order[k]] = y[k] < ratio * neighbour_min
+    return dips
 
 
 def drop_rows_without_core(fit_input: ShotFitInput, shot: int) -> ShotFitInput:
