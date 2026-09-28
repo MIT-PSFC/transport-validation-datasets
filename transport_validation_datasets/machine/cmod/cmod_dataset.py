@@ -9,7 +9,7 @@ from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 
-from transport_validation_datasets.cleaning import drop_in_both
+from transport_validation_datasets.cleaning import drop_in_both, relative_dips
 from transport_validation_datasets.dispy_utils import passive_log_settings, summary
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.cmod.dispy_methods import (
@@ -320,6 +320,17 @@ class CModDataWorkflow(DataWorkflow):
         # Near the magnetic axis, Te this low is not physically real
         core_problem = (rho_tor_norm >= 0.0) & (rho_tor_norm < 0.4) & (te_y < 0.4)
         te_y = np.where(core_problem, np.nan, te_y)
+
+        # A reading far under both its rho neighbours is probably a dead channel
+        te_dips = relative_dips(rho_tor_norm, te_y)
+        ne_dips = relative_dips(rho_tor_norm, ne_y)
+        te_y = np.where(te_dips, np.nan, te_y)
+        ne_y = np.where(ne_dips, np.nan, ne_y)
+        if te_dips.any() or ne_dips.any():
+            logger.info(
+                f"Shot {shot}: dropped {int(te_dips.sum())} te and {int(ne_dips.sum())} ne readings "
+                "under 0.35x both rho neighbours"
+            )
 
         # Error floors.
         # Sometimes C-Mod TS has extremely tiny error bars which I don't think are real.
