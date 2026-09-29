@@ -384,8 +384,7 @@ class CmodThomsonMethods:
         Data stays on the native TS timebase
         (~20 Hz), not params.times.
         The edge samples are placed on the core timebase sample by sample (_align_region).
-        An inconsistent core read raises (see _get_region_channels),
-        an edge read failure is logged and the edge skipped.
+        Both systems are required, and a failed or inconsistent read of either raises.
 
         Args:
             params: disruption-py physics method parameters for the shot.
@@ -424,21 +423,14 @@ class CmodThomsonMethods:
                 params.logger.warning(repr(e))
                 params.logger.opt(exception=True).debug(e)
 
-        edge = None
-        try:
-            edge = CmodThomsonMethods._get_region_channels(
-                params, CmodThomsonMethods.edge_nodes
-            )
-        except Exception as e:
-            params.logger.warning(
-                "Edge Thomson scattering data not found, continuing with core only."
-            )
-            params.logger.warning(repr(e))
-            params.logger.opt(exception=True).debug(e)
-        if edge is not None:
-            edge = CmodThomsonMethods._align_region(params, edge, core["time"])
+        # Edge TS is always required for a good fit.
+        # Without the edge the data ends at rho_tor_norm ~0.8
+        edge = CmodThomsonMethods._get_region_channels(
+            params, CmodThomsonMethods.edge_nodes
+        )
+        edge = CmodThomsonMethods._align_region(params, edge, core["time"])
 
-        regions = {"core": core} if edge is None else {"core": core, "edge": edge}
+        regions = {"core": core, "edge": edge}
 
         # Radius of the vertical laser beam, shared by all channels
         r_beam = float(
