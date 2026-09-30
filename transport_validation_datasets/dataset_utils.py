@@ -5,7 +5,7 @@ Based on popsim/data/dataset_utils.py
 
 import os
 import shutil
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Hashable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -43,10 +43,13 @@ def build_tensorized_dataset(
         episode_dim: Name of the dimension episodes are stacked along.
         extend_existing: Append to the store at zarr_path if it already exists,
             instead of refusing to touch it.
-        episodes_per_chunk: Episodes per storage chunk. Mutually exclusive with
-            mb_per_chunk. None with mb_per_chunk None leaves the chunking alone.
-        mb_per_chunk: Target chunk size, used to pick episodes_per_chunk from
-            the mean episode size. Mutually exclusive with episodes_per_chunk.
+        episodes_per_chunk: Episodes per storage chunk, the same for every variable.
+            Mutually exclusive with mb_per_chunk.
+            None with mb_per_chunk None leaves the chunking alone.
+        mb_per_chunk: Target size of each variable's chunks.
+            Each variable gets its own episodes per chunk from its own size per episode,
+            so a 0D signal packs many more episodes into a chunk than a 2D map.
+            Mutually exclusive with episodes_per_chunk.
         dim_sizes: Upper bound per non-episode dimension. Every episode is
             padded to these sizes before being written, so the store never has
             to be extended (which rewrites the chunks of every episode already
@@ -120,21 +123,11 @@ def build_tensorized_dataset(
             if dim in ds.dims and dim != episode_dim:
                 ds = trim_trailing_nan_slices(ds, dim)
 
-    if mb_per_chunk is not None:
-        n_episodes = ds.sizes[episode_dim]
-        mb_per_episode = ds.isel({episode_dim: 0}).nbytes / (1024 * 1024)
-        episodes_per_chunk = min(max(1, int(mb_per_chunk / mb_per_episode)), n_episodes)
-        logger.info(
-            f"Chunking {episodes_per_chunk} episodes per chunk "
-            f"(mb_per_chunk={mb_per_chunk}, {mb_per_episode:.2f} MB per episode)"
+    if mb_per_chunk is not None or episodes_per_chunk is not None:
+        chunk_specs = episode_chunk_specs(
+            ds, episode_dim, mb_per_chunk, episodes_per_chunk
         )
-
-    if episodes_per_chunk is not None:
-        # Chunk across episodes only, every other dimension stays in one chunk.
-        chunk_spec = {episode_dim: episodes_per_chunk} | {
-            dim: ds.sizes[dim] for dim in ds.dims if dim != episode_dim
-        }
-        ds = zarr_chunk(ds, chunk_spec)
+        ds = zarr_chunk(ds, chunk_specs)
 
         # Write the rechunked store beside the old one, then swap, so a crash
         # mid-rewrite leaves the original store intact.
@@ -374,20 +367,72 @@ def _pad(ds: xr.Dataset, pad_widths: dict[str, tuple[int, int]]) -> xr.Dataset:
     return ds
 
 
-def zarr_chunk(ds: xr.Dataset, chunk_spec: dict[str, int]) -> xr.Dataset:
-    """Chunk a dataset, clearing the encoding that would override the new chunks.
+def episode_chunk_specs(
+    ds: xr.Dataset,
+    episode_dim: str,
+    mb_per_chunk: float | None = None,
+    episodes_per_chunk: int | None = None,
+) -> dict[Hashable, dict[str, int]]:
+    """Chunk sizes for every variable, chunking across episodes only.
 
+    Zarr chunks every variable separately, so each one is sized on its own.
+    Every other dimension stays in one chunk.
+
+    Args:
+        ds: Dataset to chunk, every variable carrying episode_dim.
+        episode_dim: Name of the dimension episodes are stacked along.
+        mb_per_chunk: Target size of each variable's chunks,
+            divided by the variable's own size per episode.
+        episodes_per_chunk: Episodes per chunk, the same for every variable.
+            Used only when mb_per_chunk is None.
+
+    Returns:
+        Chunk size per dimension, per variable, for zarr_chunk.
+    """
+    n_episodes = ds.sizes[episode_dim]
+    chunk_specs = {}
+    var_names_by_episodes_per_chunk = {}
+    for name in ds.data_vars:
+        if mb_per_chunk is not None:
+            mb_per_episode = ds[name].nbytes / n_episodes / (1024 * 1024)
+            var_episodes_per_chunk = int(mb_per_chunk / mb_per_episode)
+            var_episodes_per_chunk = min(max(1, var_episodes_per_chunk), n_episodes)
+        else:
+            var_episodes_per_chunk = episodes_per_chunk
+        chunk_specs[name] = dict(ds[name].sizes) | {episode_dim: var_episodes_per_chunk}
+        var_names_by_episodes_per_chunk.setdefault(var_episodes_per_chunk, []).append(
+            name
+        )
+    for var_episodes_per_chunk, var_names in sorted(
+        var_names_by_episodes_per_chunk.items()
+    ):
+        logger.info(
+            f"Chunking {var_episodes_per_chunk} episodes per chunk "
+            f"(mb_per_chunk={mb_per_chunk}): {', '.join(var_names)}"
+        )
+    return chunk_specs
+
+
+def zarr_chunk(
+    ds: xr.Dataset, chunk_specs: dict[Hashable, dict[str, int]]
+) -> xr.Dataset:
+    """Chunk each variable of a dataset on its own.
+
+    Clears the encoding that would override the new chunks.
     See https://stackoverflow.com/questions/67476513, zarr keeps the chunk sizes
     from the encoding unless they are deleted first.
 
     Args:
         ds: Dataset to chunk.
-        chunk_spec: Chunk size per dimension.
+        chunk_specs: Chunk size per dimension, per variable.
+            Variables left out keep their chunks.
 
     Returns:
         The chunked dataset.
     """
-    ds = ds.chunk(chunk_spec)
+    ds = ds.assign(
+        {name: ds[name].chunk(chunk_spec) for name, chunk_spec in chunk_specs.items()}
+    )
     for name in list(ds.data_vars) + list(ds.coords):
         ds[name].encoding.pop("chunks", None)
     return ds

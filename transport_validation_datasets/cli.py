@@ -122,8 +122,8 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
-            mb_per_chunk: Target size of a chunk of the internal Zarr store,
-                which is chunked along the shot dimension.
+            mb_per_chunk: Target size of each variable's chunks in the internal
+                Zarr store, which is chunked along the shot dimension.
             config: TOML file(s), comma separated, with the [cluster] table
                 and the [cmod] settings table (see config.py, CModSettings).
                 None fits locally with the default settings.
@@ -181,8 +181,8 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
-            mb_per_chunk: Target size of a chunk of the internal Zarr store,
-                which is chunked along the shot dimension.
+            mb_per_chunk: Target size of each variable's chunks in the internal
+                Zarr store, which is chunked along the shot dimension.
             prepare_workers: Threads used to read source data. None keeps the
                 MAST default, which the public S3 store tolerates.
             config: TOML file(s), comma separated, with the [cluster] table
@@ -218,7 +218,7 @@ def _execute(workflow, stage: str, clean_fit_state: bool, mb_per_chunk: int):
         workflow: The device's DataWorkflow.
         stage: Which stage to run, one of STAGES.
         clean_fit_state: Wipe the staged fit batches before fitting.
-        mb_per_chunk: Target chunk size of the internal Zarr store.
+        mb_per_chunk: Target size of each variable's chunks in the internal Zarr store.
 
     Raises:
         ValueError: If the stage is not one of STAGES.

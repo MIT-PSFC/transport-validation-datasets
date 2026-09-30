@@ -1528,8 +1528,8 @@ class DataWorkflow(ABC):
         fresh_profile marking the window center.
 
         Args:
-            mb_per_chunk: Target size of a storage chunk, chunked along
-                EPISODE_DIM only. None leaves the chunking alone.
+            mb_per_chunk: Target size of each variable's storage chunks,
+                chunked along EPISODE_DIM only. None leaves the chunking alone.
             drop_unfit_slices: Ignore the slices whose te or ne fit did not come
                 back usable (USABLE_FIT_STATUSES), as though the shot had no
                 Thomson sample there. False places every slice on the grid,
