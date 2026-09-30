@@ -127,14 +127,13 @@ def build_tensorized_dataset(
         chunk_specs = episode_chunk_specs(
             ds, episode_dim, mb_per_chunk, episodes_per_chunk
         )
-        ds = zarr_chunk(ds, chunk_specs)
 
         # Write the rechunked store beside the old one, then swap, so a crash
         # mid-rewrite leaves the original store intact.
         tmp_path = zarr_path.with_suffix(".zarr.tmp")
         if tmp_path.exists():
             shutil.rmtree(tmp_path)
-        ds.to_zarr(tmp_path, mode="w", consolidated=True)
+        write_rechunked_store(ds, tmp_path, episode_dim, chunk_specs)
         ds.close()
         shutil.rmtree(zarr_path)
         os.rename(tmp_path, zarr_path)
@@ -411,6 +410,40 @@ def episode_chunk_specs(
             f"(mb_per_chunk={mb_per_chunk}): {', '.join(var_names)}"
         )
     return chunk_specs
+
+
+def write_rechunked_store(
+    ds: xr.Dataset,
+    zarr_path: Path | str,
+    episode_dim: str,
+    chunk_specs: dict[Hashable, dict[str, int]],
+):
+    """Write a dataset to a new Zarr store with new chunks, one chunk at a time.
+
+    One dask compute over the whole dataset reads source chunks far ahead of the writes,
+    which can OOM a workstation when working with thousands of shots.
+    Filling each variable one block of episodes at a time holds one chunk in memory.
+
+    Args:
+        ds: Dataset to write, its data variables dask backed and chunked across episodes only,
+            its coordinates in memory.
+        zarr_path: Path of the new Zarr store, must not exist.
+        episode_dim: Name of the dimension episodes are stacked along.
+        chunk_specs: Chunk size per dimension, per data variable, from episode_chunk_specs.
+    """
+    ds = zarr_chunk(ds, chunk_specs)
+    # Writes the metadata and the in-memory coordinates, the dask-backed variables are filled below
+    ds.to_zarr(zarr_path, mode="w-", consolidated=True, compute=False)
+    n_episodes = ds.sizes[episode_dim]
+    for name, chunk_spec in chunk_specs.items():
+        episodes_per_chunk = chunk_spec[episode_dim]
+        for start in range(0, n_episodes, episodes_per_chunk):
+            region = slice(start, min(start + episodes_per_chunk, n_episodes))
+            variable_block = ds[name].variable.isel({episode_dim: region})
+            variable_block = variable_block.compute()
+            ds_block = xr.Dataset({name: variable_block})
+            ds_block.to_zarr(zarr_path, mode="r+", region={episode_dim: region})
+    zarr.consolidate_metadata(zarr_path)
 
 
 def zarr_chunk(
