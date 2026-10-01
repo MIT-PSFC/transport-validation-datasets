@@ -13,6 +13,8 @@ and `machine/cmod/dispy_methods.py`. The GEQDSK block's attributes are shared
 variable onto that convention.
 Each unprocessed file records the COCOS index of its GEQDSK signals in a root
 attribute `cocos`. The final dataset carries it as the per-shot variable `cocos`.
+It is identified per shot from the signs of the reconstruction's own Ip, B0, psi and q (`cocos_from_signs`):
+The psi signals are per radian for MAST and C-Mod from EFIT, while the IMAS nodes their `ref` points at hold the total flux in Wb, in COCOS 17.
 
 Every file records where it came from in its root attributes.
 The unprocessed files carry the source package that pulled
@@ -107,7 +109,8 @@ Unprocessed stage (`filter_and_plot`), per shot:
    or the kept segments sum to less than `min_usable_time`.
 8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a 0D signal that is NaN at every kept time
-   - a mean `power_radiated` below `min_mean_power_radiated` (likely faulty bolometry)
+   - a mean `power_radiated` below `min_radiated_fraction` of the mean heating power (a dead bolometer),
+     1 percent on C-Mod and 2.5 percent on MAST
    - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point.
 
 Fit stage: the Thomson channels map through the nearest usable reconstruction in reach,
@@ -326,6 +329,6 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 | Device | Source | Shotlist | Notes |
 | ------ | ------ | -------- | ----- |
 | C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. |
-| MAST | Level 2 Zarr store at https://s3.echo.stfc.ac.uk/mast/level2/shots, plus two level 1 groups: EFM for the GEQDSK safety factor and AYC for the Thomson profiles | 1693 shots from the M7-M9 campaigns, shipped with the package and built by `machine/mast/shotlist.py` | Public, anonymous, read in a thread pool (`--prepare_workers`) |
+| MAST | Level 1 Zarr store at https://s3.echo.stfc.ac.uk/mast/level1/shots: EFM for the equilibrium (GEQDSK and 0D), ESM for the ohmic power, AYC for the Thomson profiles. The level 2 store at https://s3.echo.stfc.ac.uk/mast/level2/shots supplies only the summary signals (ip, NBI and radiated power, line averaged density) | 1693 shots from the M7-M9 campaigns, shipped with the package and built by `machine/mast/shotlist.py` | Public, anonymous, read in a thread pool (`--prepare_workers`) |
 | DIII-D | | | |
 | TCV | | | |
