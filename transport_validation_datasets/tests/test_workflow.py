@@ -195,19 +195,26 @@ class TestHoldOntoGrid:
         assert np.flatnonzero(fresh).tolist() == [5]
 
 
-def unprocessed_with_equilibrium(grid: np.ndarray, reconstructed: list[int]):
+def unprocessed_with_equilibrium(
+    grid: np.ndarray, reconstructed: list[int], nan_qpsi: tuple[int, ...] = ()
+):
     # One shot's unprocessed dataset as _hold_equilibrium sees it: the time
     # coordinate already dropped, a reconstruction only at the grid times that
     # have one, and NaN everywhere else
     n_t = grid.size
     simagx = np.full(n_t, np.nan)
     psirz = np.full((n_t, 2, 2), np.nan)
+    qpsi = np.full((n_t, 3), np.nan)
     for value, i_time in enumerate(reconstructed, start=1):
         simagx[i_time] = float(value)
         psirz[i_time] = float(value)
+        if i_time not in nan_qpsi:
+            qpsi[i_time] = 1.0
     return xr.Dataset(
         {
             "simagx": ((EPISODE_DIM, TIME_COORD), simagx[None]),
+            "sibdry": ((EPISODE_DIM, TIME_COORD), simagx[None] + 1.0),
+            "qpsi": ((EPISODE_DIM, TIME_COORD, "psi_idx"), qpsi[None]),
             "psirz": ((EPISODE_DIM, TIME_COORD, "r_grid", "z_grid"), psirz[None]),
         }
     )
@@ -247,6 +254,21 @@ class TestHoldEquilibrium:
         assert np.array_equal(
             np.flatnonzero(np.isfinite(simagx)), np.flatnonzero(fresh)
         )
+
+    def test_unusable_reconstruction_held_over_for_the_clock_period(self):
+        # A 5 ms clock with no qpsi at 7 ms,
+        # so the 2 ms reconstruction holds for 1.5 clock periods, to 9.5 ms,
+        # not for 1.5 of the 10 ms the usable ones are apart
+        grid = grid_ms(20)
+        ds = unprocessed_with_equilibrium(grid, [2, 7, 12], nan_qpsi=(7,))
+
+        held, fresh = _hold_equilibrium(ds, grid, True)
+
+        simagx = held["simagx"].squeeze(EPISODE_DIM, drop=True).values
+        assert np.flatnonzero(fresh).tolist() == [2, 12]
+        assert (simagx[2:10] == 1.0).all()
+        assert np.isnan(simagx[10:12]).all()
+        assert (simagx[12:] == 3.0).all()
 
     def test_device_without_equilibrium_passes_signals_through(self):
         grid = grid_ms(20)

@@ -169,8 +169,10 @@ class TestMapChannels:
     def test_slice_maps_through_nearest_reconstruction_in_reach(self):
         # Reconstructions every 5 ms, then a 20 ms gap, so the reach is 7.5 ms.
         # t = 3 ms takes the 5 ms reconstruction.
-        # t = 12 ms is nearest the 10 ms one, which has no q profile, so it stays NaN.
-        # t = 20 ms is 10 ms from both neighbours, out of reach.
+        # t = 12 ms is nearest the 10 ms one, which has no q profile,
+        # so it takes the 5 ms one, 7 ms away.
+        # t = 20 ms is out of reach of every usable reconstruction.
+        # The unusable one still counts for the clock, without it the reach would be 22.5 ms.
         minor_radii = [0.30, 0.25, 0.28, 0.32]
         channel_r = np.array([R0 + 0.2])
         channel_z = np.array([0.0])
@@ -188,7 +190,7 @@ class TestMapChannels:
         psi_n_at_5ms = (0.2 / minor_radii[1]) ** 2
         expected = rho_tor_norm_from_psi_n(np.array([psi_n_at_5ms]), QPSI, "secant")
         np.testing.assert_allclose(rho_tor_norm[0], expected, atol=1e-4)
-        assert np.isnan(rho_tor_norm[1]).all()
+        np.testing.assert_allclose(rho_tor_norm[1], expected, atol=1e-4)
         assert np.isnan(rho_tor_norm[2]).all()
 
 
