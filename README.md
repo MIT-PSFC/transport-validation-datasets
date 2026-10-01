@@ -86,12 +86,16 @@ Unprocessed stage (`filter_and_plot`), per shot:
 
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
 2. Everything from `end_margin` before the last finite `ip` on is cut.
-3. Grid times outside the device's `valid_filter` bounds are cut.
+3. Grid times where a signal listed in the device's `valid_filter` is not finite or outside its bounds are cut.
+   An empty entry only checks that the signal is finite.
 4. Everything from the first time a `transient_filter` signal, smoothed over 5 ms, exceeds its threshold is cut.
-5. Kept segments shorter than `min_segment_length` are cut.
-6. The shot is rejected when the kept span is shorter than `min_pulse_length`,
+5. The leading grid times of each kept segment that no kept usable reconstruction (`usable_reconstructions`) reaches
+   within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock) are cut, since the store would have no equilibrium there.
+   This is mostly the early parts of a shot, before its first usable reconstruction.
+6. Kept segments shorter than `min_segment_length` are cut.
+7. The shot is rejected when the kept span is shorter than `min_pulse_length`,
    or the kept segments sum to less than `min_usable_time`.
-7. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
+8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a 0D signal that is NaN at every kept time
    - a mean `power_radiated` below `min_mean_power_radiated` (likely faulty bolometry)
    - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point.
@@ -134,7 +138,6 @@ indicating a large change in the Thomson density calibration.
   e.g. 24623 at 0.29-0.33 s (though this is minor, 39 reconstructions in 26 shots out of ~1000 total shots).
 - **Equilibrium gaps.** A hold of `MAX_HOLD_PERIODS` cannot bridge a missing reconstruction.
   Around one unusable MAST reconstruction the previous one covers 3 ms and the next 2 ms carry no equilibrium.
-  Many MAST shots also start their kept window 1-6 ms before their first reconstruction.
 - **C-Mod `power_ohm` is noise dominated at 1 kHz.** Its median sample-to-sample change is 45 percent of its level,
   and it swings 0-2.5 MW timestep to timestep in some ohmic shots. We publish the raw value, but you could consider smoothing it.
 - **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.

@@ -287,8 +287,11 @@ class DataWorkflow(ABC):
     def valid_filter(self) -> dict[str, dict[str, float]]:
         """Dictionary of valid ranges for signals, used to filter out invalid data.
 
+        A listed signal must also be finite, so an empty entry only checks that.
+        The bounds are min, max, min_abs and max_abs.
+
         Returns:
-            Valid ranges for signals, e.g. {"signal_name": {"min": 0.0, "max": 1.0}}.
+            Valid ranges for signals, e.g. {"signal_name": {"min": 0.0, "max": 1.0}, "other_signal": {}}.
         """
 
     @property
@@ -716,8 +719,9 @@ class DataWorkflow(ABC):
     def filter_and_plot(self, ds_input: xr.Dataset) -> xr.Dataset | None:
         """Take datasets with standardized names, run filtering on them, and plot results.
 
-        What survives is whatever passes the valid and transient filters, minus the
-        contiguous segments shorter than min_segment_length.
+        What survives is whatever passes the valid and transient filters,
+        each contiguous segment started where a kept usable reconstruction (usable_reconstructions) reaches,
+        minus the segments shorter than min_segment_length.
         The shot is rejected when too little survives,
         or when shot_rejection_reason finds a broken record in what does.
 
@@ -740,8 +744,9 @@ class DataWorkflow(ABC):
         end_margin_time = last_valid_time - self.end_margin
         valid_mask = ds_input["time"] < end_margin_time
 
-        # 1: Apply valid_filter
+        # 1: Apply valid_filter, every listed signal finite and inside its bounds
         for signal, bounds in self.valid_filter.items():
+            valid_mask = valid_mask & np.isfinite(ds_input[signal])
             if "min" in bounds:
                 valid_mask = valid_mask & (ds_input[signal] >= bounds["min"])
             if "max" in bounds:
@@ -782,13 +787,32 @@ class DataWorkflow(ABC):
         if transient_margin_time is not None:
             valid_mask = valid_mask & (ds_input["time"] < transient_margin_time)
 
-        # 3: Drop the short segments the filters leave behind.
+        # 3: Start each kept segment where the store will have an equilibrium, then drop the short segments.
+        # The store only holds the reconstructions that are kept (_hold_equilibrium),
+        # so a segment's first grid times have none when the one before it is cut.
         times = ds_input["time"].values
         time_mask = (
             valid_mask.any(dim="shot") if "shot" in valid_mask.dims else valid_mask
         )
+        keep = time_mask.values
+        if "simagx" in ds_input:
+            reconstruction_usable = usable_reconstructions(ds_input)
+            reconstruction_kept = np.flatnonzero(reconstruction_usable & keep)
+            clock_period = _reconstruction_clock_period(ds_input, times)
+            held_index, _ = _hold_onto_grid(
+                times, times[reconstruction_kept], True, clock_period
+            )
+            has_equilibrium = held_index >= 0
+            keep_trimmed = _trim_segment_starts(keep, has_equilibrium)
+            n_trimmed = int(keep.sum() - keep_trimmed.sum())
+            if n_trimmed:
+                logger.debug(
+                    f"Shot {shot}: trimmed {n_trimmed} grid times with no equilibrium in reach "
+                    f"from the starts of their segments"
+                )
+            keep = keep_trimmed
         kept_mask, dropped_lengths = drop_short_segments(
-            time_mask.values, times, self.min_segment_length
+            keep, times, self.min_segment_length
         )
         if dropped_lengths:
             logger.info(
@@ -866,7 +890,7 @@ class DataWorkflow(ABC):
         so a file written before a check existed is judged by the code as it is now.
         The checks, in order:
         1: A signal of DATASET_0D_SIGNALS that is NaN at every kept time.
-           The valid filter only NaN-checks the signals it bounds.
+           The valid filter only NaN-checks the signals it lists.
            A signal the dataset does not carry is skipped.
         2: A mean power_radiated below min_mean_power_radiated.
         3: Energy sanity.
@@ -2392,18 +2416,65 @@ def drop_short_segments(
         the runs that were cleared.
     """
     keep = np.asarray(keep, dtype=bool).copy()
-    # Pad with False on both sides so a run touching either end still has an edge
-    edges = np.diff(np.concatenate(([False], keep, [False])).astype(np.int8))
-    starts = np.flatnonzero(edges == 1)
-    ends = np.flatnonzero(edges == -1) - 1  # Inclusive
-
+    starts, ends = _kept_segments(keep)
     dropped_lengths = []
     for start, end in zip(starts, ends):
-        length = float(times[end] - times[start])
+        length = float(times[end - 1] - times[start])
         if length < min_length:
-            keep[start : end + 1] = False
+            keep[start:end] = False
             dropped_lengths.append(length)
     return keep, dropped_lengths
+
+
+def _kept_segments(keep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Find the runs of kept samples.
+
+    Args:
+        keep: Mask over the uniform 1 kHz grid.
+
+    Returns:
+        (starts, ends): the index of each run's first sample and one past its last.
+    """
+    # Pad with False on both sides so a run touching either end still has an edge
+    keep_padded = np.concatenate(([False], keep, [False]))
+    edges = np.diff(keep_padded.astype(np.int8))
+    return np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+
+
+def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
+    """Clear the samples of each run of kept samples ahead of its first sample that can start one.
+
+    A run is a stretch of consecutive kept samples on the grid, as in drop_short_segments.
+    Each run is cut from the front only:
+    its samples before the first one marked in can_start are cleared,
+    and that sample and everything after it stay, whatever can_start says further on.
+    A run with no sample marked in can_start is cleared whole.
+    can_start outside the runs is ignored, a marked sample just before a run does not start it.
+
+    filter_and_plot passes the grid times that a kept usable reconstruction reaches within the hold,
+    so every kept segment starts where the store will have an equilibrium.
+    Lapses inside a segment are left for the stack stage to show as gaps.
+    It runs before drop_short_segments, so a trimmed run is judged on what is left of it.
+
+    Example, with 1 for True:
+        keep      1 1 1 0 1 1 1 1 0 1 1
+        can_start 1 0 0 0 0 0 1 0 1 0 0
+        returned  1 1 1 0 0 0 1 1 0 0 0
+
+    Args:
+        keep: Mask over the uniform 1 kHz grid, True where the sample survived the filters. Not modified.
+        can_start: Mask over the same grid, True where a run may start.
+
+    Returns:
+        A copy of keep with every run starting on a sample of can_start.
+    """
+    keep = np.asarray(keep, dtype=bool).copy()
+    starts, ends = _kept_segments(keep)
+    for start, end in zip(starts, ends):
+        startable = np.flatnonzero(can_start[start:end])
+        first_startable = startable[0] if startable.size else end - start
+        keep[start : start + first_startable] = False
+    return keep
 
 
 def pulse_and_usable_time(kept_times: np.ndarray) -> tuple[float, float]:
@@ -2703,6 +2774,26 @@ def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
     return tiled
 
 
+def _reconstruction_clock_period(ds: xr.Dataset, grid: np.ndarray) -> float:
+    """Median spacing of a shot's reconstructions, the unusable ones included.
+
+    An equilibrium is held for this clock's period,
+    so dropping an unusable reconstruction does not stretch the hold.
+    A lone reconstruction only fills its own grid step, as in _hold_onto_grid.
+
+    Args:
+        ds: One shot's dataset with the GEQDSK block on its grid.
+        grid: The shot's 1 kHz timebase [s].
+
+    Returns:
+        The period [s].
+    """
+    simagx = ds["simagx"].squeeze(EPISODE_DIM, drop=True).transpose(TIME_COORD).values
+    clock_times = grid[np.isfinite(simagx)]
+    clock_steps = np.diff(clock_times) if clock_times.size > 1 else np.diff(grid)
+    return float(np.median(clock_steps))
+
+
 def _hold_equilibrium(
     ds_unprocessed: xr.Dataset, grid: np.ndarray, forward_fill: bool
 ) -> tuple[dict[str, xr.DataArray], np.ndarray]:
@@ -2731,12 +2822,7 @@ def _hold_equilibrium(
             grid.size, dtype=bool
         )
 
-    simagx = ds_unprocessed["simagx"].squeeze(EPISODE_DIM, drop=True)
-    clock_times = grid[simagx.transpose(TIME_COORD).notnull().values]
-    # Held for the clock's period, so a dropped reconstruction does not stretch the hold.
-    # A lone reconstruction only fills its own grid step, as in _hold_onto_grid.
-    clock_steps = np.diff(clock_times) if clock_times.size > 1 else np.diff(grid)
-    clock_period = float(np.median(clock_steps))
+    clock_period = _reconstruction_clock_period(ds_unprocessed, grid)
     usable = usable_reconstructions(ds_unprocessed)
     reconstructed = np.flatnonzero(usable)
     reconstruction_index, fresh = _hold_onto_grid(
