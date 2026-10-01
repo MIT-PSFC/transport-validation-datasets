@@ -44,8 +44,9 @@ from transport_validation_datasets.machine.mast.mast_dataset import (
     open_shot_sources,
 )
 from transport_validation_datasets.workflow import (
-    drop_short_segments,
-    pulse_and_usable_time,
+    bridge_short_lapses,
+    keep_longest_segment,
+    kept_span,
 )
 
 # FAIR-MAST shot catalog, pages of at most 100 shots
@@ -87,8 +88,8 @@ def _ip_window(summary: xr.Dataset, timebase: np.ndarray) -> np.ndarray:
     """Mask the timebase where the workflow's ip gates keep the shot.
 
     The ip part of DataWorkflow.filter_and_plot:
-    before the end margin, inside the valid_filter ip bounds,
-    and in segments no shorter than min_segment_length.
+    before the end margin and inside the valid_filter ip bounds,
+    with the short lapses bridged and only the longest segment kept.
     The other signals can only cut this down,
     so a shot too short here is too short for the workflow.
 
@@ -110,9 +111,8 @@ def _ip_window(summary: xr.Dataset, timebase: np.ndarray) -> np.ndarray:
         & (ip >= ip_bounds["min_abs"])
         & (ip <= ip_bounds["max_abs"])
     )
-    mask_kept, _ = drop_short_segments(
-        mask_window, timebase, MASTDataWorkflow.min_segment_length
-    )
+    mask_bridged = bridge_short_lapses(mask_window)
+    mask_kept, _ = keep_longest_segment(mask_bridged, timebase)
     return mask_kept
 
 
@@ -215,12 +215,9 @@ def _scan_shot(shot: int) -> dict | None:
 
     mask_window = _ip_window(sources.summary, sources.timebase)
     window_times = sources.timebase[mask_window]
-    pulse_length, usable_time = pulse_and_usable_time(window_times)
-    row.update(pulse_length=round(pulse_length, 3), usable_time=round(usable_time, 3))
-    if (
-        pulse_length < MASTDataWorkflow.min_pulse_length
-        or usable_time < MASTDataWorkflow.min_usable_time
-    ):
+    pulse_length = kept_span(mask_window, sources.timebase)
+    row.update(pulse_length=round(pulse_length, 3))
+    if pulse_length < MASTDataWorkflow.min_pulse_length:
         return {**row, "reason": "Plasma current window too short."}
 
     try:
@@ -284,7 +281,6 @@ class MASTShotlistCLI:
             "accepted",
             "reason",
             "pulse_length",
-            "usable_time",
             "near_axis_fraction",
             "rho_tor_norm_min_median",
         ]

@@ -76,6 +76,17 @@ from transport_validation_datasets.windows import (
 # Width of the centered boxcar applied before the transient thresholds are checked [s].
 TRANSIENT_SMOOTHING_WINDOW = 5e-3
 
+# Width of the trailing boxcar applied to the heating power for the radiative collapse check
+# (DataWorkflow.max_radiated_fraction) [s].
+# The ohmic power reads 0 for milliseconds at a time (ICRF trips, sawteeth, current ramps),
+# so it spans a few energy confinement times, the heating the stored energy still holds.
+# Trailing, since a centered one would see the ohmic spike of the current quench ahead.
+RADIATED_FRACTION_WINDOW = 50e-3
+
+# Valid samples each side of a valid filter lapse needs per lapsed sample for the lapse to be bridged.
+# On the 1 kHz grid, 50 ms of valid data on both sides bridges 1 ms of lapse, see bridge_short_lapses.
+LAPSE_BRIDGE_RATIO = 50
+
 # How far a shot's stored-energy rise may exceed the heating energy put in before it is rejected.
 # The 5 percent covers integration error and EFIT noise, see DataWorkflow.shot_rejection_reason.
 ENERGY_SANITY_LEEWAY = 1.05
@@ -108,7 +119,7 @@ SAMPLE_TIME_TOL = 1e-6
 # How long a slowly sampled signal (a fitted profile, an equilibrium) is held
 # forward onto the 1 kHz timebase, in periods of its own sampling. Above 1 to
 # tolerate jitter in the sampling, low enough that nothing is carried across a
-# real gap: the end of the shot, or a stretch the filtering cut away.
+# real gap: the end of the shot, or a diagnostic dropping out.
 MAX_HOLD_PERIODS = 1.5
 
 # Unprocessed signals carried into the internal dataset. The union over every
@@ -318,31 +329,10 @@ class DataWorkflow(ABC):
     @property
     @abstractmethod
     def min_pulse_length(self) -> float:
-        """Minimum time between the first and last valid ip after filtering.
+        """Minimum length of the one contiguous segment the filters keep of a shot.
 
         Returns:
             Minimum pulse length in seconds.
-        """
-
-    @property
-    @abstractmethod
-    def min_usable_time(self) -> float:
-        """Minimum summed duration of the valid ip segments after filtering.
-
-        Returns:
-            Minimum usable time in seconds.
-        """
-
-    @property
-    @abstractmethod
-    def min_segment_length(self) -> float:
-        """Minimum length of a single contiguous segment kept by the filters.
-
-        Shorter segments are dropped, so that the sporadic few-millisecond chunks
-        the filters leave behind do not reach the fits or the datasets.
-
-        Returns:
-            Minimum segment length in seconds.
         """
 
     @property
@@ -357,6 +347,13 @@ class DataWorkflow(ABC):
     # Floor on a shot's mean power_radiated over its kept times, as a fraction of its mean heating power, 0 for none.
     # A dead bolometer reading ~0 W passes the valid filter but breaks every power balance.
     min_radiated_fraction = 0.0
+
+    # Radiative collapse, a transient like those of transient_filter, None for no check.
+    # Everything is cut from the first time power_radiated, smoothed like the transient_filter signals,
+    # exceeds both radiated_collapse_floor [W]
+    # and max_radiated_fraction of the heating power averaged over the trailing RADIATED_FRACTION_WINDOW.
+    max_radiated_fraction = None
+    radiated_collapse_floor = 0.0
 
     # Shots numbered below this are left out like blacklisted ones, 0 for none.
     first_shot = 0
@@ -719,16 +716,17 @@ class DataWorkflow(ABC):
     def filter_and_plot(self, ds_input: xr.Dataset) -> xr.Dataset | None:
         """Take datasets with standardized names, run filtering on them, and plot results.
 
-        What survives is whatever passes the valid and transient filters,
-        each contiguous segment started where a kept usable reconstruction (usable_reconstructions) reaches,
-        minus the segments shorter than min_segment_length.
-        The shot is rejected when too little survives,
-        or when shot_rejection_reason finds a broken record in what does.
+        What survives is one contiguous segment of the times that pass the valid and transient filters.
+        Valid filter lapses short next to the segments on both sides are bridged (bridge_short_lapses),
+        each segment is started on a passing sample a kept usable reconstruction (usable_reconstructions) reaches,
+        and only the longest segment is kept.
+        The shot is rejected when that segment is shorter than min_pulse_length,
+        or when shot_rejection_reason finds a broken record in it.
 
-        Rejected shots are plotted unfiltered to rejected_shots_dir. Accepted shots
-        are plotted unfiltered to accepted_shots_dir, with the kept segments shaded
-        green. Both plots mark the end margin cutoff and (if one was found) the
-        transient cutoff.
+        Rejected shots are plotted unfiltered to rejected_shots_dir.
+        Accepted shots are plotted unfiltered to accepted_shots_dir,
+        with the kept segment shaded green and its bridged lapses yellow.
+        Both plots mark the end margin cutoff and (if one was found) the transient cutoff.
 
         Args:
             ds_input: Dataset with standardized signal names for one shot.
@@ -760,49 +758,69 @@ class DataWorkflow(ABC):
                     np.abs(ds_input[signal]) <= bounds["max_abs"]
                 )
 
-        # 2: Apply transient_filter: cut everything from the first time a signal exceeds
-        # its threshold. The comparison uses each signal smoothed by a centered boxcar
-        # (TRANSIENT_SMOOTHING_WINDOW wide) so that sporadic noise spikes on their own do
-        # not trip the filter.
+        # 2: Cut everything from the first transient among the passing times:
+        # a transient_filter signal above its threshold, or a radiative collapse (max_radiated_fraction).
+        # Both compare signals smoothed by a centered boxcar,
+        # so that sporadic noise spikes on their own do not trip them.
         dt = float(np.median(np.diff(ds_input["time"].values)))
-        smoothing_samples = max(1, round(TRANSIENT_SMOOTHING_WINDOW / dt))
-        if smoothing_samples % 2 == 0:
-            # Boxcar must be odd so it stays centered on the present timestep
-            smoothing_samples += 1
+        exceeded_by_check = {}
+        for signal, threshold in self.transient_filter.items():
+            smoothed = _boxcar_mean(ds_input[signal], TRANSIENT_SMOOTHING_WINDOW, dt)
+            exceeded_by_check[signal] = smoothed > threshold
+        radiated_limit = None
+        if self.max_radiated_fraction is not None:
+            radiated = ds_input["power_radiated"].clip(min=0.0)
+            radiated_smooth = _boxcar_mean(radiated, TRANSIENT_SMOOTHING_WINDOW, dt)
+            heating = _heating_power(ds_input)
+            heating_trailing = _boxcar_mean(
+                heating, RADIATED_FRACTION_WINDOW, dt, trailing=True
+            )
+            radiated_fraction_limit = self.max_radiated_fraction * heating_trailing
+            radiated_limit = radiated_fraction_limit.clip(
+                min=self.radiated_collapse_floor
+            )
+            exceeded_by_check["radiated fraction"] = radiated_smooth > radiated_limit
 
         transient_margin_time = None
-        for signal, threshold in self.transient_filter.items():
-            smoothed = (
-                ds_input[signal]
-                .rolling(time=smoothing_samples, center=True, min_periods=1)
-                .mean()
+        for check, exceeded in exceeded_by_check.items():
+            exceeded_valid = valid_mask & exceeded
+            if not exceeded_valid.any():
+                continue
+            first_time = float(
+                ds_input["time"].where(exceeded_valid.any(dim="shot")).min()
             )
-            exceeded = valid_mask & (smoothed > threshold)
-            if exceeded.any():
-                first_time = float(
-                    ds_input["time"].where(exceeded.any(dim="shot")).min()
-                )
-                if transient_margin_time is None or first_time < transient_margin_time:
-                    transient_margin_time = first_time
+            logger.debug(f"Shot {shot}: {check} transient at {first_time:.3f} s")
+            if transient_margin_time is None or first_time < transient_margin_time:
+                transient_margin_time = first_time
         if transient_margin_time is not None:
             valid_mask = valid_mask & (ds_input["time"] < transient_margin_time)
 
-        # 3: Start each kept segment where the store will have an equilibrium, then drop the short segments.
+        # 3: Bridge the short valid filter lapses,
+        # start each segment where the store will have an equilibrium, then keep only the longest.
         # The store only holds the reconstructions that are kept (_hold_equilibrium),
         # so a segment's first grid times have none when the one before it is cut.
+        # The end margin and the transient cut only remove a shot's tail,
+        # so every lapse with a segment after it is a valid filter lapse.
         times = ds_input["time"].values
         time_mask = (
             valid_mask.any(dim="shot") if "shot" in valid_mask.dims else valid_mask
         )
+        filtered_mask = time_mask.values
+        bridged_mask = bridge_short_lapses(filtered_mask)
+        n_bridged = int(bridged_mask.sum() - filtered_mask.sum())
+        if n_bridged:
+            logger.info(
+                f"Shot {shot}: bridged {n_bridged} grid times of valid filter lapses"
+            )
         if "simagx" in ds_input:
             reconstruction_usable = usable_reconstructions(ds_input)
             clock_period = reconstruction_clock_period(ds_input, times)
-            kept_mask, dropped_lengths, n_trimmed = _trim_and_drop_segments(
-                time_mask.values,
+            kept_mask, dropped_lengths, n_trimmed = _trim_and_keep_longest(
+                bridged_mask,
+                filtered_mask,
                 times,
                 reconstruction_usable,
                 clock_period,
-                self.min_segment_length,
             )
             if n_trimmed:
                 logger.debug(
@@ -810,18 +828,16 @@ class DataWorkflow(ABC):
                     f"from the starts of their segments"
                 )
         else:
-            kept_mask, dropped_lengths = drop_short_segments(
-                time_mask.values, times, self.min_segment_length
-            )
+            kept_mask, dropped_lengths = keep_longest_segment(bridged_mask, times)
         if dropped_lengths:
             logger.info(
-                f"Shot {shot}: dropped {len(dropped_lengths)} segment(s) shorter than "
-                f"{1e3 * self.min_segment_length:.0f} ms, lengths [ms]: "
+                f"Shot {shot}: kept the longest segment, dropped {len(dropped_lengths)} "
+                f"shorter one(s), lengths [ms]: "
                 + ", ".join(f"{1e3 * length:.0f}" for length in dropped_lengths)
             )
-        valid_mask = valid_mask & xr.DataArray(
-            kept_mask, coords={"time": times}, dims="time"
-        )
+        # Replaces valid_mask rather than narrowing it, the bridged lapses fail the valid filter
+        kept_time_mask = xr.DataArray(kept_mask, coords={"time": times}, dims="time")
+        valid_mask = kept_time_mask.broadcast_like(valid_mask)
 
         # Load-bearing broadcast: valid_mask carries the shot and time dims, so
         # this also gives every static quantity (the limiter contour, the fixed
@@ -830,18 +846,12 @@ class DataWorkflow(ABC):
         # _hold_equilibrium indexes them by grid time.
         ds_filtered = ds_input.where(valid_mask, drop=True)
 
-        # 4: If there is not sufficient data after filtering, return None to indicate that this shot should be rejected:
-        # the first and last non-nan ip must be at least min_pulse_length apart,
-        # and the non-nan segments within must sum to at least min_usable_time
-        ip_valid_filtered = ds_filtered["ip"].notnull().any(dim="shot")
-        ip_times = ds_filtered["time"].values[ip_valid_filtered.values]
-        pulse_length, usable_time = pulse_and_usable_time(ip_times)
-
-        if pulse_length < self.min_pulse_length or usable_time < self.min_usable_time:
+        # 4: Reject the shot when the kept segment is shorter than min_pulse_length
+        pulse_length = kept_span(kept_mask, times)
+        if pulse_length < self.min_pulse_length:
             rejection_reason = (
-                f"pulse length {pulse_length:.3f} s (min {self.min_pulse_length}) "
-                f"or usable time {usable_time:.3f} s (min {self.min_usable_time}) "
-                f"insufficient after filtering"
+                f"longest segment {pulse_length:.3f} s after filtering, "
+                f"shorter than min_pulse_length {self.min_pulse_length} s"
             )
         else:
             # 5: Whole-shot checks on what survived, see shot_rejection_reason
@@ -857,14 +867,23 @@ class DataWorkflow(ABC):
                 transient_filter=self.transient_filter,
                 end_margin_time=end_margin_time,
                 transient_margin_time=transient_margin_time,
+                radiated_limit=radiated_limit,
             )
             return None
         else:
-            # Plot the entire shot, with the kept segments shaded green
-            kept_times = ds_filtered["time"].values
-            breaks = np.flatnonzero(np.diff(kept_times) > 1.5e-3)
-            span_starts = np.insert(kept_times[breaks + 1], 0, kept_times[0])
-            span_ends = np.append(kept_times[breaks], kept_times[-1])
+            # Plot the entire shot, with the kept segment shaded green and its bridged lapses yellow.
+            # A lapse is shaded from the passing sample before it to the one after, so a single sample shows.
+            # The kept segment starts and ends on a passing sample, so both neighbours exist.
+            good_starts, good_ends = _kept_segments(kept_mask & filtered_mask)
+            kept_spans = [
+                (float(times[start]), float(times[end - 1]))
+                for start, end in zip(good_starts, good_ends)
+            ]
+            lapse_starts, lapse_ends = _kept_segments(kept_mask & ~filtered_mask)
+            bridged_spans = [
+                (float(times[start - 1]), float(times[end]))
+                for start, end in zip(lapse_starts, lapse_ends)
+            ]
             window_spans = (
                 None if self.shot_windows is None else self.shot_windows.get(int(shot))
             )
@@ -876,7 +895,9 @@ class DataWorkflow(ABC):
                 transient_filter=self.transient_filter,
                 end_margin_time=end_margin_time,
                 transient_margin_time=transient_margin_time,
-                kept_spans=list(zip(span_starts.tolist(), span_ends.tolist())),
+                radiated_limit=radiated_limit,
+                kept_spans=kept_spans,
+                bridged_spans=bridged_spans,
                 window_spans=window_spans,
             )
             return ds_filtered
@@ -898,9 +919,8 @@ class DataWorkflow(ABC):
            may not exceed ENERGY_SANITY_LEEWAY times the heating energy put in over the same span.
            The input ignores every loss, so a larger rise means a missing or broken power record.
            The rise rather than the peak, so energy stored before the first kept time needs no input.
-        The heating power is power_ohm + power_nbi + power_ic + power_lh.
-        Powers are clipped at 0 and a NaN heating power counts as 0,
-        as _clip_powers leaves them in the unprocessed file,
+        The heating power is _heating_power,
+        which clips at 0 and counts a NaN as 0 as _clip_powers leaves them in the unprocessed file,
         so both call sites reach the same verdict.
 
         Args:
@@ -916,11 +936,7 @@ class DataWorkflow(ABC):
             if name in ds_shot and bool(ds_shot[name].isnull().all()):
                 return f"{name} is NaN at every kept time"
 
-        power_heating = np.zeros(times.size)
-        for name in ("power_ohm", "power_nbi", "power_ic", "power_lh"):
-            if name in ds_shot:
-                power = np.nan_to_num(ds_shot[name].values, nan=0.0)
-                power_heating += np.clip(power, 0.0, None)
+        power_heating = _heating_power(ds_shot).values
 
         power_heating_mean = float(power_heating.mean())
         check_radiated = self.min_radiated_fraction > 0.0 and power_heating_mean > 0.0
@@ -2335,10 +2351,12 @@ class DataWorkflow(ABC):
                     "valid_filter": self.valid_filter,
                     "transient_filter": self.transient_filter,
                     "transient_smoothing_window": TRANSIENT_SMOOTHING_WINDOW,
+                    "max_radiated_fraction": self.max_radiated_fraction,
+                    "radiated_collapse_floor": self.radiated_collapse_floor,
+                    "radiated_fraction_window": RADIATED_FRACTION_WINDOW,
                     "end_margin": self.end_margin,
+                    "lapse_bridge_ratio": LAPSE_BRIDGE_RATIO,
                     "min_pulse_length": self.min_pulse_length,
-                    "min_usable_time": self.min_usable_time,
-                    "min_segment_length": self.min_segment_length,
                     "shot_blacklist": list(self.shot_blacklist),
                     "first_shot": self.first_shot,
                     "min_radiated_fraction": self.min_radiated_fraction,
@@ -2433,33 +2451,134 @@ def _clip_powers(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
-def drop_short_segments(
-    keep: np.ndarray, times: np.ndarray, min_length: float
-) -> tuple[np.ndarray, list[float]]:
-    """Clear the runs of kept samples that are shorter than min_length.
+def _heating_power(ds: xr.Dataset) -> xr.DataArray:
+    """Sum a shot's heating power, power_ohm + power_nbi + power_ic + power_lh [W].
 
-    A segment is measured from its first to its last sample, the same way the
-    pulse length and the plotted spans are, so a segment of n samples on the
-    1 kHz grid is n - 1 milliseconds long.
+    Each is clipped at 0 and a NaN counts as 0, so a missing record reads as no heating.
+
+    Args:
+        ds: One shot's dataset with standardized names.
+
+    Returns:
+        The heating power on the dataset's times.
+    """
+    power_heating = xr.zeros_like(ds[TIME_COORD], dtype=float)
+    for name in ("power_ohm", "power_nbi", "power_ic", "power_lh"):
+        if name in ds:
+            power = ds[name].fillna(0.0).clip(min=0.0)
+            power_heating = power_heating + power
+    return power_heating
+
+
+def _boxcar_mean(
+    signal: xr.DataArray, window: float, dt: float, trailing: bool = False
+) -> xr.DataArray:
+    """Smooth a signal with a boxcar, centered on each sample or trailing it.
+
+    Args:
+        signal: The signal, on a uniform time dimension.
+        window: Width of the boxcar [s].
+        dt: The sample spacing [s].
+        trailing: Average each sample with the ones before it only, ending on it.
+
+    Returns:
+        The smoothed signal, averaged over the samples present near the ends and around NaNs.
+    """
+    n_samples = max(1, round(window / dt))
+    if trailing:
+        return signal.rolling(time=n_samples, min_periods=1).mean()
+    if n_samples % 2 == 0:
+        # Odd so it stays centered on the present sample
+        n_samples += 1
+    return signal.rolling(time=n_samples, center=True, min_periods=1).mean()
+
+
+def bridge_short_lapses(keep: np.ndarray) -> np.ndarray:
+    """Fill the lapses between runs of kept samples that are short next to the runs on both sides.
+
+    A lapse of n samples is filled when the runs on both sides
+    each hold at least LAPSE_BRIDGE_RATIO * n kept samples.
+    A run counts only the samples that were kept, not the lapses already filled inside it.
+    Filling repeats until nothing changes,
+    since a filled lapse joins two runs into a longer one for the lapses next to it.
+    Filling a lapse only lengthens the runs around the others,
+    so the result does not depend on the order the lapses are filled in.
+
+    Example, with LAPSE_BRIDGE_RATIO 50 on the 1 kHz grid:
+        500 kept, 4 lapsed, 200 kept -> filled, 200 kept samples bridge 4
+        500 kept, 5 lapsed, 200 kept -> left
+        900 kept, 1 lapsed, 40 kept  -> left, 40 kept samples bridge none
+
+    Args:
+        keep: Mask over the uniform 1 kHz grid, True where the sample survived the filters. Not modified.
+
+    Returns:
+        A copy of keep with the short lapses filled.
+    """
+    keep = np.asarray(keep, dtype=bool)
+    # Kept samples ahead of each index, so a run's count is the difference of two entries
+    n_kept_through = np.cumsum(keep)
+    n_kept_before = np.concatenate(([0], n_kept_through))
+    bridged = keep.copy()
+    while True:
+        starts, ends = _kept_segments(bridged)
+        n_kept_per_run = n_kept_before[ends] - n_kept_before[starts]
+        n_kept_both_sides = np.minimum(n_kept_per_run[:-1], n_kept_per_run[1:])
+        lapse_starts = ends[:-1]
+        lapse_ends = starts[1:]
+        lapse_lengths = lapse_ends - lapse_starts
+        mask_bridgeable = LAPSE_BRIDGE_RATIO * lapse_lengths <= n_kept_both_sides
+        if not mask_bridgeable.any():
+            return bridged
+        for lapse_start, lapse_end in zip(
+            lapse_starts[mask_bridgeable], lapse_ends[mask_bridgeable]
+        ):
+            bridged[lapse_start:lapse_end] = True
+
+
+def keep_longest_segment(
+    keep: np.ndarray, times: np.ndarray
+) -> tuple[np.ndarray, list[float]]:
+    """Clear every run of kept samples but the longest.
+
+    A run is measured from its first to its last sample, the same way kept_span measures the one left,
+    so a run of n samples on the 1 kHz grid is n - 1 milliseconds long.
+    The earliest of equally long runs is kept.
+
+    Args:
+        keep: Mask over times, True where the sample survived the filters. Not modified.
+        times: The shot's timebase [s].
+
+    Returns:
+        The mask with only the longest run left, and the lengths [s] of the runs cleared.
+    """
+    keep = np.asarray(keep, dtype=bool)
+    keep_longest = np.zeros(keep.size, dtype=bool)
+    starts, ends = _kept_segments(keep)
+    if starts.size == 0:
+        return keep_longest, []
+    run_lengths = times[ends - 1] - times[starts]
+    longest = int(np.argmax(run_lengths))
+    keep_longest[starts[longest] : ends[longest]] = True
+    dropped_lengths = np.delete(run_lengths, longest)
+    return keep_longest, dropped_lengths.tolist()
+
+
+def kept_span(keep: np.ndarray, times: np.ndarray) -> float:
+    """Time from the first to the last kept sample, for the min_pulse_length gate.
 
     Args:
         keep: Mask over times, True where the sample survived the filters.
-        times: The shot's timebase in seconds.
-        min_length: Shortest segment to keep, in seconds.
+        times: The shot's timebase [s].
 
     Returns:
-        The mask with the short runs cleared, and the lengths in seconds of
-        the runs that were cleared.
+        The span [s], 0 when fewer than two samples are kept.
     """
-    keep = np.asarray(keep, dtype=bool).copy()
-    starts, ends = _kept_segments(keep)
-    dropped_lengths = []
-    for start, end in zip(starts, ends):
-        length = float(times[end - 1] - times[start])
-        if length < min_length:
-            keep[start:end] = False
-            dropped_lengths.append(length)
-    return keep, dropped_lengths
+    keep = np.asarray(keep, dtype=bool)
+    kept_times = times[keep]
+    if kept_times.size < 2:
+        return 0.0
+    return float(kept_times[-1] - kept_times[0])
 
 
 def _kept_segments(keep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -2480,17 +2599,18 @@ def _kept_segments(keep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
     """Clear the samples of each run of kept samples ahead of its first sample that can start one.
 
-    A run is a stretch of consecutive kept samples on the grid, as in drop_short_segments.
+    A run is a stretch of consecutive kept samples on the grid, as in keep_longest_segment.
     Each run is cut from the front only:
     its samples before the first one marked in can_start are cleared,
     and that sample and everything after it stay, whatever can_start says further on.
     A run with no sample marked in can_start is cleared whole.
     can_start outside the runs is ignored, a marked sample just before a run does not start it.
 
-    _trim_and_drop_segments passes the grid times that a kept usable reconstruction reaches within the hold,
-    so every kept segment starts where the store will have an equilibrium.
-    Lapses inside a segment are left for the stack stage to show as gaps.
-    It runs before drop_short_segments, so a trimmed run is judged on what is left of it.
+    _trim_and_keep_longest passes the grid times that passed the filters
+    and that a kept usable reconstruction reaches within the hold,
+    so every kept segment starts on a passing sample where the store will have an equilibrium.
+    Equilibrium lapses inside a segment are left for the stack stage to show as gaps.
+    It runs before keep_longest_segment, so a trimmed run is judged on what is left of it.
 
     Example, with 1 for True:
         keep      1 1 1 0 1 1 1 1 0 1 1
@@ -2513,32 +2633,34 @@ def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
     return keep
 
 
-def _trim_and_drop_segments(
+def _trim_and_keep_longest(
     keep: np.ndarray,
+    passed: np.ndarray,
     times: np.ndarray,
     reconstruction_usable: np.ndarray,
     clock_period: float,
-    min_length: float,
 ) -> tuple[np.ndarray, list[float], int]:
-    """Start each kept segment where a kept reconstruction reaches, and drop the segments left too short.
+    """Start each kept segment where a kept reconstruction reaches, and keep only the longest.
 
     A grid time has an equilibrium in the store when a kept usable reconstruction
     at or before it is within MAX_HOLD_PERIODS of the clock period (_hold_equilibrium).
     _trim_segment_starts cuts each segment's leading grid times without one,
-    then drop_short_segments judges each segment on what is left.
+    and those that only sit in a bridged lapse, so every segment starts on a sample that passed the filters.
+    Then keep_longest_segment judges the segments on what is left.
     The two repeat until the mask stops changing,
-    since a dropped segment can hold the reconstruction that reached the start of the next one.
+    since a dropped segment can hold the reconstruction that reached the start of the longest.
 
     Args:
-        keep: Mask over the uniform 1 kHz grid, True where the sample survived the filters. Not modified.
+        keep: Mask over the uniform 1 kHz grid, True where the sample survived the filters
+            or sits in a bridged lapse (bridge_short_lapses). Not modified.
+        passed: Mask over the grid, True where the sample survived the filters, the bridged lapses False.
         times: The grid times [s].
         reconstruction_usable: Mask over the grid, True at the usable reconstructions (usable_reconstructions).
         clock_period: The reconstruction clock's period [s] (reconstruction_clock_period).
-        min_length: Shortest segment to keep [s].
 
     Returns:
         (keep, dropped_lengths, n_trimmed): the new mask,
-        the lengths [s] of the segments dropped as short,
+        the lengths [s] of the segments dropped for a longer one,
         and how many grid times the trims cut.
     """
     dropped_lengths = []
@@ -2548,32 +2670,14 @@ def _trim_and_drop_segments(
         held_index, _ = _hold_onto_grid(
             times, times[reconstruction_kept], True, clock_period
         )
-        keep_trimmed = _trim_segment_starts(keep, held_index >= 0)
+        can_start = (held_index >= 0) & passed
+        keep_trimmed = _trim_segment_starts(keep, can_start)
         n_trimmed += int(keep.sum() - keep_trimmed.sum())
-        keep_next, dropped = drop_short_segments(keep_trimmed, times, min_length)
+        keep_next, dropped = keep_longest_segment(keep_trimmed, times)
         dropped_lengths.extend(dropped)
         if np.array_equal(keep_next, keep):
             return keep_next, dropped_lengths, n_trimmed
         keep = keep_next
-
-
-def pulse_and_usable_time(kept_times: np.ndarray) -> tuple[float, float]:
-    """Measure what the filters left of a shot, for the min_pulse_length and min_usable_time gates.
-
-    Args:
-        kept_times: The kept times on the uniform 1 kHz grid [s].
-
-    Returns:
-        (pulse_length, usable_time): the time from the first to the last kept sample,
-        and the summed length of the kept segments [s].
-    """
-    if kept_times.size < 2:
-        return 0.0, 0.0
-    pulse_length = float(kept_times[-1] - kept_times[0])
-    # Timebase is uniform 1 kHz, so any gap beyond 1.5 ms separates two segments
-    gaps = np.diff(kept_times)
-    usable_time = float(gaps[gaps < 1.5e-3].sum())
-    return pulse_length, usable_time
 
 
 def usable_slice_mask(ds_fit: xr.Dataset) -> np.ndarray:

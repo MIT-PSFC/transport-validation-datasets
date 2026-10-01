@@ -14,9 +14,10 @@ from transport_validation_datasets.workflow import (
     MAX_HOLD_PERIODS,
     _hold_equilibrium,
     _hold_onto_grid,
-    _trim_and_drop_segments,
+    _trim_and_keep_longest,
     _trim_segment_starts,
-    drop_short_segments,
+    bridge_short_lapses,
+    keep_longest_segment,
     usable_slice_mask,
 )
 
@@ -26,92 +27,57 @@ def grid_ms(n: int) -> np.ndarray:
     return np.round(np.arange(n) * 1e-3, 3)
 
 
-class TestDropShortSegments:
-    def test_segment_shorter_than_the_minimum_cleared(self):
-        times = grid_ms(10)
-        keep = np.array(
-            [False, False, True, True, True, False, False, False, False, False]
-        )
+def runs(*lengths: int) -> np.ndarray:
+    # Alternating kept and lapsed runs of the given lengths in samples, starting with a kept run
+    return np.concatenate([np.full(n, i % 2 == 0) for i, n in enumerate(lengths)])
 
-        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
 
-        assert not kept.any()
-        assert len(dropped) == 1
+class TestBridgeShortLapses:
+    def test_lapse_bridged_per_50_kept_samples_on_the_shorter_side(self):
+        # 200 kept samples on the shorter side bridge up to 4 lapsed ones
+        assert bridge_short_lapses(runs(500, 4, 200)).all()
 
-    def test_long_segment_survives(self):
-        times = grid_ms(10)
-        keep = np.array(
-            [False, False, True, True, True, True, True, True, False, False]
-        )
+        bridged = bridge_short_lapses(runs(500, 5, 200))
+        assert np.array_equal(bridged, runs(500, 5, 200))
 
-        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
+    def test_short_side_too_short_to_bridge_anything(self):
+        bridged = bridge_short_lapses(runs(900, 1, 40))
 
-        assert np.array_equal(kept, keep)
-        assert dropped == []
+        assert np.array_equal(bridged, runs(900, 1, 40))
 
-    def test_segment_measured_first_to_last_sample(self):
-        # n samples on the 1 kHz grid span n - 1 ms,
-        # so a 5 sample run is exactly 4 ms long and a 4 ms minimum keeps it
-        times = grid_ms(10)
-        keep = np.array(
-            [False, True, True, True, True, True, False, False, False, False]
-        )
+    def test_bridged_lapse_lengthens_the_side_of_the_next_one(self):
+        # 100 bridges the 2 on its right, then 3 needs 150 on both sides,
+        # which only the joined 100 + 400 holds
+        keep = runs(500, 3, 100, 2, 400)
 
-        kept, dropped = drop_short_segments(keep, times, min_length=0.004)
-        assert np.array_equal(kept, keep)
-        assert dropped == []
+        assert bridge_short_lapses(keep).all()
 
-        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
-        assert not kept.any()
-        assert dropped == [0.004]
+    def test_bridged_samples_do_not_count_toward_a_side(self):
+        # 99 + 1 lapsed + 99 spans 199 samples, but holds only 198 kept, one short of bridging 4
+        keep = runs(1000, 4, 99, 1, 99)
 
-    def test_short_and_long_segments_judged_independently(self):
-        times = grid_ms(12)
-        keep = np.array(
-            [True, True, False, False, False]
-            + [True, True, True, True, True, True, True]
-        )
+        bridged = bridge_short_lapses(keep)
 
-        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
+        assert np.array_equal(bridged, runs(1000, 4, 199))
 
-        assert np.array_equal(
-            kept,
-            np.array(
-                [False, False, False, False, False]
-                + [True, True, True, True, True, True, True]
-            ),
-        )
-        assert len(dropped) == 1
 
-    def test_run_touching_either_end_still_seen(self):
-        times = grid_ms(10)
-        keep = np.array(
-            [True, True, False, False, False, False, False, False, True, True]
-        )
+class TestKeepLongestSegment:
+    def test_only_the_longest_run_left(self):
+        times = grid_ms(30)
+        keep = runs(5, 2, 10, 3, 10)
 
-        kept, dropped = drop_short_segments(keep, times, min_length=0.005)
+        kept, dropped = keep_longest_segment(keep, times)
 
-        assert not kept.any()
-        assert len(dropped) == 2
+        # Equally long runs keep the earliest
+        assert np.flatnonzero(kept).tolist() == list(range(7, 17))
+        # Measured first to last sample, so n samples span n - 1 ms
+        assert np.allclose(dropped, [0.004, 0.009])
 
-    def test_empty_mask_drops_nothing(self):
-        times = grid_ms(10)
-
-        kept, dropped = drop_short_segments(np.zeros(10, dtype=bool), times, 0.005)
+    def test_empty_mask_keeps_nothing(self):
+        kept, dropped = keep_longest_segment(np.zeros(10, dtype=bool), grid_ms(10))
 
         assert not kept.any()
         assert dropped == []
-
-    def test_input_mask_not_mutated(self):
-        times = grid_ms(10)
-        keep = np.array(
-            [False, False, True, True, True, False, False, False, False, False]
-        )
-        original = keep.copy()
-
-        drop_short_segments(keep, times, min_length=0.005)
-
-        assert np.array_equal(keep, original)
 
 
 class TestTrimSegmentStarts:
@@ -126,11 +92,11 @@ class TestTrimSegmentStarts:
         assert np.flatnonzero(trimmed).tolist() == [0, 1, 2, 6, 7]
 
 
-class TestTrimAndDropSegments:
-    def test_dropped_segment_no_longer_starts_the_next(self):
+class TestTrimAndKeepLongest:
+    def test_dropped_segment_no_longer_starts_the_longest(self):
         # A 5 ms clock, so a reconstruction reaches 7.5 ms.
         # The 0-2 ms segment holds the 0 ms reconstruction, which reaches the start of the 4-20 ms segment.
-        # Once 0-2 ms is dropped as short, 4-9 ms have no equilibrium and are trimmed.
+        # Once 0-2 ms is dropped for the longer one, 4-9 ms have no equilibrium and are trimmed.
         times = grid_ms(30)
         keep = np.zeros(30, dtype=bool)
         keep[0:3] = True
@@ -138,13 +104,30 @@ class TestTrimAndDropSegments:
         reconstruction_usable = np.zeros(30, dtype=bool)
         reconstruction_usable[[0, 10, 15, 20]] = True
 
-        kept, dropped, n_trimmed = _trim_and_drop_segments(
-            keep, times, reconstruction_usable, 0.005, 0.005
+        kept, dropped, n_trimmed = _trim_and_keep_longest(
+            keep, keep, times, reconstruction_usable, 0.005
         )
 
         assert np.flatnonzero(kept).tolist() == list(range(10, 21))
         assert len(dropped) == 1
         assert n_trimmed == 6
+
+    def test_segment_never_starts_in_a_bridged_lapse(self):
+        # The 4 ms reconstruction sits in the 3-5 ms lapse and would start the segment there.
+        # Starting on the passing 6 ms instead drops it,
+        # so 6-7 ms have no equilibrium and the start moves to the 8 ms reconstruction.
+        times = grid_ms(30)
+        keep = np.ones(30, dtype=bool)
+        passed = keep.copy()
+        passed[3:6] = False
+        reconstruction_usable = np.zeros(30, dtype=bool)
+        reconstruction_usable[[4, 8, 12, 16, 20, 24, 28]] = True
+
+        kept, _, _ = _trim_and_keep_longest(
+            keep, passed, times, reconstruction_usable, 0.004
+        )
+
+        assert np.flatnonzero(kept).tolist() == list(range(8, 30))
 
 
 class TestHoldOntoGrid:

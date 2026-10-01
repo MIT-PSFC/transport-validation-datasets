@@ -49,16 +49,19 @@ Shots are stacked along `shot` and NaN padded along every other dimension, so
 shots of different lengths line up. Only one shot is ever held in memory while
 the internal store is built, and the published store is streamed from it.
 
-The timebase is the unprocessed data's uniform 1 kHz grid. `time_idx` is the
-grid ordinal, so shots of different lengths pad to a common size, and the
-`time` variable carries the times themselves.
+The timebase is the unprocessed data's uniform 1 kHz grid.
+Each shot keeps one contiguous stretch of it (see [Filtering](#filtering)),
+so `time_idx` counts grid steps from the shot's first kept time,
+shots of different lengths pad to a common size,
+and the `time` variable carries the times themselves.
+A shotlist with time windows keeps only the grid times inside them, so there `time` jumps between windows.
 
 Profiles arrive one per Thomson sample and equilibria on the reconstruction
 clock, both far slower than 1 kHz, so both are held forward over the grid times
 that follow them and `fresh_profile` / `fresh_equilibrium` mark the grid times
 that carry a sample of their own. A sample is held for at most
 `MAX_HOLD_PERIODS` of its own sampling period, so nothing is carried across the
-end of the shot or a stretch the filtering cut away. By default the slices
+end of the shot or a diagnostic dropping out. By default the slices
 the stack stage screens out (see [Filtering](#filtering)) are ignored, as though the
 shot had no Thomson sample there.
 
@@ -87,7 +90,7 @@ The stores record every threshold in their `filters` attribute.
 A reconstruction is usable (`usable_reconstructions`) when its axis and boundary psi are finite and meaningfully different,
 and every value of its psirz and qpsi is finite.
 All three stages that touch the equilibrium contain only the usable ones:
-the unprocessed stage starts each kept segment where one reaches (step 5 below),
+the unprocessed stage starts each kept segment where one reaches (step 6 below),
 the fit stage maps the Thomson channels through the nearest one,
 and the stack stage holds them onto the grid, so an unusable one is held over by the one before and is not marked fresh.
 The reach and the hold both run on the reconstruction clock (`reconstruction_clock_period`), which counts the unusable ones too.
@@ -95,19 +98,36 @@ The reach and the hold both run on the reconstruction clock (`reconstruction_clo
 Unprocessed stage (`filter_and_plot`), per shot:
 
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
-2. Everything from `end_margin` before the last finite `ip` on is cut.
-3. Grid times where a signal listed in the device's `valid_filter` is not finite or outside its bounds are cut.
+2. Everything from `end_margin` (C-Mod 20 ms, MAST 40 ms) before the last finite `ip` on is cut.
+3. Grid times where a signal listed in the device's `valid_filter` is not finite or outside its bounds fail the filter.
    An empty entry only checks that the signal is finite.
-4. Everything from the first time a `transient_filter` signal, smoothed over 5 ms, exceeds its threshold is cut.
-5. The leading grid times of each kept segment that no kept usable reconstruction (`usable_reconstructions`) reaches
-   within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock) are cut, since the store would have no equilibrium there.
+4. Everything from the first transient among the passing times is cut:
+   - a `transient_filter` signal smoothed over 5 ms above its threshold, `power_ohm` above 5 MW on both devices
+   - a radiative collapse, `power_radiated` smoothed over 5 ms above both `radiated_collapse_floor` (1 MW)
+     and `max_radiated_fraction` (2) times the heating power averaged over the trailing `RADIATED_FRACTION_WINDOW` (50 ms)
+
+   The heating power is power_ohm + power_nbi + power_ic + power_lh.
+   The 50 ms average rides over the milliseconds where the ohmic power reads 0 (ICRF trips, sawteeth, current ramps),
+   and the floor keeps low radiation during those from counting.
+   It trails, since a centered average would see the ohmic spike of the current quench ahead and mask the collapse before it.
+   The smoothed signals only place the cut, every kept signal is written as recorded.
+   The unprocessed plots draw the collapse limit as a dashed red line.
+5. A valid filter lapse between two passing stretches is bridged when it is short next to both (`bridge_short_lapses`).
+   Each side needs `LAPSE_BRIDGE_RATIO` (50) passing samples per lapsed sample,
+   so 50 ms of passing data on both sides bridges 1 ms.
+   A 500 ms and a 200 ms stretch bridge up to 4 ms between them, a 900 ms and a 40 ms stretch bridge nothing.
+   Bridging repeats until it changes nothing, since a bridged lapse joins two stretches into a longer one.
+   A bridged lapse keeps its samples as they are, out of bounds or NaN.
+   The accepted-shot plots shade bridged lapses yellow and the passing stretches of the kept segment green.
+6. The leading grid times of each segment are cut up to its first passing sample
+   that a kept usable reconstruction (`usable_reconstructions`) reaches
+   within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock), since the store would have no equilibrium before it.
    This is mostly the early parts of a shot, before its first usable reconstruction.
-6. Kept segments shorter than `min_segment_length` are cut.
-   Steps 5 and 6 repeat until neither changes anything,
-   since a segment cut as short can hold the reconstruction that reached the start of the next one.
-7. The shot is rejected when the kept span is shorter than `min_pulse_length`,
-   or the kept segments sum to less than `min_usable_time`.
-8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
+7. Only the longest segment is kept.
+   Steps 6 and 7 repeat until neither changes anything,
+   since a dropped segment can hold the reconstruction that reached the start of the longest one.
+8. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod 0.5 s, MAST 0.2 s).
+9. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a 0D signal that is NaN at every kept time
    - a mean `power_radiated` below `min_radiated_fraction` of the mean heating power (a dead bolometer),
      1 percent on C-Mod and 2.5 percent on MAST
@@ -146,7 +166,7 @@ indicating a large change in the Thomson density calibration.
   The kept shots sit at 0.76-1.16 on C-Mod and 0.75-1.10 on MAST.
 - **MAST transients inside the kept windows.** Reconnection events and Ip spikes that stay under the transient thresholds remain,
   e.g. 28203 at 0.343 s, where core Te drops from 0.55 to 0.12 keV, Ip spikes from 0.53 to 0.68 MA and P_rad reaches 2.8 MW.
-  The transient filter needs P_rad above 3 MW after smoothing, and only cuts from the first exceedance.
+  The radiative collapse cut needs P_rad above twice the heating power of the trailing 50 ms, and only cuts from the first exceedance.
 - **MAST EFIT vertical glitches.** Single reconstructions jump zmagx and zbdry by 5-10 cm and come back at the next one,
   e.g. 24623 at 0.29-0.33 s (though this is minor, 39 reconstructions in 26 shots out of ~1000 total shots).
 - **Equilibrium gaps.** A hold of `MAX_HOLD_PERIODS` cannot bridge a missing reconstruction.

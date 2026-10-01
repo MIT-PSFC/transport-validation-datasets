@@ -310,8 +310,6 @@ class MASTDataWorkflow(DataWorkflow):
     signal_attrs = SIGNAL_ATTRS
 
     min_pulse_length = 0.2
-    min_usable_time = 0.1
-    min_segment_length = 0.1
     valid_filter = {
         # Only care about the magnitude of ip. These shots run 0.4-0.9 MA, so a
         # 1.5 MA reading is a broken record rather than a real current.
@@ -322,21 +320,25 @@ class MASTDataWorkflow(DataWorkflow):
         # 1.9 percent of the times iteration 12 kept, mostly ramp phases
         "energy_mhd": {"min": 5e3, "max": 2e6},
         "beta_tor_norm": {"min": 0.01, "max": 10.0},
-        # Sample validity, distinct from the transient gate below: MAST total
+        # Sample validity, distinct from the radiative collapse gate below: MAST total
         # input power tops out near 5 MW, so a recorded radiated power above
         # 4 MW is not a valid measurement.
         "power_radiated": {"min": 0.0, "max": 4e6},
         # Finite only, it11 had 10 NaN power_ohm samples in 23999 and 24991
         "power_ohm": {},
     }
-    # Both thresholds are empirical, and both gate the radiative or ohmic
-    # collapse at the end of a shot rather than normal operation: the closest
-    # ordinary approach found while porting these was shot 29153, whose ohmic
-    # power peaks at 3.9 MW right before the end of the shot.
+    # Empirical, gates the ohmic collapse at the end of a shot rather than normal operation:
+    # the closest ordinary approach found while porting it was shot 29153,
+    # whose ohmic power peaks at 3.9 MW right before the end of the shot.
     transient_filter = {
-        "power_radiated": 3.0e6,
         "power_ohm": 5.0e6,
     }
+    # Radiative collapse, see DataWorkflow.max_radiated_fraction.
+    # Fires on no kept time of the it11 store,
+    # and neither it nor the absolute 3 MW cut it replaces fires on 25 shots read from source.
+    # The floor keeps the current ramp, whose ohmic power reads 0 for milliseconds, from counting.
+    max_radiated_fraction = 2.0
+    radiated_collapse_floor = 1e6
     # MAST's ip record runs through the current quench, so a small ip cutoff
     # still lets disruption transients in. Has to be longer than C-Mod's 20 ms.
     end_margin = 0.04
