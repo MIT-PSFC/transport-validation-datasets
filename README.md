@@ -23,8 +23,8 @@ the shot (`source_package`, `source_version`, `source_url`,
 shot they hold (a key the shots disagree on becomes a JSON list of its
 values), and add the build (`build_time`, `build_host`), this package's state
 at build time, and the run configuration as JSON: `device_settings` (the
-`[<device>]` table), `filters` (every threshold the unprocessed stage
-applied), and `fit_settings` (the fit staging knobs).
+`[<device>]` table), `filters` (every threshold the unprocessed and stack
+stages applied, see [Filtering](#filtering)), and `fit_settings` (the fit staging knobs).
 
 # Workflow
 
@@ -57,7 +57,7 @@ that follow them and `fresh_profile` / `fresh_equilibrium` mark the grid times
 that carry a sample of their own. A sample is held for at most
 `MAX_HOLD_PERIODS` of its own sampling period, so nothing is carried across the
 end of the shot or a stretch the filtering cut away. By default the slices
-whose Te and ne fits did not both come back usable are ignored, as though the
+the stack stage screens out (see [Filtering](#filtering)) are ignored, as though the
 shot had no Thomson sample there.
 
 | Group | Signals | Dimensions |
@@ -76,6 +76,69 @@ one schema. Everything is float32, flags included, because the padding between
 shots of different lengths is NaN.
 The power signals (power_ohm/radiated/nbi/ic/lh) are clipped at zero since source records often dip negative
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
+
+# Filtering
+
+Each stage drops what it can judge from its own inputs.
+The stores record every threshold in their `filters` attribute.
+
+Unprocessed stage (`filter_and_plot`), per shot:
+
+1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
+2. Everything from `end_margin` before the last finite `ip` on is cut.
+3. Grid times outside the device's `valid_filter` bounds are cut.
+4. Everything from the first time a `transient_filter` signal, smoothed over 5 ms, exceeds its threshold is cut.
+5. Kept segments shorter than `min_segment_length` are cut.
+6. The shot is rejected when the kept span is shorter than `min_pulse_length`,
+   or the kept segments sum to less than `min_usable_time`.
+7. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
+   - a 0D signal that is NaN at every kept time
+   - a mean `power_radiated` below `min_mean_power_radiated` (likely faulty bolometry)
+   - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point.
+
+Fit stage: the Thomson screens in `cleaning.py` run on every sample before fitting,
+and the fit method's own checks give each slice a fit status.
+
+Stack stage (`_internal_shot_dataset`), per shot:
+
+1. The shots excluded or rejected by the unprocessed stage checks above are left out again.
+2. A slice is dropped (`usable_slice_mask`) when
+   - its Te or ne fit status is not usable (not OK or REPAIRED)
+   - Te at rho_tor_norm 1 is above `FLAT_TE_EDGE_RATIO` (0.4) of its peak,
+     a flat profile from inboard and outboard Thomson channels that disagree after mapping
+   - the 1 sigma band of Te or ne inside the LCFS is wider than the profile's peak,
+     one channel's huge error carried into the band
+
+   The previous slice holds over a dropped one like over any gap.
+3. The shot is dropped when its fitted density disagrees with the interferometer (`fit_rejection_reason`).
+   The shot median over its slices of mean(n_e over rho_tor_norm 0-1) / `n_e_line_average`
+   must sit inside the device's `density_ratio_bounds` (C-Mod 0.72-1.3, MAST 0.7-1.3).
+   The ratio is a proxy for the chord integral, and the bounds absorb its offset on each device.
+4. A reconstruction is unusable (`usable_reconstructions`) when its axis and boundary psi are not finite and meaningfully different,
+   or any value of its psirz or qpsi is not finite.
+   The previous reconstruction holds over it and it is not marked fresh.
+   The Thomson mapping of the fit stage skips it the same way.
+
+MAST starts at shot 23809 (`first_shot`).
+Before it the Thomson density reads ~0.87x the interferometer, against 0.98-1.00 after,
+indicating a large change in the Thomson density calibration.
+
+# Known limitations
+
+- **Thomson against interferometer.** Inside the density bounds the two still differ shot to shot.
+  The kept shots sit at 0.76-1.16 on C-Mod and 0.75-1.10 on MAST.
+- **MAST transients inside the kept windows.** Reconnection events and Ip spikes that stay under the transient thresholds remain,
+  e.g. 28203 at 0.343 s, where core Te drops from 0.55 to 0.12 keV, Ip spikes from 0.53 to 0.68 MA and P_rad reaches 2.8 MW.
+  The transient filter needs P_rad above 3 MW after smoothing, and only cuts from the first exceedance.
+- **MAST EFIT vertical glitches.** Single reconstructions jump zmagx and zbdry by 5-10 cm and come back at the next one,
+  e.g. 24623 at 0.29-0.33 s (though this is minor, 39 reconstructions in 26 shots out of ~1000 total shots).
+- **Equilibrium gaps.** A hold of `MAX_HOLD_PERIODS` cannot bridge a missing reconstruction.
+  Around one unusable MAST reconstruction the previous one covers 3 ms and the next 2 ms carry no equilibrium.
+  Many MAST shots also start their kept window 1-6 ms before their first reconstruction.
+- **C-Mod `power_ohm` is noise dominated at 1 kHz.** Its median sample-to-sample change is 45 percent of its level,
+  and it swings 0-2.5 MW timestep to timestep in some ohmic shots. We publish the raw value, but you could consider smoothing it.
+- **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
+  It is an artifact of the EFIT basis functions.
 
 # Running
 
