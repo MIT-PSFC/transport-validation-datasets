@@ -2512,7 +2512,7 @@ def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
     A run with no sample marked in can_start is cleared whole.
     can_start outside the runs is ignored, a marked sample just before a run does not start it.
 
-    _trim_and_keep_longest passes the grid times that a kept usable reconstruction reaches within the hold,
+    _trim_and_keep_longest passes the grid times that a usable reconstruction of the same run reaches within the hold,
     so every kept segment starts where the store will have an equilibrium.
     Equilibrium lapses inside a segment are left for the stack stage to show as gaps.
     It runs before keep_longest_segment, so a trimmed run is judged on what is left of it.
@@ -2544,14 +2544,15 @@ def _trim_and_keep_longest(
     reconstruction_usable: np.ndarray,
     clock_period: float,
 ) -> tuple[np.ndarray, list[float], int]:
-    """Start each kept segment where a kept reconstruction reaches, and keep only the longest.
+    """Start each kept segment where one of its own reconstructions reaches, and keep only the longest.
 
     A grid time has an equilibrium in the store when a kept usable reconstruction
     at or before it is within MAX_HOLD_PERIODS of the clock period (_hold_equilibrium).
-    _trim_segment_starts cuts each segment's leading grid times without one,
+    Only the segment kept here reaches the store, so only its own reconstructions are kept,
+    and a reconstruction in an earlier segment never starts a later one.
+    _trim_segment_starts cuts each segment's leading grid times that none of its own reconstructions reaches,
     then keep_longest_segment judges the segments on what is left.
-    The two repeat until the mask stops changing,
-    since a dropped segment can hold the reconstruction that reached the start of the longest.
+    Since each segment is trimmed as it would be if it alone were kept, one pass is exact.
 
     Args:
         keep: Mask over the uniform 1 kHz grid, True where the sample survived the filters. Not modified.
@@ -2564,20 +2565,25 @@ def _trim_and_keep_longest(
         the lengths [s] of the segments dropped for a longer one,
         and how many grid times the trims cut.
     """
-    dropped_lengths = []
-    n_trimmed = 0
-    while True:
-        reconstruction_kept = np.flatnonzero(reconstruction_usable & keep)
-        held_index, _ = _hold_onto_grid(
-            times, times[reconstruction_kept], True, clock_period
-        )
-        keep_trimmed = _trim_segment_starts(keep, held_index >= 0)
-        n_trimmed += int(keep.sum() - keep_trimmed.sum())
-        keep_next, dropped = keep_longest_segment(keep_trimmed, times)
-        dropped_lengths.extend(dropped)
-        if np.array_equal(keep_next, keep):
-            return keep_next, dropped_lengths, n_trimmed
-        keep = keep_next
+    keep = np.asarray(keep, dtype=bool)
+    reconstruction_kept = np.flatnonzero(reconstruction_usable & keep)
+    held_index, _ = _hold_onto_grid(
+        times, times[reconstruction_kept], True, clock_period
+    )
+    has_held = held_index >= 0
+    # Grid index of the reconstruction each grid time holds, and of the start of the run it sits in
+    held_row = np.full(keep.size, -1)
+    held_row[has_held] = reconstruction_kept[held_index[has_held]]
+    starts, _ = _kept_segments(keep)
+    is_start = np.zeros(keep.size, dtype=bool)
+    is_start[starts] = True
+    index_if_start = np.where(is_start, np.arange(keep.size), -1)
+    run_start = np.maximum.accumulate(index_if_start)
+    can_start = has_held & (held_row >= run_start)
+    keep_trimmed = _trim_segment_starts(keep, can_start)
+    n_trimmed = int(keep.sum() - keep_trimmed.sum())
+    keep_longest, dropped_lengths = keep_longest_segment(keep_trimmed, times)
+    return keep_longest, dropped_lengths, n_trimmed
 
 
 def usable_slice_mask(ds_fit: xr.Dataset) -> np.ndarray:

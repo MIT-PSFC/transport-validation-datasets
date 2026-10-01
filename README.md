@@ -107,12 +107,12 @@ Unprocessed stage (`filter_and_plot`), per shot:
    A transient does not end the shot, step 6 keeps the longest stretch around it.
    The unprocessed plots shade the transients red.
 5. The leading grid times of each segment are cut up to its first sample
-   that a kept usable reconstruction (`usable_reconstructions`) reaches
+   that a usable reconstruction (`usable_reconstructions`) of the same segment reaches
    within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock), since the store would have no equilibrium before it.
    This is mostly the early parts of a shot, before its first usable reconstruction.
 6. Only the longest segment is kept, shaded green in the accepted-shot plots.
-   Steps 5 and 6 repeat until neither changes anything,
-   since a dropped segment can hold the reconstruction that reached the start of the longest one.
+   Only the kept segment's reconstructions reach the store,
+   so step 5 trims each segment as if it alone were kept, and the longest is chosen after every trim.
 7. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod 0.5 s, MAST 0.2 s).
 8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a 0D signal that is NaN at every kept time
