@@ -181,6 +181,8 @@ uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_d
 `--help` lists every flag, and the stages resume: rerunning the same command
 picks up whatever is not on disk yet. Stack and publish are the exceptions,
 each always rebuilds its store.
+The fit stage plots every shot's fits to a PDF, about a minute per shot.
+`--skip_fit_plots` leaves them out. If a later fit stage is run without this flag it will plot the shots that have no PDF yet.
 
 # Configuration
 

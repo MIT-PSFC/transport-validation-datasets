@@ -100,6 +100,7 @@ class DatasetCLI:
         stage: str = "all",
         method: str = DEFAULT_METHOD,
         clean_fit_state: bool = False,
+        skip_fit_plots: bool = False,
         mb_per_chunk: int = 50,
         config: Path | str | None = None,
     ):
@@ -122,6 +123,8 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
+            skip_fit_plots: Leave out the fit stage's per-shot PDFs, about a minute per shot.
+                A later fit stage without it plots the shots that have no PDF yet.
             mb_per_chunk: Target size of each variable's chunks in the internal
                 Zarr store, which is chunked along the shot dimension.
             config: TOML file(s), comma separated, with the [cluster] table
@@ -146,7 +149,7 @@ class DatasetCLI:
             cluster_config=cluster_config,
             settings=settings,
         )
-        _execute(workflow, stage, clean_fit_state, mb_per_chunk)
+        _execute(workflow, stage, clean_fit_state, skip_fit_plots, mb_per_chunk)
 
     def mast(
         self,
@@ -158,6 +161,7 @@ class DatasetCLI:
         stage: str = "all",
         method: str = DEFAULT_METHOD,
         clean_fit_state: bool = False,
+        skip_fit_plots: bool = False,
         mb_per_chunk: int = 50,
         prepare_workers: int | None = None,
         config: Path | str | None = None,
@@ -181,6 +185,8 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
+            skip_fit_plots: Leave out the fit stage's per-shot PDFs, about a minute per shot.
+                A later fit stage without it plots the shots that have no PDF yet.
             mb_per_chunk: Target size of each variable's chunks in the internal
                 Zarr store, which is chunked along the shot dimension.
             prepare_workers: Threads used to read source data. None keeps the
@@ -208,16 +214,23 @@ class DatasetCLI:
             prepare_workers=prepare_workers,
             settings=settings,
         )
-        _execute(workflow, stage, clean_fit_state, mb_per_chunk)
+        _execute(workflow, stage, clean_fit_state, skip_fit_plots, mb_per_chunk)
 
 
-def _execute(workflow, stage: str, clean_fit_state: bool, mb_per_chunk: int):
+def _execute(
+    workflow,
+    stage: str,
+    clean_fit_state: bool,
+    skip_fit_plots: bool,
+    mb_per_chunk: int,
+):
     """Run the requested stages of an already built workflow.
 
     Args:
         workflow: The device's DataWorkflow.
         stage: Which stage to run, one of STAGES.
         clean_fit_state: Wipe the staged fit batches before fitting.
+        skip_fit_plots: Leave out the fit stage's per-shot PDFs.
         mb_per_chunk: Target size of each variable's chunks in the internal Zarr store.
 
     Raises:
@@ -230,7 +243,7 @@ def _execute(workflow, stage: str, clean_fit_state: bool, mb_per_chunk: int):
     if stage in ("fit", "all"):
         if clean_fit_state:
             workflow.clean_fit_state()
-        workflow.run_gp_fitting()
+        workflow.run_gp_fitting(skip_plots=skip_fit_plots)
     if stage in ("stack", "all"):
         workflow.stack_internal_dataset(mb_per_chunk=mb_per_chunk)
     if stage in ("publish", "all"):

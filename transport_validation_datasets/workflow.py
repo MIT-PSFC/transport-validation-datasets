@@ -1054,7 +1054,7 @@ class DataWorkflow(ABC):
         """
         return sorted(int(p.stem) for p in self.unprocessed_data_dir.glob("*.nc"))
 
-    def run_gp_fitting(self, max_pages: int | None = None):
+    def run_gp_fitting(self, max_pages: int | None = None, skip_plots: bool = False):
         """Run GP profile fitting on the unprocessed data files.
 
         The stages, each skipping work that already exists on disk:
@@ -1068,10 +1068,13 @@ class DataWorkflow(ABC):
            the SLURM cluster.
         3. Write the batch results out as one netCDF per shot into
            fit_shots_dir.
-        4. Plot the fits per shot into fit_plots_dir.
+        4. Plot the fits per shot into fit_plots_dir, unless skip_plots.
+           The plots take about a minute per shot, far longer than the rest on a cluster.
+           A later run without skip_plots plots the shots that have no PDF yet.
 
         Args:
             max_pages: Maximum number of pages to plot per shot. None plots all.
+            skip_plots: Leave out step 4.
         """
         shots = self.unprocessed_shots()
         skipped = {s for s in shots if self.fit_already_failed(s)}
@@ -1113,7 +1116,8 @@ class DataWorkflow(ABC):
             )
             dispatcher.run(batches)
         self.write_fit_results()
-        self.plot_fit_results(max_pages=max_pages)
+        if not skip_plots:
+            self.plot_fit_results(max_pages=max_pages)
 
     def clean_fit_state(self):
         """Delete every staged fit batch so the next run refits from scratch.
