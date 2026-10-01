@@ -44,7 +44,6 @@ from transport_validation_datasets.machine.mast.mast_dataset import (
     open_shot_sources,
 )
 from transport_validation_datasets.workflow import (
-    bridge_short_lapses,
     keep_longest_segment,
     kept_span,
 )
@@ -89,7 +88,7 @@ def _ip_window(summary: xr.Dataset, timebase: np.ndarray) -> np.ndarray:
 
     The ip part of DataWorkflow.filter_and_plot:
     before the end margin and inside the valid_filter ip bounds,
-    with the short lapses bridged and only the longest segment kept.
+    with only the longest segment kept.
     The other signals can only cut this down,
     so a shot too short here is too short for the workflow.
 
@@ -111,8 +110,7 @@ def _ip_window(summary: xr.Dataset, timebase: np.ndarray) -> np.ndarray:
         & (ip >= ip_bounds["min_abs"])
         & (ip <= ip_bounds["max_abs"])
     )
-    mask_bridged = bridge_short_lapses(mask_window)
-    mask_kept, _ = keep_longest_segment(mask_bridged, timebase)
+    mask_kept, _ = keep_longest_segment(mask_window, timebase)
     return mask_kept
 
 

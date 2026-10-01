@@ -76,7 +76,6 @@ def plot_unprocessed_data(
     transient_margin_time: float | None = None,
     radiated_limit: xr.DataArray | None = None,
     kept_spans: list[tuple[float, float]] | None = None,
-    bridged_spans: list[tuple[float, float]] | None = None,
     window_spans: list[tuple[float, float]] | None = None,
 ):
     """For all the 0D signals in the dataset, plot them over time and save the figure to disk.
@@ -104,11 +103,8 @@ def plot_unprocessed_data(
         transient_margin_time: Time of the transient cutoff [s], if one was found.
         radiated_limit: The smoothed power_radiated above which filter_and_plot finds a radiative collapse [W],
             drawn as a dashed line on the power subplot.
-        kept_spans: (start, end) time intervals kept by filter_and_plot that pass the filters,
+        kept_spans: (start, end) time intervals kept by filter_and_plot,
             shaded as green vertical bars on each subplot.
-        bridged_spans: (start, end) valid filter lapses filter_and_plot bridged,
-            from the last passing sample before to the first after,
-            shaded as yellow vertical bars on each subplot.
         window_spans: (start, end) time windows the shotlist asked for, shaded
             as blue vertical bars on each subplot.
     """
@@ -125,10 +121,6 @@ def plot_unprocessed_data(
         for ax in axes:
             for span_start, span_end in kept_spans:
                 ax.axvspan(span_start, span_end, color="green", alpha=0.2, linewidth=0)
-    if bridged_spans is not None:
-        for ax in axes:
-            for span_start, span_end in bridged_spans:
-                ax.axvspan(span_start, span_end, color="yellow", alpha=0.5, linewidth=0)
     if window_spans is not None:
         for ax in axes:
             for span_start, span_end in window_spans:

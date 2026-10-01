@@ -80,7 +80,7 @@ class CModDataWorkflow(DataWorkflow):
     valid_filter = {
         "ip": {"min_abs": 100e3},  # Only care about magnitude of ip
         "n_e_line_average": {"min": 1e18, "max": 6e20},
-        "energy_mhd": {"min": 3e3},
+        "energy_mhd": {"min": 2.7e3},
         "beta_tor_norm": {"min": 0.05, "max": 2.0},
     }
     transient_filter = {

@@ -90,7 +90,7 @@ The stores record every threshold in their `filters` attribute.
 A reconstruction is usable (`usable_reconstructions`) when its axis and boundary psi are finite and meaningfully different,
 and every value of its psirz and qpsi is finite.
 All three stages that touch the equilibrium contain only the usable ones:
-the unprocessed stage starts each kept segment where one reaches (step 6 below),
+the unprocessed stage starts each kept segment where one reaches (step 5 below),
 the fit stage maps the Thomson channels through the nearest one,
 and the stack stage holds them onto the grid, so an unusable one is held over by the one before and is not marked fresh.
 The reach and the hold both run on the reconstruction clock (`reconstruction_clock_period`), which counts the unusable ones too.
@@ -112,22 +112,15 @@ Unprocessed stage (`filter_and_plot`), per shot:
    It trails, since a centered average would see the ohmic spike of the current quench ahead and mask the collapse before it.
    The smoothed signals only place the cut, every kept signal is written as recorded.
    The unprocessed plots draw the collapse limit as a dashed red line.
-5. A valid filter lapse between two passing stretches is bridged when it is short next to both (`bridge_short_lapses`).
-   Each side needs `LAPSE_BRIDGE_RATIO` (50) passing samples per lapsed sample,
-   so 50 ms of passing data on both sides bridges 1 ms.
-   A 500 ms and a 200 ms stretch bridge up to 4 ms between them, a 900 ms and a 40 ms stretch bridge nothing.
-   Bridging repeats until it changes nothing, since a bridged lapse joins two stretches into a longer one.
-   A bridged lapse keeps its samples as they are, out of bounds or NaN.
-   The accepted-shot plots shade bridged lapses yellow and the passing stretches of the kept segment green.
-6. The leading grid times of each segment are cut up to its first passing sample
+5. The leading grid times of each segment are cut up to its first sample
    that a kept usable reconstruction (`usable_reconstructions`) reaches
    within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock), since the store would have no equilibrium before it.
    This is mostly the early parts of a shot, before its first usable reconstruction.
-7. Only the longest segment is kept.
-   Steps 6 and 7 repeat until neither changes anything,
+6. Only the longest segment is kept, shaded green in the accepted-shot plots.
+   Steps 5 and 6 repeat until neither changes anything,
    since a dropped segment can hold the reconstruction that reached the start of the longest one.
-8. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod 0.5 s, MAST 0.2 s).
-9. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
+7. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod 0.5 s, MAST 0.2 s).
+8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a 0D signal that is NaN at every kept time
    - a mean `power_radiated` below `min_radiated_fraction` of the mean heating power (a dead bolometer),
      1 percent on C-Mod and 2.5 percent on MAST
