@@ -1,11 +1,12 @@
 """MAST data workflow, built from the open-access Zarr stores on STFC ECHO S3.
 
-Most of it comes out of the level 2 store: https://s3.echo.stfc.ac.uk/mast/level2/shots/{shot}.zarr
-the 0D summary and equilibrium signals and the full GEQDSK reconstruction, whose flux map also places
-the Thomson channels in rho_tor_norm.
-Two things come from the level 1 store instead:
-the GEQDSK safety factor, which only level 1 publishes as a flux function (see equilibrium_qpsi),
-and the Thomson profiles, which level 2 only carries interpolated onto a uniform (R, t) grid and without uncertainties (see _thomson_dataset).
+Most of it comes out of the level 1 store: https://s3.echo.stfc.ac.uk/mast/level1/shots/{shot}.zarr
+- efm: the EFIT reconstruction, as the full GEQDSK block and the 0D equilibrium signals.
+  Its flux map also places the Thomson channels in rho_tor_norm.
+- esm: the ohmic power.
+- ayc: the Thomson profiles, see _thomson_dataset.
+The level 2 store (https://s3.echo.stfc.ac.uk/mast/level2/shots/{shot}.zarr)
+only supplies the summary signals: ip, power_nbi, n_e_line_average and power_radiated.
 
 No MDSplus is involved, so this workflow runs anywhere with internet access.
 Reads are slow, so staging runs in a thread pool of prepare_workers threads.
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import xarray as xr
-from disruption_py.core.utils.math import causal_boxcar_smooth, interp1
+from disruption_py.core.utils.math import interp1
 from loguru import logger
 
 from transport_validation_datasets import PACKAGE_ROOT
@@ -38,21 +39,8 @@ from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 S3_ENDPOINT = "https://s3.echo.stfc.ac.uk"
 LEVEL2_PATH = "mast/level2/shots"
 
-# The raw diagnostic output. Two groups are read:
-# EFM for the one GEQDSK field the level 2 store does not carry as a flux function (qpsi, see equilibrium_qpsi)
-# AYC for the Thomson profiles (see _thomson_dataset)
+# The raw diagnostic output, see the module docstring for the groups read
 LEVEL1_PATH = "mast/level1/shots"
-LEVEL1_EFM_GROUP = "efm"
-LEVEL1_TS_GROUP = "ayc"
-
-# Variables the ayc group must carry to be usable. Everything else it holds
-# (raw spectra, laser diagnostics, the pe product) is not needed here.
-REQUIRED_TS_VARIABLES = ("radius", "te", "te_error", "ne", "ne_error")
-
-# Two equilibrium samples closer than this are the same reconstruction slice
-# published on two timebases (level 2 keeps the level 1 values, on a longer
-# grid), so level 1 rows are matched to level 2 times, never interpolated [s].
-EQUILIBRIUM_TIME_TOL = 1e-4
 
 # Shotlist for the M7-M9 campaigns, built by shotlist.py
 DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "machine" / "mast" / "mast_shotlist_M7_M9"
@@ -65,9 +53,6 @@ TS_CHANNEL_Z = 0.0
 # Only used to find the last time worth putting on the timebase,
 # the real current cut is valid_filter["ip"].
 SHOT_WINDOW_MIN_IP = 100e3
-
-# Samples of the causal boxcar smoothing dIp/dt in the ohmic power calculation
-OHMIC_SMOOTHING_SAMPLES = 10
 
 # Channels this far outside the separatrix sit in the far SOL,
 # where mapping through a magnetics-only reconstruction is not trustworthy.
@@ -100,18 +85,18 @@ BRANCH_MAX_GAP = 0.08
 BRANCH_SMOOTH_HALFWIDTH = 0.05
 BRANCH_MIN_CHANNELS = 3
 
-# level 2 equilibrium signal -> standardized name.
+# efm signal -> standardized name.
 # All 0D, interpolated onto the 1 kHz timebase.
 EQUILIBRIUM_SIGNALS = {
     # plasma_energy (EFM_PLASMA_ENERGY) is 3/2 the volume integral of the reconstructed pressure.
-    # Not wmhd (EFM_WPLASMD), the diamagnetic energy, built on a measured diamagnetic flux that is 0 in level 1
+    # Not wplasmd (EFM_WPLASMD), the diamagnetic energy, built on a measured diamagnetic flux that is 0 in level 1
     "plasma_energy": "energy_mhd",
-    "beta_tor_normal": "beta_tor_norm",
+    "betan": "beta_tor_norm",
     "minor_radius": "minor_radius",
     "elongation": "elongation",
-    "triangularity_upper": "triangularity_upper",
-    "triangularity_lower": "triangularity_lower",
-    "geometric_axis_r": "geometric_axis_r",
+    "triang_upper": "triangularity_upper",
+    "triang_lower": "triangularity_lower",
+    "geom_axis_rc": "geometric_axis_r",
 }
 
 # level 2 summary signal -> standardized name, same treatment
@@ -120,34 +105,39 @@ SUMMARY_SIGNALS = {
     "power_radiated": "power_radiated",
 }
 
-# GEQDSK 1D flux-function profiles: freeqdsk name -> level 2 equilibrium name.
+# GEQDSK 1D flux-function profiles: freeqdsk name -> efm name.
 # All are published on the uniform psi_norm grid the GEQDSK block wants.
-# qpsi is absent here on purpose, level 2 only has q along the midplane
 GEQDSK_PROFILES = {
-    "fpol": "f",
-    "pres": "pressure",
-    "ffprime": "f_df_dpsi",
-    "pprime": "dpressure_dpsi",
+    "fpol": "fpsi_c",
+    "pres": "ppsi_c",
+    "ffprime": "ffprime",
+    "pprime": "pprime",
+    "qpsi": "qpsi_c",
 }
 
-# Level 2 groups and the signals in them a shot must carry to be worth staging.
-# Everything else is derived.
-# summary/power_nbi is required rather than zero filled: nothing in the archive
-# can tell a shot whose beams were off from one whose beam record is missing.
-REQUIRED_LEVEL2_SIGNALS = {
-    "summary": ("ip", "power_nbi", *SUMMARY_SIGNALS),
-    "equilibrium": (
-        "psi",
+# Groups and the signals in them a shot must carry to be worth staging, in the order they are opened.
+# ayc goes first, it is the cheapest to open and shots from before AYC was installed have none.
+# Everything else is derived, or optional like the GEQDSK profiles and the limiter.
+REQUIRED_LEVEL1_SIGNALS = {
+    "ayc": ("radius", "te", "te_error", "ne", "ne_error"),
+    "efm": (
+        "psirz",
+        "gridr",
+        "gridz",
         "psi_axis",
         "psi_boundary",
         "magnetic_axis_r",
         "magnetic_axis_z",
-        "ip",
+        "plasma_current_c",
         "bvac_rmag",
-        "li",
-        "vloop_dynamic",
         *EQUILIBRIUM_SIGNALS,
     ),
+    "esm": ("pphix",),
+}
+# summary/power_nbi is required rather than zero filled: nothing in the archive
+# can tell a shot whose beams were off from one whose beam record is missing.
+REQUIRED_LEVEL2_SIGNALS = {
+    "summary": ("ip", "power_nbi", *SUMMARY_SIGNALS),
 }
 
 # Per-variable attributes, IMAS data dictionary path under "ref"
@@ -178,7 +168,10 @@ SIGNAL_ATTRS = {
         "ref": "/summary/line_average/n_e/value",
     },
     "power_ohm": {
-        "description": "Ohmic heating power, Ip * (V_loop - L dIp/dt), clipped at 0",
+        "description": (
+            "Ohmic heating power, Ip * V_loop at the LCFS minus the rate of change of the stored poloidal magnetic energy "
+            "(ESM_PPHIX), clipped at 0"
+        ),
         "units": "W",
         "ref": "/summary/global_quantities/power_ohm/value",
     },
@@ -373,14 +366,16 @@ class ShotSources:
 
     Attributes:
         summary: The level 2 summary group.
-        equilibrium: The level 2 equilibrium group.
+        efm: The level 1 efm group, the equilibrium reconstruction.
+        esm: The level 1 esm group, for the ohmic power.
         ds_thomson: The usable Thomson slices inside the shot window,
             on their own timebase (see _thomson_dataset).
         timebase: The shot's uniform 1 kHz timebase [s].
     """
 
     summary: xr.Dataset
-    equilibrium: xr.Dataset
+    efm: xr.Dataset
+    esm: xr.Dataset
     ds_thomson: xr.Dataset
     timebase: np.ndarray
 
@@ -518,15 +513,12 @@ class MASTDataWorkflow(DataWorkflow):
         if sources is None:
             return None
 
-        limiter = _open_store_group(LEVEL2_PATH, shot, "wall")
-        if limiter is None and _store_path_exists(f"{LEVEL2_PATH}/{shot}.zarr/wall"):
-            return None
-
         timebase = sources.timebase
-        ds_0d = _zero_d_dataset(shot, sources.summary, sources.equilibrium, timebase)
-        ds_equilibrium = snap_to_grid(
-            _equilibrium_dataset(shot, sources.equilibrium, limiter), timebase
+        ds_0d = _zero_d_dataset(
+            shot, sources.summary, sources.efm, sources.esm, timebase
         )
+        ds_equilibrium_efit = _equilibrium_dataset(shot, sources.efm)
+        ds_equilibrium = snap_to_grid(ds_equilibrium_efit, timebase)
         ds_thomson = snap_to_grid(sources.ds_thomson, timebase)
 
         ds = xr.merge(
@@ -736,10 +728,9 @@ def _branch_disagreement_errors(
 def open_shot_sources(shot: int) -> ShotSources | None:
     """Open one shot's stores and check they carry everything get_source_dataset reads.
 
+    The groups open in the order of REQUIRED_LEVEL1_SIGNALS, then REQUIRED_LEVEL2_SIGNALS,
+    and the first one missing a signal fails the shot.
     The shot window ends at the last plasma current above SHOT_WINDOW_MIN_IP.
-
-    The Thomson group is checked first, it is the cheapest to open
-    and shots from before AYC was installed have none.
 
     Args:
         shot: Shot number to open.
@@ -749,36 +740,28 @@ def open_shot_sources(shot: int) -> ShotSources | None:
         which is worth retrying on the next run.
 
     Raises:
-        MissingSourceError: If the shot has no store, a required signal,
+        MissingSourceError: If the shot has no store, a required group or signal,
             plasma current, or usable Thomson slice.
     """
-    thomson = _open_store_group(LEVEL1_PATH, shot, LEVEL1_TS_GROUP)
-    if thomson is None:
-        if _store_path_exists(f"{LEVEL1_PATH}/{shot}.zarr/{LEVEL1_TS_GROUP}"):
-            return None
-        raise MissingSourceError(
-            f"No level 1 {LEVEL1_TS_GROUP} Thomson group for this shot."
-        )
-    missing_ts = [v for v in REQUIRED_TS_VARIABLES if v not in thomson]
-    if missing_ts:
-        raise MissingSourceError(
-            f"Missing level 1 {LEVEL1_TS_GROUP} signals: {', '.join(missing_ts)}."
-        )
+    groups = {}
+    for store_path, required, level in (
+        (LEVEL1_PATH, REQUIRED_LEVEL1_SIGNALS, "level 1"),
+        (LEVEL2_PATH, REQUIRED_LEVEL2_SIGNALS, "level 2"),
+    ):
+        for group, names in required.items():
+            ds_group = _open_store_group(store_path, shot, group)
+            if ds_group is None:
+                if _store_path_exists(f"{store_path}/{shot}.zarr/{group}"):
+                    return None
+                raise MissingSourceError(f"No {level} {group} group for this shot.")
+            missing = [f"{group}/{name}" for name in names if name not in ds_group]
+            if missing:
+                raise MissingSourceError(
+                    f"Missing {level} signals: {', '.join(missing)}."
+                )
+            groups[group] = ds_group
 
-    level2 = {}
-    missing = []
-    for group, names in REQUIRED_LEVEL2_SIGNALS.items():
-        ds_group = _open_store_group(LEVEL2_PATH, shot, group)
-        if ds_group is None:
-            if _store_path_exists(f"{LEVEL2_PATH}/{shot}.zarr/{group}"):
-                return None
-            raise MissingSourceError(f"No level 2 {group} group for this shot.")
-        missing += [f"{group}/{name}" for name in names if name not in ds_group]
-        level2[group] = ds_group
-    if missing:
-        raise MissingSourceError(f"Missing level 2 signals: {', '.join(missing)}.")
-
-    summary = level2["summary"]
+    summary = groups["summary"]
     summary_time = summary["time"].values
     ip = np.asarray(summary["ip"].values, dtype=float)
     in_shot = np.abs(ip) > SHOT_WINDOW_MIN_IP
@@ -786,14 +769,15 @@ def open_shot_sources(shot: int) -> ShotSources | None:
         raise MissingSourceError(f"No plasma current above {SHOT_WINDOW_MIN_IP:.0f} A.")
     timebase = make_uniform_1kHz_timebase(float(summary_time[in_shot][-1]))
 
-    ds_thomson = _thomson_dataset(shot, thomson, timebase)
+    ds_thomson = _thomson_dataset(shot, groups["ayc"], timebase)
     if ds_thomson.sizes["idx"] == 0:
         raise MissingSourceError(
             "No Thomson slices with usable data within the shot window."
         )
     return ShotSources(
         summary=summary,
-        equilibrium=level2["equilibrium"],
+        efm=groups["efm"],
+        esm=groups["esm"],
         ds_thomson=ds_thomson,
         timebase=timebase,
     )
@@ -867,51 +851,11 @@ def _open_store_group(store_path: str, shot: int, group: str) -> xr.Dataset | No
         return None
 
 
-def _ohmic_power(
-    summary_time: np.ndarray,
-    ip: np.ndarray,
-    eq_time: np.ndarray,
-    li: np.ndarray,
-    r_axis: np.ndarray,
-    v_loop: np.ndarray,
-    timebase: np.ndarray,
-) -> np.ndarray:
-    """Compute the ohmic heating power on the timebase.
-
-    P_oh = Ip * (V_loop - L dIp/dt), with the internal inductance
-    L = mu0 * R_axis * li / 2 and the dynamic LCFS loop voltage from the
-    equilibrium. dIp/dt is smoothed with a causal boxcar first, since
-    differentiating the raw current is noisy. Negative results are clipped to
-    zero: they mean the inductive term overshot, not that the plasma is
-    generating power.
-
-    Args:
-        summary_time: Timebase of the summary signals [s].
-        ip: Plasma current on summary_time [A].
-        eq_time: Timebase of the equilibrium signals [s].
-        li: Internal inductance on eq_time.
-        r_axis: Magnetic axis major radius on eq_time [m].
-        v_loop: Dynamic LCFS loop voltage on eq_time [V].
-        timebase: Uniform 1 kHz timebase to return the power on [s].
-
-    Returns:
-        Ohmic heating power on timebase [W].
-    """
-    dip_dt = np.gradient(ip, summary_time)
-    if dip_dt.size >= OHMIC_SMOOTHING_SAMPLES:
-        dip_dt = causal_boxcar_smooth(dip_dt, OHMIC_SMOOTHING_SAMPLES)
-    inductance = 2.0e-7 * np.pi * r_axis * li  # mu0 * R * li / 2
-
-    v_resistive = interp1(eq_time, v_loop, timebase) - interp1(
-        eq_time, inductance, timebase
-    ) * interp1(summary_time, dip_dt, timebase)
-    return np.clip(interp1(summary_time, ip, timebase) * v_resistive, 0.0, None)
-
-
 def _zero_d_dataset(
     shot: int,
     summary: xr.Dataset,
-    equilibrium: xr.Dataset,
+    efm: xr.Dataset,
+    esm: xr.Dataset,
     timebase: np.ndarray,
 ) -> xr.Dataset:
     """Interpolate the 0D signals onto the timebase under standardized names.
@@ -921,18 +865,19 @@ def _zero_d_dataset(
 
     Args:
         shot: Shot number being read.
-        summary: The store's summary group.
-        equilibrium: The store's equilibrium group.
+        summary: The level 2 summary group.
+        efm: The level 1 efm group.
+        esm: The level 1 esm group.
         timebase: Uniform 1 kHz timebase [s].
 
     Returns:
         Dataset of 0D signals on dim "idx", with "time" and "shot" coords.
     """
     summary_time = summary["time"].values
-    eq_time = equilibrium["time"].values
+    eq_time = np.asarray(efm["time"].values, dtype=float)
 
     data = {
-        name: interp1(eq_time, equilibrium[source].values, timebase)
+        name: interp1(eq_time, efm[source].values, timebase)
         for source, name in EQUILIBRIUM_SIGNALS.items()
     }
     data.update(
@@ -943,24 +888,19 @@ def _zero_d_dataset(
     )
 
     ip = np.asarray(summary["ip"].values, dtype=float)
-    data["ip"] = np.abs(interp1(summary_time, ip, timebase))
+    ip_on_timebase = interp1(summary_time, ip, timebase)
+    data["ip"] = np.abs(ip_on_timebase)
     # bvac_rmag is the vacuum field at the magnetic axis. Rescale it by 1/R to
     # the geometric axis, so b0 is referenced the same way as on the other
     # devices (C-Mod rout, D3D rsurf, TCV R_geom).
-    data["b0"] = np.abs(
-        interp1(eq_time, equilibrium["bvac_rmag"].values, timebase)
-        * interp1(eq_time, equilibrium["magnetic_axis_r"].values, timebase)
-        / data["geometric_axis_r"]
-    )
-    data["power_ohm"] = _ohmic_power(
-        summary_time,
-        ip,
-        eq_time,
-        equilibrium["li"].values,
-        equilibrium["magnetic_axis_r"].values,
-        equilibrium["vloop_dynamic"].values,
-        timebase,
-    )
+    bvac_rmag = interp1(eq_time, efm["bvac_rmag"].values, timebase)
+    r_axis = interp1(eq_time, efm["magnetic_axis_r"].values, timebase)
+    data["b0"] = np.abs(bvac_rmag * r_axis / data["geometric_axis_r"])
+    # esm sits on a 20 us axis but only holds values at the reconstruction times
+    esm_time = np.asarray(esm["time"].values, dtype=float)
+    pphix = np.asarray(esm["pphix"].values, dtype=float)
+    has_pphix = np.isfinite(pphix)
+    data["power_ohm"] = interp1(esm_time[has_pphix], pphix[has_pphix], timebase)
     data["power_nbi"] = interp1(summary_time, summary["power_nbi"].values, timebase)
     # MAST has no ICRF or lower hybrid, zero where ip is valid
     data["power_ic"] = data["ip"] * 0.0
@@ -1012,109 +952,84 @@ def _optional_rows(
     return _time_first(source[name])
 
 
-def equilibrium_qpsi(shot: int, eq_time: np.ndarray, n_psi: int) -> np.ndarray:
-    """Read the safety factor profile from the level 1 EFM reconstruction.
+def efm_flux_map(efm: xr.Dataset) -> xr.DataArray:
+    """Read the poloidal flux map of the efm group on its own grid.
 
-    The level 2 store's own "q" is q(R) along the midplane (its own label says
-    "q(r) at z=0"), which is not the GEQDSK 1D block's q(psi), so this is the
-    one GEQDSK field that has to come from level 1. Both stores publish the
-    same EFM reconstruction (their psi_axis agrees bit for bit at shared
-    times), so level 1 rows are matched to the level 2 slice times within
-    EQUILIBRIUM_TIME_TOL rather than interpolated. Level 2 covers a longer
-    window than level 1, and those extra slices come back NaN.
+    psirz shares its radial dimension with the 129-point radial profiles (jr, qr, ...),
+    so it is NaN everywhere off its own gridr points.
+    Those points sit up to one float32 step (~1e-7 m) off gridr itself,
+    and the union's closest points are 3e-4 m apart, hence the nearest match within 1e-6 m.
 
     Args:
-        shot: Shot number being read.
-        eq_time: Level 2 equilibrium slice times [s].
-        n_psi: Points on the psi grid, to shape the fallback.
+        efm: The shot's level 1 efm group.
 
     Returns:
-        The (n_time, n_psi) safety factor, NaN where level 1 has no slice.
+        The flux map [Wb/rad] on dims (time, major_radius, z), with gridr and gridz as coordinates.
     """
-    qpsi = np.full((eq_time.size, n_psi), np.nan)
-    efm = _open_store_group(LEVEL1_PATH, shot, LEVEL1_EFM_GROUP)
-    if efm is None or "qpsi_c" not in efm:
-        logger.warning(f"Shot {shot}: no level 1 qpsi_c, staging qpsi as NaN")
-        return qpsi
-
-    source_time = np.asarray(efm["time"].values, dtype=float)
-    source_qpsi = _time_first(efm["qpsi_c"])
-    if source_qpsi.shape[1] != n_psi:
-        logger.warning(
-            f"Shot {shot}: level 1 qpsi_c has {source_qpsi.shape[1]} psi points "
-            f"against level 2's {n_psi}, staging qpsi as NaN"
-        )
-        return qpsi
-
-    nearest = np.abs(source_time[:, None] - eq_time[None, :]).argmin(axis=0)
-    matched = np.abs(source_time[nearest] - eq_time) <= EQUILIBRIUM_TIME_TOL
-    qpsi[matched] = source_qpsi[nearest[matched]]
-    return qpsi
+    r_grid = efm["gridr"].values
+    z_grid = efm["gridz"].values
+    psirz = efm["psirz"].sel(
+        profile_r=r_grid, profile_z=z_grid, method="nearest", tolerance=1e-6
+    )
+    psirz = psirz.rename(profile_r="major_radius", profile_z="z")
+    psirz = psirz.assign_coords(major_radius=r_grid, z=z_grid)
+    return psirz.transpose("time", "major_radius", "z")
 
 
-def _equilibrium_dataset(
-    shot: int, equilibrium: xr.Dataset, limiter: xr.Dataset | None
-) -> xr.Dataset:
+def _equilibrium_dataset(shot: int, efm: xr.Dataset) -> xr.Dataset:
     """Build the full GEQDSK reconstruction, on the EFIT timebase.
 
-    Everything comes from the level 2 equilibrium group except qpsi (see
-    equilibrium_qpsi) and the limiter contour (the store's wall group).
-    Profiles the store is missing are staged as NaN rather than dropping the
-    shot.
+    Profiles and contours the group is missing are staged as NaN rather than dropping the shot.
 
     Args:
         shot: Shot number being read.
-        equilibrium: The store's equilibrium group.
-        limiter: The store's wall group, or None when it has none.
+        efm: The shot's level 1 efm group.
 
     Returns:
         Dataset on dim "idx" with "time"/"shot" coords, in the freeqdsk
         canonical names (see machine.generic.make_geqdsk_dataset), carrying the
         COCOS number as an attribute.
     """
-    eq_time = np.asarray(equilibrium["time"].values, dtype=float)
-    n_psi = equilibrium.sizes["psi_norm"]
-    # Named dimension transpose so the array layout matches the labels below
-    psirz = equilibrium["psi"].transpose("time", "major_radius", "z").values
-    current = np.asarray(equilibrium["ip"].values, dtype=float)
-    r_grid = np.asarray(equilibrium["major_radius"].values, dtype=float)
+    eq_time = np.asarray(efm["time"].values, dtype=float)
+    n_psi = efm.sizes["psi_norm"]
+    psi_map = efm_flux_map(efm)
+    psirz = np.asarray(psi_map.values, dtype=float)
+    current = np.asarray(efm["plasma_current_c"].values, dtype=float)
+    r_grid = np.asarray(efm["gridr"].values, dtype=float)
     # MAST publishes no RCENTR, so the grid midpoint serves as the reference radius.
     # A reader rebuilds the vacuum field as bcentr*rcentr/R, which has to land on fpol at the boundary.
     # So the published vacuum field, given at the magnetic axis, is rescaled by 1/R onto rcentr.
     rcentr = r_grid[len(r_grid) // 2]
-    bcentr = (
-        np.asarray(equilibrium["bvac_rmag"].values, dtype=float)
-        * np.asarray(equilibrium["magnetic_axis_r"].values, dtype=float)
-        / rcentr
-    )
+    bvac_rmag = np.asarray(efm["bvac_rmag"].values, dtype=float)
+    r_axis = np.asarray(efm["magnetic_axis_r"].values, dtype=float)
+    bcentr = bvac_rmag * r_axis / rcentr
     profiles = {
-        name: _optional_rows(shot, equilibrium, source, (eq_time.size, n_psi))
+        name: _optional_rows(shot, efm, source, (eq_time.size, n_psi))
         for name, source in GEQDSK_PROFILES.items()
     }
-    n_boundary = equilibrium.sizes.get("n_boundary_coords", 1)
+    n_boundary = efm.sizes.get("lcfs_coords", 1)
     boundary = {
-        name: _optional_rows(shot, equilibrium, source, (eq_time.size, n_boundary))
+        name: _optional_rows(shot, efm, source, (eq_time.size, n_boundary))
         for name, source in (("rbdry", "lcfs_r"), ("zbdry", "lcfs_z"))
     }
-    if limiter is None or "limiter_r" not in limiter:
-        logger.warning(f"Shot {shot}: no limiter contour in the store")
+    if "limiterr" not in efm or "limiterz" not in efm:
+        logger.warning(f"Shot {shot}: no limiter contour in efm")
         rlim = zlim = None
     else:
-        rlim = np.asarray(limiter["limiter_r"].values, dtype=float)
-        zlim = np.asarray(limiter["limiter_z"].values, dtype=float)
+        rlim = np.asarray(efm["limiterr"].values, dtype=float)
+        zlim = np.asarray(efm["limiterz"].values, dtype=float)
 
     return make_geqdsk_dataset(
         shot_id=shot,
         times=eq_time,
         r_grid=r_grid,
-        z_grid=equilibrium["z"].values,
-        rmagx=np.asarray(equilibrium["magnetic_axis_r"].values, dtype=float),
-        zmagx=np.asarray(equilibrium["magnetic_axis_z"].values, dtype=float),
-        simagx=np.asarray(equilibrium["psi_axis"].values, dtype=float),
-        sibdry=np.asarray(equilibrium["psi_boundary"].values, dtype=float),
+        z_grid=np.asarray(efm["gridz"].values, dtype=float),
+        rmagx=r_axis,
+        zmagx=np.asarray(efm["magnetic_axis_z"].values, dtype=float),
+        simagx=np.asarray(efm["psi_axis"].values, dtype=float),
+        sibdry=np.asarray(efm["psi_boundary"].values, dtype=float),
         bcentr=bcentr,
         current=current,
-        qpsi=equilibrium_qpsi(shot, eq_time, n_psi),
         psirz=psirz,
         cocos_input=efit_cocos_from_signs(current, bcentr),
         rcentr=rcentr,

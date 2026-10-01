@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "dask>=2026",
-    "disruption-py>=0.14.0",
+    "disruption-py==0.14.0",
     "fire>=0.7.1",
     "freeqdsk>=0.5.2",
     "matplotlib>=3.11.1",

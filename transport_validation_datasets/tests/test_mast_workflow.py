@@ -18,7 +18,6 @@ from transport_validation_datasets.machine.mast.mast_dataset import (
     MASTDataWorkflow,
     _branch_disagreement_errors,
     _inboard_channels,
-    _ohmic_power,
     _store_path_exists,
     _thomson_dataset,
 )
@@ -45,62 +44,6 @@ def mast_workflow(test_dir, shotlist=None, **kwargs) -> MASTDataWorkflow:
         data_assembly_dir=test_dir,
         **kwargs,
     )
-
-
-class TestOhmicPower:
-    def test_resistive_power_is_ip_times_resistive_voltage(self):
-        # Flat current, so the inductive term vanishes and P = Ip * V_loop
-        timebase = np.linspace(0.0, 0.1, 11)
-        ip = np.full(timebase.size, 4.0e5)
-        v_loop = np.full(timebase.size, 2.0)
-
-        power = _ohmic_power(
-            summary_time=timebase,
-            ip=ip,
-            eq_time=timebase,
-            li=np.full(timebase.size, 1.0),
-            r_axis=np.full(timebase.size, 0.9),
-            v_loop=v_loop,
-            timebase=timebase,
-        )
-
-        assert np.allclose(power, 4.0e5 * 2.0)
-
-    def test_negative_power_clipped_to_zero(self):
-        # A negative loop voltage would give negative ohmic power,
-        # which means the inductive term overshot
-        timebase = np.linspace(0.0, 0.1, 11)
-
-        power = _ohmic_power(
-            summary_time=timebase,
-            ip=np.full(timebase.size, 4.0e5),
-            eq_time=timebase,
-            li=np.full(timebase.size, 1.0),
-            r_axis=np.full(timebase.size, 0.9),
-            v_loop=np.full(timebase.size, -2.0),
-            timebase=timebase,
-        )
-
-        assert (power == 0.0).all()
-
-    def test_rising_current_costs_inductive_power(self):
-        timebase = np.linspace(0.0, 0.1, 51)
-        rising = np.linspace(1.0e5, 5.0e5, timebase.size)
-        flat = np.full(timebase.size, 3.0e5)
-        args = dict(
-            eq_time=timebase,
-            li=np.full(timebase.size, 1.0),
-            r_axis=np.full(timebase.size, 0.9),
-            v_loop=np.full(timebase.size, 5.0),
-            timebase=timebase,
-        )
-
-        ramp = _ohmic_power(summary_time=timebase, ip=rising, **args)
-        steady = _ohmic_power(summary_time=timebase, ip=flat, **args)
-
-        # Compared at the point the two currents cross, so only dIp/dt differs
-        i_mid = timebase.size // 2
-        assert ramp[i_mid] < steady[i_mid]
 
 
 def thomson_group(times, radius, te, ne, error_frac=0.1) -> xr.Dataset:
