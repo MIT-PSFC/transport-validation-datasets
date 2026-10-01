@@ -13,7 +13,7 @@ and `machine/cmod/dispy_methods.py`. The GEQDSK block's attributes are shared
 variable onto that convention.
 Each unprocessed file records the COCOS index of its GEQDSK signals in a root
 attribute `cocos`. The final dataset carries it as the per-shot variable `cocos`.
-It is identified per shot from the signs of the reconstruction's own Ip, B0, psi and q (`cocos_from_signs`):
+It is identified per shot from the signs of the reconstruction's own Ip, B0, psi and q (`cocos_from_signs`).
 The psi signals are per radian for MAST and C-Mod from EFIT, while the IMAS nodes their `ref` points at hold the total flux in Wb, in COCOS 17.
 
 Every file records where it came from in its root attributes.
@@ -160,6 +160,7 @@ indicating a large change in the Thomson density calibration.
   Around one unusable MAST reconstruction the previous one covers 3 ms and the next 2 ms carry no equilibrium.
 - **C-Mod `power_ohm` is noise dominated at 1 kHz.** Its median sample-to-sample change is 45 percent of its level,
   and it swings 0-2.5 MW timestep to timestep in some ohmic shots. We publish the raw value, but you could consider smoothing it.
+- **MAST `power_ohm` is interpolated across missing ESM samples.** Some converged reconstructions have no `pphix`, and the interpolation runs straight across them, up to 25 ms at flat-top in 24891.
 - **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
   It is an artifact of the EFIT basis functions.
 

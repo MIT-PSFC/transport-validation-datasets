@@ -8,6 +8,7 @@ import pytest
 import xarray as xr
 
 from transport_validation_datasets.machine.generic import (
+    cocos_from_signs,
     make_uniform_1kHz_timebase,
     snap_to_grid,
 )
@@ -142,3 +143,27 @@ class TestMakeUniform1kHzTimebase:
         times = make_uniform_1kHz_timebase(0.0104)
 
         assert times[-1] >= 0.0104
+
+
+class TestCocosFromSigns:
+    @pytest.mark.parametrize(
+        "ip_sign, b0_sign, psi_sign, cocos",
+        [(-1, -1, 1, 7), (1, 1, 1, 1), (1, -1, -1, 3)],
+        ids=["cmod_normal_field", "cmod_reversed_field", "mast"],
+    )
+    def test_signs_give_the_device_cocos(self, ip_sign, b0_sign, psi_sign, cocos):
+        # Three reconstructions, one non-converged, and q > 0 as both EFITs write it
+        current = ip_sign * np.array([8e5, np.nan, 7e5])
+        bcentr = b0_sign * np.array([5.4, np.nan, 5.3])
+        simagx = np.array([-0.05, np.nan, -0.04])
+        sibdry = simagx + psi_sign * 0.11
+        qpsi = np.tile(np.linspace(1.0, 4.0, 5), (3, 1))
+        qpsi[1] = np.nan
+
+        assert cocos_from_signs(current, bcentr, simagx, sibdry, qpsi) == cocos
+
+    @pytest.mark.filterwarnings("ignore:All-NaN slice")
+    def test_no_reconstruction_falls_back_to_1(self):
+        nan = np.full(3, np.nan)
+
+        assert cocos_from_signs(nan, nan, nan, nan, np.full((3, 5), np.nan)) == 1
