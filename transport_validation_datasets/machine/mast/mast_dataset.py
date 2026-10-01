@@ -130,6 +130,8 @@ REQUIRED_LEVEL1_SIGNALS = {
         "magnetic_axis_z",
         "plasma_current_c",
         "bvac_rmag",
+        "bvac_r",
+        "bvac_val",
         *EQUILIBRIUM_SIGNALS,
     ),
     "esm": ("pphix",),
@@ -818,7 +820,9 @@ def _zero_d_dataset(
     bvac_rmag = interp1(eq_time, efm["bvac_rmag"].values, timebase)
     r_axis = interp1(eq_time, efm["magnetic_axis_r"].values, timebase)
     data["b0"] = np.abs(bvac_rmag * r_axis / data["geometric_axis_r"])
-    # esm sits on a 20 us axis but only holds values at the reconstruction times
+    # esm sits on a 20 us axis but only holds values at the reconstruction times.
+    # Some converged reconstructions have no pphix (97 of 1446 shots, up to 25 ms in 24891),
+    # and the interpolation runs straight across them.
     esm_time = np.asarray(esm["time"].values, dtype=float)
     pphix = np.asarray(esm["pphix"].values, dtype=float)
     has_pphix = np.isfinite(pphix)
@@ -918,13 +922,12 @@ def _equilibrium_dataset(shot: int, efm: xr.Dataset) -> xr.Dataset:
     psirz = np.asarray(psi_map.values, dtype=float)
     current = np.asarray(efm["plasma_current_c"].values, dtype=float)
     r_grid = np.asarray(efm["gridr"].values, dtype=float)
-    # MAST publishes no RCENTR, so the grid midpoint serves as the reference radius.
-    # A reader rebuilds the vacuum field as bcentr*rcentr/R, which has to land on fpol at the boundary.
-    # So the published vacuum field, given at the magnetic axis, is rescaled by 1/R onto rcentr.
-    rcentr = r_grid[len(r_grid) // 2]
-    bvac_rmag = np.asarray(efm["bvac_rmag"].values, dtype=float)
+    # EFIT's own reference radius and the vacuum field there, bvac_r (a fixed 1.0 m) and bvac_val.
+    # The same pair C-Mod's EFIT writes as RZERO and BCENTR, and bcentr * rcentr equals fpol at the boundary.
+    bvac_r = np.asarray(efm["bvac_r"].values, dtype=float)
+    rcentr = float(np.nanmedian(bvac_r))
+    bcentr = np.asarray(efm["bvac_val"].values, dtype=float)
     r_axis = np.asarray(efm["magnetic_axis_r"].values, dtype=float)
-    bcentr = bvac_rmag * r_axis / rcentr
     simagx = np.asarray(efm["psi_axis"].values, dtype=float)
     sibdry = np.asarray(efm["psi_boundary"].values, dtype=float)
     profiles = {
