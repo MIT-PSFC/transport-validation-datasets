@@ -14,6 +14,7 @@ from transport_validation_datasets.workflow import (
     MAX_HOLD_PERIODS,
     _hold_equilibrium,
     _hold_onto_grid,
+    _trim_segment_starts,
     drop_short_segments,
     usable_slice_mask,
 )
@@ -110,6 +111,18 @@ class TestDropShortSegments:
         drop_short_segments(keep, times, min_length=0.005)
 
         assert np.array_equal(keep, original)
+
+
+class TestTrimSegmentStarts:
+    def test_each_segment_starts_on_its_first_startable_sample(self):
+        # Three segments: one starting on a sample that can start it,
+        # one whose first such sample is 2 samples in, and one with none
+        keep = np.array([1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1], dtype=bool)
+        can_start = np.array([1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0], dtype=bool)
+
+        trimmed = _trim_segment_starts(keep, can_start)
+
+        assert np.flatnonzero(trimmed).tolist() == [0, 1, 2, 6, 7]
 
 
 class TestHoldOntoGrid:

@@ -404,6 +404,8 @@ class MASTDataWorkflow(DataWorkflow):
         # input power tops out near 5 MW, so a recorded radiated power above
         # 4 MW is not a valid measurement.
         "power_radiated": {"min": 0.0, "max": 4e6},
+        # Finite only, it11 had 10 NaN power_ohm samples in 23999 and 24991
+        "power_ohm": {},
     }
     # Both thresholds are empirical, and both gate the radiative or ohmic
     # collapse at the end of a shot rather than normal operation: the closest
