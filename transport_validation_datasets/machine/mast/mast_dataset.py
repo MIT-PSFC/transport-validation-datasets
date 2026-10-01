@@ -26,7 +26,7 @@ from transport_validation_datasets.cleaning import drop_in_both
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
     channel_rows_at_times,
-    efit_cocos_from_signs,
+    cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
@@ -1003,6 +1003,8 @@ def _equilibrium_dataset(shot: int, efm: xr.Dataset) -> xr.Dataset:
     bvac_rmag = np.asarray(efm["bvac_rmag"].values, dtype=float)
     r_axis = np.asarray(efm["magnetic_axis_r"].values, dtype=float)
     bcentr = bvac_rmag * r_axis / rcentr
+    simagx = np.asarray(efm["psi_axis"].values, dtype=float)
+    sibdry = np.asarray(efm["psi_boundary"].values, dtype=float)
     profiles = {
         name: _optional_rows(shot, efm, source, (eq_time.size, n_psi))
         for name, source in GEQDSK_PROFILES.items()
@@ -1026,12 +1028,12 @@ def _equilibrium_dataset(shot: int, efm: xr.Dataset) -> xr.Dataset:
         z_grid=np.asarray(efm["gridz"].values, dtype=float),
         rmagx=r_axis,
         zmagx=np.asarray(efm["magnetic_axis_z"].values, dtype=float),
-        simagx=np.asarray(efm["psi_axis"].values, dtype=float),
-        sibdry=np.asarray(efm["psi_boundary"].values, dtype=float),
+        simagx=simagx,
+        sibdry=sibdry,
         bcentr=bcentr,
         current=current,
         psirz=psirz,
-        cocos_input=efit_cocos_from_signs(current, bcentr),
+        cocos_input=cocos_from_signs(current, bcentr, simagx, sibdry, profiles["qpsi"]),
         rcentr=rcentr,
         rlim=rlim,
         zlim=zlim,

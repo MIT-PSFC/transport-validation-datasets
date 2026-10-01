@@ -47,7 +47,6 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
 )
 from transport_validation_datasets.machine.generic import (
     SOL_EXTENSIONS,
-    efit_cocos_from_signs,
     reconstruction_clock_period,
     standardize_signal_attrs,
     usable_reconstructions,
@@ -2234,14 +2233,8 @@ class DataWorkflow(ABC):
         standardize_signal_attrs(ds_stacked)
 
         # The sign convention of the GEQDSK block, per shot since a dataset
-        # may mix field directions: the unprocessed file's attribute, or
-        # inferred from the signs the way the devices set it, for files
-        # from before the attribute was kept
+        # may mix field directions, from the unprocessed file's attribute (see cocos_from_signs)
         cocos = ds_unprocessed.attrs.get("cocos")
-        if cocos is None and "current" in ds_unprocessed and "bcentr" in ds_unprocessed:
-            cocos = efit_cocos_from_signs(
-                ds_unprocessed["current"].values, ds_unprocessed["bcentr"].values
-            )
         ds_stacked["cocos"] = xr.DataArray(
             np.array([np.nan if cocos is None else cocos], dtype=np.float32),
             dims=(EPISODE_DIM,),

@@ -60,7 +60,6 @@ import eqdsk
 import imas
 import numpy as np
 import xarray as xr
-from freeqdsk import geqdsk as freeqdsk_geqdsk
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import minimize
 
@@ -367,32 +366,9 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     )
 
 
-def _source_cocos(geqdsk_path) -> int:
-    """Determine the COCOS convention of one raw C-Mod EFIT geqdsk file.
-
-    C-Mod's EFIT writes psi increasing from axis to boundary whatever the
-    signs of Ip and Bt (verified across the staged 2003-2016 campaigns:
-    574 shots, 770k reconstructions, sibdry > simagx and q > 0 in every
-    one), so no single COCOS number covers the machine: the file's sigma_Bp
-    follows sign(Ip). In the file's right-handed (R, phi, Z) frame that
-    makes normal-field shots (Ip < 0) COCOS 7 and reversed-field shots
-    (Ip > 0) COCOS 1, with sigma_rho_theta_phi = +1 throughout (q > 0 with
-    Ip and B0 always of like sign). A mismatched fixed number does not
-    corrupt silently -- eqdsk's sign identification raises -- but this
-    keeps both field polarities converting.
-
-    Args:
-        geqdsk_path: The `.geqdsk` file to classify.
-
-    Returns:
-        7 when the file's plasma current is negative, 1 otherwise.
-    """
-    with open(geqdsk_path) as fh:
-        cpasma = float(freeqdsk_geqdsk.read(fh)["cpasma"])
-    return 7 if cpasma < 0 else 1
-
-
-def build_equilibrium(factory, times, geqdsk_paths, target_cocos: int | None = None):
+def build_equilibrium(
+    factory, times, geqdsk_paths, source_cocos: int, target_cocos: int | None = None
+):
     """`equilibrium` IDS: one `time_slice` per real EFIT reconstruction time.
 
     Args:
@@ -400,6 +376,8 @@ def build_equilibrium(factory, times, geqdsk_paths, target_cocos: int | None = N
         times: (n_eq,) real EFIT reconstruction times [s].
         geqdsk_paths: (n_eq,) `.geqdsk` file paths, one per time in `times`
             (see `geqdsk_writer.write_geqdsk`).
+        source_cocos: COCOS convention of the files,
+            the unprocessed file's cocos attribute (see machine.generic.cocos_from_signs).
         target_cocos: COCOS convention the IDS is written in. None takes
             the convention matching DD_VERSION (see _target_cocos); pass
             the one matching the factory's DD version when it differs.
@@ -427,7 +405,7 @@ def build_equilibrium(factory, times, geqdsk_paths, target_cocos: int | None = N
     for i, (t, geqdsk_path) in enumerate(zip(times, geqdsk_paths)):
         eqi = eqdsk.EQDSKInterface.from_file(
             str(geqdsk_path),
-            from_cocos=_source_cocos(geqdsk_path),
+            from_cocos=source_cocos,
             to_cocos=target_cocos,
         )
         ts = eq.time_slice[i]
@@ -675,7 +653,7 @@ def build_imas_from_shot(
             `n_e_fit_status` on `(shot, TIME_DIM, rho_tor_norm)`, real slice times in
             `TIME_COORD`, and the `sol_extension` attribute the channels were staged with.
         unprocessed_ds: This shot's unprocessed data
-            (`01_unprocessed/<shot>.nc`) -- needs `ip` and
+            (`01_unprocessed/<shot>.nc`) -- needs `ip`, the `cocos` attribute, and
             `workflow.DATASET_EQUILIBRIUM_SIGNALS`, all on the shot's common
             time grid (the equilibrium signals NaN outside a real EFIT
             reconstruction time). Every other `workflow.DATASET_0D_SIGNALS`
@@ -721,8 +699,10 @@ def build_imas_from_shot(
         )
         for i in range(eq_times.size)
     ]
+    source_cocos = int(unprocessed_ds.attrs["cocos"])
+    target_cocos = _target_cocos(dd_version)
     eq, eqi_first, derived_by_time = build_equilibrium(
-        factory, eq_times, geqdsk_paths, target_cocos=_target_cocos(dd_version)
+        factory, eq_times, geqdsk_paths, source_cocos, target_cocos=target_cocos
     )
 
     usable = usable_slice_mask(fit_ds)
