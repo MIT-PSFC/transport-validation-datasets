@@ -354,9 +354,9 @@ class DataWorkflow(ABC):
             List of shot numbers to exclude.
         """
 
-    # Floor on a shot's mean power_radiated over its kept times [W], 0 for none.
-    # A bolometer record reading ~0 W passes the valid filter but breaks every power balance.
-    min_mean_power_radiated = 0.0
+    # Floor on a shot's mean power_radiated over its kept times, as a fraction of its mean heating power, 0 for none.
+    # A dead bolometer reading ~0 W passes the valid filter but breaks every power balance.
+    min_radiated_fraction = 0.0
 
     # Shots numbered below this are left out like blacklisted ones, 0 for none.
     first_shot = 0
@@ -891,13 +891,15 @@ class DataWorkflow(ABC):
         1: A signal of DATASET_0D_SIGNALS that is NaN at every kept time.
            The valid filter only NaN-checks the signals it lists.
            A signal the dataset does not carry is skipped.
-        2: A mean power_radiated below min_mean_power_radiated.
+        2: A mean power_radiated below min_radiated_fraction of the mean heating power.
+           Skipped when the shot has no power_radiated or no heating power.
         3: Energy sanity.
            The energy_mhd rise from the first kept time to its peak
            may not exceed ENERGY_SANITY_LEEWAY times the heating energy put in over the same span.
            The input ignores every loss, so a larger rise means a missing or broken power record.
            The rise rather than the peak, so energy stored before the first kept time needs no input.
-        Powers are clipped at 0 and a NaN power counts as 0,
+        The heating power is power_ohm + power_nbi + power_ic + power_lh.
+        Powers are clipped at 0 and a NaN heating power counts as 0,
         as _clip_powers leaves them in the unprocessed file,
         so both call sites reach the same verdict.
 
@@ -914,13 +916,24 @@ class DataWorkflow(ABC):
             if name in ds_shot and bool(ds_shot[name].isnull().all()):
                 return f"{name} is NaN at every kept time"
 
-        if self.min_mean_power_radiated > 0.0 and "power_radiated" in ds_shot:
+        power_heating = np.zeros(times.size)
+        for name in ("power_ohm", "power_nbi", "power_ic", "power_lh"):
+            if name in ds_shot:
+                power = np.nan_to_num(ds_shot[name].values, nan=0.0)
+                power_heating += np.clip(power, 0.0, None)
+
+        power_heating_mean = float(power_heating.mean())
+        check_radiated = self.min_radiated_fraction > 0.0 and power_heating_mean > 0.0
+        if check_radiated and "power_radiated" in ds_shot:
             power_radiated = ds_shot["power_radiated"].clip(min=0.0)
             power_radiated_mean = float(power_radiated.mean())
-            if power_radiated_mean < self.min_mean_power_radiated:
+            radiated_fraction = power_radiated_mean / power_heating_mean
+            if radiated_fraction < self.min_radiated_fraction:
                 return (
                     f"mean power_radiated {1e-3 * power_radiated_mean:.1f} kW "
-                    f"is below the {1e-3 * self.min_mean_power_radiated:.1f} kW floor"
+                    f"is {100 * radiated_fraction:.1f} percent "
+                    f"of the {1e-3 * power_heating_mean:.0f} kW mean heating power, "
+                    f"below the {100 * self.min_radiated_fraction:.1f} percent floor"
                 )
 
         if "energy_mhd" not in ds_shot:
@@ -929,11 +942,6 @@ class DataWorkflow(ABC):
         has_energy = np.isfinite(energy_mhd)
         if has_energy.sum() < 2:
             return None
-        power_heating = np.zeros(times.size)
-        for name in ("power_ohm", "power_nbi", "power_ic", "power_lh"):
-            if name in ds_shot:
-                power = np.nan_to_num(ds_shot[name].values, nan=0.0)
-                power_heating += np.clip(power, 0.0, None)
         energy_times = times[has_energy]
         energy_stored = energy_mhd[has_energy]
         peak = int(np.argmax(energy_stored))
@@ -2333,7 +2341,7 @@ class DataWorkflow(ABC):
                     "min_segment_length": self.min_segment_length,
                     "shot_blacklist": list(self.shot_blacklist),
                     "first_shot": self.first_shot,
-                    "min_mean_power_radiated": self.min_mean_power_radiated,
+                    "min_radiated_fraction": self.min_radiated_fraction,
                     "density_ratio_bounds": self.density_ratio_bounds,
                     "energy_sanity_leeway": ENERGY_SANITY_LEEWAY,
                     "flat_te_edge_ratio": FLAT_TE_EDGE_RATIO,

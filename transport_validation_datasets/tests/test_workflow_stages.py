@@ -322,16 +322,20 @@ class TestShotRejectionReason:
         assert "power_radiated" in reason
         assert workflow.shot_rejection_reason(self.kept_dataset()) is None
 
-    def test_radiated_power_floor_only_when_set(self, tmp_path):
+    def test_radiated_fraction_floor_only_when_set(self, tmp_path):
         workflow = make_workflow(tmp_path)
-        ds = self.kept_dataset(power_radiated=3e3)
+        # 3 kW radiated against 1 MW of heating is 0.3 percent
+        ds = self.kept_dataset(power_radiated=3e3, power_nbi=1e6)
         assert workflow.shot_rejection_reason(ds) is None
 
-        workflow.min_mean_power_radiated = 5e3
+        workflow.min_radiated_fraction = 0.025
 
         assert "power_radiated" in workflow.shot_rejection_reason(ds)
-        healthy = self.kept_dataset(power_radiated=2e5)
+        healthy = self.kept_dataset(power_radiated=2e5, power_nbi=1e6)
         assert workflow.shot_rejection_reason(healthy) is None
+        # No heating record, nothing to compare against
+        unheated = self.kept_dataset(power_radiated=3e3)
+        assert workflow.shot_rejection_reason(unheated) is None
 
     def test_energy_rise_beyond_heating_rejected(self, tmp_path):
         workflow = make_workflow(tmp_path)
@@ -643,14 +647,14 @@ class TestStackInternalDataset:
     def test_check_added_after_unprocessed_stage_drops_shot(self, tmp_path):
         workflow = make_workflow(tmp_path)
         workflow.extra_signals = {
-            1: {"power_radiated": 3e3},
-            2: {"power_radiated": 2e5},
+            1: {"power_radiated": 3e3, "power_nbi": 1e6},
+            2: {"power_radiated": 2e5, "power_nbi": 1e6},
         }
         workflow.make_unprocessed_data_files()
         workflow.run_gp_fitting()
 
         # The files on disk were written without a floor, the stack applies it now
-        workflow.min_mean_power_radiated = 5e3
+        workflow.min_radiated_fraction = 0.025
         store = xr.open_zarr(workflow.stack_internal_dataset(), consolidated=True)
 
         assert store[EPISODE_DIM].values.tolist() == [2]
