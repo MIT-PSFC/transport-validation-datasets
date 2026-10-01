@@ -140,7 +140,7 @@ REQUIRED_LEVEL2_SIGNALS = {
     "summary": ("ip", "power_nbi", *SUMMARY_SIGNALS),
 }
 
-# Per-variable attributes, IMAS data dictionary path under "ref"
+# Per-variable attributes
 SIGNAL_ATTRS = {
     "ip": {
         "description": "Measured plasma current magnitude",
@@ -176,24 +176,24 @@ SIGNAL_ATTRS = {
         "ref": "/summary/global_quantities/power_ohm/value",
     },
     "power_radiated": {
-        "description": "Bulk radiated power",
+        "description": "Total radiated power from the poloidal bolometer array (ABM_PRAD_POL)",
         "units": "W",
-        "ref": "/summary/global_quantities/power_radiated_inside_lcfs/value",
+        "ref": "/summary/global_quantities/power_radiated/value",
     },
     "power_nbi": {
-        "description": "Neutral beam heating power",
+        "description": "Neutral beam power injected into the vessel (ANB_TOT_SUM_POWER)",
         "units": "W",
-        "ref": "/summary/heating_current_drive/power_nbi/value",
+        "ref": "/summary/heating_current_drive/power_launched_nbi/value",
     },
     "power_ic": {
         "description": "Ion cyclotron heating power (none on MAST)",
         "units": "W",
-        "ref": "/summary/heating_current_drive/power_ic/value",
+        "ref": "/summary/heating_current_drive/power_launched_ic/value",
     },
     "power_lh": {
         "description": "Lower hybrid heating power (none on MAST)",
         "units": "W",
-        "ref": "/summary/heating_current_drive/power_lh/value",
+        "ref": "/summary/heating_current_drive/power_launched_lh/value",
     },
     "minor_radius": {
         "description": "Plasma minor radius",
@@ -260,36 +260,6 @@ SIGNAL_ATTRS = {
         "units": "eV",
         "ref": "/thomson_scattering/channel(i1)/t_e/data_error_upper",
     },
-    "psirz": {
-        "description": "Poloidal flux per radian on the reconstruction grid",
-        "units": "Wb/rad",
-        "ref": "/equilibrium/time_slice(itime)/profiles_2d(i1)/psi",
-    },
-    "simagx": {
-        "description": "Poloidal flux at the magnetic axis",
-        "units": "Wb/rad",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/psi_axis",
-    },
-    "sibdry": {
-        "description": "Poloidal flux at the plasma boundary",
-        "units": "Wb/rad",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/psi_boundary",
-    },
-    "rmagx": {
-        "description": "Major radius of the magnetic axis",
-        "units": "m",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/magnetic_axis/r",
-    },
-    "zmagx": {
-        "description": "Height of the magnetic axis",
-        "units": "m",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/magnetic_axis/z",
-    },
-    "current": {
-        "description": "Plasma current from the equilibrium reconstruction, signed",
-        "units": "A",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/ip",
-    },
     "bcentr": {
         "description": (
             "Vacuum toroidal field at the GEQDSK reference radius rcentr, signed. "
@@ -297,53 +267,6 @@ SIGNAL_ATTRS = {
         ),
         "units": "T",
         "ref": "/equilibrium/vacuum_toroidal_field/b0",
-    },
-    "fpol": {
-        "description": "Poloidal current function f = R*B_phi on the psi grid",
-        "units": "m T",
-        "ref": "/equilibrium/time_slice(itime)/profiles_1d/f",
-    },
-    "pres": {
-        "description": "Total pressure on the psi grid",
-        "units": "Pa",
-        "ref": "/equilibrium/time_slice(itime)/profiles_1d/pressure",
-    },
-    "ffprime": {
-        "description": "f df/dpsi on the psi grid",
-        "units": "m^2 T^2 rad / Wb",
-        "ref": "/equilibrium/time_slice(itime)/profiles_1d/f_df_dpsi",
-    },
-    "pprime": {
-        "description": "dp/dpsi on the psi grid",
-        "units": "Pa rad / Wb",
-        "ref": "/equilibrium/time_slice(itime)/profiles_1d/dpressure_dpsi",
-    },
-    "qpsi": {
-        "description": (
-            "Safety factor on the psi grid, from the level 1 EFM reconstruction"
-        ),
-        "units": "dimensionless",
-        "ref": "/equilibrium/time_slice(itime)/profiles_1d/q",
-    },
-    "rbdry": {
-        "description": "Major radius of the plasma boundary contour",
-        "units": "m",
-        "ref": "/equilibrium/time_slice(itime)/boundary/outline/r",
-    },
-    "zbdry": {
-        "description": "Height of the plasma boundary contour",
-        "units": "m",
-        "ref": "/equilibrium/time_slice(itime)/boundary/outline/z",
-    },
-    "rlim": {
-        "description": "Major radius of the limiter contour",
-        "units": "m",
-        "ref": "/wall/description_2d(i1)/limiter/unit(i2)/outline/r",
-    },
-    "zlim": {
-        "description": "Height of the limiter contour",
-        "units": "m",
-        "ref": "/wall/description_2d(i1)/limiter/unit(i2)/outline/z",
     },
 }
 

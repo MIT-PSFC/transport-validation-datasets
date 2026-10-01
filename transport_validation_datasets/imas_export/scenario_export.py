@@ -509,11 +509,12 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
 # ---------------------------------------------------------------------------
 
 
-# `workflow.DATASET_0D_SIGNALS` name -> (summary sub-structure, field) it is
-# written to; each target is a `summary_dynamic` node whose `.value` holds the
-# time series. Every DATASET_0D_SIGNALS entry has a home here, and the paths
-# match the `ref` attrs the machine modules record on the unprocessed signals
-# (confirmed against the installed DD 4.0.0 by introspection).
+# `workflow.DATASET_0D_SIGNALS` name -> (summary sub-structure, field) it is written to.
+# Each target is a `summary_dynamic` node whose `.value` holds the time series.
+# Every DATASET_0D_SIGNALS entry has a home here (checked against DD 4.1.1).
+# A signal whose `ref` attr is under /summary lands on that same node.
+# The others (/equilibrium, /bolometer) name where the device's value comes from,
+# and land on summary's node for the same quantity.
 _SUMMARY_SIGNAL_PATHS = {
     "ip": ("global_quantities", "ip"),
     "b0": ("global_quantities", "b0"),
@@ -527,9 +528,9 @@ _SUMMARY_SIGNAL_PATHS = {
     "elongation": ("boundary", "elongation"),
     "triangularity_upper": ("boundary", "triangularity_upper"),
     "triangularity_lower": ("boundary", "triangularity_lower"),
-    "power_nbi": ("heating_current_drive", "power_nbi"),
-    "power_ic": ("heating_current_drive", "power_ic"),
-    "power_lh": ("heating_current_drive", "power_lh"),
+    "power_nbi": ("heating_current_drive", "power_launched_nbi"),
+    "power_ic": ("heating_current_drive", "power_launched_ic"),
+    "power_lh": ("heating_current_drive", "power_launched_lh"),
 }
 
 
