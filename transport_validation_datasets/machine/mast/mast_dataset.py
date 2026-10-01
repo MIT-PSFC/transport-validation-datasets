@@ -420,6 +420,10 @@ class MASTDataWorkflow(DataWorkflow):
     # Six it11 shots (23349, 23352, 23386, 23814, 23997, 24421) average 2-4 kW, some with MW of NBI,
     # a broken bolometer record the valid filter's min of 0 lets through.
     min_mean_power_radiated = 5e3
+    # There appears to be a systematic change in TS calibrations after this early-campaign shot.
+    first_shot = 23809
+    # From 23809 on, 23990 sits at 0.13 and the next lowest shot at 0.75, the highest at 1.10
+    density_ratio_bounds = (0.7, 1.3)
     # Shots the validity filtering rejects outright (checked 2026-08-20 by
     # running them through the pipeline), skipped here to save the processing.
     # 29430 is the worst of them: its bolometer is broken, the raw radiated

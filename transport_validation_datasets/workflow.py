@@ -350,6 +350,13 @@ class DataWorkflow(ABC):
     # A bolometer record reading ~0 W passes the valid filter but breaks every power balance.
     min_mean_power_radiated = 0.0
 
+    # Shots numbered below this are left out like blacklisted ones, 0 for none.
+    first_shot = 0
+
+    # Thomson n_e against the interferometer. Large disagreement indicates TS miscalibration.
+    # None to disable this check.
+    density_ratio_bounds: tuple[float, float] | None = None
+
     # Threads used to stage source data.
     # Only above 1 for sources that tolerate concurrent reads
     # MAST reads public S3 and does, disruption-py's MDSplus connections do not.
@@ -598,9 +605,9 @@ class DataWorkflow(ABC):
         signal names on a common 1 kHz timebase, plus a plot per shot showing
         what was kept and why.
 
-        Resumes: shots that already have a file, are blacklisted, or failed on
-        an earlier run are skipped without touching the source. Source reads
-        run prepare_workers at a time; filtering, plotting, and writing stay on
+        Resumes: shots that already have a file, are excluded (excluded_shot_reason),
+        or failed on an earlier run are skipped without touching the source.
+        Source reads run prepare_workers at a time; filtering, plotting, and writing stay on
         this thread, since they are matplotlib and netCDF work.
         """
         self.unprocessed_data_dir.mkdir(parents=True, exist_ok=True)
@@ -625,8 +632,9 @@ class DataWorkflow(ABC):
                 if shot is None:
                     exhausted = True
                     break
-                if shot in self.shot_blacklist:
-                    logger.info(f"Shot {shot} is blacklisted. Skipping.")
+                exclusion_reason = self.excluded_shot_reason(shot)
+                if exclusion_reason is not None:
+                    logger.info(f"Shot {shot} is {exclusion_reason}. Skipping.")
                     continue
                 if (self.unprocessed_data_dir / f"{shot}.nc").exists():
                     logger.info(
@@ -910,6 +918,85 @@ class DataWorkflow(ABC):
                 f"energy_mhd rises {1e-3 * energy_rise:.1f} kJ "
                 f"from {energy_times[0]:.3f} s to {energy_times[peak]:.3f} s, "
                 f"more than the {1e-3 * energy_input:.1f} kJ of heating put in"
+            )
+        return None
+
+    def excluded_shot_reason(self, shot: int) -> str | None:
+        """Check whether a shot is left out by number, before any of its data is looked at.
+
+        Applied before the source read and again at the stack stage,
+        so a shot excluded after its files were written stays out of the store.
+
+        Args:
+            shot: Shot number.
+
+        Returns:
+            Why the shot is left out, or None if it is not.
+        """
+        if shot in self.shot_blacklist:
+            return "blacklisted"
+        if shot < self.first_shot:
+            return f"before first_shot {self.first_shot}"
+        return None
+
+    def fit_rejection_reason(
+        self, ds_fit: xr.Dataset, ds_unprocessed: xr.Dataset
+    ) -> str | None:
+        """Check a shot's fitted density against its line-averaged density.
+
+        Thomson and the interferometer measure the same density,
+        so a shot whose fits sit far off the interferometer has a broken Thomson calibration.
+        Each slice's ratio is the mean of the fitted n_e over rho_tor_norm in [0, 1]
+        over n_e_line_average at the slice time.
+        The shot median of the ratios must lie inside density_ratio_bounds.
+        The mean over rho stands in for the chord integral, whose geometry neither device records.
+        Its offset from 1 depends on the chord and the profile shapes, which the per-device bounds absorb.
+
+        Args:
+            ds_fit: One shot's usable fitted slices, with their time coordinate.
+            ds_unprocessed: The shot's unprocessed dataset.
+
+        Returns:
+            Why the shot is rejected, or None if it passes or the device has no gate.
+        """
+        if (
+            self.density_ratio_bounds is None
+            or "n_e_line_average" not in ds_unprocessed
+        ):
+            return None
+        grid = np.asarray(ds_unprocessed[TIME_COORD].values, dtype=float)
+        line_average = np.asarray(
+            ds_unprocessed["n_e_line_average"].squeeze(EPISODE_DIM, drop=True).values,
+            dtype=float,
+        )
+        has_line_average = np.isfinite(line_average)
+        if not has_line_average.any():
+            return None
+        slice_times = np.asarray(
+            ds_fit[TIME_COORD].squeeze(EPISODE_DIM, drop=True).values, dtype=float
+        )
+        line_average_at_slices = np.interp(
+            slice_times, grid[has_line_average], line_average[has_line_average]
+        )
+        inside_lcfs = ds_fit["rho_tor_norm"].values <= 1.0
+        ne_fit = (
+            ds_fit["n_e"]
+            .squeeze(EPISODE_DIM, drop=True)
+            .transpose(TIME_DIM, "rho_tor_norm")
+            .values
+        )
+        ne_fit_mean = ne_fit[:, inside_lcfs].mean(axis=1)
+        ratio = ne_fit_mean / line_average_at_slices
+        # Only the unfit rows a store kept on request are NaN, and they say nothing
+        ratio_finite = ratio[np.isfinite(ratio)]
+        if ratio_finite.size == 0:
+            return None
+        ratio_median = float(np.median(ratio_finite))
+        ratio_low, ratio_high = self.density_ratio_bounds
+        if not ratio_low <= ratio_median <= ratio_high:
+            return (
+                f"fitted n_e averages {ratio_median:.2f}x n_e_line_average, "
+                f"outside {ratio_low}-{ratio_high}"
             )
         return None
 
@@ -1744,7 +1831,7 @@ class DataWorkflow(ABC):
 
         Returns:
             Sorted shots that have both an unprocessed data file and a fit
-            result file.
+            result file, less the excluded ones (excluded_shot_reason).
         """
         unprocessed = {int(p.stem) for p in self.unprocessed_data_dir.glob("*.nc")}
         fitted = {int(p.stem) for p in self.fit_shots_dir.glob("*.nc")}
@@ -1754,7 +1841,17 @@ class DataWorkflow(ABC):
                 f"{len(missing)} unprocessed shots have no '{self.fit_method}' fit results yet "
                 f"and are left out of the internal dataset"
             )
-        return sorted(unprocessed & fitted)
+        excluded = {
+            shot
+            for shot in unprocessed & fitted
+            if self.excluded_shot_reason(shot) is not None
+        }
+        if excluded:
+            logger.info(
+                f"{len(excluded)} shots are blacklisted or before first_shot "
+                f"and are left out of the internal dataset"
+            )
+        return sorted((unprocessed & fitted) - excluded)
 
     def export_to_imas(self, overwrite: bool = False):
         """Writes every fitted shot's equilibrium/core_profiles/summary/wall to IMAS format.
@@ -1926,12 +2023,21 @@ class DataWorkflow(ABC):
 
         Returns:
             The shot's dataset, or None when it has no usable fitted slice
-            or shot_rejection_reason rejects its unprocessed file.
+            or shot_rejection_reason or fit_rejection_reason rejects it.
 
         Raises:
             ValueError: If the fitted slice times are not on the unprocessed
                 file's timebase, or no time window overlaps it.
         """
+        with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_file:
+            ds_unprocessed = ds_file.load()
+        rejection_reason = self.shot_rejection_reason(ds_unprocessed)
+        if rejection_reason is not None:
+            logger.warning(
+                f"Shot {shot}: {rejection_reason}, leaving it out of the internal dataset"
+            )
+            return None
+
         with xr.open_dataset(self.fit_shots_dir / f"{shot}.nc") as ds_file:
             ds_fit = ds_file.load()
         fit_mode = ds_fit.attrs["fit_mode"]
@@ -1953,6 +2059,12 @@ class DataWorkflow(ABC):
                 f"Shot {shot}: keeping {int(keep.sum())} of {keep.size} fitted slices"
             )
         ds_fit = ds_fit.isel({TIME_DIM: np.flatnonzero(keep)})
+        rejection_reason = self.fit_rejection_reason(ds_fit, ds_unprocessed)
+        if rejection_reason is not None:
+            logger.warning(
+                f"Shot {shot}: {rejection_reason}, leaving it out of the internal dataset"
+            )
+            return None
         # A per-method fit diagnostic, kept in the fit files but left out of
         # the store, where it would be the only string-labelled dimension
         if "hyperparameter" in ds_fit.dims:
@@ -1967,14 +2079,6 @@ class DataWorkflow(ABC):
         # come through as the fresh_profile flag, and the windows only place the rows
         ds_fit = ds_fit.drop_vars([TIME_COORD, "window_index"])
 
-        with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_file:
-            ds_unprocessed = ds_file.load()
-        rejection_reason = self.shot_rejection_reason(ds_unprocessed)
-        if rejection_reason is not None:
-            logger.warning(
-                f"Shot {shot}: {rejection_reason}, leaving it out of the internal dataset"
-            )
-            return None
         grid = np.asarray(ds_unprocessed[TIME_COORD].values, dtype=float)
         # Dropped so the dimension can be reindexed and renamed,
         # the times come back as a per-shot variable at the end
@@ -2176,7 +2280,7 @@ class DataWorkflow(ABC):
 
         Returns:
             device_settings (the settings_cls instance), filters (every
-            threshold the unprocessed stage applied), and fit_settings (the
+            threshold the unprocessed and stack stages applied), and fit_settings (the
             staging knobs the fits were made with,
             including the full fit grid the store's rho_tor_norm coordinate is cut from).
         """
@@ -2192,7 +2296,9 @@ class DataWorkflow(ABC):
                     "min_usable_time": self.min_usable_time,
                     "min_segment_length": self.min_segment_length,
                     "shot_blacklist": list(self.shot_blacklist),
+                    "first_shot": self.first_shot,
                     "min_mean_power_radiated": self.min_mean_power_radiated,
+                    "density_ratio_bounds": self.density_ratio_bounds,
                     "energy_sanity_leeway": ENERGY_SANITY_LEEWAY,
                 }
             ),
