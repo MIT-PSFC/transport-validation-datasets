@@ -96,6 +96,10 @@ STORED_RHO_TOR_NORM_MAX = 1.1
 # Per-slice fit statuses that count as a usable profile, see gp_fitting.batch_io.
 USABLE_FIT_STATUSES = (STATUS_OK, STATUS_REPAIRED)
 
+# A slice whose fitted te at the LCFS is above this fraction of its peak is unusable, see usable_slice_mask.
+# In it11 no C-Mod slice goes above 0.25 and 99 percent of MAST slices stay below 0.15.
+FLAT_TE_EDGE_RATIO = 0.4
+
 # A grid time carries a sample of its own when it sits this close to one [s].
 # Only absorbs float round-off, everything shares the staged 1 kHz timebase.
 SAMPLE_TIME_TOL = 1e-6
@@ -1702,10 +1706,9 @@ class DataWorkflow(ABC):
         Args:
             mb_per_chunk: Target size of each variable's storage chunks,
                 chunked along EPISODE_DIM only. None leaves the chunking alone.
-            drop_unfit_slices: Ignore the slices whose te or ne fit did not come
-                back usable (USABLE_FIT_STATUSES), as though the shot had no
-                Thomson sample there. False places every slice on the grid,
-                all-NaN profiles included.
+            drop_unfit_slices: Ignore the slices usable_slice_mask rejects,
+                as though the shot had no Thomson sample there.
+                False places every slice on the grid, all-NaN profiles included.
             forward_fill: Hold each fitted profile and each equilibrium forward
                 over the grid times that follow it, for at most
                 MAX_HOLD_PERIODS of their own sampling period. False leaves the
@@ -1980,22 +1983,6 @@ class DataWorkflow(ABC):
             )
         return sizes
 
-    @staticmethod
-    def _usable_slice_mask(ds_fit: xr.Dataset) -> np.ndarray:
-        """Find the slices whose te and ne fits both came back usable.
-
-        Args:
-            ds_fit: One shot's fit result dataset.
-
-        Returns:
-            (n_t,) boolean mask over the shot's slices.
-        """
-        mask = np.ones(ds_fit.sizes[TIME_DIM], dtype=bool)
-        for name in ("t_e_fit_status", "n_e_fit_status"):
-            status = ds_fit[name].squeeze(EPISODE_DIM, drop=True).values
-            mask &= np.isin(status, USABLE_FIT_STATUSES)
-        return mask
-
     def _internal_shot_dataset(
         self, shot: int, drop_unfit_slices: bool, forward_fill: bool
     ) -> xr.Dataset | None:
@@ -2016,8 +2003,8 @@ class DataWorkflow(ABC):
 
         Args:
             shot: Shot number.
-            drop_unfit_slices: Ignore the slices whose te or ne fit did not come
-                back usable, as though the shot had no Thomson sample there.
+            drop_unfit_slices: Ignore the slices usable_slice_mask rejects,
+                as though the shot had no Thomson sample there.
             forward_fill: Hold profiles and equilibria forward onto the grid
                 times between their samples.
 
@@ -2045,7 +2032,7 @@ class DataWorkflow(ABC):
         # a window whose every fit was culled still bounds the stored grid
         windows = _fit_windows(ds_fit)
         keep = (
-            self._usable_slice_mask(ds_fit)
+            usable_slice_mask(ds_fit)
             if drop_unfit_slices
             else np.ones(ds_fit.sizes[TIME_DIM], dtype=bool)
         )
@@ -2054,10 +2041,6 @@ class DataWorkflow(ABC):
                 f"Shot {shot}: no usable {self.fit_method} fits, leaving it out of the internal dataset"
             )
             return None
-        if not keep.all():
-            logger.debug(
-                f"Shot {shot}: keeping {int(keep.sum())} of {keep.size} fitted slices"
-            )
         ds_fit = ds_fit.isel({TIME_DIM: np.flatnonzero(keep)})
         rejection_reason = self.fit_rejection_reason(ds_fit, ds_unprocessed)
         if rejection_reason is not None:
@@ -2300,6 +2283,7 @@ class DataWorkflow(ABC):
                     "min_mean_power_radiated": self.min_mean_power_radiated,
                     "density_ratio_bounds": self.density_ratio_bounds,
                     "energy_sanity_leeway": ENERGY_SANITY_LEEWAY,
+                    "flat_te_edge_ratio": FLAT_TE_EDGE_RATIO,
                 }
             ),
             "fit_settings": to_json(
@@ -2438,6 +2422,56 @@ def pulse_and_usable_time(kept_times: np.ndarray) -> tuple[float, float]:
     gaps = np.diff(kept_times)
     usable_time = float(gaps[gaps < 1.5e-3].sum())
     return pulse_length, usable_time
+
+
+def usable_slice_mask(ds_fit: xr.Dataset) -> np.ndarray:
+    """Find the slices of a shot's fit that hold a usable te and ne profile.
+
+    A slice is unusable when either fit did not come back usable (USABLE_FIT_STATUSES),
+    or when a profile that did come back fails a screen:
+    - flat te: te at the LCFS above FLAT_TE_EDGE_RATIO of its peak.
+      MAST slices whose outboard Thomson reads far hotter than the inboard fit this flat,
+      most likely an equilibrium that maps the two branches to the wrong flux surfaces.
+    - te band, ne band: the 1 sigma band inside the LCFS wider than the profile's peak,
+      one channel's huge error carried straight into the band.
+    The screens are method agnostic and run at the stack stage, so retuning them needs a restack, not a refit.
+    Logs how many slices each check rejects.
+
+    Args:
+        ds_fit: One shot's fit result dataset.
+
+    Returns:
+        (n_t,) boolean mask over the shot's slices.
+    """
+    ds_shot = ds_fit.squeeze(EPISODE_DIM)
+    shot = int(ds_shot[EPISODE_DIM])
+    unusable = {}
+    status_usable = np.ones(ds_shot.sizes[TIME_DIM], dtype=bool)
+    for name in ("t_e_fit_status", "n_e_fit_status"):
+        status = ds_shot[name].values
+        status_usable &= np.isin(status, USABLE_FIT_STATUSES)
+    unusable["fit status"] = ~status_usable
+    te_edge = ds_shot["t_e"].interp(rho_tor_norm=1.0).values
+    te_peak = ds_shot["t_e"].max("rho_tor_norm").values
+    unusable["flat te"] = te_edge > FLAT_TE_EDGE_RATIO * te_peak
+    # Past the LCFS the band holds the outermost channel's error flat, which says nothing about the profile inside
+    inside_lcfs = np.flatnonzero(ds_shot["rho_tor_norm"].values <= 1.0)
+    ds_core = ds_shot.isel(rho_tor_norm=inside_lcfs)
+    for name in ("t_e", "n_e"):
+        error_peak = ds_core[f"{name}_error"].max("rho_tor_norm").values
+        profile_peak = ds_core[name].max("rho_tor_norm").values
+        unusable[f"{name} band"] = error_peak > profile_peak
+    unusable_masks = list(unusable.values())
+    unusable_any = np.logical_or.reduce(unusable_masks)
+    if unusable_any.any():
+        rejected_counts = {
+            check: int(mask.sum()) for check, mask in unusable.items() if mask.any()
+        }
+        logger.debug(
+            f"Shot {shot}: {int(unusable_any.sum())} of {unusable_any.size} "
+            f"fitted slices unusable, per check {rejected_counts}"
+        )
+    return ~unusable_any
 
 
 def _hold_onto_grid(

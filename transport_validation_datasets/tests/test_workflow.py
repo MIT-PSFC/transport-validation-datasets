@@ -8,12 +8,14 @@ change here quietly changes what lands in every device's store.
 import numpy as np
 import xarray as xr
 
-from transport_validation_datasets import EPISODE_DIM, TIME_COORD
+from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_validation_datasets.gp_fitting.batch_io import STATUS_CULLED, STATUS_OK
 from transport_validation_datasets.workflow import (
     MAX_HOLD_PERIODS,
     _hold_equilibrium,
     _hold_onto_grid,
     drop_short_segments,
+    usable_slice_mask,
 )
 
 
@@ -257,3 +259,42 @@ class TestHoldEquilibrium:
         assert set(held) == {"rmagx"}
         assert not fresh.any()
         assert held["rmagx"].shape == (1, grid.size)
+
+
+class TestUsableSliceMask:
+    def test_flat_te_and_band_wider_than_profile_inside_lcfs_rejected(self):
+        rho_tor_norm = np.linspace(0.0, 1.1, 23)
+        i_mid = 10  # rho_tor_norm 0.5
+        i_sol = 21  # rho_tor_norm 1.05
+        n_t = 6
+        te = np.tile(1000.0 * (1.0 - (rho_tor_norm / 1.2) ** 2), (n_t, 1))
+        ne = np.tile(1.0e20 * (1.0 - (rho_tor_norm / 1.2) ** 2), (n_t, 1))
+        te_error = np.full((n_t, rho_tor_norm.size), 50.0)
+        ne_error = np.full((n_t, rho_tor_norm.size), 5.0e18)
+        status = np.full(n_t, STATUS_OK)
+        # 0 is a healthy slice
+        te[1] = 500.0  # flat, te at the LCFS equals its peak
+        te_error[2, i_mid] = 2000.0
+        ne_error[3, i_mid] = 2.0e20
+        # Past the LCFS a blown band says nothing about the profile inside
+        te_error[4, i_sol] = 2000.0
+        status[5] = STATUS_CULLED
+        profile_dims = (EPISODE_DIM, TIME_DIM, "rho_tor_norm")
+        ds_fit = xr.Dataset(
+            {
+                "t_e": (profile_dims, te[None]),
+                "t_e_error": (profile_dims, te_error[None]),
+                "n_e": (profile_dims, ne[None]),
+                "n_e_error": (profile_dims, ne_error[None]),
+                "t_e_fit_status": ((EPISODE_DIM, TIME_DIM), status[None]),
+                "n_e_fit_status": (
+                    (EPISODE_DIM, TIME_DIM),
+                    np.full((1, n_t), STATUS_OK),
+                ),
+            },
+            coords={EPISODE_DIM: [1], "rho_tor_norm": rho_tor_norm},
+        )
+
+        usable = usable_slice_mask(ds_fit)
+
+        assert np.flatnonzero(usable).tolist() == [0, 4]

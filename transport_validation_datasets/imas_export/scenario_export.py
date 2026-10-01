@@ -696,7 +696,7 @@ def build_imas_from_shot(
         DATASET_EQUILIBRIUM_SIGNALS,
         TIME_COORD,
         TIME_DIM,
-        USABLE_FIT_STATUSES,
+        usable_slice_mask,
     )
 
     factory = imas.IDSFactory(version=dd_version)
@@ -727,11 +727,8 @@ def build_imas_from_shot(
         factory, eq_times, geqdsk_paths, target_cocos=_target_cocos(dd_version)
     )
 
-    usable = (
-        fit_ds["t_e_fit_status"].isin(list(USABLE_FIT_STATUSES))
-        & fit_ds["n_e_fit_status"].isin(list(USABLE_FIT_STATUSES))
-    ).squeeze("shot", drop=True)
-    fit_ds = fit_ds.squeeze("shot", drop=True).isel({TIME_DIM: usable.values})
+    usable = usable_slice_mask(fit_ds)
+    fit_ds = fit_ds.squeeze("shot", drop=True).isel({TIME_DIM: usable})
     ts_times = fit_ds[TIME_COORD].to_numpy().astype(float)
     rho_tor_norm = fit_ds["rho_tor_norm"].to_numpy().astype(float)
     sol_extension = fit_ds.attrs["sol_extension"]
