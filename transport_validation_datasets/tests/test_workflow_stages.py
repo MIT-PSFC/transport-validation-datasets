@@ -137,8 +137,6 @@ class DummyWorkflow(DataWorkflow):
     transient_filter = {}
     end_margin = 0.01
     min_pulse_length = 0.1
-    min_usable_time = 0.05
-    min_segment_length = 0.01
     shot_blacklist = [BLACKLISTED_SHOT]
     fit_rho_tor_norm = np.linspace(0.0, 1.4, 29)
     fit_min_points = 3

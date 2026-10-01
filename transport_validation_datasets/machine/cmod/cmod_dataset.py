@@ -77,18 +77,22 @@ class CModDataWorkflow(DataWorkflow):
     signal_attrs = SIGNAL_ATTRS
 
     min_pulse_length = 0.5
-    min_usable_time = 0.2
-    min_segment_length = 0.1
     valid_filter = {
         "ip": {"min_abs": 100e3},  # Only care about magnitude of ip
         "n_e_line_average": {"min": 1e18, "max": 6e20},
         "energy_mhd": {"min": 3e3},
-        "beta_tor_norm": {"min": 0.08, "max": 2.0},
+        "beta_tor_norm": {"min": 0.05, "max": 2.0},
     }
     transient_filter = {
         "power_ohm": 5.0e6,
-        "power_radiated": 2.5e6,
     }
+    # Radiative collapse, see DataWorkflow.max_radiated_fraction.
+    # The absolute 2.5 MW cut this replaces fired mid-shot in 15 of 32 sampled shots,
+    # ICRF H-modes radiating 3 MW of 5 MW in.
+    # Twice the trailing heating power fires in 4 of the 32,
+    # a ramp-up spike, a minor disruption and two late radiative drops.
+    max_radiated_fraction = 2.0
+    radiated_collapse_floor = 1e6
     end_margin = 0.02
     shot_blacklist = []
     # Shots radiate a median 25 percent of their heating power (it11 store).
