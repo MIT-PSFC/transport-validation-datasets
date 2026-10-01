@@ -82,6 +82,14 @@ The power signals (power_ohm/radiated/nbi/ic/lh) are clipped at zero since sourc
 Each stage drops what it can judge from its own inputs.
 The stores record every threshold in their `filters` attribute.
 
+A reconstruction is usable (`usable_reconstructions`) when its axis and boundary psi are finite and meaningfully different,
+and every value of its psirz and qpsi is finite.
+All three stages that touch the equilibrium contain only the usable ones:
+the unprocessed stage starts each kept segment where one reaches (step 5 below),
+the fit stage maps the Thomson channels through the nearest one,
+and the stack stage holds them onto the grid, so an unusable one is held over by the one before and is not marked fresh.
+The reach and the hold both run on the reconstruction clock (`reconstruction_clock_period`), which counts the unusable ones too.
+
 Unprocessed stage (`filter_and_plot`), per shot:
 
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
@@ -93,6 +101,8 @@ Unprocessed stage (`filter_and_plot`), per shot:
    within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock) are cut, since the store would have no equilibrium there.
    This is mostly the early parts of a shot, before its first usable reconstruction.
 6. Kept segments shorter than `min_segment_length` are cut.
+   Steps 5 and 6 repeat until neither changes anything,
+   since a segment cut as short can hold the reconstruction that reached the start of the next one.
 7. The shot is rejected when the kept span is shorter than `min_pulse_length`,
    or the kept segments sum to less than `min_usable_time`.
 8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
@@ -100,7 +110,8 @@ Unprocessed stage (`filter_and_plot`), per shot:
    - a mean `power_radiated` below `min_mean_power_radiated` (likely faulty bolometry)
    - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point.
 
-Fit stage: the Thomson screens in `cleaning.py` run on every sample before fitting,
+Fit stage: the Thomson channels map through the nearest usable reconstruction in reach,
+the Thomson screens in `cleaning.py` run on every sample before fitting,
 and the fit method's own checks give each slice a fit status.
 
 Stack stage (`_internal_shot_dataset`), per shot:
@@ -118,10 +129,9 @@ Stack stage (`_internal_shot_dataset`), per shot:
    The shot median over its slices of mean(n_e over rho_tor_norm 0-1) / `n_e_line_average`
    must sit inside the device's `density_ratio_bounds` (C-Mod 0.72-1.3, MAST 0.7-1.3).
    The ratio is a proxy for the chord integral, and the bounds absorb its offset on each device.
-4. A reconstruction is unusable (`usable_reconstructions`) when its axis and boundary psi are not finite and meaningfully different,
-   or any value of its psirz or qpsi is not finite.
-   The previous reconstruction holds over it and it is not marked fresh.
-   The Thomson mapping of the fit stage skips it the same way.
+4. The usable reconstructions are held onto the grid, as above.
+
+`export_to_imas` runs checks 1-3 too (`_usable_shot_fit`), so the IMAS export holds the same shots as the stores.
 
 MAST starts at shot 23809 (`first_shot`).
 Before it the Thomson density reads ~0.87x the interferometer, against 0.98-1.00 after,

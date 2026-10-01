@@ -408,6 +408,34 @@ def usable_reconstructions(ds: xr.Dataset) -> np.ndarray:
     return psi_range_usable & qpsi_finite & psirz_finite
 
 
+def reconstruction_clock_period(ds: xr.Dataset, grid: np.ndarray) -> float:
+    """Median spacing of a shot's reconstructions, the unusable ones included.
+
+    The Thomson mapping's reach and the stores' equilibrium hold both run on this clock,
+    so dropping an unusable reconstruction (usable_reconstructions) stretches neither.
+    A lone reconstruction has no spacing of its own, so the grid step stands in,
+    and a one-sample grid has none either, giving 0.
+
+    Args:
+        ds: One shot's dataset with the GEQDSK block on its time axis.
+        grid: The times of that axis [s].
+
+    Returns:
+        The period [s].
+    """
+    if "shot" in ds.dims:
+        ds = ds.squeeze("shot", drop=True)
+    simagx = ds["simagx"].transpose("time").values
+    clock_times = grid[np.isfinite(simagx)]
+    if clock_times.size > 1:
+        clock_steps = np.diff(clock_times)
+    elif grid.size > 1:
+        clock_steps = np.diff(grid)
+    else:
+        return 0.0
+    return float(np.median(clock_steps))
+
+
 def cumulative_q_integral(qpsi: np.ndarray) -> np.ndarray:
     """Integrate the safety factor over normalized poloidal flux, outward from the axis.
 
@@ -559,21 +587,13 @@ def map_ts_channels_to_rho_tor_norm(
     r_grid = ds_shot["r_grid"].values
     z_grid = ds_shot["z_grid"].values
 
-    # Each TS slice maps through the usable reconstruction nearest in time.
-    # The reach comes from the reconstruction clock, unusable reconstructions included.
-    # A lone reconstruction has no period of its own, so the grid step stands in,
-    # as in workflow._hold_onto_grid.
+    # Each TS slice maps through the usable reconstruction nearest in time,
+    # in reach of the reconstruction clock, unusable reconstructions included.
     all_times = ds_shot["time"].values
-    clock_times = all_times[np.isfinite(simagx)]
     usable = usable_reconstructions(ds_shot)
     eq_rows = np.flatnonzero(usable)
     eq_times = all_times[eq_rows]
-    if clock_times.size > 1:
-        eq_period = float(np.median(np.diff(clock_times)))
-    elif all_times.size > 1:
-        eq_period = float(np.median(np.diff(all_times)))
-    else:
-        eq_period = 0.0
+    eq_period = reconstruction_clock_period(ds_shot, all_times)
     eq_tol = EQ_MATCH_MAX_PERIODS * eq_period
 
     rho_tor_norm = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)

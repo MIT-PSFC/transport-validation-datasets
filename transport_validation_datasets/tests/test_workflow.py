@@ -14,6 +14,7 @@ from transport_validation_datasets.workflow import (
     MAX_HOLD_PERIODS,
     _hold_equilibrium,
     _hold_onto_grid,
+    _trim_and_drop_segments,
     _trim_segment_starts,
     drop_short_segments,
     usable_slice_mask,
@@ -123,6 +124,27 @@ class TestTrimSegmentStarts:
         trimmed = _trim_segment_starts(keep, can_start)
 
         assert np.flatnonzero(trimmed).tolist() == [0, 1, 2, 6, 7]
+
+
+class TestTrimAndDropSegments:
+    def test_dropped_segment_no_longer_starts_the_next(self):
+        # A 5 ms clock, so a reconstruction reaches 7.5 ms.
+        # The 0-2 ms segment holds the 0 ms reconstruction, which reaches the start of the 4-20 ms segment.
+        # Once 0-2 ms is dropped as short, 4-9 ms have no equilibrium and are trimmed.
+        times = grid_ms(30)
+        keep = np.zeros(30, dtype=bool)
+        keep[0:3] = True
+        keep[4:21] = True
+        reconstruction_usable = np.zeros(30, dtype=bool)
+        reconstruction_usable[[0, 10, 15, 20]] = True
+
+        kept, dropped, n_trimmed = _trim_and_drop_segments(
+            keep, times, reconstruction_usable, 0.005, 0.005
+        )
+
+        assert np.flatnonzero(kept).tolist() == list(range(10, 21))
+        assert len(dropped) == 1
+        assert n_trimmed == 6
 
 
 class TestHoldOntoGrid:

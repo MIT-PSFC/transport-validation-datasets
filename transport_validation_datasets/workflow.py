@@ -48,6 +48,7 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
 from transport_validation_datasets.machine.generic import (
     SOL_EXTENSIONS,
     efit_cocos_from_signs,
+    reconstruction_clock_period,
     standardize_signal_attrs,
     usable_reconstructions,
 )
@@ -794,26 +795,25 @@ class DataWorkflow(ABC):
         time_mask = (
             valid_mask.any(dim="shot") if "shot" in valid_mask.dims else valid_mask
         )
-        keep = time_mask.values
         if "simagx" in ds_input:
             reconstruction_usable = usable_reconstructions(ds_input)
-            reconstruction_kept = np.flatnonzero(reconstruction_usable & keep)
-            clock_period = _reconstruction_clock_period(ds_input, times)
-            held_index, _ = _hold_onto_grid(
-                times, times[reconstruction_kept], True, clock_period
+            clock_period = reconstruction_clock_period(ds_input, times)
+            kept_mask, dropped_lengths, n_trimmed = _trim_and_drop_segments(
+                time_mask.values,
+                times,
+                reconstruction_usable,
+                clock_period,
+                self.min_segment_length,
             )
-            has_equilibrium = held_index >= 0
-            keep_trimmed = _trim_segment_starts(keep, has_equilibrium)
-            n_trimmed = int(keep.sum() - keep_trimmed.sum())
             if n_trimmed:
                 logger.debug(
                     f"Shot {shot}: trimmed {n_trimmed} grid times with no equilibrium in reach "
                     f"from the starts of their segments"
                 )
-            keep = keep_trimmed
-        kept_mask, dropped_lengths = drop_short_segments(
-            keep, times, self.min_segment_length
-        )
+        else:
+            kept_mask, dropped_lengths = drop_short_segments(
+                time_mask.values, times, self.min_segment_length
+            )
         if dropped_lengths:
             logger.info(
                 f"Shot {shot}: dropped {len(dropped_lengths)} segment(s) shorter than "
@@ -1884,6 +1884,8 @@ class DataWorkflow(ABC):
     def export_to_imas(self, overwrite: bool = False):
         """Writes every fitted shot's equilibrium/core_profiles/summary/wall to IMAS format.
 
+        Exports the shots the stores take, through the same checks (_usable_shot_fit).
+
         Optional post-fitting step, requiring the `imas` extra (imas-python,
         eqdsk) -- the only stage that does; the rest of this
         package works without it. One shot-scoped output directory per shot
@@ -1910,12 +1912,20 @@ class DataWorkflow(ABC):
             return
 
         n_written = 0
+        n_rejected = 0
         for shot in shots:
             shot_dir = self.imas_export_dir / str(shot)
             if (shot_dir / "core_profiles.nc").exists() and not overwrite:
                 continue
-            fit_ds = xr.open_dataset(self.fit_shots_dir / f"{shot}.nc")
-            unprocessed_ds = xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc")
+            with xr.open_dataset(self.fit_shots_dir / f"{shot}.nc") as ds_file:
+                fit_ds = ds_file.load()
+            with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_file:
+                unprocessed_ds = ds_file.load()
+            # The shots the stores leave out stay out of the export too
+            fit_ds = self._usable_shot_fit(shot, unprocessed_ds, fit_ds, True)
+            if fit_ds is None:
+                n_rejected += 1
+                continue
             try:
                 ids_list = build_imas_from_shot(
                     shot,
@@ -1933,8 +1943,9 @@ class DataWorkflow(ABC):
             n_written += 1
 
         logger.info(
-            f"Wrote IMAS output for {n_written} of {len(shots)} shots to {self.imas_export_dir} "
-            f"({len(shots) - n_written} already up to date or failed)"
+            f"Wrote IMAS output for {n_written} of {len(shots)} shots to {self.imas_export_dir}, "
+            f"{n_rejected} rejected by the checks of the stores, "
+            f"{len(shots) - n_written - n_rejected} already up to date or failed"
         )
 
     def _internal_dataset_dim_sizes(self, shots: list[int]) -> dict[str, int]:
@@ -2008,6 +2019,48 @@ class DataWorkflow(ABC):
             )
         return sizes
 
+    def _usable_shot_fit(
+        self,
+        shot: int,
+        ds_unprocessed: xr.Dataset,
+        ds_fit: xr.Dataset,
+        drop_unfit_slices: bool,
+    ) -> xr.Dataset | None:
+        """Run the whole-shot checks of the stores on a shot's files and keep its usable slices.
+
+        The stack stage and export_to_imas both go through here, so they leave out the same shots.
+        The checks, in order:
+        shot_rejection_reason on the unprocessed file,
+        at least one slice left (usable_slice_mask),
+        and fit_rejection_reason on the slices left.
+        A rejected shot is logged with its reason.
+
+        Args:
+            shot: Shot number, for the log.
+            ds_unprocessed: The shot's unprocessed dataset.
+            ds_fit: The shot's fit result dataset.
+            drop_unfit_slices: Keep only the slices usable_slice_mask accepts. False keeps every slice.
+
+        Returns:
+            The fit dataset cut to the kept slices, or None when a check rejects the shot.
+        """
+        rejection_reason = self.shot_rejection_reason(ds_unprocessed)
+        if rejection_reason is None:
+            keep = (
+                usable_slice_mask(ds_fit)
+                if drop_unfit_slices
+                else np.ones(ds_fit.sizes[TIME_DIM], dtype=bool)
+            )
+            ds_fit = ds_fit.isel({TIME_DIM: np.flatnonzero(keep)})
+            if keep.any():
+                rejection_reason = self.fit_rejection_reason(ds_fit, ds_unprocessed)
+            else:
+                rejection_reason = f"no usable {self.fit_method} fits"
+        if rejection_reason is not None:
+            logger.warning(f"Shot {shot}: {rejection_reason}, leaving it out")
+            return None
+        return ds_fit
+
     def _internal_shot_dataset(
         self, shot: int, drop_unfit_slices: bool, forward_fill: bool
     ) -> xr.Dataset | None:
@@ -2034,8 +2087,7 @@ class DataWorkflow(ABC):
                 times between their samples.
 
         Returns:
-            The shot's dataset, or None when it has no usable fitted slice
-            or shot_rejection_reason or fit_rejection_reason rejects it.
+            The shot's dataset, or None when _usable_shot_fit rejects it.
 
         Raises:
             ValueError: If the fitted slice times are not on the unprocessed
@@ -2043,35 +2095,14 @@ class DataWorkflow(ABC):
         """
         with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_file:
             ds_unprocessed = ds_file.load()
-        rejection_reason = self.shot_rejection_reason(ds_unprocessed)
-        if rejection_reason is not None:
-            logger.warning(
-                f"Shot {shot}: {rejection_reason}, leaving it out of the internal dataset"
-            )
-            return None
-
         with xr.open_dataset(self.fit_shots_dir / f"{shot}.nc") as ds_file:
             ds_fit = ds_file.load()
         fit_mode = ds_fit.attrs["fit_mode"]
         # The full window list, before the unusable rows go:
         # a window whose every fit was culled still bounds the stored grid
         windows = _fit_windows(ds_fit)
-        keep = (
-            usable_slice_mask(ds_fit)
-            if drop_unfit_slices
-            else np.ones(ds_fit.sizes[TIME_DIM], dtype=bool)
-        )
-        if not keep.any():
-            logger.warning(
-                f"Shot {shot}: no usable {self.fit_method} fits, leaving it out of the internal dataset"
-            )
-            return None
-        ds_fit = ds_fit.isel({TIME_DIM: np.flatnonzero(keep)})
-        rejection_reason = self.fit_rejection_reason(ds_fit, ds_unprocessed)
-        if rejection_reason is not None:
-            logger.warning(
-                f"Shot {shot}: {rejection_reason}, leaving it out of the internal dataset"
-            )
+        ds_fit = self._usable_shot_fit(shot, ds_unprocessed, ds_fit, drop_unfit_slices)
+        if ds_fit is None:
             return None
         # A per-method fit diagnostic, kept in the fit files but left out of
         # the store, where it would be the only string-labelled dimension
@@ -2451,7 +2482,7 @@ def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
     A run with no sample marked in can_start is cleared whole.
     can_start outside the runs is ignored, a marked sample just before a run does not start it.
 
-    filter_and_plot passes the grid times that a kept usable reconstruction reaches within the hold,
+    _trim_and_drop_segments passes the grid times that a kept usable reconstruction reaches within the hold,
     so every kept segment starts where the store will have an equilibrium.
     Lapses inside a segment are left for the stack stage to show as gaps.
     It runs before drop_short_segments, so a trimmed run is judged on what is left of it.
@@ -2475,6 +2506,50 @@ def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
         first_startable = startable[0] if startable.size else end - start
         keep[start : start + first_startable] = False
     return keep
+
+
+def _trim_and_drop_segments(
+    keep: np.ndarray,
+    times: np.ndarray,
+    reconstruction_usable: np.ndarray,
+    clock_period: float,
+    min_length: float,
+) -> tuple[np.ndarray, list[float], int]:
+    """Start each kept segment where a kept reconstruction reaches, and drop the segments left too short.
+
+    A grid time has an equilibrium in the store when a kept usable reconstruction
+    at or before it is within MAX_HOLD_PERIODS of the clock period (_hold_equilibrium).
+    _trim_segment_starts cuts each segment's leading grid times without one,
+    then drop_short_segments judges each segment on what is left.
+    The two repeat until the mask stops changing,
+    since a dropped segment can hold the reconstruction that reached the start of the next one.
+
+    Args:
+        keep: Mask over the uniform 1 kHz grid, True where the sample survived the filters. Not modified.
+        times: The grid times [s].
+        reconstruction_usable: Mask over the grid, True at the usable reconstructions (usable_reconstructions).
+        clock_period: The reconstruction clock's period [s] (reconstruction_clock_period).
+        min_length: Shortest segment to keep [s].
+
+    Returns:
+        (keep, dropped_lengths, n_trimmed): the new mask,
+        the lengths [s] of the segments dropped as short,
+        and how many grid times the trims cut.
+    """
+    dropped_lengths = []
+    n_trimmed = 0
+    while True:
+        reconstruction_kept = np.flatnonzero(reconstruction_usable & keep)
+        held_index, _ = _hold_onto_grid(
+            times, times[reconstruction_kept], True, clock_period
+        )
+        keep_trimmed = _trim_segment_starts(keep, held_index >= 0)
+        n_trimmed += int(keep.sum() - keep_trimmed.sum())
+        keep_next, dropped = drop_short_segments(keep_trimmed, times, min_length)
+        dropped_lengths.extend(dropped)
+        if np.array_equal(keep_next, keep):
+            return keep_next, dropped_lengths, n_trimmed
+        keep = keep_next
 
 
 def pulse_and_usable_time(kept_times: np.ndarray) -> tuple[float, float]:
@@ -2774,26 +2849,6 @@ def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
     return tiled
 
 
-def _reconstruction_clock_period(ds: xr.Dataset, grid: np.ndarray) -> float:
-    """Median spacing of a shot's reconstructions, the unusable ones included.
-
-    An equilibrium is held for this clock's period,
-    so dropping an unusable reconstruction does not stretch the hold.
-    A lone reconstruction only fills its own grid step, as in _hold_onto_grid.
-
-    Args:
-        ds: One shot's dataset with the GEQDSK block on its grid.
-        grid: The shot's 1 kHz timebase [s].
-
-    Returns:
-        The period [s].
-    """
-    simagx = ds["simagx"].squeeze(EPISODE_DIM, drop=True).transpose(TIME_COORD).values
-    clock_times = grid[np.isfinite(simagx)]
-    clock_steps = np.diff(clock_times) if clock_times.size > 1 else np.diff(grid)
-    return float(np.median(clock_steps))
-
-
 def _hold_equilibrium(
     ds_unprocessed: xr.Dataset, grid: np.ndarray, forward_fill: bool
 ) -> tuple[dict[str, xr.DataArray], np.ndarray]:
@@ -2822,7 +2877,7 @@ def _hold_equilibrium(
             grid.size, dtype=bool
         )
 
-    clock_period = _reconstruction_clock_period(ds_unprocessed, grid)
+    clock_period = reconstruction_clock_period(ds_unprocessed, grid)
     usable = usable_reconstructions(ds_unprocessed)
     reconstructed = np.flatnonzero(usable)
     reconstruction_index, fresh = _hold_onto_grid(
