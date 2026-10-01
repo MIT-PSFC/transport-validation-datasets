@@ -1878,7 +1878,7 @@ class DataWorkflow(ABC):
             write_ids,
         )
 
-        shots = self._final_dataset_shots()
+        shots = self._internal_dataset_shots()
         if not shots:
             logger.warning(
                 "No shots have both unprocessed data and fit results; nothing to export to IMAS"
