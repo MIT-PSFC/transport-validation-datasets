@@ -16,7 +16,6 @@ from transport_validation_datasets.workflow import (
     _hold_onto_grid,
     _trim_and_keep_longest,
     _trim_segment_starts,
-    bridge_short_lapses,
     keep_longest_segment,
     usable_slice_mask,
 )
@@ -28,37 +27,8 @@ def grid_ms(n: int) -> np.ndarray:
 
 
 def runs(*lengths: int) -> np.ndarray:
-    # Alternating kept and lapsed runs of the given lengths in samples, starting with a kept run
+    # Alternating kept and cut runs of the given lengths in samples, starting with a kept run
     return np.concatenate([np.full(n, i % 2 == 0) for i, n in enumerate(lengths)])
-
-
-class TestBridgeShortLapses:
-    def test_lapse_bridged_per_50_kept_samples_on_the_shorter_side(self):
-        # 200 kept samples on the shorter side bridge up to 4 lapsed ones
-        assert bridge_short_lapses(runs(500, 4, 200)).all()
-
-        bridged = bridge_short_lapses(runs(500, 5, 200))
-        assert np.array_equal(bridged, runs(500, 5, 200))
-
-    def test_short_side_too_short_to_bridge_anything(self):
-        bridged = bridge_short_lapses(runs(900, 1, 40))
-
-        assert np.array_equal(bridged, runs(900, 1, 40))
-
-    def test_bridged_lapse_lengthens_the_side_of_the_next_one(self):
-        # 100 bridges the 2 on its right, then 3 needs 150 on both sides,
-        # which only the joined 100 + 400 holds
-        keep = runs(500, 3, 100, 2, 400)
-
-        assert bridge_short_lapses(keep).all()
-
-    def test_bridged_samples_do_not_count_toward_a_side(self):
-        # 99 + 1 lapsed + 99 spans 199 samples, but holds only 198 kept, one short of bridging 4
-        keep = runs(1000, 4, 99, 1, 99)
-
-        bridged = bridge_short_lapses(keep)
-
-        assert np.array_equal(bridged, runs(1000, 4, 199))
 
 
 class TestKeepLongestSegment:
@@ -105,29 +75,12 @@ class TestTrimAndKeepLongest:
         reconstruction_usable[[0, 10, 15, 20]] = True
 
         kept, dropped, n_trimmed = _trim_and_keep_longest(
-            keep, keep, times, reconstruction_usable, 0.005
+            keep, times, reconstruction_usable, 0.005
         )
 
         assert np.flatnonzero(kept).tolist() == list(range(10, 21))
         assert len(dropped) == 1
         assert n_trimmed == 6
-
-    def test_segment_never_starts_in_a_bridged_lapse(self):
-        # The 4 ms reconstruction sits in the 3-5 ms lapse and would start the segment there.
-        # Starting on the passing 6 ms instead drops it,
-        # so 6-7 ms have no equilibrium and the start moves to the 8 ms reconstruction.
-        times = grid_ms(30)
-        keep = np.ones(30, dtype=bool)
-        passed = keep.copy()
-        passed[3:6] = False
-        reconstruction_usable = np.zeros(30, dtype=bool)
-        reconstruction_usable[[4, 8, 12, 16, 20, 24, 28]] = True
-
-        kept, _, _ = _trim_and_keep_longest(
-            keep, passed, times, reconstruction_usable, 0.004
-        )
-
-        assert np.flatnonzero(kept).tolist() == list(range(8, 30))
 
 
 class TestHoldOntoGrid:

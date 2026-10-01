@@ -83,10 +83,6 @@ TRANSIENT_SMOOTHING_WINDOW = 5e-3
 # Trailing, since a centered one would see the ohmic spike of the current quench ahead.
 RADIATED_FRACTION_WINDOW = 50e-3
 
-# Valid samples each side of a valid filter lapse needs per lapsed sample for the lapse to be bridged.
-# On the 1 kHz grid, 50 ms of valid data on both sides bridges 1 ms of lapse, see bridge_short_lapses.
-LAPSE_BRIDGE_RATIO = 50
-
 # How far a shot's stored-energy rise may exceed the heating energy put in before it is rejected.
 # The 5 percent covers integration error and EFIT noise, see DataWorkflow.shot_rejection_reason.
 ENERGY_SANITY_LEEWAY = 1.05
@@ -717,15 +713,14 @@ class DataWorkflow(ABC):
         """Take datasets with standardized names, run filtering on them, and plot results.
 
         What survives is one contiguous segment of the times that pass the valid and transient filters.
-        Valid filter lapses short next to the segments on both sides are bridged (bridge_short_lapses),
-        each segment is started on a passing sample a kept usable reconstruction (usable_reconstructions) reaches,
+        Each segment is started where a kept usable reconstruction (usable_reconstructions) reaches,
         and only the longest segment is kept.
         The shot is rejected when that segment is shorter than min_pulse_length,
         or when shot_rejection_reason finds a broken record in it.
 
         Rejected shots are plotted unfiltered to rejected_shots_dir.
         Accepted shots are plotted unfiltered to accepted_shots_dir,
-        with the kept segment shaded green and its bridged lapses yellow.
+        with the kept segment shaded green.
         Both plots mark the end margin cutoff and (if one was found) the transient cutoff.
 
         Args:
@@ -795,28 +790,18 @@ class DataWorkflow(ABC):
         if transient_margin_time is not None:
             valid_mask = valid_mask & (ds_input["time"] < transient_margin_time)
 
-        # 3: Bridge the short valid filter lapses,
-        # start each segment where the store will have an equilibrium, then keep only the longest.
+        # 3: Start each segment where the store will have an equilibrium, then keep only the longest.
         # The store only holds the reconstructions that are kept (_hold_equilibrium),
         # so a segment's first grid times have none when the one before it is cut.
-        # The end margin and the transient cut only remove a shot's tail,
-        # so every lapse with a segment after it is a valid filter lapse.
         times = ds_input["time"].values
         time_mask = (
             valid_mask.any(dim="shot") if "shot" in valid_mask.dims else valid_mask
         )
         filtered_mask = time_mask.values
-        bridged_mask = bridge_short_lapses(filtered_mask)
-        n_bridged = int(bridged_mask.sum() - filtered_mask.sum())
-        if n_bridged:
-            logger.info(
-                f"Shot {shot}: bridged {n_bridged} grid times of valid filter lapses"
-            )
         if "simagx" in ds_input:
             reconstruction_usable = usable_reconstructions(ds_input)
             clock_period = reconstruction_clock_period(ds_input, times)
             kept_mask, dropped_lengths, n_trimmed = _trim_and_keep_longest(
-                bridged_mask,
                 filtered_mask,
                 times,
                 reconstruction_usable,
@@ -828,16 +813,15 @@ class DataWorkflow(ABC):
                     f"from the starts of their segments"
                 )
         else:
-            kept_mask, dropped_lengths = keep_longest_segment(bridged_mask, times)
+            kept_mask, dropped_lengths = keep_longest_segment(filtered_mask, times)
         if dropped_lengths:
             logger.info(
                 f"Shot {shot}: kept the longest segment, dropped {len(dropped_lengths)} "
                 f"shorter one(s), lengths [ms]: "
                 + ", ".join(f"{1e3 * length:.0f}" for length in dropped_lengths)
             )
-        # Replaces valid_mask rather than narrowing it, the bridged lapses fail the valid filter
         kept_time_mask = xr.DataArray(kept_mask, coords={"time": times}, dims="time")
-        valid_mask = kept_time_mask.broadcast_like(valid_mask)
+        valid_mask = valid_mask & kept_time_mask
 
         # Load-bearing broadcast: valid_mask carries the shot and time dims, so
         # this also gives every static quantity (the limiter contour, the fixed
@@ -871,18 +855,11 @@ class DataWorkflow(ABC):
             )
             return None
         else:
-            # Plot the entire shot, with the kept segment shaded green and its bridged lapses yellow.
-            # A lapse is shaded from the passing sample before it to the one after, so a single sample shows.
-            # The kept segment starts and ends on a passing sample, so both neighbours exist.
-            good_starts, good_ends = _kept_segments(kept_mask & filtered_mask)
+            # Plot the entire shot, with the kept segment shaded green
+            kept_starts, kept_ends = _kept_segments(kept_mask)
             kept_spans = [
                 (float(times[start]), float(times[end - 1]))
-                for start, end in zip(good_starts, good_ends)
-            ]
-            lapse_starts, lapse_ends = _kept_segments(kept_mask & ~filtered_mask)
-            bridged_spans = [
-                (float(times[start - 1]), float(times[end]))
-                for start, end in zip(lapse_starts, lapse_ends)
+                for start, end in zip(kept_starts, kept_ends)
             ]
             window_spans = (
                 None if self.shot_windows is None else self.shot_windows.get(int(shot))
@@ -897,7 +874,6 @@ class DataWorkflow(ABC):
                 transient_margin_time=transient_margin_time,
                 radiated_limit=radiated_limit,
                 kept_spans=kept_spans,
-                bridged_spans=bridged_spans,
                 window_spans=window_spans,
             )
             return ds_filtered
@@ -2355,7 +2331,6 @@ class DataWorkflow(ABC):
                     "radiated_collapse_floor": self.radiated_collapse_floor,
                     "radiated_fraction_window": RADIATED_FRACTION_WINDOW,
                     "end_margin": self.end_margin,
-                    "lapse_bridge_ratio": LAPSE_BRIDGE_RATIO,
                     "min_pulse_length": self.min_pulse_length,
                     "shot_blacklist": list(self.shot_blacklist),
                     "first_shot": self.first_shot,
@@ -2493,49 +2468,6 @@ def _boxcar_mean(
     return signal.rolling(time=n_samples, center=True, min_periods=1).mean()
 
 
-def bridge_short_lapses(keep: np.ndarray) -> np.ndarray:
-    """Fill the lapses between runs of kept samples that are short next to the runs on both sides.
-
-    A lapse of n samples is filled when the runs on both sides
-    each hold at least LAPSE_BRIDGE_RATIO * n kept samples.
-    A run counts only the samples that were kept, not the lapses already filled inside it.
-    Filling repeats until nothing changes,
-    since a filled lapse joins two runs into a longer one for the lapses next to it.
-    Filling a lapse only lengthens the runs around the others,
-    so the result does not depend on the order the lapses are filled in.
-
-    Example, with LAPSE_BRIDGE_RATIO 50 on the 1 kHz grid:
-        500 kept, 4 lapsed, 200 kept -> filled, 200 kept samples bridge 4
-        500 kept, 5 lapsed, 200 kept -> left
-        900 kept, 1 lapsed, 40 kept  -> left, 40 kept samples bridge none
-
-    Args:
-        keep: Mask over the uniform 1 kHz grid, True where the sample survived the filters. Not modified.
-
-    Returns:
-        A copy of keep with the short lapses filled.
-    """
-    keep = np.asarray(keep, dtype=bool)
-    # Kept samples ahead of each index, so a run's count is the difference of two entries
-    n_kept_through = np.cumsum(keep)
-    n_kept_before = np.concatenate(([0], n_kept_through))
-    bridged = keep.copy()
-    while True:
-        starts, ends = _kept_segments(bridged)
-        n_kept_per_run = n_kept_before[ends] - n_kept_before[starts]
-        n_kept_both_sides = np.minimum(n_kept_per_run[:-1], n_kept_per_run[1:])
-        lapse_starts = ends[:-1]
-        lapse_ends = starts[1:]
-        lapse_lengths = lapse_ends - lapse_starts
-        mask_bridgeable = LAPSE_BRIDGE_RATIO * lapse_lengths <= n_kept_both_sides
-        if not mask_bridgeable.any():
-            return bridged
-        for lapse_start, lapse_end in zip(
-            lapse_starts[mask_bridgeable], lapse_ends[mask_bridgeable]
-        ):
-            bridged[lapse_start:lapse_end] = True
-
-
 def keep_longest_segment(
     keep: np.ndarray, times: np.ndarray
 ) -> tuple[np.ndarray, list[float]]:
@@ -2606,9 +2538,8 @@ def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
     A run with no sample marked in can_start is cleared whole.
     can_start outside the runs is ignored, a marked sample just before a run does not start it.
 
-    _trim_and_keep_longest passes the grid times that passed the filters
-    and that a kept usable reconstruction reaches within the hold,
-    so every kept segment starts on a passing sample where the store will have an equilibrium.
+    _trim_and_keep_longest passes the grid times that a kept usable reconstruction reaches within the hold,
+    so every kept segment starts where the store will have an equilibrium.
     Equilibrium lapses inside a segment are left for the stack stage to show as gaps.
     It runs before keep_longest_segment, so a trimmed run is judged on what is left of it.
 
@@ -2635,7 +2566,6 @@ def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
 
 def _trim_and_keep_longest(
     keep: np.ndarray,
-    passed: np.ndarray,
     times: np.ndarray,
     reconstruction_usable: np.ndarray,
     clock_period: float,
@@ -2645,15 +2575,12 @@ def _trim_and_keep_longest(
     A grid time has an equilibrium in the store when a kept usable reconstruction
     at or before it is within MAX_HOLD_PERIODS of the clock period (_hold_equilibrium).
     _trim_segment_starts cuts each segment's leading grid times without one,
-    and those that only sit in a bridged lapse, so every segment starts on a sample that passed the filters.
-    Then keep_longest_segment judges the segments on what is left.
+    then keep_longest_segment judges the segments on what is left.
     The two repeat until the mask stops changing,
     since a dropped segment can hold the reconstruction that reached the start of the longest.
 
     Args:
-        keep: Mask over the uniform 1 kHz grid, True where the sample survived the filters
-            or sits in a bridged lapse (bridge_short_lapses). Not modified.
-        passed: Mask over the grid, True where the sample survived the filters, the bridged lapses False.
+        keep: Mask over the uniform 1 kHz grid, True where the sample survived the filters. Not modified.
         times: The grid times [s].
         reconstruction_usable: Mask over the grid, True at the usable reconstructions (usable_reconstructions).
         clock_period: The reconstruction clock's period [s] (reconstruction_clock_period).
@@ -2670,8 +2597,7 @@ def _trim_and_keep_longest(
         held_index, _ = _hold_onto_grid(
             times, times[reconstruction_kept], True, clock_period
         )
-        can_start = (held_index >= 0) & passed
-        keep_trimmed = _trim_segment_starts(keep, can_start)
+        keep_trimmed = _trim_segment_starts(keep, held_index >= 0)
         n_trimmed += int(keep.sum() - keep_trimmed.sum())
         keep_next, dropped = keep_longest_segment(keep_trimmed, times)
         dropped_lengths.extend(dropped)
