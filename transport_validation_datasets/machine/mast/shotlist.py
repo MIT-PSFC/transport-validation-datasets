@@ -40,7 +40,7 @@ from transport_validation_datasets.machine.mast.mast_dataset import (
     MASTDataWorkflow,
     MASTSettings,
     MissingSourceError,
-    equilibrium_qpsi,
+    efm_flux_map,
     open_shot_sources,
 )
 from transport_validation_datasets.workflow import (
@@ -117,7 +117,7 @@ def _ip_window(summary: xr.Dataset, timebase: np.ndarray) -> np.ndarray:
 
 
 def _chord_rho_tor_norm_min(
-    shot: int, equilibrium: xr.Dataset, ds_thomson: xr.Dataset
+    efm: xr.Dataset, ds_thomson: xr.Dataset
 ) -> tuple[np.ndarray, np.ndarray]:
     """Smallest rho_tor_norm on the Thomson chord, per reconstruction.
 
@@ -127,28 +127,23 @@ def _chord_rho_tor_norm_min(
     under the same usability rules as map_ts_channels_to_rho_tor_norm.
 
     Args:
-        shot: Shot number being scanned.
-        equilibrium: The level 2 equilibrium group.
+        efm: The level 1 efm group.
         ds_thomson: The shot's usable Thomson slices, for the channel radii.
 
     Returns:
         (eq_time, rho_min): the times of the reconstructions with a flux map [s],
         and the smallest rho_tor_norm on the chord at each, NaN where it is unusable.
     """
-    eq_time = np.asarray(equilibrium["time"].values, dtype=float)
-    psi_axis = np.asarray(equilibrium["psi_axis"].values, dtype=float)
-    psi_range = np.asarray(equilibrium["psi_boundary"].values, dtype=float) - psi_axis
-    psi_chord = (
-        equilibrium["psi"]
-        .interp(z=TS_CHANNEL_Z)
-        .transpose("time", "major_radius")
-        .values
-    )
-    r_grid = equilibrium["major_radius"].values
+    eq_time = np.asarray(efm["time"].values, dtype=float)
+    psi_axis = np.asarray(efm["psi_axis"].values, dtype=float)
+    psi_range = np.asarray(efm["psi_boundary"].values, dtype=float) - psi_axis
+    psi_map = efm_flux_map(efm)
+    psi_chord = psi_map.interp(z=TS_CHANNEL_Z).transpose("time", "major_radius").values
+    r_grid = psi_map["major_radius"].values
     ts_r = ds_thomson["ts_channel_r"].values
     mask_on_chord = (r_grid >= np.nanmin(ts_r)) & (r_grid <= np.nanmax(ts_r))
     psi_n_chord = (psi_chord[:, mask_on_chord] - psi_axis[:, None]) / psi_range[:, None]
-    qpsi = equilibrium_qpsi(shot, eq_time, equilibrium.sizes["psi_norm"])
+    qpsi = np.asarray(efm["qpsi_c"].transpose("time", "psi_norm").values, dtype=float)
     sol_extension = MASTSettings().sol_extension
 
     rho_min = np.full(eq_time.size, np.nan)
@@ -229,14 +224,12 @@ def _scan_shot(shot: int) -> dict | None:
         return {**row, "reason": "Plasma current window too short."}
 
     try:
-        eq_time, rho_min = _chord_rho_tor_norm_min(
-            shot, sources.equilibrium, sources.ds_thomson
-        )
+        eq_time, rho_min = _chord_rho_tor_norm_min(sources.efm, sources.ds_thomson)
     except Exception as e:
         logger.warning(f"Shot {shot}: failed to read the equilibrium: {e}")
         return None
     if not np.isfinite(rho_min).any():
-        # Also where the level 1 qpsi_c read failed, see equilibrium_qpsi
+        # Also where qpsi_c is NaN
         return {**row, "reason": "No usable reconstruction on the chord."}
     near_axis_fraction = _near_axis_fraction(
         window_times.astype(float), eq_time, rho_min
