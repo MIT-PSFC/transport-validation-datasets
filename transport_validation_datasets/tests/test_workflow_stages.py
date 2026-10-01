@@ -655,6 +655,33 @@ class TestStackInternalDataset:
 
         assert store[EPISODE_DIM].values.tolist() == [2]
 
+    def test_shots_excluded_after_files_written_left_out(self, tmp_path):
+        workflow = make_workflow(tmp_path, shots=[1, 2, 3])
+        workflow.make_unprocessed_data_files()
+        workflow.run_gp_fitting()
+
+        workflow.first_shot = 2
+        workflow.shot_blacklist = [3]
+        store = xr.open_zarr(workflow.stack_internal_dataset(), consolidated=True)
+
+        assert store[EPISODE_DIM].values.tolist() == [2]
+
+    def test_density_far_off_interferometer_drops_shot(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        # The fitted parabola averages ~0.77 of its axis value over rho_tor_norm 0-1,
+        # so shot 2's interferometer reads ~5x its Thomson
+        workflow.extra_signals = {
+            1: {"n_e_line_average": NE_AXIS * shot_scale(1)},
+            2: {"n_e_line_average": 4.0 * NE_AXIS * shot_scale(2)},
+        }
+        workflow.make_unprocessed_data_files()
+        workflow.run_gp_fitting()
+
+        workflow.density_ratio_bounds = (0.5, 1.3)
+        store = xr.open_zarr(workflow.stack_internal_dataset(), consolidated=True)
+
+        assert store[EPISODE_DIM].values.tolist() == [1]
+
     def test_publish_strips_raw_channels(self, tmp_path):
         workflow = make_workflow(tmp_path)
         run_all(workflow)

@@ -91,6 +91,9 @@ class CModDataWorkflow(DataWorkflow):
     }
     end_margin = 0.02
     shot_blacklist = []
+    # Thomson n_e against the interferometer. Large disagreement indicates TS miscalibration.
+    # 1160527001 and 1160527002 are 0.69, the next lowest shot is 0.76, the highest at 1.16
+    density_ratio_bounds = (0.72, 1.3)
 
     # GP fit staging knobs
     # TS channels whose Te is dropped from every shot, their ne is kept.
