@@ -63,10 +63,10 @@ class TestTrimSegmentStarts:
 
 
 class TestTrimAndKeepLongest:
-    def test_dropped_segment_no_longer_starts_the_longest(self):
+    def test_earlier_segment_never_starts_a_later_one(self):
         # A 5 ms clock, so a reconstruction reaches 7.5 ms.
-        # The 0-2 ms segment holds the 0 ms reconstruction, which reaches the start of the 4-20 ms segment.
-        # Once 0-2 ms is dropped for the longer one, 4-9 ms have no equilibrium and are trimmed.
+        # The 0 ms reconstruction of the 0-2 ms segment reaches 4-7 ms, but only one segment is kept,
+        # so 4-9 ms have no equilibrium of their own and are trimmed.
         times = grid_ms(30)
         keep = np.zeros(30, dtype=bool)
         keep[0:3] = True
@@ -81,6 +81,26 @@ class TestTrimAndKeepLongest:
         assert np.flatnonzero(kept).tolist() == list(range(10, 21))
         assert len(dropped) == 1
         assert n_trimmed == 6
+
+    def test_longest_judged_after_every_trim(self):
+        # 0-45 ms starts on its own 0 ms reconstruction.
+        # 47-95 ms is reached at 47 only by the 45 ms reconstruction before it,
+        # so on its own it starts at 58 and spans 37 ms, shorter than 0-45 ms.
+        times = grid_ms(100)
+        keep = np.zeros(100, dtype=bool)
+        keep[0:46] = True
+        keep[47:96] = True
+        reconstruction_usable = np.zeros(100, dtype=bool)
+        reconstruction_usable[0:46:5] = True
+        reconstruction_usable[58:96:5] = True
+
+        kept, dropped, n_trimmed = _trim_and_keep_longest(
+            keep, times, reconstruction_usable, 0.005
+        )
+
+        assert np.flatnonzero(kept).tolist() == list(range(0, 46))
+        assert np.allclose(dropped, [0.037])
+        assert n_trimmed == 11
 
 
 class TestHoldOntoGrid:
