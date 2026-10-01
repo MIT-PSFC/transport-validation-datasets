@@ -103,7 +103,9 @@ BRANCH_MIN_CHANNELS = 3
 # level 2 equilibrium signal -> standardized name.
 # All 0D, interpolated onto the 1 kHz timebase.
 EQUILIBRIUM_SIGNALS = {
-    "wmhd": "energy_mhd",
+    # plasma_energy (EFM_PLASMA_ENERGY) is 3/2 the volume integral of the reconstructed pressure.
+    # Not wmhd (EFM_WPLASMD), the diamagnetic energy, built on a measured diamagnetic flux that is 0 in level 1
+    "plasma_energy": "energy_mhd",
     "beta_tor_normal": "beta_tor_norm",
     "minor_radius": "minor_radius",
     "elongation": "elongation",
@@ -161,7 +163,7 @@ SIGNAL_ATTRS = {
         "ref": "/summary/global_quantities/b0/value",
     },
     "energy_mhd": {
-        "description": "Total stored energy from the equilibrium reconstruction",
+        "description": "Stored energy from the equilibrium reconstruction, 3/2 the volume integral of its pressure",
         "units": "J",
         "ref": "/equilibrium/time_slice(itime)/global_quantities/energy_mhd",
     },
@@ -398,7 +400,9 @@ class MASTDataWorkflow(DataWorkflow):
         "ip": {"min_abs": 210e3, "max_abs": 1.5e6},
         # Upper bound is the MAST density limit, 10.1088/1361-6587/ace476
         "n_e_line_average": {"min": 1e19, "max": 1.2e20},
-        "energy_mhd": {"min": 10e3, "max": 2e6},
+        # 5 kJ of plasma_energy cuts about what 10 kJ of the old wmhd did (median ratio 2.1),
+        # 1.9 percent of the times iteration 12 kept, mostly ramp phases
+        "energy_mhd": {"min": 5e3, "max": 2e6},
         "beta_tor_norm": {"min": 0.01, "max": 10.0},
         # Sample validity, distinct from the transient gate below: MAST total
         # input power tops out near 5 MW, so a recorded radiated power above

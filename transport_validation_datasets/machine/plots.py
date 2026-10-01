@@ -81,7 +81,7 @@ def plot_unprocessed_data(
 
     One plot with several subplots, in the following groups:
 
-    1: ip (in MA) and b0 on left axis, wmhd (in MJ) on right axis
+    1: ip (in MA) and b0 on left axis, energy_mhd (in MJ) on right axis
     - Also has a vertical red line indicating the end margin time as identified by filter_and_plot
     - And a vertical yellow line indicating the cutoff before a transient event, as identified by filter_and_plot (if provided)
     2: n_e_line_average (in 10^20 m^-3) on left axis, beta_n (unitless) on right axis
@@ -125,7 +125,7 @@ def plot_unprocessed_data(
                     span_start, span_end, color="tab:blue", alpha=0.25, linewidth=0
                 )
 
-    # ip and b0 on the left y axis, wmhd on the right y axis
+    # ip and b0 on the left y axis, energy_mhd on the right y axis
     ax_ip = axes[0]
     ip, ip_label = _abs_if_negative(ds["ip"])
     ip_ma = ip / 1e6
@@ -148,17 +148,17 @@ def plot_unprocessed_data(
         edgecolor=BACKGROUND_COLOR,
         loc="upper left",
     )
-    ax_wmhd = ax_ip.twinx()
-    wmhd_signals = []
+    ax_energy = ax_ip.twinx()
+    energy_signals = []
     if "energy_mhd" in ds:
-        wmhd = ds["energy_mhd"] / 1e6
-        ax_wmhd.plot(time, wmhd, label="wmhd [MJ]", color="red")
-        _valid_range_lines(ax_wmhd, valid_filter, "energy_mhd", 1e-6, "red")
-        wmhd_signals.append(wmhd)
-    ax_wmhd.set_ylabel("Wmhd [MJ]", fontsize=LABEL_FONTSIZE, color="red")
-    ax_wmhd.set_ylim(_signal_ylim(wmhd_signals))
-    ax_wmhd.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-    all_axes.append(ax_wmhd)
+        energy_mhd_MJ = ds["energy_mhd"] / 1e6
+        ax_energy.plot(time, energy_mhd_MJ, label="energy_mhd [MJ]", color="red")
+        _valid_range_lines(ax_energy, valid_filter, "energy_mhd", 1e-6, "red")
+        energy_signals.append(energy_mhd_MJ)
+    ax_energy.set_ylabel("energy_mhd [MJ]", fontsize=LABEL_FONTSIZE, color="red")
+    ax_energy.set_ylim(_signal_ylim(energy_signals))
+    ax_energy.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+    all_axes.append(ax_energy)
 
     # line average density on the left y axis, normalized beta on the right y axis
     ax_ne = axes[1]
