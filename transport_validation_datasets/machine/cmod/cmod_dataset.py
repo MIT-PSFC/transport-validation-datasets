@@ -33,7 +33,7 @@ SIGNAL_ATTRS = {
     "power_nbi": {
         "description": "Neutral beam heating power (none on C-Mod)",
         "units": "W",
-        "ref": "/summary/heating_current_drive/power_nbi/value",
+        "ref": "/summary/heating_current_drive/power_launched_nbi/value",
     },
     "geometric_axis_r": {
         "description": "Major radius of the geometric center of the boundary (EFIT rout)",
