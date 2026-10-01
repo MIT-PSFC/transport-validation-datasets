@@ -302,6 +302,33 @@ class TestMakeUnprocessedDataFiles:
         assert workflow.shot_already_failed(1)
 
 
+class TestTransientGaps:
+    grid = make_uniform_1kHz_timebase(DURATION).astype(float)
+
+    def kept_times(self, tmp_path, spike_time: float) -> np.ndarray:
+        # A 20 MW ohmic spike 5 ms wide, above the 5 MW threshold for 7 ms after smoothing
+        workflow = make_workflow(tmp_path)
+        workflow.transient_filter = {"power_ohm": 5e6}
+        power_ohm = np.where(np.abs(self.grid - spike_time) <= 2.5e-3, 2e7, 1e5)
+        ds = make_source_dataset(
+            1, parabola, DURATION, None, False, extra_signals={"power_ohm": power_ohm}
+        )
+        ds_filtered = workflow.filter_and_plot(ds)
+        return ds_filtered[TIME_COORD].values
+
+    def test_early_spike_cut_out_and_the_longer_stretch_after_kept(self, tmp_path):
+        times = self.kept_times(tmp_path, 0.06)
+
+        assert 0.06 < times.min() < 0.07
+        assert times.max() > 0.28
+
+    def test_late_spike_keeps_the_longer_stretch_before(self, tmp_path):
+        times = self.kept_times(tmp_path, 0.22)
+
+        assert times.min() < 1e-3
+        assert 0.21 < times.max() < 0.22
+
+
 class TestShotRejectionReason:
     grid = make_uniform_1kHz_timebase(DURATION).astype(float)
 

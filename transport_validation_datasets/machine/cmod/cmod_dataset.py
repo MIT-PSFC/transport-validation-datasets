@@ -80,19 +80,18 @@ class CModDataWorkflow(DataWorkflow):
     valid_filter = {
         "ip": {"min_abs": 100e3},  # Only care about magnitude of ip
         "n_e_line_average": {"min": 1e18, "max": 6e20},
+        # The energy and beta floors were lowered from 3 kJ and 0.08 so the ramp-ups count.
+        # Over 990 shots read from source, 0.05 adds 11 shots and 45 s of kept time, 2.7 kJ another 3 s.
         "energy_mhd": {"min": 2.7e3},
         "beta_tor_norm": {"min": 0.05, "max": 2.0},
     }
+    # Input power tops out near 6 MW, so 5.5 MW radiated is a collapse or a broken record.
+    # The 2.5 MW this replaces caught ICRF H-modes radiating 3 MW of 5 MW in.
+    # Over the same 990 shots it fires in 48 and costs 28 s of kept time, 2 percent.
     transient_filter = {
         "power_ohm": 5.0e6,
+        "power_radiated": 5.5e6,
     }
-    # Radiative collapse, see DataWorkflow.max_radiated_fraction.
-    # The absolute 2.5 MW cut this replaces fired mid-shot in 15 of 32 sampled shots,
-    # ICRF H-modes radiating 3 MW of 5 MW in.
-    # Twice the trailing heating power fires in 4 of the 32,
-    # a ramp-up spike, a minor disruption and two late radiative drops.
-    max_radiated_fraction = 2.0
-    radiated_collapse_floor = 1e6
     end_margin = 0.02
     shot_blacklist = []
     # Shots radiate a median 25 percent of their heating power (it11 store).
