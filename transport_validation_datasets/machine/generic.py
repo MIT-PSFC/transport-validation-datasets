@@ -183,6 +183,9 @@ SOL_EXTENSIONS = ("secant", "tangent")
 # The secant SOL extension takes its slope over psi_N from here to the LCFS.
 SECANT_PSI_N = 0.95
 
+# A reconstruction whose boundary and axis psi sit closer than this has no usable flux map.
+MIN_PSI_RANGE = 1e-10
+
 
 def make_uniform_1kHz_timebase(max_time: float) -> np.ndarray:
     """Create a uniform timebase at 1 kHz up to the specified maximum time.
@@ -380,6 +383,31 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     )
 
 
+def usable_reconstructions(ds: xr.Dataset) -> np.ndarray:
+    """Mark the times that carry a reconstruction the Thomson mapping and the stores can use.
+
+    A reconstruction is usable when its axis and boundary psi are finite and meaningfully different,
+    and its whole psirz and qpsi are finite.
+
+    Args:
+        ds: One shot's dataset with the GEQDSK block on its time axis.
+
+    Returns:
+        (n_t,) boolean mask over the time axis, False where nothing was reconstructed.
+    """
+    if "shot" in ds.dims:
+        ds = ds.squeeze("shot", drop=True)
+    simagx = ds["simagx"].transpose("time").values
+    sibdry = ds["sibdry"].transpose("time").values
+    psi_range = sibdry - simagx
+    psi_range_usable = np.isfinite(psi_range) & (np.abs(psi_range) > MIN_PSI_RANGE)
+    qpsi_finite = np.isfinite(ds["qpsi"]).all("psi_idx").transpose("time").values
+    psirz_finite = (
+        np.isfinite(ds["psirz"]).all(("r_grid", "z_grid")).transpose("time").values
+    )
+    return psi_range_usable & qpsi_finite & psirz_finite
+
+
 def cumulative_q_integral(qpsi: np.ndarray) -> np.ndarray:
     """Integrate the safety factor over normalized poloidal flux, outward from the axis.
 
@@ -497,10 +525,12 @@ def map_ts_channels_to_rho_tor_norm(
     Only times with at least one finite TS value are mapped.
     The equilibrium is not necessarily reconstructed at each of those times
     (EFIT21 on C-Mod is native 1 kHz, but ANALYSIS runs on a ~20 ms clock),
-    so each TS slice maps through the reconstruction nearest in time,
-    accepted within EQ_MATCH_MAX_PERIODS of that reconstruction's sampling period.
-    A slice with no reconstruction in reach, or one without a usable flux map or qpsi,
-    keeps a NaN row, and the fit-staging min-points gate then skips it.
+    so each TS slice maps through the usable reconstruction (usable_reconstructions) nearest in time,
+    accepted within EQ_MATCH_MAX_PERIODS of the reconstruction clock's period.
+    The clock counts the unusable reconstructions too,
+    so a slice whose nearest reconstruction is unusable can map through a neighbour of it.
+    A slice with no usable reconstruction in reach keeps a NaN row,
+    and the fit-staging min-points gate then skips it.
 
     Args:
         ds_shot: One shot's unprocessed dataset with standardized names
@@ -529,14 +559,17 @@ def map_ts_channels_to_rho_tor_norm(
     r_grid = ds_shot["r_grid"].values
     z_grid = ds_shot["z_grid"].values
 
-    # Each TS slice maps through the reconstruction nearest in time.
+    # Each TS slice maps through the usable reconstruction nearest in time.
+    # The reach comes from the reconstruction clock, unusable reconstructions included.
     # A lone reconstruction has no period of its own, so the grid step stands in,
     # as in workflow._hold_onto_grid.
     all_times = ds_shot["time"].values
-    eq_rows = np.flatnonzero(np.isfinite(simagx))
+    clock_times = all_times[np.isfinite(simagx)]
+    usable = usable_reconstructions(ds_shot)
+    eq_rows = np.flatnonzero(usable)
     eq_times = all_times[eq_rows]
-    if eq_times.size > 1:
-        eq_period = float(np.median(np.diff(eq_times)))
+    if clock_times.size > 1:
+        eq_period = float(np.median(np.diff(clock_times)))
     elif all_times.size > 1:
         eq_period = float(np.median(np.diff(all_times)))
     else:
@@ -554,19 +587,9 @@ def map_ts_channels_to_rho_tor_norm(
             n_no_equilibrium += 1
             continue
         eq_idx = int(eq_rows[nearest])
-
         psi_range = sibdry[eq_idx] - simagx[eq_idx]
-        psi_slice = psirz[eq_idx]
         qpsi_slice = qpsi[eq_idx]
-        if (
-            not np.isfinite(psi_range)  # psi range NaN or inf
-            or np.abs(psi_range) < 1e-10  # psi range too small to be physical
-            or not np.all(np.isfinite(psi_slice))  # psi slice has NaN or inf
-            or not np.all(np.isfinite(qpsi_slice))  # no q profile to integrate
-        ):
-            n_no_equilibrium += 1
-            continue
-        psi_n_grid = (psi_slice - simagx[eq_idx]) / psi_range
+        psi_n_grid = (psirz[eq_idx] - simagx[eq_idx]) / psi_range
 
         # Channel psi_n at the measured (R, Z)
         # NaN positions or positions off the grid stay NaN.

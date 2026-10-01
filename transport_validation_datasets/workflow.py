@@ -49,6 +49,7 @@ from transport_validation_datasets.machine.generic import (
     SOL_EXTENSIONS,
     efit_cocos_from_signs,
     standardize_signal_attrs,
+    usable_reconstructions,
 )
 from transport_validation_datasets.machine.plots import (
     plot_ts_fits,
@@ -2711,6 +2712,8 @@ def _hold_equilibrium(
     the grid on some devices (MAST reconstructs every 5 ms, C-Mod every
     millisecond). The grid times a reconstruction landed on are the ones
     with a finite simagx, the rest hold the last one.
+    An unusable reconstruction (usable_reconstructions) is treated as missing,
+    so the previous one holds over it for up to MAX_HOLD_PERIODS of the clock and it is not fresh.
 
     Args:
         ds_unprocessed: The shot's unprocessed dataset, on the grid, with
@@ -2728,15 +2731,16 @@ def _hold_equilibrium(
             grid.size, dtype=bool
         )
 
-    reconstructed = np.flatnonzero(
-        ds_unprocessed["simagx"]
-        .squeeze(EPISODE_DIM, drop=True)
-        .transpose(TIME_COORD)
-        .notnull()
-        .values
-    )
+    simagx = ds_unprocessed["simagx"].squeeze(EPISODE_DIM, drop=True)
+    clock_times = grid[simagx.transpose(TIME_COORD).notnull().values]
+    # Held for the clock's period, so a dropped reconstruction does not stretch the hold.
+    # A lone reconstruction only fills its own grid step, as in _hold_onto_grid.
+    clock_steps = np.diff(clock_times) if clock_times.size > 1 else np.diff(grid)
+    clock_period = float(np.median(clock_steps))
+    usable = usable_reconstructions(ds_unprocessed)
+    reconstructed = np.flatnonzero(usable)
     reconstruction_index, fresh = _hold_onto_grid(
-        grid, grid[reconstructed], forward_fill
+        grid, grid[reconstructed], forward_fill, clock_period
     )
     # reconstruction_index counts reconstructions, the dataset is indexed by
     # grid time, so index the grid times the reconstructions landed on

@@ -68,6 +68,7 @@ from transport_validation_datasets.imas_export.geqdsk_writer import write_geqdsk
 from transport_validation_datasets.machine.generic import (
     cumulative_q_integral,
     psi_n_from_rho_tor_norm,
+    usable_reconstructions,
 )
 
 
@@ -705,13 +706,10 @@ def build_imas_from_shot(
     if "shot" in unprocessed_ds.dims:
         unprocessed_ds = unprocessed_ds.squeeze("shot", drop=True)
 
-    # DATASET_EQUILIBRIUM_SIGNALS lives on the shot's common time grid (same as
-    # the 0D signals), NaN outside a real EFIT reconstruction time -- not a
-    # compact per-EFIT-time array. Filter down to the real reconstruction
-    # times first (any one scalar field, e.g. simagx, is finite exactly
-    # where every field in the block is, since they're all written together
-    # for the same reconstruction).
-    eq_valid = np.flatnonzero(np.isfinite(unprocessed_ds["simagx"].to_numpy()))
+    # DATASET_EQUILIBRIUM_SIGNALS lives on the shot's common time grid (same as the 0D signals),
+    # NaN outside a real EFIT reconstruction time. Filter down to the usable reconstructions first.
+    eq_usable = usable_reconstructions(unprocessed_ds)
+    eq_valid = np.flatnonzero(eq_usable)
     eq_ds = unprocessed_ds[list(DATASET_EQUILIBRIUM_SIGNALS)].isel(time=eq_valid)
     eq_times = eq_ds["time"].to_numpy().astype(float)
     geqdsk_paths = [
