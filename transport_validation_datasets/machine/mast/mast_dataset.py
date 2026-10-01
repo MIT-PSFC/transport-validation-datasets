@@ -417,10 +417,9 @@ class MASTDataWorkflow(DataWorkflow):
     # MAST's ip record runs through the current quench, so a small ip cutoff
     # still lets disruption transients in. Has to be longer than C-Mod's 20 ms.
     end_margin = 0.04
-    # Typical shots radiate hundreds of kW.
-    # Six it11 shots (23349, 23352, 23386, 23814, 23997, 24421) average 2-4 kW, some with MW of NBI,
-    # a broken bolometer record the valid filter's min of 0 lets through.
-    min_mean_power_radiated = 5e3
+    # Shots radiate a median 10 percent of their heating power (it11 store, from 23809 on).
+    # 12 shots sit below 1 percent with MW of input, a dead bolometer, and the next lowest is at 3.75 percent.
+    min_radiated_fraction = 0.025
     # There appears to be a systematic change in TS calibrations after this early-campaign shot.
     first_shot = 23809
     # From 23809 on, 23990 sits at 0.13 and the next lowest shot at 0.75, the highest at 1.10

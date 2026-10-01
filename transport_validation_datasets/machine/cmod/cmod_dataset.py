@@ -91,6 +91,10 @@ class CModDataWorkflow(DataWorkflow):
     }
     end_margin = 0.02
     shot_blacklist = []
+    # Shots radiate a median 25 percent of their heating power (it11 store).
+    # The lowest live bolometer record, 1160928005, sits at 1.9 percent.
+    # The two shots with no record at all are caught by the all-NaN check.
+    min_radiated_fraction = 0.01
     # Thomson n_e against the interferometer. Large disagreement indicates TS miscalibration.
     # 1160527001 and 1160527002 are 0.69, the next lowest shot is 0.76, the highest at 1.16
     density_ratio_bounds = (0.72, 1.3)
