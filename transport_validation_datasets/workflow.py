@@ -11,6 +11,7 @@ import numpy as np
 import xarray as xr
 import zarr
 from loguru import logger
+from scipy.integrate import trapezoid
 
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_validation_datasets.cleaning import (
@@ -73,6 +74,10 @@ from transport_validation_datasets.windows import (
 
 # Width of the centered boxcar applied before the transient thresholds are checked [s].
 TRANSIENT_SMOOTHING_WINDOW = 5e-3
+
+# How far a shot's stored-energy rise may exceed the heating energy put in before it is rejected.
+# The 5 percent covers integration error and EFIT noise, see DataWorkflow.shot_rejection_reason.
+ENERGY_SANITY_LEEWAY = 1.05
 
 # Shots per staged batch when fitting locally: one, so a slow serial run can
 # resume shot by shot. Cluster runs use ClusterFitConfig.shots_per_batch.
@@ -340,6 +345,10 @@ class DataWorkflow(ABC):
         Returns:
             List of shot numbers to exclude.
         """
+
+    # Floor on a shot's mean power_radiated over its kept times [W], 0 for none.
+    # A bolometer record reading ~0 W passes the valid filter but breaks every power balance.
+    min_mean_power_radiated = 0.0
 
     # Threads used to stage source data.
     # Only above 1 for sources that tolerate concurrent reads
@@ -696,6 +705,8 @@ class DataWorkflow(ABC):
 
         What survives is whatever passes the valid and transient filters, minus the
         contiguous segments shorter than min_segment_length.
+        The shot is rejected when too little survives,
+        or when shot_rejection_reason finds a broken record in what does.
 
         Rejected shots are plotted unfiltered to rejected_shots_dir. Accepted shots
         are plotted unfiltered to accepted_shots_dir, with the kept segments shaded
@@ -783,7 +794,7 @@ class DataWorkflow(ABC):
         # _hold_equilibrium indexes them by grid time.
         ds_filtered = ds_input.where(valid_mask, drop=True)
 
-        # If there is not sufficient data after filtering, return None to indicate that this shot should be rejected:
+        # 4: If there is not sufficient data after filtering, return None to indicate that this shot should be rejected:
         # the first and last non-nan ip must be at least min_pulse_length apart,
         # and the non-nan segments within must sum to at least min_usable_time
         ip_valid_filtered = ds_filtered["ip"].notnull().any(dim="shot")
@@ -791,11 +802,17 @@ class DataWorkflow(ABC):
         pulse_length, usable_time = pulse_and_usable_time(ip_times)
 
         if pulse_length < self.min_pulse_length or usable_time < self.min_usable_time:
-            logger.warning(
-                f"Shot {shot} rejected: pulse length {pulse_length:.3f} s "
-                f"(min {self.min_pulse_length}) or usable time {usable_time:.3f} s "
-                f"(min {self.min_usable_time}) insufficient after filtering"
+            rejection_reason = (
+                f"pulse length {pulse_length:.3f} s (min {self.min_pulse_length}) "
+                f"or usable time {usable_time:.3f} s (min {self.min_usable_time}) "
+                f"insufficient after filtering"
             )
+        else:
+            # 5: Whole-shot checks on what survived, see shot_rejection_reason
+            rejection_reason = self.shot_rejection_reason(ds_filtered)
+
+        if rejection_reason is not None:
+            logger.warning(f"Shot {shot} rejected: {rejection_reason}")
             plot_unprocessed_data(
                 ds_input,
                 self.rejected_shots_dir / f"{shot}.png",
@@ -827,6 +844,74 @@ class DataWorkflow(ABC):
                 window_spans=window_spans,
             )
             return ds_filtered
+
+    def shot_rejection_reason(self, ds: xr.Dataset) -> str | None:
+        """Check one shot's kept times for broken records the filters let through.
+
+        Runs on the filtered dataset in filter_and_plot,
+        and again on the unprocessed file at the stack stage,
+        so a file written before a check existed is judged by the code as it is now.
+        The checks, in order:
+        1: A signal of DATASET_0D_SIGNALS that is NaN at every kept time.
+           The valid filter only NaN-checks the signals it bounds.
+           A signal the dataset does not carry is skipped.
+        2: A mean power_radiated below min_mean_power_radiated.
+        3: Energy sanity.
+           The energy_mhd rise from the first kept time to its peak
+           may not exceed ENERGY_SANITY_LEEWAY times the heating energy put in over the same span.
+           The input ignores every loss, so a larger rise means a missing or broken power record.
+           The rise rather than the peak, so energy stored before the first kept time needs no input.
+        Powers are clipped at 0 and a NaN power counts as 0,
+        as _clip_powers leaves them in the unprocessed file,
+        so both call sites reach the same verdict.
+
+        Args:
+            ds: One shot's dataset on its kept times, with standardized names.
+
+        Returns:
+            Why the shot is rejected, or None if it passes.
+        """
+        ds_shot = ds.squeeze(EPISODE_DIM, drop=True)
+        times = np.asarray(ds_shot[TIME_COORD].values, dtype=float)
+
+        for name in DATASET_0D_SIGNALS:
+            if name in ds_shot and bool(ds_shot[name].isnull().all()):
+                return f"{name} is NaN at every kept time"
+
+        if self.min_mean_power_radiated > 0.0 and "power_radiated" in ds_shot:
+            power_radiated = ds_shot["power_radiated"].clip(min=0.0)
+            power_radiated_mean = float(power_radiated.mean())
+            if power_radiated_mean < self.min_mean_power_radiated:
+                return (
+                    f"mean power_radiated {1e-3 * power_radiated_mean:.1f} kW "
+                    f"is below the {1e-3 * self.min_mean_power_radiated:.1f} kW floor"
+                )
+
+        if "energy_mhd" not in ds_shot:
+            return None
+        energy_mhd = np.asarray(ds_shot["energy_mhd"].values, dtype=float)
+        has_energy = np.isfinite(energy_mhd)
+        if has_energy.sum() < 2:
+            return None
+        power_heating = np.zeros(times.size)
+        for name in ("power_ohm", "power_nbi", "power_ic", "power_lh"):
+            if name in ds_shot:
+                power = np.nan_to_num(ds_shot[name].values, nan=0.0)
+                power_heating += np.clip(power, 0.0, None)
+        energy_times = times[has_energy]
+        energy_stored = energy_mhd[has_energy]
+        peak = int(np.argmax(energy_stored))
+        energy_rise = energy_stored[peak] - energy_stored[0]
+        # Bridges the filter gaps, the heating did not stop while the samples were cut
+        power_to_peak = power_heating[has_energy][: peak + 1]
+        energy_input = trapezoid(power_to_peak, energy_times[: peak + 1])
+        if energy_rise > ENERGY_SANITY_LEEWAY * energy_input:
+            return (
+                f"energy_mhd rises {1e-3 * energy_rise:.1f} kJ "
+                f"from {energy_times[0]:.3f} s to {energy_times[peak]:.3f} s, "
+                f"more than the {1e-3 * energy_input:.1f} kJ of heating put in"
+            )
+        return None
 
     @abstractmethod
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
@@ -1840,7 +1925,8 @@ class DataWorkflow(ABC):
                 times between their samples.
 
         Returns:
-            The shot's dataset, or None when it has no usable fitted slice.
+            The shot's dataset, or None when it has no usable fitted slice
+            or shot_rejection_reason rejects its unprocessed file.
 
         Raises:
             ValueError: If the fitted slice times are not on the unprocessed
@@ -1883,6 +1969,12 @@ class DataWorkflow(ABC):
 
         with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_file:
             ds_unprocessed = ds_file.load()
+        rejection_reason = self.shot_rejection_reason(ds_unprocessed)
+        if rejection_reason is not None:
+            logger.warning(
+                f"Shot {shot}: {rejection_reason}, leaving it out of the internal dataset"
+            )
+            return None
         grid = np.asarray(ds_unprocessed[TIME_COORD].values, dtype=float)
         # Dropped so the dimension can be reindexed and renamed,
         # the times come back as a per-shot variable at the end
@@ -2100,6 +2192,8 @@ class DataWorkflow(ABC):
                     "min_usable_time": self.min_usable_time,
                     "min_segment_length": self.min_segment_length,
                     "shot_blacklist": list(self.shot_blacklist),
+                    "min_mean_power_radiated": self.min_mean_power_radiated,
+                    "energy_sanity_leeway": ENERGY_SANITY_LEEWAY,
                 }
             ),
             "fit_settings": to_json(

@@ -77,6 +77,7 @@ def make_source_dataset(
     duration: float,
     broken_sample: int | None,
     bad_readings: bool,
+    extra_signals: dict[str, float | np.ndarray] | None = None,
 ) -> xr.Dataset:
     grid = make_uniform_1kHz_timebase(duration)
     n_t = grid.size
@@ -109,9 +110,16 @@ def make_source_dataset(
     def channel(values):
         return ((EPISODE_DIM, TIME_COORD, "ts_channel"), values[None])
 
+    zero_d = {"ip": 1.0e6, **(extra_signals or {})}
     return xr.Dataset(
         {
-            "ip": ((EPISODE_DIM, TIME_COORD), np.full((1, n_t), 1.0e6)),
+            **{
+                name: (
+                    (EPISODE_DIM, TIME_COORD),
+                    np.full((1, n_t), values, dtype=float),
+                )
+                for name, values in zero_d.items()
+            },
             # rho_tor_norm stands in for R, see DummyWorkflow.prepare_fit_input
             "ts_channel_r": channel(np.tile(RHO_TOR_NORM_CH, (n_t, 1))),
             "ts_channel_z": channel(np.zeros((n_t, n_ch))),
@@ -140,6 +148,8 @@ class DummyWorkflow(DataWorkflow):
         self.shape = parabola
         self.broken_samples: dict[int, int] = {}
         self.bad_readings = False
+        # 0D signals a shot's source carries beyond ip, a value or an array on the grid
+        self.extra_signals: dict[int, dict[str, float | np.ndarray]] = {}
         super().__init__(*args, **kwargs)
 
     def get_shotlist_from_source(self) -> list[int]:
@@ -156,6 +166,7 @@ class DummyWorkflow(DataWorkflow):
             duration,
             broken_sample=self.broken_samples.get(shot),
             bad_readings=self.bad_readings,
+            extra_signals=self.extra_signals.get(shot),
         )
 
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
@@ -282,6 +293,74 @@ class TestMakeUnprocessedDataFiles:
         workflow.make_unprocessed_data_files()
 
         assert workflow.unprocessed_shots() == [1]
+
+    def test_broken_record_rejected_and_recorded(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        workflow.extra_signals = {1: {"power_radiated": np.nan}}
+
+        workflow.make_unprocessed_data_files()
+
+        assert workflow.unprocessed_shots() == [2]
+        assert workflow.shot_already_failed(1)
+
+
+class TestShotRejectionReason:
+    grid = make_uniform_1kHz_timebase(DURATION).astype(float)
+
+    def kept_dataset(self, **signals) -> xr.Dataset:
+        return make_source_dataset(
+            1, parabola, DURATION, None, False, extra_signals=signals
+        )
+
+    def test_all_nan_signal_named_absent_signal_skipped(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+
+        reason = workflow.shot_rejection_reason(
+            self.kept_dataset(power_ic=0.0, power_radiated=np.nan)
+        )
+
+        assert "power_radiated" in reason
+        assert workflow.shot_rejection_reason(self.kept_dataset()) is None
+
+    def test_radiated_power_floor_only_when_set(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        ds = self.kept_dataset(power_radiated=3e3)
+        assert workflow.shot_rejection_reason(ds) is None
+
+        workflow.min_mean_power_radiated = 5e3
+
+        assert "power_radiated" in workflow.shot_rejection_reason(ds)
+        healthy = self.kept_dataset(power_radiated=2e5)
+        assert workflow.shot_rejection_reason(healthy) is None
+
+    def test_energy_rise_beyond_heating_rejected(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        # 100 kJ stored over the 0.3 s shot, peaking at the end
+        energy_mhd = 1e5 * self.grid / self.grid[-1]
+        # 0.3 s at 0.1 MW is 30 kJ, and the NaN half of a power record puts nothing in
+        power_nbi_half_nan = np.where(self.grid < 0.15, np.nan, 0.0)
+        unheated = self.kept_dataset(
+            energy_mhd=energy_mhd, power_ohm=1e5, power_nbi=power_nbi_half_nan
+        )
+        # 0.3 s at 0.1 + 0.3 MW is 120 kJ, and a negative power takes nothing out
+        heated = self.kept_dataset(
+            energy_mhd=energy_mhd, power_ohm=1e5, power_nbi=3e5, power_lh=-1e6
+        )
+
+        assert "energy_mhd" in workflow.shot_rejection_reason(unheated)
+        assert workflow.shot_rejection_reason(heated) is None
+
+    def test_rise_from_first_kept_time_against_input_up_to_peak(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        # 0.3 MW puts in 30 kJ by the peak at 0.1 s and 90 kJ over the shot.
+        # Both shots start at 200 kJ, so judging the peak itself would reject both,
+        # and integrating past the peak would pass both.
+        rise_shape = np.minimum(self.grid, 0.2 - self.grid) / 0.1
+        small_rise = self.kept_dataset(energy_mhd=2e5 + 2e4 * rise_shape, power_ohm=3e5)
+        large_rise = self.kept_dataset(energy_mhd=2e5 + 4e4 * rise_shape, power_ohm=3e5)
+
+        assert workflow.shot_rejection_reason(small_rise) is None
+        assert "energy_mhd" in workflow.shot_rejection_reason(large_rise)
 
 
 class TestStageFitBatches:
@@ -560,6 +639,21 @@ class TestStackInternalDataset:
         assert int(kept["fresh_profile"].values[i, : times.size].sum()) == 15
         assert kept["t_e_fit_status"].values[i, at] == STATUS_SKIPPED
         assert np.isnan(kept["t_e"].values[i, at]).all()
+
+    def test_check_added_after_unprocessed_stage_drops_shot(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        workflow.extra_signals = {
+            1: {"power_radiated": 3e3},
+            2: {"power_radiated": 2e5},
+        }
+        workflow.make_unprocessed_data_files()
+        workflow.run_gp_fitting()
+
+        # The files on disk were written without a floor, the stack applies it now
+        workflow.min_mean_power_radiated = 5e3
+        store = xr.open_zarr(workflow.stack_internal_dataset(), consolidated=True)
+
+        assert store[EPISODE_DIM].values.tolist() == [2]
 
     def test_publish_strips_raw_channels(self, tmp_path):
         workflow = make_workflow(tmp_path)
