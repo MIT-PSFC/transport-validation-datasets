@@ -416,6 +416,10 @@ class MASTDataWorkflow(DataWorkflow):
     # MAST's ip record runs through the current quench, so a small ip cutoff
     # still lets disruption transients in. Has to be longer than C-Mod's 20 ms.
     end_margin = 0.04
+    # Typical shots radiate hundreds of kW.
+    # Six it11 shots (23349, 23352, 23386, 23814, 23997, 24421) average 2-4 kW, some with MW of NBI,
+    # a broken bolometer record the valid filter's min of 0 lets through.
+    min_mean_power_radiated = 5e3
     # Shots the validity filtering rejects outright (checked 2026-08-20 by
     # running them through the pipeline), skipped here to save the processing.
     # 29430 is the worst of them: its bolometer is broken, the raw radiated
