@@ -73,8 +73,7 @@ def plot_unprocessed_data(
     valid_filter: dict[str, dict[str, float]],
     transient_filter: dict[str, float],
     end_margin_time: float,
-    transient_margin_time: float | None = None,
-    radiated_limit: xr.DataArray | None = None,
+    transient_spans: list[tuple[float, float]] | None = None,
     kept_spans: list[tuple[float, float]] | None = None,
     window_spans: list[tuple[float, float]] | None = None,
 ):
@@ -84,7 +83,6 @@ def plot_unprocessed_data(
 
     1: ip (in MA) and b0 on left axis, energy_mhd (in MJ) on right axis
     - Also has a vertical red line indicating the end margin time as identified by filter_and_plot
-    - And a vertical yellow line indicating the cutoff before a transient event, as identified by filter_and_plot (if provided)
     2: n_e_line_average (in 10^20 m^-3) on left axis, beta_n (unitless) on right axis
     - Also has green dots at the bottom for each time index where the profiles are not NaN
     3: p_oh, p_rad, p_ic, p_lh, p_nbi (all in MW)
@@ -100,9 +98,8 @@ def plot_unprocessed_data(
         transient_filter: Transient thresholds per signal, drawn as dashed lines
             on the power subplot.
         end_margin_time: Time of the end margin cutoff [s].
-        transient_margin_time: Time of the transient cutoff [s], if one was found.
-        radiated_limit: The smoothed power_radiated above which filter_and_plot finds a radiative collapse [W],
-            drawn as a dashed line on the power subplot.
+        transient_spans: (start, end) time intervals filter_and_plot cut out as transients,
+            shaded as red vertical bars on each subplot.
         kept_spans: (start, end) time intervals kept by filter_and_plot,
             shaded as green vertical bars on each subplot.
         window_spans: (start, end) time windows the shotlist asked for, shaded
@@ -121,6 +118,10 @@ def plot_unprocessed_data(
         for ax in axes:
             for span_start, span_end in kept_spans:
                 ax.axvspan(span_start, span_end, color="green", alpha=0.2, linewidth=0)
+    if transient_spans is not None:
+        for ax in axes:
+            for span_start, span_end in transient_spans:
+                ax.axvspan(span_start, span_end, color="red", alpha=0.3, linewidth=0)
     if window_spans is not None:
         for ax in axes:
             for span_start, span_end in window_spans:
@@ -143,8 +144,6 @@ def plot_unprocessed_data(
     ax_ip.set_ylabel("Ip [MA] / B0 [T]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_ip.set_ylim(_signal_ylim(left_signals))
     ax_ip.axvline(end_margin_time, color="red")
-    if transient_margin_time is not None:
-        ax_ip.axvline(transient_margin_time, color="yellow")
     ax_ip.legend(
         fontsize=LEGEND_FONTSIZE,
         facecolor=BACKGROUND_COLOR,
@@ -217,20 +216,6 @@ def plot_unprocessed_data(
         ax_power.axhline(
             threshold / 1e6,
             color=power_colors.get(signal, "white"),
-            linestyle="--",
-            linewidth=1,
-        )
-    if radiated_limit is not None:
-        if "shot" in radiated_limit.dims:
-            radiated_limit = radiated_limit.isel(shot=0)
-        # The floor alone would run past the records and stretch the time axis
-        mask_radiated = ds["power_radiated"].notnull()
-        radiated_limit_shown = radiated_limit.where(mask_radiated)
-        radiated_limit_mw = radiated_limit_shown / 1e6
-        ax_power.plot(
-            time,
-            radiated_limit_mw,
-            color=power_colors["power_radiated"],
             linestyle="--",
             linewidth=1,
         )

@@ -101,17 +101,11 @@ Unprocessed stage (`filter_and_plot`), per shot:
 2. Everything from `end_margin` (C-Mod 20 ms, MAST 40 ms) before the last finite `ip` on is cut.
 3. Grid times where a signal listed in the device's `valid_filter` is not finite or outside its bounds fail the filter.
    An empty entry only checks that the signal is finite.
-4. Everything from the first transient among the passing times is cut:
-   - a `transient_filter` signal smoothed over 5 ms above its threshold, `power_ohm` above 5 MW on both devices
-   - a radiative collapse, `power_radiated` smoothed over 5 ms above both `radiated_collapse_floor` (1 MW)
-     and `max_radiated_fraction` (2) times the heating power averaged over the trailing `RADIATED_FRACTION_WINDOW` (50 ms)
-
-   The heating power is power_ohm + power_nbi + power_ic + power_lh.
-   The 50 ms average rides over the milliseconds where the ohmic power reads 0 (ICRF trips, sawteeth, current ramps),
-   and the floor keeps low radiation during those from counting.
-   It trails, since a centered average would see the ohmic spike of the current quench ahead and mask the collapse before it.
-   The smoothed signals only place the cut, every kept signal is written as recorded.
-   The unprocessed plots draw the collapse limit as a dashed red line.
+4. Grid times where a `transient_filter` signal, smoothed over 5 ms, is above its threshold are cut out as a gap,
+   like a valid filter failure: `power_ohm` above 5 MW on both devices,
+   `power_radiated` above 5.5 MW on C-Mod and 3 MW on MAST.
+   A transient does not end the shot, step 6 keeps the longest stretch around it.
+   The unprocessed plots shade the transients red.
 5. The leading grid times of each segment are cut up to its first sample
    that a kept usable reconstruction (`usable_reconstructions`) reaches
    within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock), since the store would have no equilibrium before it.
@@ -159,7 +153,7 @@ indicating a large change in the Thomson density calibration.
   The kept shots sit at 0.76-1.16 on C-Mod and 0.75-1.10 on MAST.
 - **MAST transients inside the kept windows.** Reconnection events and Ip spikes that stay under the transient thresholds remain,
   e.g. 28203 at 0.343 s, where core Te drops from 0.55 to 0.12 keV, Ip spikes from 0.53 to 0.68 MA and P_rad reaches 2.8 MW.
-  The radiative collapse cut needs P_rad above twice the heating power of the trailing 50 ms, and only cuts from the first exceedance.
+  The transient filter needs P_rad above 3 MW after smoothing.
 - **MAST EFIT vertical glitches.** Single reconstructions jump zmagx and zbdry by 5-10 cm and come back at the next one,
   e.g. 24623 at 0.29-0.33 s (though this is minor, 39 reconstructions in 26 shots out of ~1000 total shots).
 - **Equilibrium gaps.** A hold of `MAX_HOLD_PERIODS` cannot bridge a missing reconstruction.

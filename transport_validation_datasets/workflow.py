@@ -76,13 +76,6 @@ from transport_validation_datasets.windows import (
 # Width of the centered boxcar applied before the transient thresholds are checked [s].
 TRANSIENT_SMOOTHING_WINDOW = 5e-3
 
-# Width of the trailing boxcar applied to the heating power for the radiative collapse check
-# (DataWorkflow.max_radiated_fraction) [s].
-# The ohmic power reads 0 for milliseconds at a time (ICRF trips, sawteeth, current ramps),
-# so it spans a few energy confinement times, the heating the stored energy still holds.
-# Trailing, since a centered one would see the ohmic spike of the current quench ahead.
-RADIATED_FRACTION_WINDOW = 50e-3
-
 # How far a shot's stored-energy rise may exceed the heating energy put in before it is rejected.
 # The 5 percent covers integration error and EFIT noise, see DataWorkflow.shot_rejection_reason.
 ENERGY_SANITY_LEEWAY = 1.05
@@ -308,6 +301,7 @@ class DataWorkflow(ABC):
 
         Thresholds are compared against the signal smoothed by a centered boxcar
         TRANSIENT_SMOOTHING_WINDOW wide, NOT the raw signal.
+        The grid times above a threshold are cut out as a gap, see filter_and_plot.
 
         Returns:
             Thresholds for signals, e.g. {"signal_name": 1.0}.
@@ -343,13 +337,6 @@ class DataWorkflow(ABC):
     # Floor on a shot's mean power_radiated over its kept times, as a fraction of its mean heating power, 0 for none.
     # A dead bolometer reading ~0 W passes the valid filter but breaks every power balance.
     min_radiated_fraction = 0.0
-
-    # Radiative collapse, a transient like those of transient_filter, None for no check.
-    # Everything is cut from the first time power_radiated, smoothed like the transient_filter signals,
-    # exceeds both radiated_collapse_floor [W]
-    # and max_radiated_fraction of the heating power averaged over the trailing RADIATED_FRACTION_WINDOW.
-    max_radiated_fraction = None
-    radiated_collapse_floor = 0.0
 
     # Shots numbered below this are left out like blacklisted ones, 0 for none.
     first_shot = 0
@@ -713,6 +700,7 @@ class DataWorkflow(ABC):
         """Take datasets with standardized names, run filtering on them, and plot results.
 
         What survives is one contiguous segment of the times that pass the valid and transient filters.
+        A transient is cut out as a gap like a valid filter failure, it does not end the shot.
         Each segment is started where a kept usable reconstruction (usable_reconstructions) reaches,
         and only the longest segment is kept.
         The shot is rejected when that segment is shorter than min_pulse_length,
@@ -721,7 +709,7 @@ class DataWorkflow(ABC):
         Rejected shots are plotted unfiltered to rejected_shots_dir.
         Accepted shots are plotted unfiltered to accepted_shots_dir,
         with the kept segment shaded green.
-        Both plots mark the end margin cutoff and (if one was found) the transient cutoff.
+        Both plots mark the end margin cutoff and shade the transients red.
 
         Args:
             ds_input: Dataset with standardized signal names for one shot.
@@ -753,47 +741,32 @@ class DataWorkflow(ABC):
                     np.abs(ds_input[signal]) <= bounds["max_abs"]
                 )
 
-        # 2: Cut everything from the first transient among the passing times:
-        # a transient_filter signal above its threshold, or a radiative collapse (max_radiated_fraction).
-        # Both compare signals smoothed by a centered boxcar,
-        # so that sporadic noise spikes on their own do not trip them.
-        dt = float(np.median(np.diff(ds_input["time"].values)))
-        exceeded_by_check = {}
+        # 2: Cut the transients out as gaps, a transient_filter signal above its threshold.
+        # Each signal is smoothed by a centered boxcar, so that sporadic noise spikes on their own do not trip it.
+        # Step 3 keeps the longest stretch around the gaps.
+        times = ds_input["time"].values
+        dt = float(np.median(np.diff(times)))
+        transient_mask = xr.zeros_like(valid_mask)
         for signal, threshold in self.transient_filter.items():
             smoothed = _boxcar_mean(ds_input[signal], TRANSIENT_SMOOTHING_WINDOW, dt)
-            exceeded_by_check[signal] = smoothed > threshold
-        radiated_limit = None
-        if self.max_radiated_fraction is not None:
-            radiated = ds_input["power_radiated"].clip(min=0.0)
-            radiated_smooth = _boxcar_mean(radiated, TRANSIENT_SMOOTHING_WINDOW, dt)
-            heating = _heating_power(ds_input)
-            heating_trailing = _boxcar_mean(
-                heating, RADIATED_FRACTION_WINDOW, dt, trailing=True
-            )
-            radiated_fraction_limit = self.max_radiated_fraction * heating_trailing
-            radiated_limit = radiated_fraction_limit.clip(
-                min=self.radiated_collapse_floor
-            )
-            exceeded_by_check["radiated fraction"] = radiated_smooth > radiated_limit
-
-        transient_margin_time = None
-        for check, exceeded in exceeded_by_check.items():
-            exceeded_valid = valid_mask & exceeded
-            if not exceeded_valid.any():
-                continue
-            first_time = float(
-                ds_input["time"].where(exceeded_valid.any(dim="shot")).min()
-            )
-            logger.debug(f"Shot {shot}: {check} transient at {first_time:.3f} s")
-            if transient_margin_time is None or first_time < transient_margin_time:
-                transient_margin_time = first_time
-        if transient_margin_time is not None:
-            valid_mask = valid_mask & (ds_input["time"] < transient_margin_time)
+            exceeded = smoothed > threshold
+            n_exceeded = int(exceeded.sum())
+            if n_exceeded:
+                logger.debug(
+                    f"Shot {shot}: {signal} above {threshold:g} at {n_exceeded} grid times"
+                )
+            transient_mask = transient_mask | exceeded
+        valid_mask = valid_mask & ~transient_mask
+        transient_time_mask = (
+            transient_mask.any(dim="shot")
+            if "shot" in transient_mask.dims
+            else transient_mask
+        )
+        transient_spans = _mask_spans(transient_time_mask.values, times)
 
         # 3: Start each segment where the store will have an equilibrium, then keep only the longest.
         # The store only holds the reconstructions that are kept (_hold_equilibrium),
         # so a segment's first grid times have none when the one before it is cut.
-        times = ds_input["time"].values
         time_mask = (
             valid_mask.any(dim="shot") if "shot" in valid_mask.dims else valid_mask
         )
@@ -816,9 +789,8 @@ class DataWorkflow(ABC):
             kept_mask, dropped_lengths = keep_longest_segment(filtered_mask, times)
         if dropped_lengths:
             logger.info(
-                f"Shot {shot}: kept the longest segment, dropped {len(dropped_lengths)} "
-                f"shorter one(s), lengths [ms]: "
-                + ", ".join(f"{1e3 * length:.0f}" for length in dropped_lengths)
+                f"Shot {shot}: kept the longest segment, dropped {len(dropped_lengths)} shorter one(s), "
+                f"the longest {1e3 * max(dropped_lengths):.0f} ms, {1e3 * sum(dropped_lengths):.0f} ms in all"
             )
         kept_time_mask = xr.DataArray(kept_mask, coords={"time": times}, dims="time")
         valid_mask = valid_mask & kept_time_mask
@@ -850,17 +822,12 @@ class DataWorkflow(ABC):
                 valid_filter=self.valid_filter,
                 transient_filter=self.transient_filter,
                 end_margin_time=end_margin_time,
-                transient_margin_time=transient_margin_time,
-                radiated_limit=radiated_limit,
+                transient_spans=transient_spans,
             )
             return None
         else:
             # Plot the entire shot, with the kept segment shaded green
-            kept_starts, kept_ends = _kept_segments(kept_mask)
-            kept_spans = [
-                (float(times[start]), float(times[end - 1]))
-                for start, end in zip(kept_starts, kept_ends)
-            ]
+            kept_spans = _mask_spans(kept_mask, times)
             window_spans = (
                 None if self.shot_windows is None else self.shot_windows.get(int(shot))
             )
@@ -871,8 +838,7 @@ class DataWorkflow(ABC):
                 valid_filter=self.valid_filter,
                 transient_filter=self.transient_filter,
                 end_margin_time=end_margin_time,
-                transient_margin_time=transient_margin_time,
-                radiated_limit=radiated_limit,
+                transient_spans=transient_spans,
                 kept_spans=kept_spans,
                 window_spans=window_spans,
             )
@@ -2327,9 +2293,6 @@ class DataWorkflow(ABC):
                     "valid_filter": self.valid_filter,
                     "transient_filter": self.transient_filter,
                     "transient_smoothing_window": TRANSIENT_SMOOTHING_WINDOW,
-                    "max_radiated_fraction": self.max_radiated_fraction,
-                    "radiated_collapse_floor": self.radiated_collapse_floor,
-                    "radiated_fraction_window": RADIATED_FRACTION_WINDOW,
                     "end_margin": self.end_margin,
                     "min_pulse_length": self.min_pulse_length,
                     "shot_blacklist": list(self.shot_blacklist),
@@ -2445,23 +2408,18 @@ def _heating_power(ds: xr.Dataset) -> xr.DataArray:
     return power_heating
 
 
-def _boxcar_mean(
-    signal: xr.DataArray, window: float, dt: float, trailing: bool = False
-) -> xr.DataArray:
-    """Smooth a signal with a boxcar, centered on each sample or trailing it.
+def _boxcar_mean(signal: xr.DataArray, window: float, dt: float) -> xr.DataArray:
+    """Smooth a signal with a boxcar centered on each sample.
 
     Args:
         signal: The signal, on a uniform time dimension.
         window: Width of the boxcar [s].
         dt: The sample spacing [s].
-        trailing: Average each sample with the ones before it only, ending on it.
 
     Returns:
         The smoothed signal, averaged over the samples present near the ends and around NaNs.
     """
     n_samples = max(1, round(window / dt))
-    if trailing:
-        return signal.rolling(time=n_samples, min_periods=1).mean()
     if n_samples % 2 == 0:
         # Odd so it stays centered on the present sample
         n_samples += 1
@@ -2511,6 +2469,22 @@ def kept_span(keep: np.ndarray, times: np.ndarray) -> float:
     if kept_times.size < 2:
         return 0.0
     return float(kept_times[-1] - kept_times[0])
+
+
+def _mask_spans(mask: np.ndarray, times: np.ndarray) -> list[tuple[float, float]]:
+    """List the runs of a mask as time spans, for the plots.
+
+    Args:
+        mask: Mask over times.
+        times: The shot's timebase [s].
+
+    Returns:
+        (first, last) time [s] of each run of True samples.
+    """
+    starts, ends = _kept_segments(mask)
+    return [
+        (float(times[start]), float(times[end - 1])) for start, end in zip(starts, ends)
+    ]
 
 
 def _kept_segments(keep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
