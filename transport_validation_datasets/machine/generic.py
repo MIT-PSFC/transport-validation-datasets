@@ -2,6 +2,7 @@ import re
 
 import numpy as np
 import xarray as xr
+from eqdsk.cocos import identify_cocos
 from loguru import logger
 from scipy.integrate import cumulative_simpson
 from scipy.interpolate import RegularGridInterpolator
@@ -9,9 +10,9 @@ from scipy.interpolate import RegularGridInterpolator
 IMAS_DOCS_URL = "https://imas-data-dictionary.readthedocs.io/en/latest/generated/ids"
 
 # Attributes of the GEQDSK block make_geqdsk_dataset builds, freeqdsk names.
-# Units are those of COCOS 1 to 8, the range efit_cocos_from_signs covers,
-# where the poloidal flux is per radian; the shot's COCOS number rides on the
-# dataset's "cocos" attribute and in the store as the per-shot cocos variable.
+# Units are those of COCOS 1 to 8, the range cocos_from_signs returns, where the poloidal flux is per radian.
+# The shot's COCOS number rides on the dataset's "cocos" attribute,
+# and in the store as the per-shot cocos variable.
 # "ref" is the IMAS data dictionary path, as for every other signal.
 GEQDSK_SIGNAL_ATTRS = {
     "rmagx": {
@@ -672,30 +673,52 @@ def ts_channel_fit_rows(
     )
 
 
-def efit_cocos_from_signs(current, bcentr, logger_override=None) -> int:
-    """Identify the EFIT COCOS from the signs of median Ip and B0.
+def cocos_from_signs(
+    current, bcentr, simagx, sibdry, qpsi, logger_override=None
+) -> int:
+    """Identify the COCOS of a shot's reconstructions from the signs of their own data.
 
-    See https://efit-ai.gitlab.io/efit/files.html
+    The shot medians of Ip, B0, psi_boundary - psi_axis and q fix sigma_Bp and sigma_rho_theta_phi
+    (eqdsk.cocos.identify_cocos), with phi counterclockwise from above and psi per radian.
+    C-Mod's EFIT keeps psi increasing outward and q > 0, so its shots are COCOS 1 or 7 with the field direction.
+    MAST's EFIT has psi decreasing outward with Ip > 0, B0 < 0 and q > 0, which is COCOS 3.
+
+    Args:
+        current: (n_t,) plasma current [A].
+        bcentr: (n_t,) vacuum toroidal field [T].
+        simagx: (n_t,) poloidal flux at the magnetic axis [Wb/rad].
+        sibdry: (n_t,) poloidal flux at the plasma boundary [Wb/rad].
+        qpsi: (n_t, n_psi) safety factor.
+        logger_override: Logger for the warning, the module logger when None.
 
     Returns:
-        COCOS number (1, 3, 5, or 7). Falls back to 1 for unexpected sign combinations.
+        COCOS number (1, 3, 5, or 7).
+        1 with a warning when a median is NaN or 0, which means no usable reconstruction.
     """
     if logger_override is None:
         logger_override = logger
-    sign_ip = np.sign(np.nanmedian(current))
-    sign_b0 = np.sign(np.nanmedian(bcentr))
-    if sign_ip > 0 and sign_b0 > 0:
+    psi_rise = np.asarray(sibdry, dtype=float) - np.asarray(simagx, dtype=float)
+    current_median = np.nanmedian(current)
+    bcentr_median = np.nanmedian(bcentr)
+    psi_rise_median = np.nanmedian(psi_rise)
+    q_median = np.nanmedian(qpsi)
+    medians = np.array([current_median, bcentr_median, psi_rise_median, q_median])
+    if not np.all(np.isfinite(medians) & (medians != 0.0)):
+        logger_override.warning(
+            "No finite signs of Ip, B0, psi and q to identify the COCOS from. Assuming COCOS 1."
+        )
         return 1
-    if sign_ip < 0 and sign_b0 > 0:
-        return 3
-    if sign_ip > 0 and sign_b0 < 0:
-        return 5
-    if sign_ip < 0 and sign_b0 < 0:
-        return 7
-    logger_override.warning(
-        "Unexpected sign combination for current and magnetic field. Assuming COCOS 1."
+    # Only the sign of the boundary-to-axis rise matters, so the median rise stands in for the boundary
+    cocos = identify_cocos(
+        plasma_current=current_median,
+        b_toroidal=bcentr_median,
+        psi_at_boundary=psi_rise_median,
+        psi_at_mag_axis=0.0,
+        q_psi=np.array([q_median]),
+        phi_clockwise_from_top=False,
+        volt_seconds_per_radian=True,
     )
-    return 1
+    return cocos.index
 
 
 def orient_signal(geqdsk_data, efit_time):

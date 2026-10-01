@@ -7,10 +7,11 @@ geqdsk writing, per-shot COCOS identification, conversion to the DD's own
 convention, IDS building and writing -- then imports every written file
 back through imas.DBEntry and checks the physics-defining signs and values.
 
-Both field polarities run: C-Mod's EFIT pins psi increasing for either, so
-normal-field shots enter as COCOS 7 and reversed-field ones as COCOS 1
-(see scenario_export._source_cocos), and both must land on the same target
-convention.
+Three sign sets run, each entering under the cocos attribute its unprocessed file would carry
+(see machine.generic.cocos_from_signs), and all must land on the same target convention:
+C-Mod's EFIT pins psi increasing for either field polarity,
+so normal-field shots are COCOS 7 and reversed-field ones COCOS 1.
+MAST's EFIT has psi decreasing with Ip > 0, B0 < 0 and q > 0, COCOS 3.
 
 Needs the `imas` extra (imas-python, eqdsk); skipped without it.
 """
@@ -51,17 +52,17 @@ SOL_EXTENSION = "secant"
 QPSI = 1.0 + 2.0 * np.linspace(0.0, 1.0, N_PSI) ** 2
 
 
-def synthetic_unprocessed(polarity: int) -> xr.Dataset:
+def synthetic_unprocessed(
+    ip_sign: int, b0_sign: int, psi_sign: int, cocos: int
+) -> xr.Dataset:
     """One shot's unprocessed dataset: 0D signals + the GEQDSK block.
 
-    Circular flux surfaces around (R0, 0), psi increasing axis-to-boundary
-    (what C-Mod's EFIT writes for either polarity), q > 0, F on sign(B0),
-    pprime/ffprime negative -- the empirically verified C-Mod sign set,
-    COCOS 7 for polarity=-1 and COCOS 1 for polarity=+1.
+    Circular flux surfaces around (R0, 0), psi running axis-to-boundary along psi_sign,
+    q > 0, F on sign(B0), and pprime/ffprime on the sign that makes p and |F| fall outward.
     """
-    ip0 = polarity * 0.8e6
-    b0 = polarity * 5.4
-    psi0, dpsi = -0.05, 0.11
+    ip0 = ip_sign * 0.8e6
+    b0 = b0_sign * 5.4
+    psi0, dpsi = -0.05, psi_sign * 0.11
 
     time = np.round(np.arange(0.500, 0.6001, 0.001), 6)
     n_t = time.size
@@ -118,7 +119,9 @@ def synthetic_unprocessed(polarity: int) -> xr.Dataset:
     assert set(data_vars) == set(DATASET_EQUILIBRIUM_SIGNALS)
     data_vars["ip"] = (("time",), np.full(n_t, ip0))
     data_vars["b0"] = (("time",), np.full(n_t, b0))
-    return xr.Dataset(data_vars=data_vars, coords={"time": time})
+    return xr.Dataset(
+        data_vars=data_vars, coords={"time": time}, attrs={"cocos": cocos}
+    )
 
 
 def synthetic_fit(shot: int) -> xr.Dataset:
@@ -156,10 +159,14 @@ def synthetic_fit(shot: int) -> xr.Dataset:
     )
 
 
-@pytest.mark.parametrize("polarity", [-1, 1], ids=["normal_field", "reversed_field"])
-def test_imas_export_chain_reads_back(tmp_path, polarity):
-    shot = 900000001 if polarity < 0 else 900000002
-    unprocessed_ds = synthetic_unprocessed(polarity)
+@pytest.mark.parametrize(
+    "ip_sign, b0_sign, psi_sign, cocos",
+    [(-1, -1, 1, 7), (1, 1, 1, 1), (1, -1, -1, 3)],
+    ids=["cmod_normal_field", "cmod_reversed_field", "mast"],
+)
+def test_imas_export_chain_reads_back(tmp_path, ip_sign, b0_sign, psi_sign, cocos):
+    shot = 900000000 + cocos
+    unprocessed_ds = synthetic_unprocessed(ip_sign, b0_sign, psi_sign, cocos)
     fit_ds = synthetic_fit(shot)
 
     ids_list = build_imas_from_shot(
@@ -181,12 +188,13 @@ def test_imas_export_chain_reads_back(tmp_path, polarity):
     assert np.allclose(np.asarray(eq.time), EQ_TIMES)
     ts = eq.time_slice[0]
     dpsi = float(ts.global_quantities.psi_boundary - ts.global_quantities.psi_axis)
-    assert np.sign(dpsi) == sigma_bp * polarity, "psi direction off target COCOS"
-    assert np.sign(float(ts.global_quantities.ip)) == polarity
+    assert np.sign(dpsi) == sigma_bp * ip_sign, "psi direction off target COCOS"
+    assert np.sign(float(ts.global_quantities.ip)) == ip_sign
     p1 = ts.profiles_1d
-    assert np.all(np.asarray(p1.q) > 0)
-    assert np.sign(np.median(np.asarray(p1.phi)[1:])) == polarity, "phi off sign(B0)"
-    assert np.sign(np.median(np.asarray(p1.f))) == polarity
+    # sigma_rho_theta_phi is +1 in COCOS 11 and 17
+    assert np.all(np.sign(np.asarray(p1.q)) == ip_sign * b0_sign)
+    assert np.sign(np.median(np.asarray(p1.phi)[1:])) == b0_sign, "phi off sign(B0)"
+    assert np.sign(np.median(np.asarray(p1.f))) == b0_sign
     assert np.sign(np.median(np.asarray(p1.dpressure_dpsi))) == -np.sign(dpsi)
     rho_tor = np.asarray(p1.rho_tor)
     assert np.all(np.isfinite(rho_tor)) and np.all(np.diff(rho_tor) > 0)
@@ -213,8 +221,8 @@ def test_imas_export_chain_reads_back(tmp_path, polarity):
         assert (grid_psi_n[fit_rho_tor_norm > 1.0] > 1.0).all()
 
     sm = read_back("summary")
-    assert np.allclose(np.asarray(sm.global_quantities.ip.value), polarity * 0.8e6)
-    assert np.allclose(np.asarray(sm.global_quantities.b0.value), polarity * 5.4)
+    assert np.allclose(np.asarray(sm.global_quantities.ip.value), ip_sign * 0.8e6)
+    assert np.allclose(np.asarray(sm.global_quantities.b0.value), b0_sign * 5.4)
 
     wall = read_back("wall")
     outline = wall.description_2d[0].limiter.unit[0].outline

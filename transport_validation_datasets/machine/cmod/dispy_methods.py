@@ -10,7 +10,7 @@ from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import TimeSetting, TimeSettingParams
 
 from transport_validation_datasets.machine.generic import (
-    efit_cocos_from_signs,
+    cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     orient_signal,
@@ -186,8 +186,13 @@ class CmodEfitMethods:
 
         geqdsk_data = orient_signal(geqdsk_data, efit_time)
 
-        cocos_input = efit_cocos_from_signs(
-            geqdsk_data["current"], geqdsk_data["bcentr"], params.logger
+        cocos_input = cocos_from_signs(
+            geqdsk_data["current"],
+            geqdsk_data["bcentr"],
+            geqdsk_data["simagx"],
+            geqdsk_data["sibdry"],
+            geqdsk_data["qpsi"],
+            params.logger,
         )
 
         # geqdsk_cols keys are the make_geqdsk_dataset argument names

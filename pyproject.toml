@@ -7,6 +7,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "dask>=2026",
     "disruption-py==0.14.0",
+    "eqdsk>=0.5.0",
     "fire>=0.7.1",
     "freeqdsk>=0.5.2",
     "matplotlib>=3.11.1",
@@ -18,13 +19,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Only needed by DataWorkflow.export_to_imas() (cli.py's `--stage export`);
-# the base install, and the minimal venv gp_fitting's cluster dispatcher
-# ships, are unaffected without this extra. See imas_export/scenario_export.py's
-# module docstring for what each package is used for.
+# Only needed by DataWorkflow.export_to_imas() (cli.py's `--stage export`).
+# The base install, and the minimal venv gp_fitting's cluster dispatcher
+# ships, are unaffected without this extra.
+# eqdsk is a base dependency, machine/generic.py identifies each shot's COCOS with it.
 imas = [
     "imas-python>=2.1.0",
-    "eqdsk>=0.5.0",
 ]
 
 [dependency-groups]

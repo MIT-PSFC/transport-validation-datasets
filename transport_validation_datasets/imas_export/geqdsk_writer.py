@@ -7,12 +7,10 @@ see `workflow.DATASET_EQUILIBRIUM_SIGNALS`) already matches
 straight field copy plus NaN-stripping for the boundary/limiter contours
 (their point counts can vary slice to slice; the staged arrays are padded to
 a common width with NaN). The fields are copied untouched, in the raw EFIT
-convention they were extracted in -- which is NOT one fixed COCOS: C-Mod's
-EFIT pins psi increasing axis-to-boundary for either field polarity, so the
-convention floats with sign(Ip) (COCOS 7 for normal-field shots, COCOS 1
-for reversed-field ones; see `scenario_export._source_cocos`). COCOS
-conversion happens downstream, when `scenario_export.py` reads the file
-back.
+convention they were extracted in -- which is NOT one fixed COCOS.
+C-Mod's is 7 for normal-field shots and 1 for reversed-field ones, MAST's is 3.
+The unprocessed file records it as its cocos attribute (see `machine.generic.cocos_from_signs`).
+COCOS conversion happens downstream, when `scenario_export.py` reads the file back.
 
 `scenario_export.py`'s equilibrium builder needs a real file on disk because
 the `eqdsk` package it uses for COCOS conversion reads one, so this writer
