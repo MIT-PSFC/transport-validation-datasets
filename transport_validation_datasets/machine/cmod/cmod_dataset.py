@@ -14,14 +14,15 @@ from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFit
 from transport_validation_datasets.machine.cmod.dispy_methods import (
     CmodAeqdskMethods,
     CmodEfitMethods,
+    CmodPlasmaMethods,
     CmodPowerMethods,
     CmodThomsonMethods,
     UniformTimeSetting,
 )
 from transport_validation_datasets.machine.generic import (
-    held_signal_on_grid,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
+    signal_on_grid,
     snap_to_grid,
     ts_channel_fit_rows,
 )
@@ -31,6 +32,34 @@ from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 # attributes attached (DataWorkflow.signal_attrs). Everything else carries
 # disruption-py's, rewritten to the shared convention at the stack stage.
 SIGNAL_ATTRS = {
+    "ip": {
+        "description": "Plasma current, magnetics ip (Rogowski coil), signed, mean of each 1 ms grid step",
+        "units": "A",
+        "ref": "/summary/global_quantities/ip/value",
+    },
+    "n_e_line_average": {
+        "description": "Line-averaged electron density, TCI chord 4 (nl_04 / 0.6 m), mean of each 1 ms grid step",
+        "units": "m^-3",
+        "ref": "/summary/line_average/n_e/value",
+    },
+    "power_radiated": {
+        "description": (
+            "Total radiated power, AXUV twopi_diode x 4.5 (cross-calibrated to the 2pi foil bolometer), "
+            "mean of each 1 ms grid step, clipped at 0"
+        ),
+        "units": "W",
+        "ref": "/summary/global_quantities/power_radiated/value",
+    },
+    "power_ic": {
+        "description": "ICRF net heating power (rf_power_net), mean of each 1 ms grid step, zero outside its record",
+        "units": "W",
+        "ref": "/summary/heating_current_drive/power_launched_ic/value",
+    },
+    "power_lh": {
+        "description": "Lower hybrid net heating power (LH netpow), mean of each 1 ms grid step, zero outside its record",
+        "units": "W",
+        "ref": "/summary/heating_current_drive/power_launched_lh/value",
+    },
     "b0": {
         "description": "Vacuum toroidal field at geometric_axis_r, the magnetics btor (quoted at 0.66 m) scaled by 1/R",
         "units": "T",
@@ -569,13 +598,16 @@ def _read_with_efit_tree(
 def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     """Retrieve the fast-diagnostic 0D signals on the uniform 1 kHz grid.
 
-    Only signals sampled at least as fast as the grid belong here
-    (magnetics, TCI, bolometry, RF power),
-    so sampling them at the grid times only discards resolution.
+    Only signals sampled faster than the grid belong here
+    (magnetics, TCI, bolometry, RF and LH power),
+    and each grid time takes the mean of the preceding millisecond (signal_on_grid).
     The EFIT-derived 0D signals are in _get_efit0d_dataset instead.
     p_ohm stays here because the fast loop voltage and Ip set its time resolution.
     Its EFIT li and R are held forward from the last reconstruction,
     and it is NaN outside the EFIT time range (CmodPowerMethods.get_ohmic_power).
+    Only the custom methods run, selected by name.
+    Selected by column, the disruption-py built-ins serving the same columns would run too,
+    and they interpolate.
 
     Args:
         shot: Shot number to retrieve data for.
@@ -585,23 +617,23 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         Dataset with the fast 0D signals for the given shot, or None if
         retrieval returned no data.
     """
-    fast_signals = [
-        "ip",  # Plasma current
-        "bt",  # On-axis magnetic field
-        "n_e",  # Line average electron density [m^-3]
+    fast_methods = [
+        "get_plasma_current",  # ip
+        "get_toroidal_field",  # bt, the vacuum field at BTOR_REFERENCE_R
+        "get_line_average_density",  # n_e [m^-3]
         # Power sources and sinks
-        "p_ohm",  # Ohmic heating power, causal (CmodPowerMethods.get_ohmic_power)
-        "p_rad",  # Bulk radiated heating power
-        "p_icrf",  # ICRF heating power
-        "p_lh",  # Lower hybrid heating power (yes this is actually lower hybrid on C-Mod, NOT the LH transition threshold like on TCV)
+        "get_ohmic_power",  # p_ohm
+        "get_radiated_power",  # p_rad
+        # p_icrf, p_lh (lower hybrid heating on C-Mod, NOT the L-H threshold power as on TCV)
+        "get_heating_powers",
     ]
 
     retrieval_settings = RetrievalSettings(
-        run_columns=fast_signals,
+        run_methods=fast_methods,
         time_setting=UniformTimeSetting(),
         efit_nickname_setting=efit_tree,
-        only_requested_columns=True,
-        custom_physics_methods=[CmodPowerMethods.get_ohmic_power],
+        only_requested_columns=False,
+        custom_physics_methods=[CmodPlasmaMethods, CmodPowerMethods],
     )
     result = get_shots_data(
         tokamak=Tokamak.CMOD,
@@ -623,7 +655,7 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     time_setting="efit" makes params.times the EFIT tree's own timebase,
     so the final interp1 in the disruption-py methods is an identity.
     A tree on the grid's cadence is snapped onto it like the equilibrium and Thomson.
-    A slow tree (see SLOW_EFIT_PERIOD) is held forward (held_signal_on_grid), as MAST's 0D equilibrium signals are,
+    A slow tree (see SLOW_EFIT_PERIOD) is held forward (signal_on_grid), as MAST's 0D equilibrium signals are,
     so the filters see a signal at every grid time and none draws on a later reconstruction.
     Grid times outside the tree's time range hold NaN either way.
 
@@ -679,7 +711,7 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
 
 
 def _hold_onto_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
-    """Hold a retrieval (dim 'idx', 'time'/'shot' coords) forward onto grid_times (held_signal_on_grid).
+    """Hold a retrieval (dim 'idx', 'time'/'shot' coords) forward onto grid_times (signal_on_grid).
 
     Args:
         ds: Retrieval with dim 'idx' and 'time'/'shot' coords, 1D signals only.
@@ -693,7 +725,7 @@ def _hold_onto_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     shot_id = ds["shot"].values[0]
     data_vars = {}
     for name, variable in ds.data_vars.items():
-        values_on_grid = held_signal_on_grid(source_times, variable.values, grid_times)
+        values_on_grid = signal_on_grid(source_times, variable.values, grid_times)
         data_vars[name] = ("idx", values_on_grid, variable.attrs)
     coords = {
         "time": ("idx", grid_times),

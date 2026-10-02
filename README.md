@@ -83,13 +83,31 @@ The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since so
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
 
 Every stored value is causal: no grid time draws on a later sample.
-A 0D signal slower than the 1 kHz grid is held forward from its last finite sample
-for at most `MAX_HOLD_PERIODS` of its own sampling period (`held_signal_on_grid`), never interpolated,
-smoothing is a trailing boxcar, and derivatives are backward differences.
+A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
+One sampled faster than the grid is averaged over each grid step, grid time t taking the mean of (t - 1 ms, t].
+One sampled slower is held forward from its last finite sample for at most `MAX_HOLD_PERIODS` of its own sampling period.
+Smoothing is a trailing boxcar, and derivatives are backward differences.
 b0 is the vacuum field at geometric_axis_r on both devices.
 power_ohm is Ip V_loop - dW_pol/dt on both devices.
 MAST reads it from ESM (`pphix`), C-Mod computes it (`CmodPowerMethods.get_ohmic_power`)
 from the flux loop voltage and W_pol = mu0 R li Ip^2 / 4, smoothed by a trailing 5 ms boxcar.
+
+The C-Mod 0D signals outside EFIT are read by custom methods (`CmodPlasmaMethods`, `CmodPowerMethods`),
+since the disruption-py built-ins interpolate.
+Every one of their records is faster than the grid, so each grid time takes the mean of the preceding millisecond.
+Sample periods, checked on 5 shots from 2012 to 2016:
+
+| Signal | Node (tree) | Period [ms] |
+| --- | --- | --- |
+| ip, b0 | `\ip`, `\btor` (magnetics) | 0.2 from -0.1 to 2.2 s, 10 outside |
+| n_e_line_average | `.tci.results:nl_04` (electrons) | 0.5 |
+| power_radiated | `\twopi_diode` (spectroscopy) | 0.333 |
+| power_ic | `\rf_power_net` (rf) | 0.1 |
+| power_lh | `\top.results:netpow` (lh) | 0.04 |
+| V_loop of power_ohm | `\top.mflux:v0` (analysis) | 0.2 |
+
+power_ic and power_lh are 0 outside their records and on shots without the system.
+power_radiated is NaN outside its record.
 
 # Filtering
 
@@ -305,7 +323,7 @@ Adding ANALYSIS after it turns on pulling those shots from the ANALYSIS tree ins
 Every retrieval reads the EFIT tree at least for its timebase, so a shot takes the first tree that serves all of them.
 A tree fails when it is missing or its reconstruction is missing a node,
 and the unprocessed file records the tree it used as its `efit_tree` attribute.
-A tree slower than the 1 kHz grid (ANALYSIS reconstructs every ~20 ms) has its EFIT 0D signals interpolated onto the grid,
+A tree slower than the 1 kHz grid (ANALYSIS reconstructs every ~20 ms) has its EFIT 0D signals held forward onto the grid (`signal_on_grid`),
 and `fresh_equilibrium` marks grid times where the reconstruction exists.
 Shots already recorded in `01_unprocessed/failed_shots/` are not retried,
 so their records need deleting for a rebuild to try another tree.

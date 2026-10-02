@@ -459,17 +459,17 @@ def hold_onto_grid(
     return sample_index, fresh
 
 
-def held_signal_on_grid(
+def signal_on_grid(
     source_times: np.ndarray, values: np.ndarray, grid: np.ndarray
 ) -> np.ndarray:
-    """Place a slower-than-grid 0D signal on the grid by holding each finite sample forward.
+    """Place a 0D signal on the grid causally, so no grid value draws on a later sample.
 
-    Each grid time takes the last finite sample at or before it,
-    held for at most MAX_HOLD_PERIODS of the source's own sampling period (hold_onto_grid),
-    so no grid value draws on a later sample and a gap in the source stays NaN.
-    The period is the median spacing of the finite samples,
-    so a fast clock populated only at a slower cadence (MAST esm) holds on that cadence.
-    Fewer than two finite samples have no period, and nothing is held.
+    A source sampled faster than the grid is averaged over each grid step (_window_mean_on_grid).
+    A slower one is held forward from its last sample (_held_on_grid).
+    Only finite samples count.
+    The source's period is the median spacing of its finite samples,
+    so a fast clock populated only at a slower cadence (MAST esm) is held on that cadence.
+    Fewer than two finite samples have no period, and give all NaN.
 
     Args:
         source_times: (n_source,) ascending sample times of the source [s].
@@ -477,17 +477,80 @@ def held_signal_on_grid(
         grid: The shot's 1 kHz timebase [s].
 
     Returns:
-        (n_grid,) the signal on the grid, NaN where nothing is held.
+        (n_grid,) the signal on the grid, NaN where it has no value.
     """
-    values_on_grid = np.full(grid.size, np.nan)
     mask_finite = np.isfinite(values)
     if mask_finite.sum() < 2:
-        return values_on_grid
-    sample_index, _ = hold_onto_grid(grid, source_times[mask_finite], True)
+        return np.full(grid.size, np.nan)
+    times_finite = source_times[mask_finite]
     values_finite = values[mask_finite]
+    source_steps = np.diff(times_finite)
+    source_period = float(np.median(source_steps))
+    grid_float64 = grid.astype(np.float64)
+    grid_steps = np.diff(grid_float64)
+    grid_step = float(np.median(grid_steps))
+    if source_period < grid_step - SAMPLE_TIME_TOL:
+        return _window_mean_on_grid(
+            times_finite, values_finite, grid_float64, grid_step
+        )
+    return _held_on_grid(times_finite, values_finite, grid_float64)
+
+
+def _held_on_grid(
+    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray
+) -> np.ndarray:
+    """Each grid time takes the last sample at or before it (hold_onto_grid).
+
+    A sample is held for at most MAX_HOLD_PERIODS of the median sample spacing,
+    so a gap in the source stays NaN.
+
+    Args:
+        source_times: (n_source,) ascending finite sample times [s], at least two.
+        values: (n_source,) the samples.
+        grid: (n_grid,) the timebase [s].
+
+    Returns:
+        (n_grid,) the held signal, NaN where nothing is held.
+    """
+    sample_index, _ = hold_onto_grid(grid, source_times, True)
+    values_on_grid = np.full(grid.size, np.nan)
     mask_held = sample_index >= 0
-    values_on_grid[mask_held] = values_finite[sample_index[mask_held]]
+    values_on_grid[mask_held] = values[sample_index[mask_held]]
     return values_on_grid
+
+
+def _window_mean_on_grid(
+    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray, grid_step: float
+) -> np.ndarray:
+    """Each grid time t takes the mean of the samples in (t - grid_step, t].
+
+    A sample within SAMPLE_TIME_TOL after a grid time counts as at it, as in hold_onto_grid.
+
+    Args:
+        source_times: (n_source,) ascending finite sample times [s].
+        values: (n_source,) the samples.
+        grid: (n_grid,) the uniform timebase [s], float64.
+        grid_step: Its step [s].
+
+    Returns:
+        (n_grid,) the window means, NaN where a window holds no sample.
+    """
+    first_window_start = grid[0] - grid_step
+    window_edges = np.concatenate([[first_window_start], grid])
+    window_index = (
+        np.searchsorted(window_edges, source_times - SAMPLE_TIME_TOL, side="left") - 1
+    )
+    mask_on_grid = (window_index >= 0) & (window_index < grid.size)
+    window_index_on_grid = window_index[mask_on_grid]
+    values_in_windows = values[mask_on_grid]
+    window_sums = np.bincount(
+        window_index_on_grid, weights=values_in_windows, minlength=grid.size
+    )
+    window_counts = np.bincount(window_index_on_grid, minlength=grid.size)
+    window_means = np.full(grid.size, np.nan)
+    mask_sampled = window_counts > 0
+    window_means[mask_sampled] = window_sums[mask_sampled] / window_counts[mask_sampled]
+    return window_means
 
 
 def trailing_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.ndarray:
