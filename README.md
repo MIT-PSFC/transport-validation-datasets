@@ -337,6 +337,6 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 | Device | Source | Shotlist | Notes |
 | ------ | ------ | -------- | ----- |
 | C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. |
-| MAST | Level 1 Zarr store at https://s3.echo.stfc.ac.uk/mast/level1/shots: EFM for the equilibrium (GEQDSK and 0D), ESM for the ohmic power, AYC for the Thomson profiles. The level 2 store at https://s3.echo.stfc.ac.uk/mast/level2/shots supplies only the summary signals (ip, NBI and radiated power, line averaged density) | 1693 shots from the M7-M9 campaigns, shipped with the package and built by `machine/mast/shotlist.py` | Public, anonymous, read in a thread pool (`--prepare_workers`) |
+| MAST | Level 1 Zarr store at https://s3.echo.stfc.ac.uk/mast/level1/shots: EFM for the equilibrium (GEQDSK and 0D), ESM for the ohmic power, AYC for the Thomson profiles. The level 2 store at https://s3.echo.stfc.ac.uk/mast/level2/shots supplies only the summary signals (ip, NBI and radiated power, line averaged density) | 1671 shots from the M7-M9 campaigns, shipped with the package and built by `machine/mast/shotlist.py` | Public, anonymous, read in a thread pool (`--prepare_workers`) |
 | DIII-D | | | |
 | TCV | | | |
