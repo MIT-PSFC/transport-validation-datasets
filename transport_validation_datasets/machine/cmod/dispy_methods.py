@@ -91,6 +91,25 @@ class UniformTimeSetting(TimeSetting):
         return make_uniform_1kHz_timebase(float(np.max(efit_time)) * scale)
 
 
+def _aeqdsk_node(params, expression: str, efit_time: np.ndarray) -> np.ndarray:
+    """Read one aeqdsk node on the EFIT times, NaN when the tree lacks it.
+
+    Args:
+        params: disruption-py physics method parameters for the shot.
+        expression: MDSplus expression of the node, with any unit conversion.
+        efit_time: (n_eq,) the EFIT times [s], sizing the NaN fallback.
+
+    Returns:
+        (n_eq,) the node's values.
+    """
+    try:
+        return params.mds_conn.get_data(expression, tree_name="_efit_tree")
+    except mdsExceptions.MdsException as e:
+        params.logger.warning(repr(e))
+        params.logger.opt(exception=True).debug(e)
+        return np.full(len(efit_time), np.nan)
+
+
 class CmodAeqdskMethods:
     """0D C-Mod aeqdsk signals read as the tree stores them, which stock disruption-py skips or rebuilds."""
 
@@ -109,15 +128,7 @@ class CmodAeqdskMethods:
             Dict with rout [m] on the requested timebase.
         """
         efit_time = efit_times_in_seconds(params, r"\efit_aeqdsk:time")
-        try:
-            rout = params.mds_conn.get_data(
-                r"\efit_aeqdsk:rout/100", tree_name="_efit_tree"
-            )
-        except mdsExceptions.MdsException as e:
-            params.logger.warning(repr(e))
-            params.logger.opt(exception=True).debug(e)
-            rout = np.full(len(efit_time), np.nan)
-
+        rout = _aeqdsk_node(params, r"\efit_aeqdsk:rout/100", efit_time)
         if not np.array_equal(params.times, efit_time):
             rout = signal_on_grid(efit_time, rout, params.times, EQUILIBRIUM_HOLD_FLOOR)
         return {"rout": rout}
@@ -125,26 +136,32 @@ class CmodAeqdskMethods:
     @staticmethod
     @physics_method(columns=["betan"], tokamak=Tokamak.CMOD)
     def get_normalized_beta(params: PhysicsMethodParams):
-        """Retrieve EFIT's own normalized beta, the node DIII-D, MAST and TCV store.
+        """Retrieve the normalized beta with B_geo, the vacuum field at the geometric center rout.
 
-        disruption-py rebuilds beta_n from betat, aout, btaxp and cpasma,
-        for the pre-2000 shots that have no betan node.
+        EFIT's betat already normalizes with that field, 2 mu0 <p> / B_geo^2.
+        Its betan node does not, since it multiplies by |btaxp|, the total field at the magnetic axis.
+        So betan is rebuilt here as betat a B_geo / Ip[MA], the convention every store holds,
+        with B_geo = |bcentr| rcencm / rout, the vacuum field at rcencm carried out as 1/R.
 
         Args:
             params: disruption-py physics method parameters for the shot.
 
         Returns:
-            Dict with betan on the requested timebase.
+            Dict with betan [percent m T / MA] on the requested timebase.
         """
         efit_time = efit_times_in_seconds(params, r"\efit_aeqdsk:time")
-        try:
-            betan = params.mds_conn.get_data(
-                r"\efit_aeqdsk:betan", tree_name="_efit_tree"
-            )
-        except mdsExceptions.MdsException as e:
-            params.logger.warning(repr(e))
-            params.logger.opt(exception=True).debug(e)
-            betan = np.full(len(efit_time), np.nan)
+        betat = _aeqdsk_node(params, r"\efit_aeqdsk:betat", efit_time)  # [percent]
+        minor_radius = _aeqdsk_node(params, r"\efit_aeqdsk:aout/100", efit_time)  # [m]
+        b_center = _aeqdsk_node(params, r"\efit_aeqdsk:bcentr", efit_time)  # [T]
+        r_center = _aeqdsk_node(params, r"\efit_aeqdsk:rcencm/100", efit_time)  # [m]
+        r_geo = _aeqdsk_node(params, r"\efit_aeqdsk:rout/100", efit_time)  # [m]
+        ip_ma = _aeqdsk_node(params, r"\efit_aeqdsk:cpasma/1e6", efit_time)  # [MA]
+
+        b_center_magnitude = np.abs(b_center)
+        ip_magnitude_ma = np.abs(ip_ma)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            b_geo = b_center_magnitude * r_center / r_geo
+            betan = betat * minor_radius * b_geo / ip_magnitude_ma
 
         if not np.array_equal(params.times, efit_time):
             betan = signal_on_grid(

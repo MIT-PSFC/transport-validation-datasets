@@ -159,7 +159,10 @@ SIGNAL_ATTRS = {
         "description": "Stored energy from the equilibrium reconstruction, 3/2 the volume integral of its pressure",
     },
     "beta_tor_norm": {
-        "description": "Normalized toroidal beta",
+        "description": (
+            "Normalized toroidal beta from the reconstruction (betan), with B_geo, "
+            "the vacuum field at the geometric axis (bvac_rgeom), whatever the efm metadata says"
+        ),
     },
     "n_e_line_average": {
         "description": "Line averaged electron density",

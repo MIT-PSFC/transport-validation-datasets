@@ -98,6 +98,11 @@ Derivatives are backward differences.
 b0 is the vacuum toroidal field at the fixed major radius r0, as IMAS defines it,
 the magnetics btor at 0.66 m on C-Mod and the EFIT bvac_val at bvac_r (1.0 m) on MAST.
 ip and b0 keep their source sign, the cocos variable records the convention.
+beta_tor_norm is normalized with B_geo = b0 r0 / geometric_axis_r, in beta_tor and in a B / Ip,
+not with the IMAS b0 at r0, and the IMAS export converts it.
+MAST's efm betan already uses B_geo (bvac_rgeom).
+C-Mod's EFIT betan takes |btaxp|, the total field at the magnetic axis,
+so it is rebuilt from betat, which uses B_geo, as betat a B_geo / Ip (`get_normalized_beta`).
 power_ohm is Ip V_loop - dW_pol/dt on both devices.
 MAST reads it from ESM (`pphix`), C-Mod computes it (`CmodPowerMethods.get_ohmic_power`)
 from the flux loop voltage and W_pol = mu0 R_geo li Ip^2 / 4, R_geo the geometric major radius (EFIT `rout`).
