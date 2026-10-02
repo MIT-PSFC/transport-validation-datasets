@@ -160,13 +160,15 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
 7. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod 0.5 s, MAST 0.2 s).
 8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a mean `power_radiated` below `min_radiated_fraction` of the mean input power, ohmic plus auxiliary (a dead bolometer),
-     1 percent on C-Mod and 2.5 percent on MAST (`radiated_fraction_reason`)
+     1 percent on C-Mod and 2.5 percent on MAST,
+     or above `max_radiated_fraction` of it, 1 on both, since more cannot be radiated than is put in (`radiated_fraction_reason`)
    - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point (`energy_sanity_reason`).
 
 | Threshold | C-Mod | MAST |
 | --- | --- | --- |
 | min ip | 100 kA | 210 kA |
 | min energy_mhd | 2.7 kJ | 5 kJ |
+| min n_e_line_average | 1e19 m^-3 | 3e18 m^-3 |
 | max greenwald_fraction | 2.0 | 2.0 |
 | max power_radiated | | 4 MW |
 | transient power_ohm | 5 MW | 5 MW |
@@ -174,6 +176,7 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
 | end_margin | 20 ms | 40 ms |
 | min_pulse_length | 0.5 s | 0.2 s |
 | min_radiated_fraction | 0.01 | 0.025 |
+| max_radiated_fraction | 1.0 | 1.0 |
 | density_ratio_bounds | 0.72-1.3 | 0.7-1.3 |
 
 The standardized source pull of every shot is kept unfiltered in `01_unprocessed/source/`.

@@ -122,6 +122,8 @@ class CModDataWorkflow(DataWorkflow):
         "ip": 100e3,
         # Lowered from 3 kJ so the ramp-ups count, 2.7 kJ adds 3 s of kept time over 990 shots read from source.
         "energy_mhd": 2.7e3,
+        # A broken interferometer record, the lowest kept value in a 40-shot sample is 2.4e19
+        "n_e_line_average": 1e19,
     }
     max_filter = {
         "greenwald_fraction": 2.0,
@@ -139,6 +141,8 @@ class CModDataWorkflow(DataWorkflow):
     # The lowest live bolometer record, 1160928005, sits at 1.9 percent.
     # The two shots with no record at all are caught by the all-NaN check.
     min_radiated_fraction = 0.01
+    # More radiated than put in. The highest in a 40-shot sample is 0.87.
+    max_radiated_fraction = 1.0
     # Thomson n_e against the interferometer. Large disagreement indicates TS miscalibration.
     # 1160527001 and 1160527002 are 0.69, the next lowest shot is 0.76, the highest at 1.16
     density_ratio_bounds = (0.72, 1.3)

@@ -178,16 +178,20 @@ def clip_powers(ds: xr.Dataset) -> xr.Dataset:
 
 
 def radiated_fraction_reason(
-    ds: xr.Dataset, min_radiated_fraction: float
+    ds: xr.Dataset, min_radiated_fraction: float, max_radiated_fraction: float
 ) -> str | None:
-    """Check the radiated power against the input power, a dead bolometer reads far below it.
+    """Check the radiated power against the input power.
 
-    The mean power_radiated, clipped at 0, may not fall below min_radiated_fraction of the mean input_power.
+    The mean power_radiated, clipped at 0, may not fall below min_radiated_fraction of the mean input_power,
+    a dead bolometer, or rise above max_radiated_fraction of it.
+    Radiating more than is put in over the kept times breaks energy conservation,
+    so above 1 a bolometer or input power record is broken.
     A shot with no input power is never rejected.
 
     Args:
         ds: One shot's dataset on its kept times.
         min_radiated_fraction: The floor of the ratio of the means.
+        max_radiated_fraction: The ceiling of the ratio of the means.
 
     Returns:
         Why the shot is rejected, or None if it passes.
@@ -198,13 +202,16 @@ def radiated_fraction_reason(
     power_radiated = ds["power_radiated"].clip(min=0.0)
     power_radiated_mean = float(power_radiated.mean())
     radiated_fraction = power_radiated_mean / power_input_mean
-    if radiated_fraction >= min_radiated_fraction:
+    if radiated_fraction < min_radiated_fraction:
+        bound = f"below the {100 * min_radiated_fraction:.1f} percent floor"
+    elif radiated_fraction > max_radiated_fraction:
+        bound = f"above the {100 * max_radiated_fraction:.0f} percent ceiling"
+    else:
         return None
     return (
         f"mean power_radiated {1e-3 * power_radiated_mean:.1f} kW "
         f"is {100 * radiated_fraction:.1f} percent "
-        f"of the {1e-3 * power_input_mean:.0f} kW mean input power, "
-        f"below the {100 * min_radiated_fraction:.1f} percent floor"
+        f"of the {1e-3 * power_input_mean:.0f} kW mean input power, {bound}"
     )
 
 

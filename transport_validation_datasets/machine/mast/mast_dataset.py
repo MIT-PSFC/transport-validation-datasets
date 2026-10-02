@@ -295,6 +295,9 @@ class MASTDataWorkflow(DataWorkflow):
         # 5 kJ of plasma_energy cuts about what 10 kJ of the old wmhd did (median ratio 2.1),
         # 1.9 percent of the times iteration 12 kept, mostly ramp phases
         "energy_mhd": 5e3,
+        # A broken interferometer record. The lowest kept value in a 40-shot sample is 6e18,
+        # and 1e19 would cut 6 percent of the kept time where Thomson agrees with the interferometer.
+        "n_e_line_average": 3e18,
     }
     max_filter = {
         "greenwald_fraction": 2.0,
@@ -317,6 +320,8 @@ class MASTDataWorkflow(DataWorkflow):
     # Shots radiate a median 10 percent of their heating power (it11 store, from 23809 on).
     # 12 shots sit below 1 percent with MW of input, a dead bolometer, and the next lowest is at 3.75 percent.
     min_radiated_fraction = 0.025
+    # More radiated than put in. The highest in a 40-shot sample is 0.34.
+    max_radiated_fraction = 1.0
     # There appears to be a systematic change in TS calibrations after this early-campaign shot.
     first_shot = 23809
     # From 23809 on, 23990 sits at 0.13 and the next lowest shot at 0.75, the highest at 1.10

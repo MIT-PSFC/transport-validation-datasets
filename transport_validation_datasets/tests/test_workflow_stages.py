@@ -453,6 +453,18 @@ class TestShotRejectionReason:
         unheated = self.kept_dataset(power_radiated=3e3)
         assert workflow.shot_rejection_reason(unheated) is None
 
+    def test_radiated_fraction_ceiling_only_when_set(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        # 1.5 MW radiated against 1 MW of heating radiates more than is put in
+        ds = self.kept_dataset(power_radiated=1.5e6, power_nbi=1e6)
+        assert workflow.shot_rejection_reason(ds) is None
+
+        workflow.max_radiated_fraction = 1.0
+
+        assert "ceiling" in workflow.shot_rejection_reason(ds)
+        healthy = self.kept_dataset(power_radiated=8e5, power_nbi=1e6)
+        assert workflow.shot_rejection_reason(healthy) is None
+
     def test_energy_rise_beyond_heating_rejected(self, tmp_path):
         workflow = make_workflow(tmp_path)
         # 100 kJ stored over the 0.3 s shot, peaking at the end
