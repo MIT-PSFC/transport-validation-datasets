@@ -45,6 +45,27 @@ RHO_TOR_NORM_CH = np.linspace(0.05, 1.1, 24)
 MISFIRED_TE_CHANNEL = 3  # rho_tor_norm 0.19
 NOISY_NE_CHANNEL = 7  # rho_tor_norm 0.37
 
+# Every 0D signal of the schema, so the finite filter passes unless a test breaks one.
+# No heating power, so the shot checks only see what a test puts in.
+DEFAULT_ZERO_D = {
+    "ip": 1.0e6,
+    "b0": 2.0,
+    "energy_mhd": 1.0e5,
+    "beta_tor_norm": 1.0,
+    "n_e_line_average": NE_AXIS,
+    "minor_radius": 0.2,
+    "geometric_axis_r": 0.7,
+    "elongation": 1.6,
+    "triangularity_upper": 0.3,
+    "triangularity_lower": 0.3,
+    "power_ohm": 0.0,
+    "power_radiated": 0.0,
+    "power_nbi": 0.0,
+    "power_ic": 0.0,
+    "power_lh": 0.0,
+    "power_ec": 0.0,
+}
+
 # Dummy shot numbers used throughout the tests
 BLACKLISTED_SHOT = 9
 UNREADABLE_SHOT = 5  # the source returns None, a transient failure
@@ -110,7 +131,7 @@ def make_source_dataset(
     def channel(values):
         return ((EPISODE_DIM, TIME_COORD, "ts_channel"), values[None])
 
-    zero_d = {"ip": 1.0e6, **(extra_signals or {})}
+    zero_d = {**DEFAULT_ZERO_D, **(extra_signals or {})}
     return xr.Dataset(
         {
             **{
@@ -133,7 +154,8 @@ def make_source_dataset(
 
 
 class DummyWorkflow(DataWorkflow):
-    valid_filter = {"ip": {"min_abs": 1.0}}
+    min_filter = {"ip": 1.0}
+    max_filter = {}
     transient_filter = {}
     end_margin = 0.01
     min_pulse_length = 0.1
@@ -263,6 +285,19 @@ class TestMakeUnprocessedDataFiles:
 
         assert workflow.source_reads == reads
 
+    def test_rejected_shot_refiltered_from_its_kept_pull(self, tmp_path):
+        # A filter change after a rejection reruns from the kept pull, never the source
+        workflow = make_workflow(tmp_path, shots=[1])
+        workflow.min_filter = {"ip": 2e6}
+        workflow.make_unprocessed_data_files()
+        assert workflow.unprocessed_shots() == []
+
+        workflow.min_filter = {"ip": 1.0}
+        workflow.make_unprocessed_data_files()
+
+        assert workflow.unprocessed_shots() == [1]
+        assert workflow.source_reads == [1]
+
     def test_blacklisted_never_read_unreadable_retried(self, tmp_path):
         workflow = make_workflow(tmp_path, shots=[1, BLACKLISTED_SHOT, UNREADABLE_SHOT])
 
@@ -329,6 +364,53 @@ class TestTransientGaps:
         assert 0.21 < times.max() < 0.22
 
 
+class TestSliceFilters:
+    grid = make_uniform_1kHz_timebase(DURATION).astype(float)
+
+    def kept_times(self, workflow, **signals) -> np.ndarray:
+        ds = make_source_dataset(
+            1, parabola, DURATION, None, False, extra_signals=signals
+        )
+        ds_filtered = workflow.filter_and_plot(ds)
+        return ds_filtered[TIME_COORD].values
+
+    def test_min_max_and_nan_failures_are_gaps_around_the_longest_segment(
+        self, tmp_path
+    ):
+        # A low energy_mhd stretch, a Greenwald fraction over 2, and a NaN power sample,
+        # leaving 0.161-0.29 s (the end margin cuts after 0.29 s) as the longest segment
+        workflow = make_workflow(tmp_path)
+        workflow.min_filter = {"ip": 1.0, "energy_mhd": 5e4}
+        workflow.max_filter = {"greenwald_fraction": 2.0}
+        energy_mhd = np.where((self.grid > 0.05) & (self.grid < 0.08), 1e4, 1e5)
+        # n_GW of 1 MA in a 0.2 m minor radius is ~8e20 m^-3
+        n_e_line_average = np.where(
+            (self.grid > 0.10) & (self.grid < 0.12), 2e21, NE_AXIS
+        )
+        power_radiated = np.where(np.isclose(self.grid, 0.16), np.nan, 0.0)
+
+        times = self.kept_times(
+            workflow,
+            energy_mhd=energy_mhd,
+            n_e_line_average=n_e_line_average,
+            power_radiated=power_radiated,
+        )
+
+        assert times.min() == pytest.approx(0.161)
+        assert times.max() == pytest.approx(0.29)
+        assert np.allclose(np.diff(times), 1e-3)
+
+    def test_shot_ends_at_the_last_ip_above_its_threshold(self, tmp_path):
+        # ip stays finite but below the threshold after 0.2 s, so the end margin counts back from 0.199 s
+        workflow = make_workflow(tmp_path)
+        workflow.min_filter = {"ip": 1e5}
+        ip = np.where(self.grid < 0.2, 1e6, 1e3)
+
+        times = self.kept_times(workflow, ip=ip)
+
+        assert times.max() == pytest.approx(0.189)
+
+
 class TestShotRejectionReason:
     grid = make_uniform_1kHz_timebase(DURATION).astype(float)
 
@@ -336,16 +418,6 @@ class TestShotRejectionReason:
         return make_source_dataset(
             1, parabola, DURATION, None, False, extra_signals=signals
         )
-
-    def test_all_nan_signal_named_absent_signal_skipped(self, tmp_path):
-        workflow = make_workflow(tmp_path)
-
-        reason = workflow.shot_rejection_reason(
-            self.kept_dataset(power_ic=0.0, power_radiated=np.nan)
-        )
-
-        assert "power_radiated" in reason
-        assert workflow.shot_rejection_reason(self.kept_dataset()) is None
 
     def test_radiated_fraction_floor_only_when_set(self, tmp_path):
         workflow = make_workflow(tmp_path)

@@ -1,13 +1,18 @@
 import re
+from dataclasses import dataclass, replace
 
 import numpy as np
 import xarray as xr
 from eqdsk.cocos import identify_cocos
 from loguru import logger
 from scipy.integrate import cumulative_simpson
-from scipy.interpolate import RegularGridInterpolator
+from scipy.interpolate import CubicHermiteSpline, RegularGridInterpolator
+from scipy.special import xlogy
 
 IMAS_DOCS_URL = "https://imas-data-dictionary.readthedocs.io/en/latest/generated/ids"
+
+# Vacuum permeability [H/m]
+MU0 = 4e-7 * np.pi
 
 # Attributes of the GEQDSK block make_geqdsk_dataset builds, freeqdsk names.
 # Units are those of COCOS 1 to 8, the range cocos_from_signs returns, where the poloidal flux is per radian.
@@ -172,17 +177,32 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+# A grid time carries a sample of its own when it sits this close to one [s].
+# Only absorbs float round-off, everything shares the staged 1 kHz timebase.
+SAMPLE_TIME_TOL = 1e-6
+
+# How long a slowly sampled signal (a fitted profile, an equilibrium, a 0D signal slower than the grid)
+# is held forward onto the 1 kHz timebase, in periods of its own sampling.
+# Above 1 to tolerate jitter in the sampling, low enough that nothing is carried across a real gap:
+# the end of the shot, or a diagnostic dropping out.
+MAX_HOLD_PERIODS = 1.5
+
 # How far a TS slice may sit from the reconstruction it maps through,
 # in periods of the reconstruction's own sampling.
 # Above 1 to tolerate clock jitter, low enough that nothing is borrowed across a real gap.
-# The mapping counterpart of workflow.MAX_HOLD_PERIODS, separate to avoid a circular import.
 EQ_MATCH_MAX_PERIODS = 1.5
 
-# How Phi_N continues past the LCFS, see _phi_n_table.
+# How Phi_N continues past the LCFS, see phi_n_map.
 SOL_EXTENSIONS = ("secant", "tangent")
 
 # The secant SOL extension takes its slope over psi_N from here to the LCFS.
 SECANT_PSI_N = 0.95
+
+# Outermost finite-q surfaces the logarithmic q tail of a diverted plasma is fit to, see phi_n_map.
+Q_TAIL_FIT_SURFACES = 4
+
+# Points of the dense psi_N table PhiNMap.psi_n inverts Phi_N on
+NUM_INVERSE_POINTS = 4097
 
 # A reconstruction whose boundary and axis psi sit closer than this has no usable flux map.
 MIN_PSI_RANGE = 1e-10
@@ -384,11 +404,191 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     )
 
 
+def hold_onto_grid(
+    grid: np.ndarray,
+    sample_times: np.ndarray,
+    forward_fill: bool,
+    period: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map every grid time onto the sample it takes its values from.
+
+    A grid time that carries a sample of its own takes that one. The rest
+    take the most recent earlier sample, held for at most MAX_HOLD_PERIODS
+    sampling periods so that nothing is carried across a long gap: the end
+    of the shot, a diagnostic dropping out, or a stretch the filtering cut
+    away. With forward_fill False nothing is held and only the grid times
+    that carry a sample of their own come out.
+
+    Args:
+        grid: The shot's 1 kHz timebase [s].
+        sample_times: Times of the samples to place on it [s], ascending.
+        forward_fill: Hold each sample forward until the next one.
+        period: The sampling period to hold for [s]. None takes the median
+            spacing of sample_times, which is right when they are every
+            sample there is, and wrong when they are a windowed subset.
+
+    Returns:
+        (sample_index, fresh): sample_index[i] is the index of the sample
+        that grid time i draws from, -1 where it draws from none, and
+        fresh[i] marks the grid times that carry a sample of their own.
+    """
+    sample_index = np.full(grid.size, -1, dtype=int)
+    fresh = np.zeros(grid.size, dtype=bool)
+    if sample_times.size == 0:
+        return sample_index, fresh
+
+    # Index of the last sample at or before each grid time
+    previous_sample = (
+        np.searchsorted(sample_times, grid + SAMPLE_TIME_TOL, side="right") - 1
+    )
+    has_previous = previous_sample >= 0
+    age = grid - sample_times[np.clip(previous_sample, 0, None)]
+    fresh = has_previous & (np.abs(age) <= SAMPLE_TIME_TOL)
+    if not forward_fill:
+        sample_index[fresh] = previous_sample[fresh]
+        return sample_index, fresh
+
+    # One sample on its own has no period to hold for,
+    # so it only fills the grid step it sits on
+    if period is None:
+        period = np.median(
+            np.diff(sample_times) if sample_times.size > 1 else np.diff(grid)
+        )
+    still_held = has_previous & (age <= MAX_HOLD_PERIODS * float(period))
+    sample_index[still_held] = previous_sample[still_held]
+    return sample_index, fresh
+
+
+def held_signal_on_grid(
+    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray
+) -> np.ndarray:
+    """Place a slower-than-grid 0D signal on the grid by holding each finite sample forward.
+
+    Each grid time takes the last finite sample at or before it,
+    held for at most MAX_HOLD_PERIODS of the source's own sampling period (hold_onto_grid),
+    so no grid value draws on a later sample and a gap in the source stays NaN.
+    The period is the median spacing of every source sample, the NaN ones included.
+
+    Args:
+        source_times: (n_source,) ascending sample times of the source [s].
+        values: (n_source,) the signal at those times, NaN where missing.
+        grid: The shot's 1 kHz timebase [s].
+
+    Returns:
+        (n_grid,) the signal on the grid, NaN where nothing is held.
+    """
+    mask_finite = np.isfinite(values)
+    source_steps = np.diff(source_times)
+    period = float(np.median(source_steps)) if source_steps.size else None
+    sample_index, _ = hold_onto_grid(grid, source_times[mask_finite], True, period)
+    values_finite = values[mask_finite]
+    values_on_grid = np.full(grid.size, np.nan)
+    mask_held = sample_index >= 0
+    values_on_grid[mask_held] = values_finite[sample_index[mask_held]]
+    return values_on_grid
+
+
+def trailing_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.ndarray:
+    """Smooth a uniformly sampled signal causally, each sample the mean of itself and those before it in the window.
+
+    NaN samples are skipped, and the first samples average over what is there.
+
+    Args:
+        values: (n,) the signal.
+        window: Width of the boxcar [s].
+        dt: The sample spacing [s].
+
+    Returns:
+        (n,) the smoothed signal, NaN only where the whole window is.
+    """
+    n_samples = max(1, round(window / dt))
+    signal = xr.DataArray(values, dims="time")
+    smoothed = signal.rolling(time=n_samples, min_periods=1).mean()
+    return smoothed.values
+
+
+def ohmic_power(
+    times: np.ndarray,
+    ip: np.ndarray,
+    v_loop: np.ndarray,
+    li: np.ndarray,
+    r_axis: np.ndarray,
+) -> np.ndarray:
+    """Ohmic power P_oh = Ip V_loop - dW_pol/dt, causal.
+
+    The internal poloidal field energy is W_pol = L_i Ip^2 / 2 with L_i = mu0 R li / 2.
+    dW_pol/dt is a backward difference, so no sample draws on a later one,
+    and the first sample is NaN.
+    The sign of Ip and V_loop cancels as long as they share a convention.
+
+    Args:
+        times: (n,) ascending sample times [s].
+        ip: (n,) plasma current [A].
+        v_loop: (n,) loop voltage [V].
+        li: (n,) internal inductance.
+        r_axis: (n,) major radius of the magnetic axis [m].
+
+    Returns:
+        (n,) ohmic power [W].
+    """
+    w_pol = MU0 * r_axis * li * ip**2 / 4.0
+    dw_pol = np.diff(w_pol, prepend=np.nan)
+    dt = np.diff(times, prepend=np.nan)
+    dw_pol_dt = dw_pol / dt
+    return ip * v_loop - dw_pol_dt
+
+
+def greenwald_fraction(ip, minor_radius, n_e_line_average):
+    """Line-averaged density over the Greenwald density n_GW = Ip / (pi a^2), in 1e20 m^-3, MA and m.
+
+    Args:
+        ip: Plasma current [A], either sign.
+        minor_radius: Minor radius [m].
+        n_e_line_average: Line-averaged electron density [m^-3].
+
+    Returns:
+        The Greenwald fraction, shaped like the broadcast inputs.
+    """
+    ip_magnitude_ma = abs(ip) / 1e6
+    n_greenwald = 1e20 * ip_magnitude_ma / (np.pi * minor_radius**2)
+    return n_e_line_average / n_greenwald
+
+
+def end_of_shot_index(
+    ip_magnitude: np.ndarray, times: np.ndarray, ip_min: float, end_margin: float
+) -> int | None:
+    """Index of the first grid time the end-of-shot cut removes.
+
+    The plasma ends at the last grid time with |ip| at or above ip_min,
+    since a record can hold ip near 0 long after the plasma is gone.
+    Everything after end_margin before that is cut, to leave out the termination, often a disruption.
+    The margin is counted in grid steps, so float round-off in the times never moves the cut.
+
+    Args:
+        ip_magnitude: (n_t,) |ip| on the uniform grid [A], NaN where unknown.
+        times: (n_t,) the grid [s].
+        ip_min: The ip min_filter threshold [A].
+        end_margin: Margin before the end of the plasma [s].
+
+    Returns:
+        The index, or None when |ip| never reaches ip_min.
+    """
+    with np.errstate(invalid="ignore"):
+        mask_plasma = ip_magnitude >= ip_min
+    if not mask_plasma.any():
+        return None
+    last_plasma_idx = int(np.flatnonzero(mask_plasma)[-1])
+    grid_steps = np.diff(times)
+    margin_steps = round(end_margin / float(np.median(grid_steps)))
+    return last_plasma_idx - margin_steps + 1
+
+
 def usable_reconstructions(ds: xr.Dataset) -> np.ndarray:
     """Mark the times that carry a reconstruction the Thomson mapping and the stores can use.
 
     A reconstruction is usable when its axis and boundary psi are finite and meaningfully different,
-    and its whole psirz and qpsi are finite.
+    its whole psirz and qpsi are finite,
+    and its q profile gives a Phi_N map (phi_n_map), so q keeps one sign.
 
     Args:
         ds: One shot's dataset with the GEQDSK block on its time axis.
@@ -402,11 +602,13 @@ def usable_reconstructions(ds: xr.Dataset) -> np.ndarray:
     sibdry = ds["sibdry"].transpose("time").values
     psi_range = sibdry - simagx
     psi_range_usable = np.isfinite(psi_range) & (np.abs(psi_range) > MIN_PSI_RANGE)
-    qpsi_finite = np.isfinite(ds["qpsi"]).all("psi_idx").transpose("time").values
+    qpsi = ds["qpsi"].transpose("time", "psi_idx").values
     psirz_finite = (
         np.isfinite(ds["psirz"]).all(("r_grid", "z_grid")).transpose("time").values
     )
-    return psi_range_usable & qpsi_finite & psirz_finite
+    psi_n_grid = geqdsk_psi_n_grid(qpsi.shape[1])
+    q_mappable = mappable_q_profiles(psi_n_grid, qpsi)
+    return psi_range_usable & q_mappable & psirz_finite
 
 
 def reconstruction_clock_period(ds: xr.Dataset, grid: np.ndarray) -> float:
@@ -437,57 +639,257 @@ def reconstruction_clock_period(ds: xr.Dataset, grid: np.ndarray) -> float:
     return float(np.median(clock_steps))
 
 
-def cumulative_q_integral(qpsi: np.ndarray) -> np.ndarray:
-    """Integrate the safety factor over normalized poloidal flux, outward from the axis.
+def geqdsk_psi_n_grid(num_psi: int) -> np.ndarray:
+    """The psi_N grid of a GEQDSK profile such as qpsi, uniform from 0 at the axis to 1 at the LCFS by the format's definition.
+
+    Args:
+        num_psi: Number of points of the profile.
+
+    Returns:
+        (num_psi,) psi_N grid.
+    """
+    return np.linspace(0.0, 1.0, num_psi)
+
+
+def cumulative_q_integral(psi_n_grid: np.ndarray, qpsi: np.ndarray) -> np.ndarray:
+    """Integrate the safety factor over normalized poloidal flux, outward from the axis, by Simpson's rule.
 
     The toroidal flux is phi = integral q dpsi,
     so this is phi in units of (psi_boundary - psi_axis),
     and dividing it by its last value gives the normalized toroidal flux Phi_N.
 
     Args:
-        qpsi: (..., n_psi) safety factor on the uniform psi_N grid from 0 to 1.
+        psi_n_grid: (n_psi,) increasing psi_N grid, 0 at the axis.
+        qpsi: (..., n_psi) safety factor on psi_n_grid.
 
     Returns:
         (..., n_psi) integral of q dpsi_N from 0 to each grid point, starting at 0.
     """
-    psi_n_grid = np.linspace(0.0, 1.0, qpsi.shape[-1])
     return cumulative_simpson(qpsi, x=psi_n_grid, initial=0.0)
 
 
-def _phi_n_table(
-    qpsi: np.ndarray, sol_extension: str
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """Tabulate Phi_N on the qpsi grid, and the slope it continues with past the LCFS.
+def _q_tail_integral(
+    psi_n_from: np.ndarray | float,
+    psi_n_to: np.ndarray | float,
+    q_offset: float,
+    q_log_slope: float,
+) -> np.ndarray | float:
+    """Integral of q = q_offset - q_log_slope ln(1 - psi_N) over psi_N, finite up to psi_N = 1.
 
-    Phi_N is the q integral normalized to 1 at the LCFS.
-    q is undefined beyond it, so there Phi_N continues linearly in psi_N,
-    with the secant slope (1 - Phi_N(SECANT_PSI_N)) / (1 - SECANT_PSI_N)
-    or the tangent slope q(1) / integral_0^1 q dpsi_N.
+    The antiderivative of -ln(1 - psi_N) is (1 - psi_N) ln(1 - psi_N) - (1 - psi_N),
+    and xlogy keeps it 0 at psi_N = 1.
 
     Args:
-        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
+        psi_n_from: Lower limit.
+        psi_n_to: Upper limit, any shape broadcasting with psi_n_from.
+        q_offset: q_offset of the tail.
+        q_log_slope: q_log_slope of the tail.
+
+    Returns:
+        The integral, shaped like the broadcast limits.
+    """
+    one_minus_from = 1.0 - psi_n_from
+    one_minus_to = 1.0 - psi_n_to
+    antiderivative_from = q_offset * psi_n_from + q_log_slope * (
+        xlogy(one_minus_from, one_minus_from) - one_minus_from
+    )
+    antiderivative_to = q_offset * psi_n_to + q_log_slope * (
+        xlogy(one_minus_to, one_minus_to) - one_minus_to
+    )
+    return antiderivative_to - antiderivative_from
+
+
+@dataclass(frozen=True)
+class PhiNMap:
+    """Phi_N(psi_N) of one equilibrium, built by phi_n_map.
+
+    Phi_N is the integral of |q| over psi_N, normalized to 1 at the LCFS.
+    Inside the last surface of finite q the integral is Simpson's rule over the surfaces,
+    interpolated between them by a cubic Hermite spline whose slope is q itself,
+    so dPhi_N/dpsi_N stays continuous and gradients have no kinks at the surfaces.
+    From there to the LCFS it is the analytic integral of the logarithmic q tail,
+    zero width when q is finite at the LCFS.
+    Outside the LCFS Phi_N continues linearly in psi_N with sol_slope.
+    """
+
+    q_integral_spline: CubicHermiteSpline
+    psi_n_join: float  # last surface of finite q, 1 when q is finite at the LCFS
+    q_integral_join: float  # integral of |q| from the axis to psi_n_join
+    q_offset: float  # q_offset of the tail, 0 when q is finite at the LCFS
+    q_log_slope: float  # q_log_slope of the tail, 0 when q is finite at the LCFS
+    q_integral_total: float  # integral of |q| from the axis to the LCFS
+    sol_slope: float  # dPhi_N/dpsi_N outside the LCFS
+
+    def phi_n(self, psi_n: np.ndarray) -> np.ndarray:
+        """Phi_N at psi_N, any shape, NaN where psi_n is.
+
+        psi_N below 0, which interpolation can give next to the axis, maps to 0.
+
+        Args:
+            psi_n: Normalized poloidal flux.
+
+        Returns:
+            Phi_N shaped like psi_n, exactly 1 at the LCFS.
+        """
+        psi_n_clipped = np.maximum(psi_n, 0.0)
+        psi_n_inside = np.minimum(psi_n_clipped, 1.0)
+        psi_n_interior = np.minimum(psi_n_inside, self.psi_n_join)
+        q_integral_interior = self.q_integral_spline(psi_n_interior)
+        q_integral_tail = self.q_integral_join + _q_tail_integral(
+            self.psi_n_join, psi_n_inside, self.q_offset, self.q_log_slope
+        )
+        with np.errstate(invalid="ignore"):
+            q_integral = np.where(
+                psi_n_inside <= self.psi_n_join, q_integral_interior, q_integral_tail
+            )
+            phi_n_inside = q_integral / self.q_integral_total
+            phi_n_inside = np.where(psi_n_inside == 1.0, 1.0, phi_n_inside)
+            phi_n_outside = 1.0 + self.sol_slope * (psi_n_clipped - 1.0)
+            return np.where(psi_n_clipped <= 1.0, phi_n_inside, phi_n_outside)
+
+    def psi_n(self, phi_n: np.ndarray) -> np.ndarray:
+        """psi_N at Phi_N, the inverse of PhiNMap.phi_n.
+
+        Inside the LCFS Phi_N is inverted by interpolation on a dense table of NUM_INVERSE_POINTS,
+        outside it through the linear continuation.
+
+        Args:
+            phi_n: Normalized toroidal flux, any shape, NaN where unknown.
+
+        Returns:
+            psi_N shaped like phi_n, NaN where phi_n is.
+        """
+        psi_n_table = np.linspace(0.0, 1.0, NUM_INVERSE_POINTS)
+        phi_n_table = self.phi_n(psi_n_table)
+        psi_n_inside = np.interp(phi_n, phi_n_table, psi_n_table)
+        psi_n_outside = 1.0 + (phi_n - 1.0) / self.sol_slope
+        with np.errstate(invalid="ignore"):
+            return np.where(phi_n <= 1.0, psi_n_inside, psi_n_outside)
+
+
+def phi_n_map(
+    psi_n_grid: np.ndarray, qpsi: np.ndarray, sol_extension: str
+) -> PhiNMap | None:
+    """Build the Phi_N(psi_N) map of one equilibrium from its q profile.
+
+    The sign of q cancels in Phi_N, so |q| is integrated once q is known to keep one sign.
+    q is infinite on the surfaces of a diverted plasma where it diverges at the LCFS.
+    Past the last surface of finite q it is integrated analytically
+    as q = a - b ln(1 - psi_N), fit to the Q_TAIL_FIT_SURFACES surfaces inside it.
+    Outside the LCFS Phi_N continues linearly in psi_N,
+    with the secant slope (1 - Phi_N(SECANT_PSI_N)) / (1 - SECANT_PSI_N)
+    or the tangent slope |q(1)| / integral_0^1 |q| dpsi_N,
+    where q(1) is the outermost finite q when q diverges.
+
+    Args:
+        psi_n_grid: (n_psi,) increasing psi_N grid, 0 at the axis to 1 at the LCFS.
+        qpsi: (n_psi,) safety factor on psi_n_grid, infinite where it diverges.
         sol_extension: One of SOL_EXTENSIONS.
 
     Returns:
-        (psi_n_grid, phi_n_grid, sol_slope): the (n_psi,) psi_N grid, Phi_N on it,
-        and dPhi_N/dpsi_N outside the LCFS.
+        The map, or None when the q profile is unusable:
+        a NaN q, a finite q that changes sign, fewer than 2 surfaces of finite q from the axis,
+        a diverging q with fewer than Q_TAIL_FIT_SURFACES finite surfaces to fit the tail to,
+        a q integral that is not increasing, or a tail fit with q not positive and increasing.
 
     Raises:
         ValueError: If sol_extension is not one of SOL_EXTENSIONS.
     """
-    q_integral = cumulative_q_integral(qpsi)
-    phi_n_grid = q_integral / q_integral[-1]
-    psi_n_grid = np.linspace(0.0, 1.0, qpsi.size)
-    if sol_extension == "secant":
-        phi_n_start = np.interp(SECANT_PSI_N, psi_n_grid, phi_n_grid)
-        sol_slope = (1.0 - phi_n_start) / (1.0 - SECANT_PSI_N)
-    elif sol_extension == "tangent":
-        sol_slope = qpsi[-1] / q_integral[-1]
-    else:
+    if sol_extension not in SOL_EXTENSIONS:
         raise ValueError(
             f"sol_extension must be one of {SOL_EXTENSIONS}, got {sol_extension!r}"
         )
-    return psi_n_grid, phi_n_grid, float(sol_slope)
+    if np.isnan(qpsi).any():
+        return None
+    mask_q_infinite = np.isinf(qpsi)
+    num_q_finite = (
+        int(np.argmax(mask_q_infinite)) if mask_q_infinite.any() else qpsi.size
+    )
+    q_diverges = num_q_finite < qpsi.size
+    if num_q_finite < 2 or (q_diverges and num_q_finite < Q_TAIL_FIT_SURFACES):
+        return None
+    q_finite = qpsi[:num_q_finite]
+    if not ((q_finite > 0).all() or (q_finite < 0).all()):
+        return None
+    psi_n_inside = psi_n_grid[:num_q_finite]
+    q_inside = np.abs(q_finite)
+    q_integral_inside = cumulative_q_integral(psi_n_inside, q_inside)
+    q_integral_steps = np.diff(q_integral_inside)
+    if not (q_integral_steps > 0).all():
+        return None
+
+    psi_n_join = float(psi_n_inside[-1])
+    q_offset, q_log_slope = 0.0, 0.0
+    if q_diverges:
+        psi_n_fit = psi_n_inside[-Q_TAIL_FIT_SURFACES:]
+        q_fit = q_inside[-Q_TAIL_FIT_SURFACES:]
+        log_term_fit = -np.log(1.0 - psi_n_fit)
+        constant_term_fit = np.ones_like(psi_n_fit)
+        design = np.stack([constant_term_fit, log_term_fit], axis=1)
+        (q_offset, q_log_slope), *_ = np.linalg.lstsq(design, q_fit, rcond=None)
+        log_term_join = -np.log(1.0 - psi_n_join)
+        q_at_join = q_offset + q_log_slope * log_term_join
+        if q_log_slope <= 0 or q_at_join <= 0:
+            return None
+    q_integral_join = float(q_integral_inside[-1])
+    q_integral_tail = _q_tail_integral(psi_n_join, 1.0, q_offset, q_log_slope)
+    q_integral_total = q_integral_join + float(q_integral_tail)
+    q_integral_spline = CubicHermiteSpline(psi_n_inside, q_integral_inside, q_inside)
+
+    # The secant slope needs Phi_N inside the LCFS, which does not depend on the slope
+    phi_n_mapping_inside = PhiNMap(
+        q_integral_spline=q_integral_spline,
+        psi_n_join=psi_n_join,
+        q_integral_join=q_integral_join,
+        q_offset=float(q_offset),
+        q_log_slope=float(q_log_slope),
+        q_integral_total=q_integral_total,
+        sol_slope=np.nan,
+    )
+    if sol_extension == "secant":
+        phi_n_secant_start = phi_n_mapping_inside.phi_n(SECANT_PSI_N)
+        sol_slope = (1.0 - float(phi_n_secant_start)) / (1.0 - SECANT_PSI_N)
+    else:
+        sol_slope = q_inside[-1] / q_integral_total
+    return replace(phi_n_mapping_inside, sol_slope=float(sol_slope))
+
+
+def mappable_q_profiles(psi_n_grid: np.ndarray, qpsi: np.ndarray) -> np.ndarray:
+    """Mark the reconstructions whose q profile gives a Phi_N map (phi_n_map).
+
+    Whether a q profile maps does not depend on the SOL extension.
+
+    Args:
+        psi_n_grid: (n_psi,) increasing psi_N grid, 0 at the axis to 1 at the LCFS.
+        qpsi: (n_eq, n_psi) safety factor of each reconstruction on psi_n_grid, infinite where it diverges.
+
+    Returns:
+        (n_eq,) True where the q profile maps.
+    """
+    mask_mappable = [
+        phi_n_map(psi_n_grid, qpsi_slice, "secant") is not None for qpsi_slice in qpsi
+    ]
+    return np.array(mask_mappable, dtype=bool)
+
+
+def _geqdsk_phi_n_map(qpsi: np.ndarray, sol_extension: str) -> PhiNMap:
+    """phi_n_map of a GEQDSK qpsi, which must be usable (usable_reconstructions).
+
+    Args:
+        qpsi: (n_psi,) safety factor on the GEQDSK psi_N grid.
+        sol_extension: One of SOL_EXTENSIONS.
+
+    Returns:
+        The map.
+
+    Raises:
+        ValueError: If the q profile gives no map.
+    """
+    psi_n_grid = geqdsk_psi_n_grid(qpsi.size)
+    phi_n_mapping = phi_n_map(psi_n_grid, qpsi, sol_extension)
+    if phi_n_mapping is None:
+        raise ValueError("q profile is unusable, see phi_n_map")
+    return phi_n_mapping
 
 
 def rho_tor_norm_from_psi_n(
@@ -495,25 +897,18 @@ def rho_tor_norm_from_psi_n(
 ) -> np.ndarray:
     """Map normalized poloidal flux onto rho_tor_norm through one equilibrium's q profile.
 
-    rho_tor_norm = sqrt(Phi_N), with Phi_N from _phi_n_table.
-    Inside the LCFS Phi_N is interpolated on the qpsi grid,
-    outside it Phi_N continues linearly in psi_N.
-    psi_N below 0, which interpolation can give next to the axis, maps to 0.
+    rho_tor_norm = sqrt(Phi_N), with Phi_N from phi_n_map.
 
     Args:
         psi_n: Normalized poloidal flux, any shape, NaN where unknown.
-        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
+        qpsi: (n_psi,) safety factor on the GEQDSK psi_N grid.
         sol_extension: One of SOL_EXTENSIONS.
 
     Returns:
         rho_tor_norm shaped like psi_n, NaN where psi_n is.
     """
-    psi_n_grid, phi_n_grid, sol_slope = _phi_n_table(qpsi, sol_extension)
-    psi_n_clipped = np.maximum(psi_n, 0.0)
-    phi_n_inside = np.interp(psi_n_clipped, psi_n_grid, phi_n_grid)
-    phi_n_outside = 1.0 + sol_slope * (psi_n_clipped - 1.0)
-    with np.errstate(invalid="ignore"):
-        phi_n = np.where(psi_n_clipped <= 1.0, phi_n_inside, phi_n_outside)
+    phi_n_mapping = _geqdsk_phi_n_map(qpsi, sol_extension)
+    phi_n = phi_n_mapping.phi_n(psi_n)
     return np.sqrt(phi_n)
 
 
@@ -522,25 +917,17 @@ def psi_n_from_rho_tor_norm(
 ) -> np.ndarray:
     """Map rho_tor_norm back onto normalized poloidal flux, the inverse of rho_tor_norm_from_psi_n.
 
-    Phi_N = rho_tor_norm^2 is inverted by interpolation on the qpsi grid inside the LCFS
-    and through the linear continuation outside it.
-    Phi_N rises monotonically with psi_N while q keeps one sign, so the inverse is single valued.
-
     Args:
         rho_tor_norm: Any shape, NaN where unknown.
-        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
+        qpsi: (n_psi,) safety factor on the GEQDSK psi_N grid.
         sol_extension: One of SOL_EXTENSIONS.
 
     Returns:
         psi_N shaped like rho_tor_norm, NaN where rho_tor_norm is.
     """
-    psi_n_grid, phi_n_grid, sol_slope = _phi_n_table(qpsi, sol_extension)
+    phi_n_mapping = _geqdsk_phi_n_map(qpsi, sol_extension)
     phi_n = np.square(rho_tor_norm)
-    psi_n_inside = np.interp(phi_n, phi_n_grid, psi_n_grid)
-    psi_n_outside = 1.0 + (phi_n - 1.0) / sol_slope
-    with np.errstate(invalid="ignore"):
-        psi_n = np.where(phi_n <= 1.0, psi_n_inside, psi_n_outside)
-    return psi_n
+    return phi_n_mapping.psi_n(phi_n)
 
 
 def map_ts_channels_to_rho_tor_norm(

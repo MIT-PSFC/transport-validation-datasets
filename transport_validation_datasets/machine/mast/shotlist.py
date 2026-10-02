@@ -27,11 +27,12 @@ from pathlib import Path
 import fire
 import numpy as np
 import xarray as xr
-from disruption_py.core.utils.math import interp1
 from loguru import logger
 
 from transport_validation_datasets.machine.generic import (
     EQ_MATCH_MAX_PERIODS,
+    end_of_shot_index,
+    held_signal_on_grid,
     rho_tor_norm_from_psi_n,
 )
 from transport_validation_datasets.machine.mast.mast_dataset import (
@@ -87,7 +88,7 @@ def _ip_window(summary: xr.Dataset, timebase: np.ndarray) -> np.ndarray:
     """Mask the timebase where the workflow's ip gates keep the shot.
 
     The ip part of DataWorkflow.filter_and_plot:
-    before the end margin and inside the valid_filter ip bounds,
+    before the end-of-shot cut (end_of_shot_index) and above the min_filter ip threshold,
     with only the longest segment kept.
     The other signals can only cut this down,
     so a shot too short here is too short for the workflow.
@@ -99,17 +100,17 @@ def _ip_window(summary: xr.Dataset, timebase: np.ndarray) -> np.ndarray:
     Returns:
         Mask over timebase, True where the ip gates keep the sample.
     """
-    ip_bounds = MASTDataWorkflow.valid_filter["ip"]
+    ip_min = MASTDataWorkflow.min_filter["ip"]
     summary_time = summary["time"].values
     ip_source = np.asarray(summary["ip"].values, dtype=float)
-    ip_signed = interp1(summary_time, ip_source, timebase)
+    ip_signed = held_signal_on_grid(summary_time, ip_source, timebase)
     ip = np.abs(ip_signed)
-    last_valid_time = timebase[np.isfinite(ip)][-1]
-    mask_window = (
-        (timebase < last_valid_time - MASTDataWorkflow.end_margin)
-        & (ip >= ip_bounds["min_abs"])
-        & (ip <= ip_bounds["max_abs"])
-    )
+    end_cut_index = end_of_shot_index(ip, timebase, ip_min, MASTDataWorkflow.end_margin)
+    if end_cut_index is None:
+        return np.zeros(timebase.size, dtype=bool)
+    mask_before_end = np.arange(timebase.size) < end_cut_index
+    with np.errstate(invalid="ignore"):
+        mask_window = mask_before_end & (ip >= ip_min)
     mask_kept, _ = keep_longest_segment(mask_window, timebase)
     return mask_kept
 

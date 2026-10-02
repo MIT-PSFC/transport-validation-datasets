@@ -322,7 +322,7 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     # and both IMAS targets (11, 17) have sigma_rho_theta_phi = +1,
     # so phi = sigma_bp * integral(q dpsi).
     # That lands phi on the sign of B0, its physical direction, for either field polarity under either target.
-    q_integral = cumulative_q_integral(qpsi)
+    q_integral = cumulative_q_integral(psi_norm, qpsi)
     phi = sigma_bp * (psi_boundary - psi_axis) * q_integral
     # rho_tor needs a reference field to carry units of meters; phi and
     # bcentr share a sign, so the ratio is positive. A zero vacuum field is
@@ -531,6 +531,7 @@ _SUMMARY_SIGNAL_PATHS = {
     "power_nbi": ("heating_current_drive", "power_launched_nbi"),
     "power_ic": ("heating_current_drive", "power_launched_ic"),
     "power_lh": ("heating_current_drive", "power_launched_lh"),
+    "power_ec": ("heating_current_drive", "power_launched_ec"),
 }
 
 
