@@ -412,7 +412,7 @@ class MASTDataWorkflow(DataWorkflow):
         """Read one shot from the MAST stores into standardized signals.
 
         The three sources are put on the shot's 1 kHz timebase differently:
-        the 0D signals are interpolated (they are smooth), while the
+        the 0D signals are held from their last sample (held_signal_on_grid), while the
         equilibrium reconstruction and the Thomson slices are snapped to the
         nearest grid time without interpolation, since neither is meaningful
         interpolated. The equilibrium is written as a full GEQDSK, so only the
@@ -822,15 +822,12 @@ def _zero_d_dataset(
     r_axis = held_signal_on_grid(eq_time, efm["magnetic_axis_r"].values, timebase)
     data["b0"] = np.abs(bvac_rmag * r_axis / data["geometric_axis_r"])
     # esm sits on a 20 us axis but only holds values at the reconstruction times,
-    # so the hold runs on the clock of the samples that have a pphix.
+    # and held_signal_on_grid holds on the clock of the finite samples.
     # Some converged reconstructions have none (97 of 1446 shots, up to 25 ms in 24891),
     # and a gap longer than the hold stays NaN.
     esm_time = np.asarray(esm["time"].values, dtype=float)
     pphix = np.asarray(esm["pphix"].values, dtype=float)
-    has_pphix = np.isfinite(pphix)
-    data["power_ohm"] = held_signal_on_grid(
-        esm_time[has_pphix], pphix[has_pphix], timebase
-    )
+    data["power_ohm"] = held_signal_on_grid(esm_time, pphix, timebase)
     data["power_nbi"] = held_signal_on_grid(
         summary_time, summary["power_nbi"].values, timebase
     )

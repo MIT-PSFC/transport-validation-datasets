@@ -467,7 +467,9 @@ def held_signal_on_grid(
     Each grid time takes the last finite sample at or before it,
     held for at most MAX_HOLD_PERIODS of the source's own sampling period (hold_onto_grid),
     so no grid value draws on a later sample and a gap in the source stays NaN.
-    The period is the median spacing of every source sample, the NaN ones included.
+    The period is the median spacing of the finite samples,
+    so a fast clock populated only at a slower cadence (MAST esm) holds on that cadence.
+    Fewer than two finite samples have no period, and nothing is held.
 
     Args:
         source_times: (n_source,) ascending sample times of the source [s].
@@ -477,12 +479,12 @@ def held_signal_on_grid(
     Returns:
         (n_grid,) the signal on the grid, NaN where nothing is held.
     """
-    mask_finite = np.isfinite(values)
-    source_steps = np.diff(source_times)
-    period = float(np.median(source_steps)) if source_steps.size else None
-    sample_index, _ = hold_onto_grid(grid, source_times[mask_finite], True, period)
-    values_finite = values[mask_finite]
     values_on_grid = np.full(grid.size, np.nan)
+    mask_finite = np.isfinite(values)
+    if mask_finite.sum() < 2:
+        return values_on_grid
+    sample_index, _ = hold_onto_grid(grid, source_times[mask_finite], True)
+    values_finite = values[mask_finite]
     mask_held = sample_index >= 0
     values_on_grid[mask_held] = values_finite[sample_index[mask_held]]
     return values_on_grid
