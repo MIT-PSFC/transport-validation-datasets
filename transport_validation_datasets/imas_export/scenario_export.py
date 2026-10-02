@@ -10,7 +10,7 @@ consolidated scenario file. Design notes:
     thinned to or deduped against the Thomson slice times).
   - `summary` is written at its own full native (1 kHz) 0D-signal
     resolution, for the same reason, and carries every
-    `workflow.DATASET_0D_SIGNALS` entry the shot has (see
+    `store_schema.DATASET_0D_SIGNALS` entry the shot has (see
     `_SUMMARY_SIGNAL_PATHS` for where each one lands).
   - `core_profiles` gets one `profiles_1d` per usable Thomson slice time,
     electrons (with the GP fit's 1-sigma uncertainties in the DD's
@@ -509,7 +509,7 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
 # ---------------------------------------------------------------------------
 
 
-# `workflow.DATASET_0D_SIGNALS` name -> (summary sub-structure, field) it is written to.
+# `store_schema.DATASET_0D_SIGNALS` name -> (summary sub-structure, field) it is written to.
 # Each target is a `summary_dynamic` node whose `.value` holds the time series.
 # Every DATASET_0D_SIGNALS entry has a home here (checked against DD 4.1.1).
 # A signal whose `ref` attr is under /summary lands on that same node.
@@ -542,7 +542,7 @@ def build_summary(factory, time, signals):
         factory: `imas.IDSFactory` to build the IDS from.
         time: (n,) time base [s] -- the unprocessed file's own 0D-signal
             sampling, independent of `equilibrium.time`/`core_profiles.time`.
-        signals: `workflow.DATASET_0D_SIGNALS` name -> (n,) signal on `time`.
+        signals: `store_schema.DATASET_0D_SIGNALS` name -> (n,) signal on `time`.
             Any subset; a signal that is absent, or NaN everywhere (how a
             device without it stages it), is left unset in the IDS. A name
             with no entry in `_SUMMARY_SIGNAL_PATHS` is an error, so a new
@@ -658,7 +658,7 @@ def build_imas_from_shot(
             (`01_unprocessed/<shot>.nc`) -- needs `ip`, the `cocos` attribute, and
             `workflow.DATASET_EQUILIBRIUM_SIGNALS`, all on the shot's common
             time grid (the equilibrium signals NaN outside a real EFIT
-            reconstruction time). Every other `workflow.DATASET_0D_SIGNALS`
+            reconstruction time). Every other `store_schema.DATASET_0D_SIGNALS`
             entry present is written to `summary` (see `build_summary`).
         geqdsk_dir: Directory to write this shot's per-equilibrium-time
             `.geqdsk` files into (see `geqdsk_writer.write_geqdsk`).
@@ -672,8 +672,8 @@ def build_imas_from_shot(
     Raises:
         KeyError: If the shot's unprocessed data has no `ip` signal.
     """
+    from transport_validation_datasets.store_schema import DATASET_0D_SIGNALS
     from transport_validation_datasets.workflow import (
-        DATASET_0D_SIGNALS,
         DATASET_EQUILIBRIUM_SIGNALS,
         TIME_COORD,
         TIME_DIM,

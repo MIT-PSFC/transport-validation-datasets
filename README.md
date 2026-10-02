@@ -124,7 +124,8 @@ and the stack stage holds them onto the grid, so an unusable one is held over by
 The reach and the hold both run on the reconstruction clock (`reconstruction_clock_period`), which counts the unusable ones too.
 
 Unprocessed stage (`filter_and_plot`), per shot.
-Every check from 2 to 4 cuts the grid times it fails out as a gap:
+Steps 2 to 4 and 8 are the filter spec every device store shares (`filters.py`).
+Every check from 2 to 4 cuts the grid times it fails out as a gap (`slice_filter_mask`):
 
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
 2. End of shot (`end_of_shot_index`): the plasma ends at the last grid time with |ip| at or above its `min_filter` threshold,
@@ -146,9 +147,9 @@ Every check from 2 to 4 cuts the grid times it fails out as a gap:
    so step 5 trims each segment as if it alone were kept, and the longest is chosen after every trim.
 7. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod 0.5 s, MAST 0.2 s).
 8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
-   - a mean `power_radiated` below `min_radiated_fraction` of the mean heating power (a dead bolometer),
-     1 percent on C-Mod and 2.5 percent on MAST
-   - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point.
+   - a mean `power_radiated` below `min_radiated_fraction` of the mean input power, ohmic plus auxiliary (a dead bolometer),
+     1 percent on C-Mod and 2.5 percent on MAST (`radiated_fraction_reason`)
+   - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point (`energy_sanity_reason`).
 
 | Threshold | C-Mod | MAST |
 | --- | --- | --- |

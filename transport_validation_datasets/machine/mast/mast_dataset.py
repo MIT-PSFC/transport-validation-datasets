@@ -33,6 +33,7 @@ from transport_validation_datasets.machine.generic import (
     snap_to_grid,
     ts_channel_fit_rows,
 )
+from transport_validation_datasets.store_schema import apply_signal_attrs
 from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 
 # Public MAST open data, no credentials needed
@@ -146,86 +147,54 @@ REQUIRED_LEVEL2_SIGNALS = {
 SIGNAL_ATTRS = {
     "ip": {
         "description": "Measured plasma current magnitude",
-        "units": "A",
-        "ref": "/summary/global_quantities/ip/value",
     },
     "b0": {
         "description": "Vacuum toroidal field magnitude at geometric_axis_r",
-        "units": "T",
-        "ref": "/summary/global_quantities/b0/value",
     },
     "energy_mhd": {
         "description": "Stored energy from the equilibrium reconstruction, 3/2 the volume integral of its pressure",
-        "units": "J",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/energy_mhd",
     },
     "beta_tor_norm": {
         "description": "Normalized toroidal beta",
-        "units": "dimensionless",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/beta_tor_norm",
     },
     "n_e_line_average": {
         "description": "Line averaged electron density",
-        "units": "m^-3",
-        "ref": "/summary/line_average/n_e/value",
     },
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop at the LCFS minus the rate of change of the stored poloidal magnetic energy "
             "(ESM_PPHIX), clipped at 0"
         ),
-        "units": "W",
-        "ref": "/summary/global_quantities/power_ohm/value",
     },
     "power_radiated": {
         "description": "Total radiated power from the poloidal bolometer array (ABM_PRAD_POL)",
-        "units": "W",
-        "ref": "/summary/global_quantities/power_radiated/value",
     },
     "power_nbi": {
         "description": "Neutral beam power injected into the vessel (ANB_TOT_SUM_POWER)",
-        "units": "W",
-        "ref": "/summary/heating_current_drive/power_launched_nbi/value",
     },
     "power_ic": {
         "description": "Ion cyclotron heating power (none on MAST)",
-        "units": "W",
-        "ref": "/summary/heating_current_drive/power_launched_ic/value",
     },
     "power_lh": {
         "description": "Lower hybrid heating power (none on MAST)",
-        "units": "W",
-        "ref": "/summary/heating_current_drive/power_launched_lh/value",
     },
     "power_ec": {
         "description": "Electron cyclotron heating power (none on MAST)",
-        "units": "W",
-        "ref": "/summary/heating_current_drive/power_launched_ec/value",
     },
     "minor_radius": {
         "description": "Plasma minor radius",
-        "units": "m",
-        "ref": "/equilibrium/time_slice(itime)/boundary/minor_radius",
     },
     "elongation": {
         "description": "Plasma elongation",
-        "units": "dimensionless",
-        "ref": "/equilibrium/time_slice(itime)/boundary/elongation",
     },
     "triangularity_upper": {
         "description": "Upper triangularity",
-        "units": "dimensionless",
-        "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_upper",
     },
     "triangularity_lower": {
         "description": "Lower triangularity",
-        "units": "dimensionless",
-        "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_lower",
     },
     "geometric_axis_r": {
         "description": "Major radius of the geometric center of the boundary",
-        "units": "m",
-        "ref": "/equilibrium/time_slice(itime)/boundary/geometric_axis/r",
     },
     "ts_channel_r": {
         "description": (
@@ -449,9 +418,7 @@ class MASTDataWorkflow(DataWorkflow):
         )
         ds = ds.set_index(idx=["shot", "time"]).unstack("idx")
         ds.attrs = dict(ds_equilibrium.attrs)
-        for name, attrs in SIGNAL_ATTRS.items():
-            if name in ds:
-                ds[name].attrs.update(attrs)
+        apply_signal_attrs(ds, SIGNAL_ATTRS)
         return ds
 
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:

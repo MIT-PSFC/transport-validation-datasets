@@ -26,6 +26,7 @@ from transport_validation_datasets.machine.generic import (
     snap_to_grid,
     ts_channel_fit_rows,
 )
+from transport_validation_datasets.store_schema import apply_signal_attrs
 from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 
 # Attributes of the signals this module makes rather than reads with
@@ -34,64 +35,42 @@ from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 SIGNAL_ATTRS = {
     "ip": {
         "description": "Plasma current, magnetics ip (Rogowski coil), signed, mean of each 1 ms grid step",
-        "units": "A",
-        "ref": "/summary/global_quantities/ip/value",
     },
     "n_e_line_average": {
         "description": "Line-averaged electron density, TCI chord 4 (nl_04 / 0.6 m), mean of each 1 ms grid step",
-        "units": "m^-3",
-        "ref": "/summary/line_average/n_e/value",
     },
     "power_radiated": {
         "description": (
             "Total radiated power, AXUV twopi_diode x 4.5 (cross-calibrated to the 2pi foil bolometer), "
             "mean of each 1 ms grid step, clipped at 0"
         ),
-        "units": "W",
-        "ref": "/summary/global_quantities/power_radiated/value",
     },
     "power_ic": {
         "description": "ICRF net heating power (rf_power_net), mean of each 1 ms grid step, zero outside its record",
-        "units": "W",
-        "ref": "/summary/heating_current_drive/power_launched_ic/value",
     },
     "power_lh": {
         "description": "Lower hybrid net heating power (LH netpow), mean of each 1 ms grid step, zero outside its record",
-        "units": "W",
-        "ref": "/summary/heating_current_drive/power_launched_lh/value",
     },
     "b0": {
         "description": "Vacuum toroidal field at geometric_axis_r, the magnetics btor (quoted at 0.66 m) scaled by 1/R",
-        "units": "T",
-        "ref": "/summary/global_quantities/b0/value",
     },
     "beta_tor_norm": {
         "description": "Normalized toroidal beta from the EFIT tree (betan)",
-        "units": "dimensionless",
-        "ref": "/equilibrium/time_slice(itime)/global_quantities/beta_tor_norm",
     },
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
             "mu0 R0 li Ip^2 / 4 with R0 the EFIT rout, causal (backward difference, trailing 5 ms boxcar), clipped at 0"
         ),
-        "units": "W",
-        "ref": "/summary/global_quantities/power_ohm/value",
     },
     "power_nbi": {
         "description": "Neutral beam heating power (none on C-Mod)",
-        "units": "W",
-        "ref": "/summary/heating_current_drive/power_launched_nbi/value",
     },
     "power_ec": {
         "description": "Electron cyclotron heating power (none on C-Mod)",
-        "units": "W",
-        "ref": "/summary/heating_current_drive/power_launched_ec/value",
     },
     "geometric_axis_r": {
         "description": "Major radius of the geometric center of the boundary (EFIT rout)",
-        "units": "m",
-        "ref": "/equilibrium/time_slice(itime)/boundary/geometric_axis/r",
     },
 }
 
@@ -339,9 +318,7 @@ class CModDataWorkflow(DataWorkflow):
             ds["power_nbi"].attrs = {}
             ds["power_ec"] = ds["ip"] * 0.0
             ds["power_ec"].attrs = {}
-        for name, attrs in self.signal_attrs.items():
-            if name in ds:
-                ds[name].attrs.update(attrs)
+        apply_signal_attrs(ds, self.signal_attrs)
 
         return ds
 

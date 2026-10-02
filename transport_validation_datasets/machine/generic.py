@@ -412,15 +412,17 @@ def hold_onto_grid(
     sample_times: np.ndarray,
     forward_fill: bool,
     period: float | None = None,
+    max_hold_periods: float = MAX_HOLD_PERIODS,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map every grid time onto the sample it takes its values from.
 
-    A grid time that carries a sample of its own takes that one. The rest
-    take the most recent earlier sample, held for at most MAX_HOLD_PERIODS
-    sampling periods so that nothing is carried across a long gap: the end
-    of the shot, a diagnostic dropping out, or a stretch the filtering cut
-    away. With forward_fill False nothing is held and only the grid times
-    that carry a sample of their own come out.
+    Each grid time takes the most recent sample at or before it,
+    held for at most max_hold_periods sampling periods so that nothing is carried across a long gap:
+    the end of the shot, a diagnostic dropping out, or a stretch the filtering cut away.
+    A sample within SAMPLE_TIME_TOL after a grid time counts as at it.
+    A grid time is fresh when its sample falls in its own grid step (t - grid step, t],
+    so each sample is fresh at the first grid time that holds it, on the grid or between grid times.
+    With forward_fill False nothing is held and only the fresh grid times come out.
 
     Args:
         grid: The shot's 1 kHz timebase [s].
@@ -429,24 +431,35 @@ def hold_onto_grid(
         period: The sampling period to hold for [s]. None takes the median
             spacing of sample_times, which is right when they are every
             sample there is, and wrong when they are a windowed subset.
+        max_hold_periods: Longest hold, in sampling periods.
 
     Returns:
         (sample_index, fresh): sample_index[i] is the index of the sample
         that grid time i draws from, -1 where it draws from none, and
-        fresh[i] marks the grid times that carry a sample of their own.
+        fresh[i] marks the grid times whose sample falls in their own grid step.
     """
     sample_index = np.full(grid.size, -1, dtype=int)
     fresh = np.zeros(grid.size, dtype=bool)
     if sample_times.size == 0:
         return sample_index, fresh
 
+    # float64, since a float32 grid time can sit just below the sample at the same millisecond
+    grid_float64 = grid.astype(np.float64)
+    sample_times_float64 = sample_times.astype(np.float64)
+    grid_steps = np.diff(grid_float64)
+    # A one-point grid has no step, so its sample is fresh wherever it lies before it
+    grid_step = float(np.median(grid_steps)) if grid_steps.size else np.inf
     # Index of the last sample at or before each grid time
     previous_sample = (
-        np.searchsorted(sample_times, grid + SAMPLE_TIME_TOL, side="right") - 1
+        np.searchsorted(
+            sample_times_float64, grid_float64 + SAMPLE_TIME_TOL, side="right"
+        )
+        - 1
     )
     has_previous = previous_sample >= 0
-    age = grid - sample_times[np.clip(previous_sample, 0, None)]
-    fresh = has_previous & (np.abs(age) <= SAMPLE_TIME_TOL)
+    previous_sample_clipped = np.clip(previous_sample, 0, None)
+    age = grid_float64 - sample_times_float64[previous_sample_clipped]
+    fresh = has_previous & (age < grid_step - SAMPLE_TIME_TOL)
     if not forward_fill:
         sample_index[fresh] = previous_sample[fresh]
         return sample_index, fresh
@@ -454,12 +467,30 @@ def hold_onto_grid(
     # One sample on its own has no period to hold for,
     # so it only fills the grid step it sits on
     if period is None:
-        period = np.median(
-            np.diff(sample_times) if sample_times.size > 1 else np.diff(grid)
+        sample_spacing = (
+            np.diff(sample_times_float64) if sample_times.size > 1 else grid_steps
         )
-    still_held = has_previous & (age <= MAX_HOLD_PERIODS * float(period))
+        period = float(np.median(sample_spacing))
+    still_held = has_previous & (age <= max_hold_periods * period)
     sample_index[still_held] = previous_sample[still_held]
     return sample_index, fresh
+
+
+def values_on_grid(sample_values: np.ndarray, sample_index: np.ndarray) -> np.ndarray:
+    """Per-sample values picked onto the grid by hold_onto_grid's sample_index.
+
+    Args:
+        sample_values: (n_samples, ...) one row per sample.
+        sample_index: (n_grid,) the sample each grid time draws from, -1 where none.
+
+    Returns:
+        (n_grid, ...) the rows, float64, NaN where no sample holds.
+    """
+    mask_held = sample_index >= 0
+    values_shape = (sample_index.size, *sample_values.shape[1:])
+    values = np.full(values_shape, np.nan)
+    values[mask_held] = sample_values[sample_index[mask_held]]
+    return values
 
 
 def signal_on_grid(
@@ -516,10 +547,7 @@ def _held_on_grid(
         (n_grid,) the held signal, NaN where nothing is held.
     """
     sample_index, _ = hold_onto_grid(grid, source_times, True)
-    values_on_grid = np.full(grid.size, np.nan)
-    mask_held = sample_index >= 0
-    values_on_grid[mask_held] = values[sample_index[mask_held]]
-    return values_on_grid
+    return values_on_grid(values, sample_index)
 
 
 def _window_mean_on_grid(
@@ -595,6 +623,29 @@ def trailing_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.nda
     n_samples = max(1, round(window / dt))
     signal = xr.DataArray(values, dims="time")
     smoothed = signal.rolling(time=n_samples, min_periods=1).mean()
+    return smoothed.values
+
+
+def centered_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.ndarray:
+    """Smooth a uniformly sampled signal with a boxcar centered on each sample, along the last axis.
+
+    The boxcar spans an odd number of samples, so it stays centered on the present one.
+    NaN samples are skipped, and near the ends and around NaNs it averages over the samples present.
+
+    Args:
+        values: (..., n) the signal, uniformly sampled along its last axis.
+        window: Width of the boxcar [s].
+        dt: The sample spacing [s].
+
+    Returns:
+        (..., n) the smoothed signal, NaN only where the whole window is.
+    """
+    n_samples = max(1, round(window / dt))
+    if n_samples % 2 == 0:
+        n_samples += 1
+    signal = xr.DataArray(values)
+    last_dim = signal.dims[-1]
+    smoothed = signal.rolling({last_dim: n_samples}, center=True, min_periods=1).mean()
     return smoothed.values
 
 
