@@ -23,6 +23,7 @@ from transport_validation_datasets.filters import (
     TRANSIENT_SMOOTHING_WINDOW,
     clip_powers,
     energy_sanity_reason,
+    mask_spans,
     radiated_fraction_reason,
     slice_filter_mask,
 )
@@ -820,7 +821,7 @@ class DataWorkflow(ABC):
         n_transient = int(transient_time_mask.sum())
         if n_transient:
             logger.debug(f"Shot {shot}: transients at {n_transient} grid times")
-        transient_spans = _mask_spans(transient_time_mask, times)
+        transient_spans = mask_spans(transient_time_mask, times)
 
         # 3: Start each segment where the store will have an equilibrium, then keep only the longest.
         # The store only holds the reconstructions that are kept (_hold_equilibrium),
@@ -877,7 +878,7 @@ class DataWorkflow(ABC):
             )
             return None
         # Plot the entire shot, with the kept segment shaded green
-        kept_spans = _mask_spans(kept_mask, times)
+        kept_spans = mask_spans(kept_mask, times)
         self._plot_unprocessed(
             ds_input, shot, end_margin_time, transient_spans, kept_spans
         )
@@ -2396,22 +2397,6 @@ class DataWorkflow(ABC):
                 ),
             }
         )
-
-
-def _mask_spans(mask: np.ndarray, times: np.ndarray) -> list[tuple[float, float]]:
-    """List the runs of a mask as time spans, for the plots.
-
-    Args:
-        mask: Mask over times.
-        times: The shot's timebase [s].
-
-    Returns:
-        (first, last) time [s] of each run of True samples.
-    """
-    starts, ends = kept_segments(mask)
-    return [
-        (float(times[start]), float(times[end - 1])) for start, end in zip(starts, ends)
-    ]
 
 
 def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:

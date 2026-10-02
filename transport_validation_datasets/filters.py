@@ -13,6 +13,7 @@ from transport_validation_datasets.machine.generic import (
     centered_boxcar_mean,
     end_of_shot_index,
     greenwald_fraction,
+    kept_segments,
 )
 from transport_validation_datasets.store_schema import (
     DATASET_0D_SIGNALS,
@@ -215,3 +216,19 @@ def energy_sanity_reason(ds: xr.Dataset) -> str | None:
         f"from {times_sorted[0]:.3f} s to {times_sorted[peak]:.3f} s, "
         f"more than the {1e-3 * energy_input:.1f} kJ of input power put in"
     )
+
+
+def mask_spans(mask: np.ndarray, times: np.ndarray) -> list[tuple[float, float]]:
+    """List the runs of a mask as time spans, for the time-trace plots (plot_unprocessed_data).
+
+    Args:
+        mask: Mask over times.
+        times: The shot's timebase [s].
+
+    Returns:
+        (first, last) time [s] of each run of True samples.
+    """
+    starts, ends = kept_segments(mask)
+    return [
+        (float(times[start]), float(times[end - 1])) for start, end in zip(starts, ends)
+    ]
