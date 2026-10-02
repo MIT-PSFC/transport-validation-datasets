@@ -704,8 +704,23 @@ def ohmic_power(
     return ip * v_loop - dw_pol_dt
 
 
+def greenwald_density(ip, minor_radius):
+    """The Greenwald density n_GW = Ip / (pi a^2), in 1e20 m^-3, MA and m.
+
+    Args:
+        ip: Plasma current [A], either sign.
+        minor_radius: Minor radius [m].
+
+    Returns:
+        n_GW [m^-3], shaped like the broadcast inputs.
+    """
+    ip_magnitude = abs(ip)
+    ip_magnitude_ma = ip_magnitude / 1e6
+    return 1e20 * ip_magnitude_ma / (np.pi * minor_radius**2)
+
+
 def greenwald_fraction(ip, minor_radius, n_e_line_average):
-    """Line-averaged density over the Greenwald density n_GW = Ip / (pi a^2), in 1e20 m^-3, MA and m.
+    """Line-averaged density over the Greenwald density (greenwald_density).
 
     Args:
         ip: Plasma current [A], either sign.
@@ -715,8 +730,7 @@ def greenwald_fraction(ip, minor_radius, n_e_line_average):
     Returns:
         The Greenwald fraction, shaped like the broadcast inputs.
     """
-    ip_magnitude_ma = abs(ip) / 1e6
-    n_greenwald = 1e20 * ip_magnitude_ma / (np.pi * minor_radius**2)
+    n_greenwald = greenwald_density(ip, minor_radius)
     return n_e_line_average / n_greenwald
 
 
