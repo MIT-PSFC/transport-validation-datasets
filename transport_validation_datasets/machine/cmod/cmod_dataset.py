@@ -59,7 +59,10 @@ SIGNAL_ATTRS = {
         "description": "Reference major radius btor is quoted at, the EFIT RZERO",
     },
     "beta_tor_norm": {
-        "description": "Normalized toroidal beta from the EFIT tree (betan)",
+        "description": (
+            "Normalized toroidal beta with B_geo, EFIT betat aout B_geo / |cpasma| with B_geo = |bcentr| rcencm / rout, "
+            "not the EFIT betan node, which takes |btaxp|"
+        ),
     },
     "power_ohm": {
         "description": (
@@ -655,7 +658,7 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     """
     efit0d_signals = [
         "wmhd",  # Total stored energy (C-Mod has no consistent fast particle measurement, so this is all we've got)
-        "betan",  # Normalized beta, EFIT's own node (CmodAeqdskMethods.get_normalized_beta)
+        "betan",  # Normalized beta with B_geo, rebuilt from betat (CmodAeqdskMethods.get_normalized_beta)
         "a_minor",  # Plasma minor radius
         "kappa",  # Plasma elongation
         "tritop",  # Top triangularity
