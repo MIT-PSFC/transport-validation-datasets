@@ -150,6 +150,8 @@ def make_source_dataset(
             "ts_channel_n_e_error": channel(ne_error),
         },
         coords={EPISODE_DIM: [shot], TIME_COORD: grid, "ts_channel": np.arange(n_ch)},
+        # The radius b0 is given at, as every device's source attaches it
+        attrs={"r0": 0.7},
     )
 
 

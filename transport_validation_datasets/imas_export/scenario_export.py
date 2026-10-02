@@ -535,7 +535,7 @@ _SUMMARY_SIGNAL_PATHS = {
 }
 
 
-def build_summary(factory, time, signals):
+def build_summary(factory, time, signals, r0):
     """`summary` IDS at its own full native (unprocessed-file) 0D-signal resolution.
 
     Args:
@@ -547,6 +547,7 @@ def build_summary(factory, time, signals):
             device without it stages it), is left unset in the IDS. A name
             with no entry in `_SUMMARY_SIGNAL_PATHS` is an error, so a new
             DATASET_0D_SIGNALS entry cannot be dropped silently.
+        r0: The reference major radius b0 is given at [m], a constant of the shot.
 
     Returns:
         The validated `summary` IDS.
@@ -561,6 +562,7 @@ def build_summary(factory, time, signals):
     sm = factory.summary()
     sm.ids_properties.homogeneous_time = 1
     sm.time = np.asarray(time, dtype=float)
+    sm.global_quantities.r0.value = float(r0)
     for name, (group, field) in _SUMMARY_SIGNAL_PATHS.items():
         if name not in signals:
             continue
@@ -759,6 +761,6 @@ def build_imas_from_shot(
         )
 
     cp = build_core_profiles(factory, slices)
-    sm = build_summary(factory, unprocessed_time, signal_0d)
+    sm = build_summary(factory, unprocessed_time, signal_0d, unprocessed_ds.attrs["r0"])
     wall = build_wall(factory, eq_times[0], eqi_first)
     return eq, cp, sm, wall

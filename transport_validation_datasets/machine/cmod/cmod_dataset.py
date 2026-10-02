@@ -52,7 +52,10 @@ SIGNAL_ATTRS = {
         "description": "Lower hybrid net heating power (LH netpow), mean of each 1 ms grid step, zero outside its record",
     },
     "b0": {
-        "description": "Vacuum toroidal field at geometric_axis_r, the magnetics btor (quoted at 0.66 m) scaled by 1/R",
+        "description": "Vacuum toroidal field at r0, magnetics btor, signed, mean of each 1 ms grid step",
+    },
+    "r0": {
+        "description": "Reference major radius btor is quoted at, the EFIT RZERO",
     },
     "beta_tor_norm": {
         "description": "Normalized toroidal beta from the EFIT tree (betan)",
@@ -60,7 +63,7 @@ SIGNAL_ATTRS = {
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
-            "mu0 R0 li Ip^2 / 4 with R0 the EFIT rout, causal (backward difference, trailing 5 ms boxcar), clipped at 0"
+            "mu0 R_geo li Ip^2 / 4 with R_geo the EFIT rout, causal (backward difference, trailing 5 ms boxcar), clipped at 0"
         ),
     },
     "power_nbi": {
@@ -79,10 +82,10 @@ SIGNAL_ATTRS = {
 # EFIT21 reconstructs every 1 ms, ANALYSIS every ~20 ms.
 SLOW_EFIT_PERIOD = 1.5e-3
 
-# Major radius the magnetics btor is quoted at [m].
+# Major radius the magnetics btor is quoted at, the store's r0 [m].
 # btor, less its pre-shot baseline, matches EFIT bcentr to 0.9996-0.9999,
 # and EFIT quotes bcentr at rcentr, stored as RZERO = 0.66 m.
-BTOR_REFERENCE_R = 0.66
+R0 = 0.66
 
 
 @dataclass(frozen=True)
@@ -263,7 +266,7 @@ class CModDataWorkflow(DataWorkflow):
 
         All signals stay in SI units.
         ip and b0 keep the sign of their source, the GEQDSK signals carry the COCOS convention.
-        b0 is moved from BTOR_REFERENCE_R to geometric_axis_r, the radius the other devices quote it at.
+        b0 is btor as read, the vacuum field at R0, which the r0 attribute carries.
 
         Args:
             ds: Merged dataset with disruption-py signal names.
@@ -307,10 +310,8 @@ class CModDataWorkflow(DataWorkflow):
             logger.warning("No Thomson scattering channels retrieved for this shot.")
             return None
 
-        # Vacuum field falls off as 1/R, so b0 at the geometric axis is btor R_ref / R_geo
-        if "b0" in ds and "geometric_axis_r" in ds:
-            ds["b0"] = ds["b0"] * BTOR_REFERENCE_R / ds["geometric_axis_r"]
-            ds["b0"].attrs = {}
+        # Per shot like cocos, the stack stage stores it as the r0 variable
+        ds.attrs["r0"] = R0
 
         # C-Mod has no NBI or ECH, zero where ip is valid
         if "ip" in ds:
@@ -596,7 +597,7 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     """
     fast_methods = [
         "get_plasma_current",  # ip
-        "get_toroidal_field",  # bt, the vacuum field at BTOR_REFERENCE_R
+        "get_toroidal_field",  # bt, the vacuum field at R0
         "get_line_average_density",  # n_e [m^-3]
         # Power sources and sinks
         "get_ohmic_power",  # p_ohm

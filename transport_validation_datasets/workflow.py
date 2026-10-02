@@ -2225,6 +2225,9 @@ class DataWorkflow(ABC):
         for name, variable in ds_stacked.data_vars.items():
             if variable.dtype == np.float64:
                 ds_stacked[name] = variable.astype(np.float32)
+        # The radius b0 is given at, per shot, from the unprocessed file's attribute
+        r0 = np.array([ds_unprocessed.attrs["r0"]], dtype=np.float32)
+        ds_stacked["r0"] = xr.DataArray(r0, dims=(EPISODE_DIM,))
         apply_signal_attrs(ds_stacked, self.signal_attrs)
         standardize_signal_attrs(ds_stacked)
 
@@ -2297,9 +2300,9 @@ class DataWorkflow(ABC):
         for shot in shots:
             with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_file:
                 per_shot.append(source_provenance(ds_file.attrs))
-        # cocos is per shot, the store carries it as a variable
+        # cocos and r0 are per shot, the store carries them as variables
         attrs.update(
-            merge_shot_attrs(per_shot, exclude=(*SOURCE_VOLATILE_KEYS, "cocos"))
+            merge_shot_attrs(per_shot, exclude=(*SOURCE_VOLATILE_KEYS, "cocos", "r0"))
         )
         attrs.update(build_stamp())
         attrs.update(build_provenance())

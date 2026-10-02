@@ -658,8 +658,8 @@ def ohmic_power(
 ) -> np.ndarray:
     """Ohmic power P_oh = Ip V_loop - dW_pol/dt, causal.
 
-    The internal poloidal field energy is W_pol = L_i Ip^2 / 2 with L_i = mu0 R0 li / 2,
-    R0 the geometric major radius.
+    The internal poloidal field energy is W_pol = L_i Ip^2 / 2 with L_i = mu0 R_geo li / 2,
+    R_geo the major radius of the geometric center of the boundary.
     dW_pol/dt is a backward difference, so no sample draws on a later one,
     and the first sample is NaN.
     The sign of Ip and V_loop cancels as long as they share a convention.

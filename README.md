@@ -69,6 +69,7 @@ shot had no Thomson sample there.
 | ------ | ------ | ------ |
 | 0D | ip, b0, energy_mhd, beta_tor_norm, n_e_line_average, minor_radius, geometric_axis_r, elongation, triangularity_upper/lower, power_ohm/radiated/nbi/ic/lh/ec | (shot, time_idx) |
 | Time | time, fresh_profile, fresh_equilibrium | (shot, time_idx) |
+| Per shot | r0, cocos | (shot) |
 | Fitted profiles | t_e, n_e, their _error, _gradient, _gradient_error, _fit_status | (shot, time_idx, rho_tor_norm) |
 | Equilibrium | the full GEQDSK block: psirz, fpol, pres, ffprime, pprime, qpsi, rbdry, zbdry, rlim, zlim, rmagx, zmagx, simagx, sibdry, bcentr, current, rcentr, rleft, rdim, zmid, zdim | (shot, time_idx, grid) |
 | Raw Thomson channels (internal store only) | ts_channel_r, ts_channel_z, ts_channel_t_e, ts_channel_n_e, their _error | (shot, time_idx, ts_channel) |
@@ -87,10 +88,12 @@ A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, grid time t taking the mean of (t - 1 ms, t].
 One sampled slower is held forward from its last finite sample for at most `MAX_HOLD_PERIODS` of its own sampling period.
 Smoothing is a trailing boxcar, and derivatives are backward differences.
-b0 is the vacuum field at geometric_axis_r on both devices.
+b0 is the vacuum toroidal field at the fixed major radius r0, as IMAS defines it,
+the magnetics btor at 0.66 m on C-Mod and the EFIT bvac_val at bvac_r (1.0 m) on MAST.
+ip and b0 keep their source sign, the cocos variable records the convention.
 power_ohm is Ip V_loop - dW_pol/dt on both devices.
 MAST reads it from ESM (`pphix`), C-Mod computes it (`CmodPowerMethods.get_ohmic_power`)
-from the flux loop voltage and W_pol = mu0 R0 li Ip^2 / 4, R0 the geometric major radius (EFIT `rout`),
+from the flux loop voltage and W_pol = mu0 R_geo li Ip^2 / 4, R_geo the geometric major radius (EFIT `rout`),
 smoothed by a trailing 5 ms boxcar.
 
 The C-Mod 0D signals outside EFIT are read by custom methods (`CmodPlasmaMethods`, `CmodPowerMethods`),
