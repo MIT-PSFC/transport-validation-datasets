@@ -31,6 +31,7 @@ from transport_validation_datasets.machine.generic import (
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
     signal_on_grid,
+    smoothed_power,
     snap_to_grid,
     ts_channel_fit_rows,
 )
@@ -166,11 +167,11 @@ SIGNAL_ATTRS = {
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop at the LCFS minus the rate of change of the stored poloidal magnetic energy "
-            "(ESM_PPHIX), clipped at 0"
+            "(ESM_PPHIX), smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0"
         ),
     },
     "power_radiated": {
-        "description": "Total radiated power from the poloidal bolometer array (ABM_PRAD_POL)",
+        "description": "Total radiated power from the poloidal bolometer array (ABM_PRAD_POL), smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0",
     },
     "power_nbi": {
         "description": "Neutral beam power injected into the vessel (ANB_TOT_SUM_POWER)",
@@ -772,7 +773,8 @@ def _zero_d_dataset(
     """Place the 0D signals onto the timebase under standardized names.
 
     Every signal is placed causally (signal_on_grid), never interpolated,
-    so no grid time draws on a later sample.
+    so no grid time draws on a later sample,
+    and power_ohm and power_radiated are then smoothed non-causally (smoothed_power), as on every device.
     Plasma current and toroidal field keep their source sign, as on C-Mod.
 
     Args:
@@ -814,9 +816,14 @@ def _zero_d_dataset(
     # and a gap longer than the hold stays NaN.
     esm_time = np.asarray(esm["time"].values, dtype=float)
     pphix = np.asarray(esm["pphix"].values, dtype=float)
-    data["power_ohm"] = signal_on_grid(
+    power_ohm_on_grid = signal_on_grid(
         esm_time, pphix, timebase, EQUILIBRIUM_HOLD_FLOOR
     )
+    # The powers are smoothed non-causally, as on every device
+    grid_steps = np.diff(timebase)
+    dt = float(np.median(grid_steps))
+    data["power_ohm"] = smoothed_power(power_ohm_on_grid, dt)
+    data["power_radiated"] = smoothed_power(data["power_radiated"], dt)
     data["power_nbi"] = signal_on_grid(
         summary_time, summary["power_nbi"].values, timebase
     )

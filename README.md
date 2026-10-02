@@ -85,19 +85,22 @@ shots of different lengths is NaN.
 The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since source records often dip negative
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
 
-Every stored value is causal: no grid time draws on a later sample.
+Every stored value is causal, no grid time draws on a later sample,
+with two exceptions.
+power_ohm and power_radiated are smoothed by a centered 50 ms boxcar applied twice (`smoothed_power`),
+the kernel DIII-D's bolometer total comes with, since unsmoothed both are noise-dominated at 1 kHz.
+The EFIT and Thomson slices are snapped to the nearest grid time (`snap_to_grid`), up to 0.5 ms early.
 A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, grid time t taking the mean of (t - 1 ms, t].
 One sampled slower is held forward from its last finite sample for at most `MAX_HOLD_PERIODS` of its own sampling period,
 or `EQUILIBRIUM_HOLD_FLOOR` (10 ms) when it comes from the equilibrium reconstruction and that is longer.
-Smoothing is a trailing boxcar, and derivatives are backward differences.
+Derivatives are backward differences.
 b0 is the vacuum toroidal field at the fixed major radius r0, as IMAS defines it,
 the magnetics btor at 0.66 m on C-Mod and the EFIT bvac_val at bvac_r (1.0 m) on MAST.
 ip and b0 keep their source sign, the cocos variable records the convention.
 power_ohm is Ip V_loop - dW_pol/dt on both devices.
 MAST reads it from ESM (`pphix`), C-Mod computes it (`CmodPowerMethods.get_ohmic_power`)
-from the flux loop voltage and W_pol = mu0 R_geo li Ip^2 / 4, R_geo the geometric major radius (EFIT `rout`),
-smoothed by a trailing 5 ms boxcar.
+from the flux loop voltage and W_pol = mu0 R_geo li Ip^2 / 4, R_geo the geometric major radius (EFIT `rout`).
 
 The C-Mod 0D signals outside EFIT are read by custom methods (`CmodPlasmaMethods`, `CmodPowerMethods`),
 since the disruption-py built-ins interpolate.
@@ -220,7 +223,6 @@ indicating a large change in the Thomson density calibration.
   so the profile before it is held there.
 - **MAST `power_ohm` gaps.** Some converged reconstructions have no `pphix` (up to 25 ms at flat-top in 24891).
   The hold bridges up to 10 ms of them, and longer ones are cut out as gaps.
-- **MAST `power_ohm` causality is not verified.** ESM computes dW_pol/dt itself, and whether it is a backward difference is not documented.
 - **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
   It is an artifact of the EFIT basis functions.
 
