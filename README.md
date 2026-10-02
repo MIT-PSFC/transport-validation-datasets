@@ -67,7 +67,7 @@ shot had no Thomson sample there.
 
 | Group | Signals | Dimensions |
 | ------ | ------ | ------ |
-| 0D | ip, b0, energy_mhd, beta_tor_norm, n_e_line_average, minor_radius, geometric_axis_r, elongation, triangularity_upper/lower, power_ohm/radiated/nbi/ic/lh | (shot, time_idx) |
+| 0D | ip, b0, energy_mhd, beta_tor_norm, n_e_line_average, minor_radius, geometric_axis_r, elongation, triangularity_upper/lower, power_ohm/radiated/nbi/ic/lh/ec | (shot, time_idx) |
 | Time | time, fresh_profile, fresh_equilibrium | (shot, time_idx) |
 | Fitted profiles | t_e, n_e, their _error, _gradient, _gradient_error, _fit_status | (shot, time_idx, rho_tor_norm) |
 | Equilibrium | the full GEQDSK block: psirz, fpol, pres, ffprime, pprime, qpsi, rbdry, zbdry, rlim, zlim, rmagx, zmagx, simagx, sibdry, bcentr, current, rcentr, rleft, rdim, zmid, zdim | (shot, time_idx, grid) |
@@ -76,11 +76,20 @@ shot had no Thomson sample there.
 The profiles are fit on rho_tor_norm from 0 to 1.6, so every fit anchor is on the fit grid and in the fit plots.
 The fit files, the stores and the IMAS export keep them out to rho_tor_norm 1.1.
 
-A signal the device does not have comes through as NaN, so the devices share
+A heating system the device does not have is zero, so the devices share
 one schema. Everything is float32, flags included, because the padding between
 shots of different lengths is NaN.
-The power signals (power_ohm/radiated/nbi/ic/lh) are clipped at zero since source records often dip negative
+The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since source records often dip negative
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
+
+Every stored value is causal: no grid time draws on a later sample.
+A 0D signal slower than the 1 kHz grid is held forward from its last finite sample
+for at most `MAX_HOLD_PERIODS` of its own sampling period (`held_signal_on_grid`), never interpolated,
+smoothing is a trailing boxcar, and derivatives are backward differences.
+b0 is the vacuum field at geometric_axis_r on both devices.
+power_ohm is Ip V_loop - dW_pol/dt on both devices.
+MAST reads it from ESM (`pphix`), C-Mod computes it (`CmodPowerMethods.get_ohmic_power`)
+from the flux loop voltage and W_pol = mu0 R li Ip^2 / 4, smoothed by a trailing 5 ms boxcar.
 
 # Filtering
 
@@ -95,16 +104,19 @@ the fit stage maps the Thomson channels through the nearest one,
 and the stack stage holds them onto the grid, so an unusable one is held over by the one before and is not marked fresh.
 The reach and the hold both run on the reconstruction clock (`reconstruction_clock_period`), which counts the unusable ones too.
 
-Unprocessed stage (`filter_and_plot`), per shot:
+Unprocessed stage (`filter_and_plot`), per shot.
+Every check from 2 to 4 cuts the grid times it fails out as a gap:
 
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
-2. Everything from `end_margin` (C-Mod 20 ms, MAST 40 ms) before the last finite `ip` on is cut.
-3. Grid times where a signal listed in the device's `valid_filter` is not finite or outside its bounds fail the filter.
-   An empty entry only checks that the signal is finite.
-4. Grid times where a `transient_filter` signal, smoothed over 5 ms, is above its threshold are cut out as a gap,
-   like a valid filter failure: `power_ohm` above 5 MW on both devices,
-   `power_radiated` above 5.5 MW on C-Mod and 3 MW on MAST.
-   A transient does not end the shot, step 6 keeps the longest stretch around it.
+2. End of shot (`end_of_shot_index`): the plasma ends at the last grid time with |ip| at or above its `min_filter` threshold,
+   and everything after `end_margin` (C-Mod 20 ms, MAST 40 ms) before that is cut.
+   A shot whose |ip| never reaches the threshold is rejected.
+3. Every 0D signal must be finite, every `min_filter` signal at or above its threshold
+   (ip compared as |ip|), and every `max_filter` signal at or below it, on the raw samples.
+   The max filters take `greenwald_fraction` = n_e_line_average / n_GW with n_GW = Ip / (pi a^2),
+   derived for the filter and not stored.
+4. Grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold.
+   The centered window only selects grid times, no stored value is smoothed by it.
    The unprocessed plots shade the transients red.
 5. The leading grid times of each segment are cut up to its first sample
    that a usable reconstruction (`usable_reconstructions`) of the same segment reaches
@@ -115,10 +127,26 @@ Unprocessed stage (`filter_and_plot`), per shot:
    so step 5 trims each segment as if it alone were kept, and the longest is chosen after every trim.
 7. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod 0.5 s, MAST 0.2 s).
 8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
-   - a 0D signal that is NaN at every kept time
    - a mean `power_radiated` below `min_radiated_fraction` of the mean heating power (a dead bolometer),
      1 percent on C-Mod and 2.5 percent on MAST
    - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point.
+
+| Threshold | C-Mod | MAST |
+| --- | --- | --- |
+| min ip | 100 kA | 210 kA |
+| min energy_mhd | 2.7 kJ | 5 kJ |
+| max greenwald_fraction | 2.0 | 2.0 |
+| max power_radiated | | 4 MW |
+| transient power_ohm | 5 MW | 5 MW |
+| transient power_radiated | 5.5 MW | 3 MW |
+| end_margin | 20 ms | 40 ms |
+| min_pulse_length | 0.5 s | 0.2 s |
+| min_radiated_fraction | 0.01 | 0.025 |
+| density_ratio_bounds | 0.72-1.3 | 0.7-1.3 |
+
+The standardized source pull of every shot is kept unfiltered in `01_unprocessed/source/`.
+A rerun filters from it without touching the source, a shot an earlier filter rejected included,
+so deleting the unprocessed files (`01_unprocessed/*.nc`) is all a filter change needs.
 
 Fit stage: the Thomson channels map through the nearest usable reconstruction in reach,
 the Thomson screens in `cleaning.py` run on every sample before fitting,
@@ -138,6 +166,7 @@ Stack stage (`_internal_shot_dataset`), per shot:
 3. The shot is dropped when its fitted density disagrees with the interferometer (`fit_rejection_reason`).
    The shot median over its slices of mean(n_e over rho_tor_norm 0-1) / `n_e_line_average`
    must sit inside the device's `density_ratio_bounds` (C-Mod 0.72-1.3, MAST 0.7-1.3).
+   A shot with no slice to compare is dropped too.
    The ratio is a proxy for the chord integral, and the bounds absorb its offset on each device.
 4. The usable reconstructions are held onto the grid, as above.
 
@@ -158,9 +187,9 @@ indicating a large change in the Thomson density calibration.
   e.g. 24623 at 0.29-0.33 s (though this is minor, 39 reconstructions in 26 shots out of ~1000 total shots).
 - **Equilibrium gaps.** A hold of `MAX_HOLD_PERIODS` cannot bridge a missing reconstruction.
   Around one unusable MAST reconstruction the previous one covers 3 ms and the next 2 ms carry no equilibrium.
-- **C-Mod `power_ohm` is noise dominated at 1 kHz.** Its median sample-to-sample change is 45 percent of its level,
-  and it swings 0-2.5 MW timestep to timestep in some ohmic shots. We publish the raw value, but you could consider smoothing it.
-- **MAST `power_ohm` is interpolated across missing ESM samples.** Some converged reconstructions have no `pphix`, and the interpolation runs straight across them, up to 25 ms at flat-top in 24891.
+- **MAST `power_ohm` gaps.** Some converged reconstructions have no `pphix` (up to 25 ms at flat-top in 24891).
+  The hold does not bridge them, so those grid times are cut out as gaps.
+- **MAST `power_ohm` causality is not verified.** ESM computes dW_pol/dt itself, and whether it is a backward difference is not documented.
 - **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
   It is an artifact of the EFIT basis functions.
 

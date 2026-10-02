@@ -21,12 +21,14 @@ import numpy as np
 import pytest
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
+from scipy.special import xlogy
 
 from transport_validation_datasets import PACKAGE_ROOT
 from transport_validation_datasets.machine.generic import (
     SECANT_PSI_N,
     cumulative_q_integral,
     map_ts_channels_to_rho_tor_norm,
+    phi_n_map,
     psi_n_from_rho_tor_norm,
     rho_tor_norm_from_psi_n,
 )
@@ -46,27 +48,59 @@ def phi_n_closed_form(psi_n):
     return (Q0 * psi_n + (Q1 - Q0) * psi_n**2 / 2.0) / Q_TOTAL
 
 
+# The phi_n_map cases below are kept identical to POPSIM-Transport-Predictor's
+# tests/datasets/test_rho_tor_norm.py, so both repos are held to the same numbers.
+# Flux surfaces at uniform rho_pol, so psi_N = rho_pol^2 is not uniform
+PSI_N_SURFACES = np.linspace(0.0, 1.0, 41) ** 2
+
+
+def log_q(psi_n):
+    """q = 1.2 - 0.8 ln(1 - psi_N), the form a diverted q takes near the LCFS."""
+    return 1.2 - 0.8 * np.log(1.0 - psi_n)
+
+
+def log_q_integral(psi_n):
+    """Closed-form integral of log_q from 0 to psi_N, finite at psi_N = 1."""
+    one_minus = 1.0 - psi_n
+    return 1.2 * psi_n + 0.8 * (xlogy(one_minus, one_minus) - one_minus + 1.0)
+
+
+def diverted_qpsi(psi_n_surfaces):
+    """log_q on the surfaces, infinite at the LCFS."""
+    qpsi = np.full(psi_n_surfaces.size, np.inf)
+    qpsi[:-1] = log_q(psi_n_surfaces[:-1])
+    return qpsi
+
+
 def circular_psirz(minor_radius):
     rr, zz = np.meshgrid(R_GRID, Z_GRID, indexing="ij")
     return ((rr - R0) ** 2 + zz**2) / minor_radius**2
 
 
 def circular_shot(
-    eq_rows, minor_radii, ts_rows, channel_r, channel_z, nan_qpsi_rows=(), n_t=40
+    eq_rows,
+    minor_radii,
+    ts_rows,
+    channel_r,
+    channel_z,
+    nan_qpsi_rows=(),
+    n_t=40,
+    flux_sign=1.0,
 ):
     # One shot on a 1 kHz grid, circular reconstructions at eq_rows and Thomson at ts_rows.
-    # psi_axis is 0 and psi_boundary 1, so psirz is psi_N itself.
+    # psi_axis is 0 and psi_boundary is flux_sign, so psirz is flux_sign psi_N.
+    # flux_sign -1 has psi decreasing outward with a negative q, as on MAST.
     time = np.arange(n_t) * 1e-3
     psirz = np.full((n_t, R_GRID.size, Z_GRID.size), np.nan)
     simagx = np.full(n_t, np.nan)
     sibdry = np.full(n_t, np.nan)
     qpsi = np.full((n_t, N_PSI), np.nan)
     for row, minor_radius in zip(eq_rows, minor_radii):
-        psirz[row] = circular_psirz(minor_radius)
+        psirz[row] = flux_sign * circular_psirz(minor_radius)
         simagx[row] = 0.0
-        sibdry[row] = 1.0
+        sibdry[row] = flux_sign
         if row not in nan_qpsi_rows:
-            qpsi[row] = QPSI
+            qpsi[row] = flux_sign * QPSI
     channel_shape = (n_t, channel_r.size)
     ts_r = np.full(channel_shape, np.nan)
     ts_z = np.full(channel_shape, np.nan)
@@ -93,7 +127,7 @@ def circular_shot(
 
 class TestToroidalFlux:
     def test_q_integral_matches_closed_form(self):
-        q_integral = cumulative_q_integral(QPSI)
+        q_integral = cumulative_q_integral(PSI_N_GRID, QPSI)
 
         expected = Q0 * PSI_N_GRID + (Q1 - Q0) * PSI_N_GRID**2 / 2.0
         np.testing.assert_allclose(q_integral, expected, atol=1e-12)
@@ -146,11 +180,67 @@ class TestToroidalFlux:
         rho_tor_norm = rho_tor_norm_from_psi_n(psi_n, QPSI, sol_extension)
         psi_n_back = psi_n_from_rho_tor_norm(rho_tor_norm, QPSI, sol_extension)
 
-        np.testing.assert_allclose(psi_n_back, psi_n, atol=1e-12)
+        # The inverse interpolates a dense Phi_N table inside the LCFS
+        np.testing.assert_allclose(psi_n_back, psi_n, atol=1e-8)
+
+
+class TestPhiNMap:
+    def test_constant_q_is_psi_n_for_either_sign(self):
+        # Constant q to the LCFS (a limited plasma) makes Phi_N = psi_N, and the sign of q cancels
+        psi_n = np.linspace(0.0, 1.0, 101)
+        qpsi = np.full(PSI_N_SURFACES.size, 3.0)
+
+        phi_n = phi_n_map(PSI_N_SURFACES, qpsi, "secant").phi_n(psi_n)
+        phi_n_flipped_q = phi_n_map(PSI_N_SURFACES, -qpsi, "secant").phi_n(psi_n)
+
+        np.testing.assert_allclose(phi_n, psi_n, atol=1e-12)
+        np.testing.assert_allclose(phi_n_flipped_q, psi_n, atol=1e-12)
+
+    def test_diverted_tail_matches_log_q(self):
+        # q diverging at the LCFS goes through the analytic tail past the last finite surface (psi_N ~ 0.95)
+        psi_n = np.concatenate(
+            [np.linspace(0.0, 0.9, 10), np.linspace(0.951, 0.9999, 50), [1.0]]
+        )
+        qpsi = diverted_qpsi(PSI_N_SURFACES)
+
+        phi_n = phi_n_map(PSI_N_SURFACES, qpsi, "secant").phi_n(psi_n)
+
+        phi_n_expected = log_q_integral(psi_n) / log_q_integral(1.0)
+        # Simpson over 41 surfaces is good to a few 1e-4 against q steepening toward the LCFS
+        np.testing.assert_allclose(phi_n, phi_n_expected, rtol=1e-3)
+        assert phi_n[-1] == 1.0
+
+    def test_finite_q_at_the_lcfs_stays_close_to_the_diverted_integral(self):
+        # EFIT writes a finite q(1), here q a little inside the LCFS, on a uniform 129-point grid
+        psi_n_grid = np.linspace(0.0, 1.0, 129)
+        qpsi = log_q(np.minimum(psi_n_grid, 1.0 - 1e-3))
+        psi_n = np.linspace(0.0, 1.0, 201)
+
+        rho_tor_norm = np.sqrt(phi_n_map(psi_n_grid, qpsi, "secant").phi_n(psi_n))
+
+        rho_tor_norm_expected = np.sqrt(log_q_integral(psi_n) / log_q_integral(1.0))
+        np.testing.assert_allclose(rho_tor_norm, rho_tor_norm_expected, atol=2e-3)
+
+    def test_rejects_unusable_q_profiles(self):
+        qpsi_good = diverted_qpsi(PSI_N_SURFACES)
+        qpsi_nan = qpsi_good.copy()
+        qpsi_nan[5] = np.nan
+        # Diverging next to the axis leaves too few finite surfaces to fit the tail to
+        qpsi_axis = qpsi_good.copy()
+        qpsi_axis[2:] = np.inf
+        # A tail whose q falls toward the LCFS
+        qpsi_falling = qpsi_good.copy()
+        qpsi_falling[-5:-1] = [4.0, 3.5, 3.0, 2.5]
+        qpsi_sign_change = np.full(PSI_N_SURFACES.size, 2.0)
+        qpsi_sign_change[10] = -2.0
+
+        for qpsi in [qpsi_nan, qpsi_axis, qpsi_falling, qpsi_sign_change]:
+            assert phi_n_map(PSI_N_SURFACES, qpsi, "secant") is None
 
 
 class TestMapChannels:
-    def test_channels_map_through_the_flux_map(self):
+    @pytest.mark.parametrize("flux_sign", [1.0, -1.0])
+    def test_channels_map_through_the_flux_map(self, flux_sign):
         # Midplane channels on both sides, off-midplane ones, one on the LCFS and one in the SOL
         minor_radius = 0.3
         channel_psi_n = np.array([0.1, 0.5, 0.9, 0.4, 0.8, 1.0, 1.2])
@@ -158,7 +248,9 @@ class TestMapChannels:
         angle = np.array([0.0, 0.0, np.pi, 0.5, -1.0, np.pi, 0.0])
         channel_r = R0 + channel_distance * np.cos(angle)
         channel_z = channel_distance * np.sin(angle)
-        ds = circular_shot([10], [minor_radius], [10], channel_r, channel_z)
+        ds = circular_shot(
+            [10], [minor_radius], [10], channel_r, channel_z, flux_sign=flux_sign
+        )
 
         ts_times, rho_tor_norm = map_ts_channels_to_rho_tor_norm(ds, "tangent")
 

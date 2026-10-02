@@ -10,10 +10,12 @@ import xarray as xr
 
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_validation_datasets.gp_fitting.batch_io import STATUS_CULLED, STATUS_OK
-from transport_validation_datasets.workflow import (
+from transport_validation_datasets.machine.generic import (
     MAX_HOLD_PERIODS,
+    hold_onto_grid,
+)
+from transport_validation_datasets.workflow import (
     _hold_equilibrium,
-    _hold_onto_grid,
     _trim_and_keep_longest,
     _trim_segment_starts,
     keep_longest_segment,
@@ -107,7 +109,7 @@ class TestHoldOntoGrid:
     def test_no_samples_means_no_grid_time_draws_on_anything(self):
         grid = grid_ms(10)
 
-        index, fresh = _hold_onto_grid(grid, np.array([]), True)
+        index, fresh = hold_onto_grid(grid, np.array([]), True)
 
         assert (index == -1).all()
         assert not fresh.any()
@@ -116,7 +118,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(20)
         samples = np.array([0.002, 0.007, 0.012])
 
-        _, fresh = _hold_onto_grid(grid, samples, True)
+        _, fresh = hold_onto_grid(grid, samples, True)
 
         assert np.array_equal(np.flatnonzero(fresh), [2, 7, 12])
 
@@ -124,7 +126,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(20)
         samples = np.array([0.002, 0.007, 0.012])
 
-        index, _ = _hold_onto_grid(grid, samples, True)
+        index, _ = hold_onto_grid(grid, samples, True)
 
         assert (index[:2] == -1).all()  # nothing before the first sample
         assert (index[2:7] == 0).all()
@@ -136,7 +138,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(30)
         samples = np.array([0.002, 0.007, 0.012])
 
-        index, _ = _hold_onto_grid(grid, samples, True)
+        index, _ = hold_onto_grid(grid, samples, True)
 
         assert index[19] == 2
         assert (index[20:] == -1).all()
@@ -148,7 +150,7 @@ class TestHoldOntoGrid:
         # The last held grid time is the last whole millisecond at or before the cutoff
         last_held = int(np.floor(1e3 * (samples[2] + MAX_HOLD_PERIODS * period) + 1e-9))
 
-        index, _ = _hold_onto_grid(grid, samples, True)
+        index, _ = hold_onto_grid(grid, samples, True)
 
         assert index[last_held] == 2
         assert (index[last_held + 1 : 35] == -1).all()
@@ -158,7 +160,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(20)
         samples = np.array([0.002, 0.007, 0.012])
 
-        index, fresh = _hold_onto_grid(grid, samples, False)
+        index, fresh = hold_onto_grid(grid, samples, False)
 
         assert np.array_equal(np.flatnonzero(index >= 0), np.flatnonzero(fresh))
         assert np.array_equal(index[fresh], [0, 1, 2])
@@ -168,7 +170,7 @@ class TestHoldOntoGrid:
         # MAX_HOLD_PERIODS grid steps rather than the rest of the shot
         grid = grid_ms(20)
 
-        index, fresh = _hold_onto_grid(grid, np.array([0.002]), True)
+        index, fresh = hold_onto_grid(grid, np.array([0.002]), True)
 
         assert np.flatnonzero(fresh).tolist() == [2]
         assert index[2] == 0
@@ -181,7 +183,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(10)
         samples = np.array([0.005 + 1e-9])
 
-        _, fresh = _hold_onto_grid(grid, samples, True)
+        _, fresh = hold_onto_grid(grid, samples, True)
 
         assert np.flatnonzero(fresh).tolist() == [5]
 

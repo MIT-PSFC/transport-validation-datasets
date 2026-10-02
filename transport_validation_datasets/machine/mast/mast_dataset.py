@@ -18,7 +18,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import xarray as xr
-from disruption_py.core.utils.math import interp1
 from loguru import logger
 
 from transport_validation_datasets import PACKAGE_ROOT
@@ -27,6 +26,7 @@ from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFit
 from transport_validation_datasets.machine.generic import (
     channel_rows_at_times,
     cocos_from_signs,
+    held_signal_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
@@ -51,7 +51,7 @@ TS_CHANNEL_Z = 0.0
 
 # Plasma current magnitude that marks the end of the shot window [A].
 # Only used to find the last time worth putting on the timebase,
-# the real current cut is valid_filter["ip"].
+# the real current cut is min_filter["ip"].
 SHOT_WINDOW_MIN_IP = 100e3
 
 # Channels this far outside the separatrix sit in the far SOL,
@@ -197,6 +197,11 @@ SIGNAL_ATTRS = {
         "units": "W",
         "ref": "/summary/heating_current_drive/power_launched_lh/value",
     },
+    "power_ec": {
+        "description": "Electron cyclotron heating power (none on MAST)",
+        "units": "W",
+        "ref": "/summary/heating_current_drive/power_launched_ec/value",
+    },
     "minor_radius": {
         "description": "Plasma minor radius",
         "units": "m",
@@ -312,24 +317,18 @@ class MASTDataWorkflow(DataWorkflow):
     signal_attrs = SIGNAL_ATTRS
 
     min_pulse_length = 0.2
-    valid_filter = {
-        # Only care about the magnitude of ip. These shots run 0.4-0.9 MA, so a
-        # 1.5 MA reading is a broken record rather than a real current.
-        "ip": {"min_abs": 210e3, "max_abs": 1.5e6},
-        # Upper bound is the MAST density limit, 10.1088/1361-6587/ace476
-        "n_e_line_average": {"min": 1e19, "max": 1.2e20},
+    min_filter = {
+        "ip": 210e3,
         # 5 kJ of plasma_energy cuts about what 10 kJ of the old wmhd did (median ratio 2.1),
         # 1.9 percent of the times iteration 12 kept, mostly ramp phases
-        "energy_mhd": {"min": 5e3, "max": 2e6},
-        "beta_tor_norm": {"min": 0.01, "max": 10.0},
-        # Sample validity, distinct from the transient gate below: MAST total
-        # input power tops out near 5 MW, so a recorded radiated power above
-        # 4 MW is not a valid measurement.
-        # No minimum: the bolometer noise dips below 0 for 1-5 ms (median -0.25 MW),
-        # which would split shots in two, and _clip_powers writes them as 0.
-        "power_radiated": {"max": 4e6},
-        # Finite only, it11 had 10 NaN power_ohm samples in 23999 and 24991
-        "power_ohm": {},
+        "energy_mhd": 5e3,
+    }
+    max_filter = {
+        "greenwald_fraction": 2.0,
+        # Sample validity, distinct from the transient gate below:
+        # MAST total input power tops out near 5 MW, so a recorded radiated power above 4 MW is not a valid measurement.
+        # No minimum, the bolometer noise dips below 0 for 1-5 ms (median -0.25 MW) and _clip_powers writes them as 0.
+        "power_radiated": 4e6,
     }
     # Both thresholds are empirical, and both gate the radiative or ohmic collapse
     # rather than normal operation: the closest ordinary approach found while porting these was shot 29153,
@@ -782,8 +781,10 @@ def _zero_d_dataset(
     esm: xr.Dataset,
     timebase: np.ndarray,
 ) -> xr.Dataset:
-    """Interpolate the 0D signals onto the timebase under standardized names.
+    """Hold the 0D signals forward onto the timebase under standardized names.
 
+    Every signal is held from its last finite sample (held_signal_on_grid), never interpolated,
+    so no grid time draws on a later sample.
     Plasma current and toroidal field are stored as magnitudes, the signed
     versions live in the equilibrium signals (see _equilibrium_dataset).
 
@@ -801,36 +802,42 @@ def _zero_d_dataset(
     eq_time = np.asarray(efm["time"].values, dtype=float)
 
     data = {
-        name: interp1(eq_time, efm[source].values, timebase)
+        name: held_signal_on_grid(eq_time, efm[source].values, timebase)
         for source, name in EQUILIBRIUM_SIGNALS.items()
     }
     data.update(
         {
-            name: interp1(summary_time, summary[source].values, timebase)
+            name: held_signal_on_grid(summary_time, summary[source].values, timebase)
             for source, name in SUMMARY_SIGNALS.items()
         }
     )
 
     ip = np.asarray(summary["ip"].values, dtype=float)
-    ip_on_timebase = interp1(summary_time, ip, timebase)
+    ip_on_timebase = held_signal_on_grid(summary_time, ip, timebase)
     data["ip"] = np.abs(ip_on_timebase)
     # bvac_rmag is the vacuum field at the magnetic axis. Rescale it by 1/R to
     # the geometric axis, so b0 is referenced the same way as on the other
     # devices (C-Mod rout, D3D rsurf, TCV R_geom).
-    bvac_rmag = interp1(eq_time, efm["bvac_rmag"].values, timebase)
-    r_axis = interp1(eq_time, efm["magnetic_axis_r"].values, timebase)
+    bvac_rmag = held_signal_on_grid(eq_time, efm["bvac_rmag"].values, timebase)
+    r_axis = held_signal_on_grid(eq_time, efm["magnetic_axis_r"].values, timebase)
     data["b0"] = np.abs(bvac_rmag * r_axis / data["geometric_axis_r"])
-    # esm sits on a 20 us axis but only holds values at the reconstruction times.
-    # Some converged reconstructions have no pphix (97 of 1446 shots, up to 25 ms in 24891),
-    # and the interpolation runs straight across them.
+    # esm sits on a 20 us axis but only holds values at the reconstruction times,
+    # so the hold runs on the clock of the samples that have a pphix.
+    # Some converged reconstructions have none (97 of 1446 shots, up to 25 ms in 24891),
+    # and a gap longer than the hold stays NaN.
     esm_time = np.asarray(esm["time"].values, dtype=float)
     pphix = np.asarray(esm["pphix"].values, dtype=float)
     has_pphix = np.isfinite(pphix)
-    data["power_ohm"] = interp1(esm_time[has_pphix], pphix[has_pphix], timebase)
-    data["power_nbi"] = interp1(summary_time, summary["power_nbi"].values, timebase)
+    data["power_ohm"] = held_signal_on_grid(
+        esm_time[has_pphix], pphix[has_pphix], timebase
+    )
+    data["power_nbi"] = held_signal_on_grid(
+        summary_time, summary["power_nbi"].values, timebase
+    )
     # MAST has no ICRF or lower hybrid, zero where ip is valid
     data["power_ic"] = data["ip"] * 0.0
     data["power_lh"] = data["ip"] * 0.0
+    data["power_ec"] = data["ip"] * 0.0
 
     return xr.Dataset(
         data_vars={name: ("idx", values) for name, values in data.items()},

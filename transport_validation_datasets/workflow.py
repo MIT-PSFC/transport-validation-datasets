@@ -46,7 +46,11 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
     plan_batches,
 )
 from transport_validation_datasets.machine.generic import (
+    MAX_HOLD_PERIODS,
     SOL_EXTENSIONS,
+    end_of_shot_index,
+    greenwald_fraction,
+    hold_onto_grid,
     reconstruction_clock_period,
     standardize_signal_attrs,
     usable_reconstructions,
@@ -101,16 +105,6 @@ USABLE_FIT_STATUSES = (STATUS_OK, STATUS_REPAIRED)
 # In it11 no C-Mod slice goes above 0.25 and 99 percent of MAST slices stay below 0.15.
 FLAT_TE_EDGE_RATIO = 0.4
 
-# A grid time carries a sample of its own when it sits this close to one [s].
-# Only absorbs float round-off, everything shares the staged 1 kHz timebase.
-SAMPLE_TIME_TOL = 1e-6
-
-# How long a slowly sampled signal (a fitted profile, an equilibrium) is held
-# forward onto the 1 kHz timebase, in periods of its own sampling. Above 1 to
-# tolerate jitter in the sampling, low enough that nothing is carried across a
-# real gap: the end of the shot, or a diagnostic dropping out.
-MAX_HOLD_PERIODS = 1.5
-
 # Unprocessed signals carried into the internal dataset. The union over every
 # device: a signal the device does not have comes through as NaN, so all the
 # devices' datasets share one schema.
@@ -130,6 +124,7 @@ DATASET_0D_SIGNALS = (
     "power_nbi",
     "power_ic",
     "power_lh",
+    "power_ec",
 )
 
 # GEQDSK block, everything needed to rebuild the equilibrium of a slice.
@@ -284,14 +279,26 @@ class DataWorkflow(ABC):
 
     @property
     @abstractmethod
-    def valid_filter(self) -> dict[str, dict[str, float]]:
-        """Dictionary of valid ranges for signals, used to filter out invalid data.
+    def min_filter(self) -> dict[str, float]:
+        """Minimum thresholds, a grid time where a listed signal is below its threshold is cut out as a gap.
 
-        A listed signal must also be finite, so an empty entry only checks that.
-        The bounds are min, max, min_abs and max_abs.
+        ip is compared as its magnitude, and its threshold also sets the end of the shot (end_of_shot_index).
+        The signals are those of _filter_inputs.
 
         Returns:
-            Valid ranges for signals, e.g. {"signal_name": {"min": 0.0, "max": 1.0}, "other_signal": {}}.
+            Thresholds for signals, e.g. {"ip": 1e5}.
+        """
+
+    @property
+    @abstractmethod
+    def max_filter(self) -> dict[str, float]:
+        """Maximum thresholds on the raw samples, a grid time where a listed signal is above its threshold is cut out as a gap.
+
+        For records that are broken or extreme, unlike the smoothed transient_filter.
+        The signals are those of _filter_inputs, greenwald_fraction included.
+
+        Returns:
+            Thresholds for signals, e.g. {"greenwald_fraction": 2.0}.
         """
 
     @property
@@ -310,7 +317,7 @@ class DataWorkflow(ABC):
     @property
     @abstractmethod
     def end_margin(self) -> float:
-        """Margin at the end of the shot to ignore when filtering for transients.
+        """Margin cut before the end of the plasma, see end_of_shot_index.
 
         Returns:
             Margin in seconds.
@@ -443,6 +450,8 @@ class DataWorkflow(ABC):
         self.rejected_shots_dir = self.unprocessed_data_dir / "rejected_shots"
         self.accepted_shots_dir = self.unprocessed_data_dir / "accepted_shots"
         self.failed_shots_dir = self.unprocessed_data_dir / "failed_shots"
+        # The standardized source pulls before any filtering, so a filter change reruns without the source
+        self.source_data_dir = self.unprocessed_data_dir / "source"
         self.fit_staging_dir = self.data_assembly_dir / "02_fit_staging"
         self.fit_batches_dir = self.fit_staging_dir / "batches"
         self.failed_fits_dir = self.fit_staging_dir / "failed_shots"
@@ -593,9 +602,12 @@ class DataWorkflow(ABC):
         signal names on a common 1 kHz timebase, plus a plot per shot showing
         what was kept and why.
 
-        Resumes: shots that already have a file, are excluded (excluded_shot_reason),
-        or failed on an earlier run are skipped without touching the source.
-        Source reads run prepare_workers at a time; filtering, plotting, and writing stay on
+        Every source pull is also kept unfiltered in source_data_dir.
+        Resumes: shots that already have a file or are excluded (excluded_shot_reason) are skipped.
+        A shot with a kept source pull is filtered from it without touching the source,
+        even when an earlier filter rejected it, so deleting the unprocessed files reruns a filter change.
+        A shot that failed on an earlier run and has no kept pull is skipped.
+        Source reads run prepare_workers at a time, while filtering, plotting, and writing stay on
         this thread, since they are matplotlib and netCDF work.
         """
         self.unprocessed_data_dir.mkdir(parents=True, exist_ok=True)
@@ -630,7 +642,8 @@ class DataWorkflow(ABC):
                     )
                     n_files += 1
                     continue
-                if self.shot_already_failed(shot):
+                has_source_pull = (self.source_data_dir / f"{shot}.nc").exists()
+                if not has_source_pull and self.shot_already_failed(shot):
                     logger.info(f"Shot {shot} failed on a previous run. Skipping.")
                     continue
                 batch.append(shot)
@@ -639,7 +652,10 @@ class DataWorkflow(ABC):
         logger.info(f"Finished with {n_files} {self.ds_name} unprocessed data files.")
 
     def _read_and_write_shots(self, shots: list[int], workers: int) -> int:
-        """Read a batch of shots from the source, then filter and write them.
+        """Read a batch of shots, then filter and write them.
+
+        A shot with a pull in source_data_dir is loaded from it,
+        the rest are read from the source and their pulls kept there.
 
         Args:
             shots: Shot numbers to read.
@@ -650,6 +666,10 @@ class DataWorkflow(ABC):
         """
         if not shots:
             return 0
+        source_pull_paths = {
+            shot: self.source_data_dir / f"{shot}.nc" for shot in shots
+        }
+        shots_to_read = [shot for shot in shots if not source_pull_paths[shot].exists()]
 
         def read(shot: int) -> xr.Dataset | None:
             """Read one shot, keeping a failure from killing the whole run.
@@ -667,16 +687,25 @@ class DataWorkflow(ABC):
                 logger.opt(exception=True).debug(e)
                 return None
 
-        if len(shots) == 1 or workers == 1:
-            datasets = [read(shot) for shot in shots]
+        if len(shots_to_read) <= 1 or workers == 1:
+            datasets_read = [read(shot) for shot in shots_to_read]
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                datasets = list(pool.map(read, shots))
+                datasets_read = list(pool.map(read, shots_to_read))
+        datasets_by_shot = dict(zip(shots_to_read, datasets_read, strict=True))
 
         n_written = 0
-        for shot, ds_standardized in zip(shots, datasets, strict=True):
-            if ds_standardized is None:
-                continue
+        for shot in shots:
+            if shot in datasets_by_shot:
+                ds_standardized = datasets_by_shot[shot]
+                if ds_standardized is None:
+                    continue
+                ds_standardized.attrs = source_provenance(ds_standardized.attrs)
+                self.source_data_dir.mkdir(parents=True, exist_ok=True)
+                ds_standardized.to_netcdf(source_pull_paths[shot])
+            else:
+                ds_standardized = xr.load_dataset(source_pull_paths[shot])
+                logger.info(f"Shot {shot}: filtering the kept source pull")
             ds_unprocessed = self.filter_and_plot(ds_standardized)
             if ds_unprocessed is None:
                 logger.warning(
@@ -699,11 +728,16 @@ class DataWorkflow(ABC):
     def filter_and_plot(self, ds_input: xr.Dataset) -> xr.Dataset | None:
         """Take datasets with standardized names, run filtering on them, and plot results.
 
-        What survives is one contiguous segment of the times that pass the valid and transient filters.
-        A transient is cut out as a gap like a valid filter failure, it does not end the shot.
+        Every check cuts the grid times it fails out as a gap:
+        the end of the shot (end_of_shot_index),
+        a 0D signal of DATASET_0D_SIGNALS that is not finite,
+        a min_filter signal below its threshold or a max_filter signal above it,
+        and a transient_filter signal above its threshold after smoothing.
+        What survives is one contiguous segment.
         Each segment is started where a kept usable reconstruction (usable_reconstructions) reaches,
         and only the longest segment is kept.
-        The shot is rejected when that segment is shorter than min_pulse_length,
+        The shot is rejected when ip never reaches its min_filter threshold,
+        when that segment is shorter than min_pulse_length,
         or when shot_rejection_reason finds a broken record in it.
 
         Rejected shots are plotted unfiltered to rejected_shots_dir.
@@ -718,34 +752,38 @@ class DataWorkflow(ABC):
             The filtered dataset, or None if the shot should be rejected.
         """
         shot = ds_input.shot.values[0]
+        times = ds_input["time"].values
+        dt = float(np.median(np.diff(times)))
+        ds_filter_inputs = _filter_inputs(ds_input)
 
-        # 0: Cut all data end_margin seconds before ip is NaN to avoid including obviously disruptive data at the end of the shot
-        ip_valid = ds_input["ip"].notnull().any(dim="shot")
-        last_valid_time = float(ip_valid[::-1].idxmax(dim="time"))
-        end_margin_time = last_valid_time - self.end_margin
-        valid_mask = ds_input["time"] < end_margin_time
+        # 0: Cut end_margin before the plasma ends
+        ip_magnitude = ds_filter_inputs["ip"]
+        if "shot" in ip_magnitude.dims:
+            ip_magnitude = ip_magnitude.max(dim="shot")
+        end_cut_index = end_of_shot_index(
+            ip_magnitude.values, times, self.min_filter["ip"], self.end_margin
+        )
+        if end_cut_index is None:
+            logger.warning(
+                f"Shot {shot} rejected: |ip| never reaches {self.min_filter['ip']:g} A"
+            )
+            self._plot_unprocessed(ds_input, shot, None, None, None)
+            return None
+        end_margin_time = float(times[np.clip(end_cut_index, 0, times.size - 1)])
+        mask_before_end = np.arange(times.size) < end_cut_index
+        valid_mask = xr.DataArray(mask_before_end, coords={"time": times}, dims="time")
 
-        # 1: Apply valid_filter, every listed signal finite and inside its bounds
-        for signal, bounds in self.valid_filter.items():
+        # 1: Every 0D signal finite, the min_filter and max_filter signals inside their thresholds
+        for signal in DATASET_0D_SIGNALS:
             valid_mask = valid_mask & np.isfinite(ds_input[signal])
-            if "min" in bounds:
-                valid_mask = valid_mask & (ds_input[signal] >= bounds["min"])
-            if "max" in bounds:
-                valid_mask = valid_mask & (ds_input[signal] <= bounds["max"])
-            if "min_abs" in bounds:
-                valid_mask = valid_mask & (
-                    np.abs(ds_input[signal]) >= bounds["min_abs"]
-                )
-            if "max_abs" in bounds:
-                valid_mask = valid_mask & (
-                    np.abs(ds_input[signal]) <= bounds["max_abs"]
-                )
+        for signal, threshold in self.min_filter.items():
+            valid_mask = valid_mask & (ds_filter_inputs[signal] >= threshold)
+        for signal, threshold in self.max_filter.items():
+            valid_mask = valid_mask & (ds_filter_inputs[signal] <= threshold)
 
         # 2: Cut the transients out as gaps, a transient_filter signal above its threshold.
         # Each signal is smoothed by a centered boxcar, so that sporadic noise spikes on their own do not trip it.
         # Step 3 keeps the longest stretch around the gaps.
-        times = ds_input["time"].values
-        dt = float(np.median(np.diff(times)))
         transient_mask = xr.zeros_like(valid_mask)
         for signal, threshold in self.transient_filter.items():
             smoothed = _boxcar_mean(ds_input[signal], TRANSIENT_SMOOTHING_WINDOW, dt)
@@ -815,34 +853,59 @@ class DataWorkflow(ABC):
 
         if rejection_reason is not None:
             logger.warning(f"Shot {shot} rejected: {rejection_reason}")
-            plot_unprocessed_data(
-                ds_input,
-                self.rejected_shots_dir / f"{shot}.png",
-                title=f"Shot {shot} (REJECTED)",
-                valid_filter=self.valid_filter,
-                transient_filter=self.transient_filter,
-                end_margin_time=end_margin_time,
-                transient_spans=transient_spans,
+            self._plot_unprocessed(
+                ds_input, shot, end_margin_time, transient_spans, None
             )
             return None
+        # Plot the entire shot, with the kept segment shaded green
+        kept_spans = _mask_spans(kept_mask, times)
+        self._plot_unprocessed(
+            ds_input, shot, end_margin_time, transient_spans, kept_spans
+        )
+        return ds_filtered
+
+    def _plot_unprocessed(
+        self,
+        ds_input: xr.Dataset,
+        shot: int,
+        end_margin_time: float | None,
+        transient_spans: list[tuple[float, float]] | None,
+        kept_spans: list[tuple[float, float]] | None,
+    ):
+        """Plot one shot's unfiltered signals with the filter thresholds, see plot_unprocessed_data.
+
+        A shot without kept_spans was rejected and goes to rejected_shots_dir,
+        one with them to accepted_shots_dir.
+
+        Args:
+            ds_input: Dataset with standardized signal names for one shot.
+            shot: Shot number.
+            end_margin_time: Time of the end-of-shot cut [s], None when there is none.
+            transient_spans: (start, end) intervals cut out as transients.
+            kept_spans: (start, end) intervals kept, None for a rejected shot.
+        """
+        if kept_spans is None:
+            fig_path = self.rejected_shots_dir / f"{shot}.png"
+            title = f"Shot {shot} (REJECTED)"
+            window_spans = None
         else:
-            # Plot the entire shot, with the kept segment shaded green
-            kept_spans = _mask_spans(kept_mask, times)
+            fig_path = self.accepted_shots_dir / f"{shot}.png"
+            title = f"Shot {shot}"
             window_spans = (
                 None if self.shot_windows is None else self.shot_windows.get(int(shot))
             )
-            plot_unprocessed_data(
-                ds_input,
-                self.accepted_shots_dir / f"{shot}.png",
-                title=f"Shot {shot}",
-                valid_filter=self.valid_filter,
-                transient_filter=self.transient_filter,
-                end_margin_time=end_margin_time,
-                transient_spans=transient_spans,
-                kept_spans=kept_spans,
-                window_spans=window_spans,
-            )
-            return ds_filtered
+        plot_unprocessed_data(
+            ds_input,
+            fig_path,
+            title=title,
+            min_filter=self.min_filter,
+            max_filter=self.max_filter,
+            transient_filter=self.transient_filter,
+            end_margin_time=end_margin_time,
+            transient_spans=transient_spans,
+            kept_spans=kept_spans,
+            window_spans=window_spans,
+        )
 
     def shot_rejection_reason(self, ds: xr.Dataset) -> str | None:
         """Check one shot's kept times for broken records the filters let through.
@@ -850,13 +913,11 @@ class DataWorkflow(ABC):
         Runs on the filtered dataset in filter_and_plot,
         and again on the unprocessed file at the stack stage,
         so a file written before a check existed is judged by the code as it is now.
+        Every 0D signal is finite at the kept times (filter_and_plot), so no check needs to skip a NaN.
         The checks, in order:
-        1: A signal of DATASET_0D_SIGNALS that is NaN at every kept time.
-           The valid filter only NaN-checks the signals it lists.
-           A signal the dataset does not carry is skipped.
-        2: A mean power_radiated below min_radiated_fraction of the mean heating power.
-           Skipped when the shot has no power_radiated or no heating power.
-        3: Energy sanity.
+        1: A mean power_radiated below min_radiated_fraction of the mean heating power.
+           Skipped when the shot has no heating power.
+        2: Energy sanity.
            The energy_mhd rise from the first kept time to its peak
            may not exceed ENERGY_SANITY_LEEWAY times the heating energy put in over the same span.
            The input ignores every loss, so a larger rise means a missing or broken power record.
@@ -873,10 +934,6 @@ class DataWorkflow(ABC):
         """
         ds_shot = ds.squeeze(EPISODE_DIM, drop=True)
         times = np.asarray(ds_shot[TIME_COORD].values, dtype=float)
-
-        for name in DATASET_0D_SIGNALS:
-            if name in ds_shot and bool(ds_shot[name].isnull().all()):
-                return f"{name} is NaN at every kept time"
 
         power_heating = _heating_power(ds_shot).values
 
@@ -965,7 +1022,7 @@ class DataWorkflow(ABC):
         )
         has_line_average = np.isfinite(line_average)
         if not has_line_average.any():
-            return None
+            return "no finite n_e_line_average to compare the fitted n_e with"
         slice_times = np.asarray(
             ds_fit[TIME_COORD].squeeze(EPISODE_DIM, drop=True).values, dtype=float
         )
@@ -984,7 +1041,7 @@ class DataWorkflow(ABC):
         # Only the unfit rows a store kept on request are NaN, and they say nothing
         ratio_finite = ratio[np.isfinite(ratio)]
         if ratio_finite.size == 0:
-            return None
+            return "no fitted slice with an n_e_line_average to compare with"
         ratio_median = float(np.median(ratio_finite))
         ratio_low, ratio_high = self.density_ratio_bounds
         if not ratio_low <= ratio_median <= ratio_high:
@@ -2111,7 +2168,7 @@ class DataWorkflow(ABC):
                 if fit_mode == FIT_MODE_WINDOW_SAMPLE
                 else None
             )
-            slice_index, fresh_profile = _hold_onto_grid(
+            slice_index, fresh_profile = hold_onto_grid(
                 grid, slice_times, forward_fill, period
             )
             if not fresh_profile.any():
@@ -2290,7 +2347,8 @@ class DataWorkflow(ABC):
             "device_settings": to_json(self.settings),
             "filters": to_json(
                 {
-                    "valid_filter": self.valid_filter,
+                    "min_filter": self.min_filter,
+                    "max_filter": self.max_filter,
                     "transient_filter": self.transient_filter,
                     "transient_smoothing_window": TRANSIENT_SMOOTHING_WINDOW,
                     "end_margin": self.end_margin,
@@ -2389,8 +2447,24 @@ def _clip_powers(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+def _filter_inputs(ds: xr.Dataset) -> xr.Dataset:
+    """The signals min_filter and max_filter judge, with ip as its magnitude and the derived greenwald_fraction.
+
+    Args:
+        ds: One shot's dataset with standardized names.
+
+    Returns:
+        The dataset with ip replaced by |ip| and greenwald_fraction added.
+    """
+    ip_magnitude = abs(ds["ip"])
+    fraction = greenwald_fraction(
+        ip_magnitude, ds["minor_radius"], ds["n_e_line_average"]
+    )
+    return ds.assign(ip=ip_magnitude, greenwald_fraction=fraction)
+
+
 def _heating_power(ds: xr.Dataset) -> xr.DataArray:
-    """Sum a shot's heating power, power_ohm + power_nbi + power_ic + power_lh [W].
+    """Sum a shot's heating power, power_ohm + power_nbi + power_ic + power_lh + power_ec [W].
 
     Each is clipped at 0 and a NaN counts as 0, so a missing record reads as no heating.
 
@@ -2401,7 +2475,7 @@ def _heating_power(ds: xr.Dataset) -> xr.DataArray:
         The heating power on the dataset's times.
     """
     power_heating = xr.zeros_like(ds[TIME_COORD], dtype=float)
-    for name in ("power_ohm", "power_nbi", "power_ic", "power_lh"):
+    for name in ("power_ohm", "power_nbi", "power_ic", "power_lh", "power_ec"):
         if name in ds:
             power = ds[name].fillna(0.0).clip(min=0.0)
             power_heating = power_heating + power
@@ -2567,7 +2641,7 @@ def _trim_and_keep_longest(
     """
     keep = np.asarray(keep, dtype=bool)
     reconstruction_kept = np.flatnonzero(reconstruction_usable & keep)
-    held_index, _ = _hold_onto_grid(
+    held_index, _ = hold_onto_grid(
         times, times[reconstruction_kept], True, clock_period
     )
     has_held = held_index >= 0
@@ -2636,67 +2710,12 @@ def usable_slice_mask(ds_fit: xr.Dataset) -> np.ndarray:
     return ~unusable_any
 
 
-def _hold_onto_grid(
-    grid: np.ndarray,
-    sample_times: np.ndarray,
-    forward_fill: bool,
-    period: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Map every grid time onto the sample it takes its values from.
-
-    A grid time that carries a sample of its own takes that one. The rest
-    take the most recent earlier sample, held for at most MAX_HOLD_PERIODS
-    sampling periods so that nothing is carried across a long gap: the end
-    of the shot, a diagnostic dropping out, or a stretch the filtering cut
-    away. With forward_fill False nothing is held and only the grid times
-    that carry a sample of their own come out.
-
-    Args:
-        grid: The shot's 1 kHz timebase [s].
-        sample_times: Times of the samples to place on it [s], ascending.
-        forward_fill: Hold each sample forward until the next one.
-        period: The sampling period to hold for [s]. None takes the median
-            spacing of sample_times, which is right when they are every
-            sample there is, and wrong when they are a windowed subset.
-
-    Returns:
-        (sample_index, fresh): sample_index[i] is the index of the sample
-        that grid time i draws from, -1 where it draws from none, and
-        fresh[i] marks the grid times that carry a sample of their own.
-    """
-    sample_index = np.full(grid.size, -1, dtype=int)
-    fresh = np.zeros(grid.size, dtype=bool)
-    if sample_times.size == 0:
-        return sample_index, fresh
-
-    # Index of the last sample at or before each grid time
-    previous_sample = (
-        np.searchsorted(sample_times, grid + SAMPLE_TIME_TOL, side="right") - 1
-    )
-    has_previous = previous_sample >= 0
-    age = grid - sample_times[np.clip(previous_sample, 0, None)]
-    fresh = has_previous & (np.abs(age) <= SAMPLE_TIME_TOL)
-    if not forward_fill:
-        sample_index[fresh] = previous_sample[fresh]
-        return sample_index, fresh
-
-    # One sample on its own has no period to hold for,
-    # so it only fills the grid step it sits on
-    if period is None:
-        period = np.median(
-            np.diff(sample_times) if sample_times.size > 1 else np.diff(grid)
-        )
-    still_held = has_previous & (age <= MAX_HOLD_PERIODS * float(period))
-    sample_index[still_held] = previous_sample[still_held]
-    return sample_index, fresh
-
-
 def _hold_fits_onto_grid(ds_fit: xr.Dataset, slice_index: np.ndarray) -> xr.Dataset:
     """Place a shot's fit results on its 1 kHz grid.
 
     Args:
         ds_fit: The shot's fit results, one row per Thomson slice.
-        slice_index: Slice each grid time draws from, from _hold_onto_grid.
+        slice_index: Slice each grid time draws from, from hold_onto_grid.
 
     Returns:
         The fit results on the grid, NaN at the grid times that draw on no
@@ -2729,7 +2748,7 @@ def _sample_period(ds_unprocessed: xr.Dataset, grid: np.ndarray) -> float | None
 
     Returns:
         The period [s], or None when the file holds fewer than two samples
-        (the caller then falls back to _hold_onto_grid's own estimate).
+        (the caller then falls back to hold_onto_grid's own estimate).
     """
     if "ts_channel_t_e" not in ds_unprocessed or "ts_channel_n_e" not in ds_unprocessed:
         return None
@@ -2774,7 +2793,7 @@ def _place_windows_on_grid(
         shot: Shot number, for the log lines.
 
     Returns:
-        (sample_index, fresh) as _hold_onto_grid returns them: the fit row
+        (sample_index, fresh) as hold_onto_grid returns them: the fit row
         each grid time draws from, -1 for none, and the window centers.
     """
     sample_index = np.full(grid.size, -1, dtype=int)
@@ -2895,7 +2914,7 @@ def _hold_equilibrium(
     clock_period = reconstruction_clock_period(ds_unprocessed, grid)
     usable = usable_reconstructions(ds_unprocessed)
     reconstructed = np.flatnonzero(usable)
-    reconstruction_index, fresh = _hold_onto_grid(
+    reconstruction_index, fresh = hold_onto_grid(
         grid, grid[reconstructed], forward_fill, clock_period
     )
     # reconstruction_index counts reconstructions, the dataset is indexed by

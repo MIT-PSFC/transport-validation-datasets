@@ -4,21 +4,27 @@ import numpy as np
 import xarray as xr
 from disruption_py.core.physics_method.decorator import physics_method
 from disruption_py.core.physics_method.params import PhysicsMethodParams
-from disruption_py.core.utils.math import interp1
 from disruption_py.inout.mds import mdsExceptions
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import TimeSetting, TimeSettingParams
 
 from transport_validation_datasets.machine.generic import (
     cocos_from_signs,
+    held_signal_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
+    ohmic_power,
     orient_signal,
     snap_to_grid,
+    trailing_boxcar_mean,
 )
 
 # Seconds per unit of the units string an MDSplus time node reports.
 _TIME_UNIT_SCALE = {"s": 1.0, "ms": 1e-3, "us": 1e-6}
+
+# Width of the trailing boxcar the ohmic power is smoothed with [s].
+# Unsmoothed, the loop voltage and the dW_pol/dt difference make it noise-dominated at 1 kHz.
+OHMIC_POWER_SMOOTHING_WINDOW = 5e-3
 
 
 def _time_unit_scale(params, expression: str) -> float:
@@ -80,8 +86,8 @@ class UniformTimeSetting(TimeSetting):
         return make_uniform_1kHz_timebase(float(np.max(efit_time)) * scale)
 
 
-class CmodGeometryMethods:
-    """Geometry signals from the C-Mod aeqdsk that stock disruption-py skips."""
+class CmodAeqdskMethods:
+    """0D C-Mod aeqdsk signals read as the tree stores them, which stock disruption-py skips or rebuilds."""
 
     @staticmethod
     @physics_method(columns=["rout"], tokamak=Tokamak.CMOD)
@@ -108,8 +114,81 @@ class CmodGeometryMethods:
             rout = np.full(len(efit_time), np.nan)
 
         if not np.array_equal(params.times, efit_time):
-            rout = interp1(efit_time, rout, params.times)
+            rout = held_signal_on_grid(efit_time, rout, params.times)
         return {"rout": rout}
+
+    @staticmethod
+    @physics_method(columns=["betan"], tokamak=Tokamak.CMOD)
+    def get_normalized_beta(params: PhysicsMethodParams):
+        """Retrieve EFIT's own normalized beta, the node DIII-D, MAST and TCV store.
+
+        disruption-py rebuilds beta_n from betat, aout, btaxp and cpasma,
+        for the pre-2000 shots that have no betan node.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with betan on the requested timebase.
+        """
+        efit_time = efit_times_in_seconds(params, r"\efit_aeqdsk:time")
+        try:
+            betan = params.mds_conn.get_data(
+                r"\efit_aeqdsk:betan", tree_name="_efit_tree"
+            )
+        except mdsExceptions.MdsException as e:
+            params.logger.warning(repr(e))
+            params.logger.opt(exception=True).debug(e)
+            betan = np.full(len(efit_time), np.nan)
+
+        if not np.array_equal(params.times, efit_time):
+            betan = held_signal_on_grid(efit_time, betan, params.times)
+        return {"betan": betan}
+
+
+class CmodPowerMethods:
+    """C-Mod power retrievals that replace stock disruption-py ones."""
+
+    @staticmethod
+    @physics_method(columns=["p_ohm"], tokamak=Tokamak.CMOD)
+    def get_ohmic_power(params: PhysicsMethodParams):
+        r"""Compute the ohmic power Ip V_loop - dW_pol/dt causally (generic.ohmic_power) on the requested timebase.
+
+        V_loop is the flux loop voltage \top.mflux:v0 of the ANALYSIS tree and Ip the magnetics \ip.
+        li and the magnetic axis radius come from the EFIT tree.
+        Every input is held forward from its last sample (held_signal_on_grid), never interpolated,
+        and the result is smoothed by a trailing OHMIC_POWER_SMOOTHING_WINDOW boxcar,
+        so no grid time draws on a later sample.
+        disruption-py's get_ohmic_parameters subtracts L_i dIp/dt instead of dW_pol/dt,
+        which drops the change of li and R that DIII-D EFIT poh and MAST ESM pphix include.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with p_ohm [W] on the requested timebase.
+        """
+        v_loop, v_loop_time = params.mds_conn.get_data_with_dims(
+            r"\top.mflux:v0", tree_name="analysis"
+        )
+        ip, ip_time = params.mds_conn.get_data_with_dims(r"\ip", tree_name="magnetics")
+        efit_time = efit_times_in_seconds(params, r"\efit_aeqdsk:time")
+        li = params.mds_conn.get_data(r"\efit_aeqdsk:ali", tree_name="_efit_tree")
+        r_axis = params.mds_conn.get_data(
+            r"\efit_aeqdsk:rmagx/100", tree_name="_efit_tree"
+        )
+
+        times = params.times
+        v_loop_on_grid = held_signal_on_grid(v_loop_time, v_loop, times)
+        ip_on_grid = held_signal_on_grid(ip_time, ip, times)
+        li_on_grid = held_signal_on_grid(efit_time, li, times)
+        r_axis_on_grid = held_signal_on_grid(efit_time, r_axis, times)
+        p_ohm_raw = ohmic_power(
+            times, ip_on_grid, v_loop_on_grid, li_on_grid, r_axis_on_grid
+        )
+        dt = float(np.median(np.diff(times)))
+        p_ohm = trailing_boxcar_mean(p_ohm_raw, OHMIC_POWER_SMOOTHING_WINDOW, dt)
+        return {"p_ohm": p_ohm}
 
 
 class CmodEfitMethods:
