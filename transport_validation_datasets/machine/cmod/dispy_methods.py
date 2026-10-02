@@ -294,7 +294,7 @@ class CmodPowerMethods:
         r"""Compute the ohmic power Ip V_loop - dW_pol/dt causally (generic.ohmic_power) on the requested timebase.
 
         V_loop is the flux loop voltage \top.mflux:v0 of the ANALYSIS tree and Ip the magnetics \ip.
-        li and the magnetic axis radius come from the EFIT tree.
+        li and the geometric major radius rout come from the EFIT tree.
         Every input is placed causally (signal_on_grid), never interpolated:
         V_loop and Ip are averaged over each grid step, and li and R are held from the last reconstruction.
         The result is smoothed by a trailing OHMIC_POWER_SMOOTHING_WINDOW boxcar,
@@ -314,17 +314,17 @@ class CmodPowerMethods:
         ip, ip_time = params.mds_conn.get_data_with_dims(r"\ip", tree_name="magnetics")
         efit_time = efit_times_in_seconds(params, r"\efit_aeqdsk:time")
         li = params.mds_conn.get_data(r"\efit_aeqdsk:ali", tree_name="_efit_tree")
-        r_axis = params.mds_conn.get_data(
-            r"\efit_aeqdsk:rmagx/100", tree_name="_efit_tree"
+        major_radius = params.mds_conn.get_data(
+            r"\efit_aeqdsk:rout/100", tree_name="_efit_tree"
         )
 
         times = params.times
         v_loop_on_grid = signal_on_grid(v_loop_time, v_loop, times)
         ip_on_grid = signal_on_grid(ip_time, ip, times)
         li_on_grid = signal_on_grid(efit_time, li, times)
-        r_axis_on_grid = signal_on_grid(efit_time, r_axis, times)
+        major_radius_on_grid = signal_on_grid(efit_time, major_radius, times)
         p_ohm_raw = ohmic_power(
-            times, ip_on_grid, v_loop_on_grid, li_on_grid, r_axis_on_grid
+            times, ip_on_grid, v_loop_on_grid, li_on_grid, major_radius_on_grid
         )
         dt = float(np.median(np.diff(times)))
         p_ohm = trailing_boxcar_mean(p_ohm_raw, OHMIC_POWER_SMOOTHING_WINDOW, dt)

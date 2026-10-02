@@ -90,7 +90,8 @@ Smoothing is a trailing boxcar, and derivatives are backward differences.
 b0 is the vacuum field at geometric_axis_r on both devices.
 power_ohm is Ip V_loop - dW_pol/dt on both devices.
 MAST reads it from ESM (`pphix`), C-Mod computes it (`CmodPowerMethods.get_ohmic_power`)
-from the flux loop voltage and W_pol = mu0 R li Ip^2 / 4, smoothed by a trailing 5 ms boxcar.
+from the flux loop voltage and W_pol = mu0 R0 li Ip^2 / 4, R0 the geometric major radius (EFIT `rout`),
+smoothed by a trailing 5 ms boxcar.
 
 The C-Mod 0D signals outside EFIT are read by custom methods (`CmodPlasmaMethods`, `CmodPowerMethods`),
 since the disruption-py built-ins interpolate.

@@ -73,7 +73,7 @@ SIGNAL_ATTRS = {
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
-            "mu0 R li Ip^2 / 4, causal (backward difference, trailing 5 ms boxcar), clipped at 0"
+            "mu0 R0 li Ip^2 / 4 with R0 the EFIT rout, causal (backward difference, trailing 5 ms boxcar), clipped at 0"
         ),
         "units": "W",
         "ref": "/summary/global_quantities/power_ohm/value",
