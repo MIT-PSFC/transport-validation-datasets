@@ -198,7 +198,7 @@ MAX_HOLD_PERIODS = 1.5
 # Shortest an equilibrium reconstruction is held, whatever its clock [s].
 # Bridges the dropouts of single reconstructions (a 1 kHz EFIT failing a few slices,
 # one missing 5 ms MAST reconstruction) that would otherwise cut every equilibrium signal.
-# fresh_equilibrium still marks only the grid times a reconstruction lands on.
+# fresh_equilibrium still marks only the grid times a usable reconstruction lands on.
 EQUILIBRIUM_HOLD_FLOOR = 10e-3
 
 # How far a TS slice may sit from the reconstruction it maps through,

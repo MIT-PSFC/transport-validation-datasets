@@ -219,7 +219,8 @@ class CModDataWorkflow(DataWorkflow):
         so grid times between their real samples hold NaN.
         The EFIT 0D signals (stored energy, shaping) are held forward from each reconstruction,
         for at least EQUILIBRIUM_HOLD_FLOOR (see _get_efit0d_dataset).
-        fresh_equilibrium in the stores marks the grid times a reconstruction landed on.
+        fresh_equilibrium in the stores marks the grid times a usable reconstruction landed on (usable_reconstructions),
+        while the EFIT 0D signals take every reconstruction.
 
         All four open the EFIT tree, at least for their timebase,
         so a shot reads everything from one tree.

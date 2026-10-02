@@ -299,13 +299,9 @@ class MASTDataWorkflow(DataWorkflow):
         # and 1e19 would cut 6 percent of the kept time where Thomson agrees with the interferometer.
         "n_e_line_average": 3e18,
     }
-    max_filter = {
-        "greenwald_fraction": 2.0,
-        # Sample validity, distinct from the transient gate below:
-        # MAST total input power tops out near 5 MW, so a recorded radiated power above 4 MW is not a valid measurement.
-        # No minimum, the bolometer noise dips below 0 for 1-5 ms (median -0.25 MW) and _clip_powers writes them as 0.
-        "power_radiated": 4e6,
-    }
+    # No power_radiated minimum or maximum.
+    # The smoothed bolometer record can dip below 0, and clip_powers writes those times as 0 after filtering.
+    max_filter = {"greenwald_fraction": 2.0}
     # Both thresholds are empirical, and both gate the radiative or ohmic collapse
     # rather than normal operation: the closest ordinary approach found while porting these was shot 29153,
     # whose ohmic power peaks at 3.9 MW right before the end of the shot.
