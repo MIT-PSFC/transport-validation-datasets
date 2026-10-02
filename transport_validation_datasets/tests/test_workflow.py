@@ -11,6 +11,7 @@ import xarray as xr
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_validation_datasets.gp_fitting.batch_io import STATUS_CULLED, STATUS_OK
 from transport_validation_datasets.machine.generic import (
+    EQUILIBRIUM_HOLD_FLOOR,
     MAX_HOLD_PERIODS,
     hold_onto_grid,
     keep_longest_segment,
@@ -270,20 +271,21 @@ class TestHoldEquilibrium:
             np.flatnonzero(np.isfinite(simagx)), np.flatnonzero(fresh)
         )
 
-    def test_unusable_reconstruction_held_over_for_the_clock_period(self):
-        # A 5 ms clock with no qpsi at 7 ms,
-        # so the 2 ms reconstruction holds for 1.5 clock periods, to 9.5 ms,
-        # not for 1.5 of the 10 ms the usable ones are apart
-        grid = grid_ms(20)
-        ds = unprocessed_with_equilibrium(grid, [2, 7, 12], nan_qpsi=(7,))
+    def test_unusable_reconstructions_bridged_up_to_the_hold_floor(self):
+        # A 5 ms clock with no qpsi at 7 and 12 ms.
+        # 1.5 clock periods are 7.5 ms, so EQUILIBRIUM_HOLD_FLOOR sets the hold,
+        # not 1.5 of the 20 ms the usable ones are apart
+        grid = grid_ms(30)
+        ds = unprocessed_with_equilibrium(grid, [2, 7, 12, 22], nan_qpsi=(7, 12))
+        last_held = 2 + round(1e3 * EQUILIBRIUM_HOLD_FLOOR)
 
         held, fresh = _hold_equilibrium(ds, grid, True)
 
         simagx = held["simagx"].squeeze(EPISODE_DIM, drop=True).values
-        assert np.flatnonzero(fresh).tolist() == [2, 12]
-        assert (simagx[2:10] == 1.0).all()
-        assert np.isnan(simagx[10:12]).all()
-        assert (simagx[12:] == 3.0).all()
+        assert np.flatnonzero(fresh).tolist() == [2, 22]
+        assert (simagx[2 : last_held + 1] == 1.0).all()
+        assert np.isnan(simagx[last_held + 1 : 22]).all()
+        assert (simagx[22:] == 4.0).all()
 
     def test_device_without_equilibrium_passes_signals_through(self):
         grid = grid_ms(20)

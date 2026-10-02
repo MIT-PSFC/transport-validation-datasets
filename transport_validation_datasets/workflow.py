@@ -53,6 +53,7 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
     plan_batches,
 )
 from transport_validation_datasets.machine.generic import (
+    EQUILIBRIUM_HOLD_FLOOR,
     MAX_HOLD_PERIODS,
     SOL_EXTENSIONS,
     hold_onto_grid,
@@ -2337,6 +2338,7 @@ class DataWorkflow(ABC):
                     "scale_per_slice": self.fit_scale_per_slice,
                     "bounds": self.fit_bounds,
                     "max_hold_periods": MAX_HOLD_PERIODS,
+                    "equilibrium_hold_floor": EQUILIBRIUM_HOLD_FLOOR,
                 }
             ),
         }
@@ -2455,7 +2457,8 @@ def _trim_and_keep_longest(
     """Start each kept segment where one of its own reconstructions reaches, and keep only the longest.
 
     A grid time has an equilibrium in the store when a kept usable reconstruction
-    at or before it is within MAX_HOLD_PERIODS of the clock period (_hold_equilibrium).
+    at or before it is within the hold of _hold_equilibrium
+    (MAX_HOLD_PERIODS of the clock period, at least EQUILIBRIUM_HOLD_FLOOR).
     Only the segment kept here reaches the store, so only its own reconstructions are kept,
     and a reconstruction in an earlier segment never starts a later one.
     _trim_segment_starts cuts each segment's leading grid times that none of its own reconstructions reaches,
@@ -2476,7 +2479,11 @@ def _trim_and_keep_longest(
     keep = np.asarray(keep, dtype=bool)
     reconstruction_kept = np.flatnonzero(reconstruction_usable & keep)
     held_index, _ = hold_onto_grid(
-        times, times[reconstruction_kept], True, clock_period
+        times,
+        times[reconstruction_kept],
+        True,
+        clock_period,
+        hold_floor=EQUILIBRIUM_HOLD_FLOOR,
     )
     has_held = held_index >= 0
     # Grid index of the reconstruction each grid time holds, and of the start of the run it sits in
@@ -2726,8 +2733,10 @@ def _hold_equilibrium(
     the grid on some devices (MAST reconstructs every 5 ms, C-Mod every
     millisecond). The grid times a reconstruction landed on are the ones
     with a finite simagx, the rest hold the last one.
+    Each is held for up to MAX_HOLD_PERIODS of the clock, or EQUILIBRIUM_HOLD_FLOOR when that is longer,
+    so a few missing reconstructions are bridged.
     An unusable reconstruction (usable_reconstructions) is treated as missing,
-    so the previous one holds over it for up to MAX_HOLD_PERIODS of the clock and it is not fresh.
+    so the previous one holds over it and it is not fresh.
 
     Args:
         ds_unprocessed: The shot's unprocessed dataset, on the grid, with
@@ -2749,7 +2758,11 @@ def _hold_equilibrium(
     usable = usable_reconstructions(ds_unprocessed)
     reconstructed = np.flatnonzero(usable)
     reconstruction_index, fresh = hold_onto_grid(
-        grid, grid[reconstructed], forward_fill, clock_period
+        grid,
+        grid[reconstructed],
+        forward_fill,
+        clock_period,
+        hold_floor=EQUILIBRIUM_HOLD_FLOOR,
     )
     # reconstruction_index counts reconstructions, the dataset is indexed by
     # grid time, so index the grid times the reconstructions landed on

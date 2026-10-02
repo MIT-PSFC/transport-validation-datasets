@@ -9,6 +9,7 @@ from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import TimeSetting, TimeSettingParams
 
 from transport_validation_datasets.machine.generic import (
+    EQUILIBRIUM_HOLD_FLOOR,
     cocos_from_signs,
     injected_power_on_grid,
     make_geqdsk_dataset,
@@ -122,7 +123,7 @@ class CmodAeqdskMethods:
             rout = np.full(len(efit_time), np.nan)
 
         if not np.array_equal(params.times, efit_time):
-            rout = signal_on_grid(efit_time, rout, params.times)
+            rout = signal_on_grid(efit_time, rout, params.times, EQUILIBRIUM_HOLD_FLOOR)
         return {"rout": rout}
 
     @staticmethod
@@ -150,7 +151,9 @@ class CmodAeqdskMethods:
             betan = np.full(len(efit_time), np.nan)
 
         if not np.array_equal(params.times, efit_time):
-            betan = signal_on_grid(efit_time, betan, params.times)
+            betan = signal_on_grid(
+                efit_time, betan, params.times, EQUILIBRIUM_HOLD_FLOOR
+            )
         return {"betan": betan}
 
 
@@ -289,7 +292,8 @@ class CmodPowerMethods:
         V_loop is the flux loop voltage \top.mflux:v0 of the ANALYSIS tree and Ip the magnetics \ip.
         li and the geometric major radius rout come from the EFIT tree.
         Every input is placed causally (signal_on_grid), never interpolated:
-        V_loop and Ip are averaged over each grid step, and li and R are held from the last reconstruction.
+        V_loop and Ip are averaged over each grid step,
+        and li and R are held from the last reconstruction, for at least EQUILIBRIUM_HOLD_FLOOR.
         The result is smoothed by a trailing OHMIC_POWER_SMOOTHING_WINDOW boxcar,
         so no grid time draws on a later sample.
         disruption-py's get_ohmic_parameters subtracts L_i dIp/dt instead of dW_pol/dt,
@@ -314,8 +318,10 @@ class CmodPowerMethods:
         times = params.times
         v_loop_on_grid = signal_on_grid(v_loop_time, v_loop, times)
         ip_on_grid = signal_on_grid(ip_time, ip, times)
-        li_on_grid = signal_on_grid(efit_time, li, times)
-        major_radius_on_grid = signal_on_grid(efit_time, major_radius, times)
+        li_on_grid = signal_on_grid(efit_time, li, times, EQUILIBRIUM_HOLD_FLOOR)
+        major_radius_on_grid = signal_on_grid(
+            efit_time, major_radius, times, EQUILIBRIUM_HOLD_FLOOR
+        )
         p_ohm_raw = ohmic_power(
             times, ip_on_grid, v_loop_on_grid, li_on_grid, major_radius_on_grid
         )

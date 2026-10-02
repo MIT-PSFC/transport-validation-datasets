@@ -61,7 +61,9 @@ clock, both far slower than 1 kHz, so both are held forward over the grid times
 that follow them and `fresh_profile` / `fresh_equilibrium` mark the grid times
 that carry a sample of their own. A sample is held for at most
 `MAX_HOLD_PERIODS` of its own sampling period, so nothing is carried across the
-end of the shot or a diagnostic dropping out. By default the slices
+end of the shot or a diagnostic dropping out.
+An equilibrium reconstruction, and every 0D signal taken from one, is held for at least `EQUILIBRIUM_HOLD_FLOOR` (10 ms),
+so a few missing reconstructions do not cut the shot. By default the slices
 the stack stage screens out (see [Filtering](#filtering)) are ignored, as though the
 shot had no Thomson sample there.
 
@@ -86,7 +88,8 @@ The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since so
 Every stored value is causal: no grid time draws on a later sample.
 A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, grid time t taking the mean of (t - 1 ms, t].
-One sampled slower is held forward from its last finite sample for at most `MAX_HOLD_PERIODS` of its own sampling period.
+One sampled slower is held forward from its last finite sample for at most `MAX_HOLD_PERIODS` of its own sampling period,
+or `EQUILIBRIUM_HOLD_FLOOR` (10 ms) when it comes from the equilibrium reconstruction and that is longer.
 Smoothing is a trailing boxcar, and derivatives are backward differences.
 b0 is the vacuum toroidal field at the fixed major radius r0, as IMAS defines it,
 the magnetics btor at 0.66 m on C-Mod and the EFIT bvac_val at bvac_r (1.0 m) on MAST.
@@ -143,7 +146,7 @@ Every check from 2 to 4 cuts the grid times it fails out as a gap (`slice_filter
    The unprocessed plots shade the transients red.
 5. The leading grid times of each segment are cut up to its first sample
    that a usable reconstruction (`usable_reconstructions`) of the same segment reaches
-   within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock), since the store would have no equilibrium before it.
+   within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock, at least `EQUILIBRIUM_HOLD_FLOOR`), since the store would have no equilibrium before it.
    This is mostly the early parts of a shot, before its first usable reconstruction.
 6. Only the longest segment is kept, shaded green in the accepted-shot plots.
    Only the kept segment's reconstructions reach the store,
@@ -211,10 +214,12 @@ indicating a large change in the Thomson density calibration.
   The transient filter needs P_rad above 3 MW after smoothing.
 - **MAST EFIT vertical glitches.** Single reconstructions jump zmagx and zbdry by 5-10 cm and come back at the next one,
   e.g. 24623 at 0.29-0.33 s (though this is minor, 39 reconstructions in 26 shots out of ~1000 total shots).
-- **Equilibrium gaps.** A hold of `MAX_HOLD_PERIODS` cannot bridge a missing reconstruction.
-  Around one unusable MAST reconstruction the previous one covers 3 ms and the next 2 ms carry no equilibrium.
+- **Equilibrium gaps.** The 10 ms hold floor bridges a missing reconstruction on either device,
+  but not two in a row on MAST (a 15 ms step), which still cuts every equilibrium signal.
+  A Thomson slice inside a bridged gap maps through no reconstruction (it reaches only `EQ_MATCH_MAX_PERIODS`),
+  so the profile before it is held there.
 - **MAST `power_ohm` gaps.** Some converged reconstructions have no `pphix` (up to 25 ms at flat-top in 24891).
-  The hold does not bridge them, so those grid times are cut out as gaps.
+  The hold bridges up to 10 ms of them, and longer ones are cut out as gaps.
 - **MAST `power_ohm` causality is not verified.** ESM computes dW_pol/dt itself, and whether it is a backward difference is not documented.
 - **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
   It is an artifact of the EFIT basis functions.
