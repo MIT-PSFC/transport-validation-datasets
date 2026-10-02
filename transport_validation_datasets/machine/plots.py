@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
+from transport_validation_datasets.machine.generic import greenwald_density
 from transport_validation_datasets.windows import window_membership
 
 BACKGROUND_COLOR = "#2F2F2F"
@@ -188,10 +189,8 @@ def plot_unprocessed_data(
         )
         ne_signals.append(ne20)
         if "greenwald_fraction" in max_filter and "minor_radius" in ds:
-            # n_GW = Ip / (pi a^2) in 1e20 m^-3, MA and m
-            ip_magnitude_ma = abs(ds["ip"]) / 1e6
-            n_greenwald20 = ip_magnitude_ma / (np.pi * ds["minor_radius"] ** 2)
-            ne20_max = max_filter["greenwald_fraction"] * n_greenwald20
+            n_greenwald = greenwald_density(ds["ip"], ds["minor_radius"])
+            ne20_max = max_filter["greenwald_fraction"] * n_greenwald / 1e20
             ax_ne.plot(time, ne20_max, color="white", linestyle="--", linewidth=1)
     ax_ne.set_ylabel("n_e [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_ne.set_ylim(_signal_ylim(ne_signals))

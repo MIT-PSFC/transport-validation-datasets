@@ -76,6 +76,7 @@ from transport_validation_datasets.provenance import (
     build_provenance,
     build_stamp,
     merge_shot_attrs,
+    pull_provenance,
     source_provenance,
     to_json,
 )
@@ -706,7 +707,9 @@ class DataWorkflow(ABC):
         """Read a batch of shots, then filter and write them.
 
         A shot with a pull in source_data_dir is loaded from it,
-        the rest are read from the source and their pulls kept there.
+        the rest are read from the source and their pulls kept there,
+        stamped with the code that read them (pull_provenance).
+        A shot that is written loses any failure note an earlier run left for it.
 
         Args:
             shots: Shot numbers to read.
@@ -751,7 +754,10 @@ class DataWorkflow(ABC):
                 ds_standardized = datasets_by_shot[shot]
                 if ds_standardized is None:
                     continue
-                ds_standardized.attrs = source_provenance(ds_standardized.attrs)
+                ds_standardized.attrs = {
+                    **source_provenance(ds_standardized.attrs),
+                    **pull_provenance(),
+                }
                 self.source_data_dir.mkdir(parents=True, exist_ok=True)
                 ds_standardized.to_netcdf(source_pull_paths[shot])
             else:
@@ -765,13 +771,15 @@ class DataWorkflow(ABC):
                 self.record_failed_shot(shot, self.filter_rejection_note())
                 continue
             ds_unprocessed = clip_powers(ds_unprocessed)
-            # What pulled the shot and what this package was when it did.
+            # What pulled the shot, the code that read it (pull_*), and what this package is now.
             # The source's own stamp is rewritten, see provenance.SOURCE_ATTR_KEYS.
             ds_unprocessed.attrs = {
                 **source_provenance(ds_unprocessed.attrs),
                 **build_provenance(),
             }
             ds_unprocessed.to_netcdf(self.unprocessed_data_dir / f"{shot}.nc")
+            # A note from a run whose filters rejected the shot would miscount the rejections
+            (self.failed_shots_dir / f"{shot}.txt").unlink(missing_ok=True)
             logger.info(f"Created unprocessed data file for shot {shot}.")
             n_written += 1
         return n_written

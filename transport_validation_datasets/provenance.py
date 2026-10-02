@@ -43,6 +43,9 @@ DEPENDENCIES = ("disruption-py", "mkgp")
 # exist. user and host are dropped.
 SOURCE_ATTR_KEYS = ("package", "version", "commit", "source", "time", "user", "host")
 
+# Prefix of the build_provenance a source pull is stamped with (pull_provenance)
+PULL_PREFIX = "pull_"
+
 # Per-shot source attributes that differ between shots by nature and stay
 # out of the stacked store.
 SOURCE_VOLATILE_KEYS = ("source_retrieval_time",)
@@ -181,6 +184,20 @@ def build_provenance() -> dict[str, str]:
     }
     attrs["dependency_versions"] = to_json(versions)
     return attrs
+
+
+def pull_provenance() -> dict[str, str]:
+    """build_provenance under PULL_PREFIX, stamped on a source pull when it is read.
+
+    A kept pull is filtered again by later code,
+    so the unprocessed file and the store carry both stamps:
+    the pull_* keys name the code that read the shot, the plain keys the code that filtered it.
+
+    Returns:
+        Every build_provenance key with PULL_PREFIX in front.
+    """
+    attrs = build_provenance()
+    return {f"{PULL_PREFIX}{key}": value for key, value in attrs.items()}
 
 
 def build_stamp() -> dict[str, str]:

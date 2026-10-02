@@ -142,7 +142,7 @@ class CModDataWorkflow(DataWorkflow):
     shot_blacklist = []
     # Shots radiate a median 25 percent of their heating power (it11 store).
     # The lowest live bolometer record, 1160928005, sits at 1.9 percent.
-    # The two shots with no record at all are caught by the all-NaN check.
+    # The two shots with no record at all are caught by the all-finite check of slice_filter_mask.
     min_radiated_fraction = 0.01
     # More radiated than put in. The highest in a 40-shot sample is 0.87.
     max_radiated_fraction = 1.0

@@ -185,10 +185,14 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
 
 The standardized source pull of every shot is kept unfiltered in `01_unprocessed/source/`.
 A rerun filters from it without touching the source.
+Each pull is stamped with the code that read it (`pull_*` attributes, `pull_provenance`),
+which the unprocessed file and the store carry, and the store lists the commits when its shots disagree.
+A rerun does not check them, so delete `01_unprocessed/source/` after a change to a device read.
 A rejection's note in `01_unprocessed/failed_shots/` records the filter settings that made it,
 so a rerun skips a shot the same settings rejected and filters it again when they change.
 Deleting the unprocessed files (`01_unprocessed/*.nc`) reruns a filter change on the shots that passed.
 A change to the filter code alone needs the notes deleted too.
+A shot that is accepted loses its note, so the notes count only the current rejections.
 
 Fit stage: the Thomson channels map through the nearest usable reconstruction in reach,
 the Thomson screens in `cleaning.py` run on every sample before fitting,
