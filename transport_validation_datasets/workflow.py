@@ -332,6 +332,8 @@ class DataWorkflow(ABC):
     # Floor on a shot's mean power_radiated over its kept times, as a fraction of its mean heating power, 0 for none.
     # A dead bolometer reading ~0 W passes the valid filter but breaks every power balance.
     min_radiated_fraction = 0.0
+    # Ceiling on the same fraction, inf for none. Above 1 more is radiated than put in.
+    max_radiated_fraction = np.inf
 
     # Shots numbered below this are left out like blacklisted ones, 0 for none.
     first_shot = 0
@@ -544,6 +546,7 @@ class DataWorkflow(ABC):
             "end_margin": self.end_margin,
             "min_pulse_length": self.min_pulse_length,
             "min_radiated_fraction": self.min_radiated_fraction,
+            "max_radiated_fraction": self.max_radiated_fraction,
             "energy_sanity_leeway": ENERGY_SANITY_LEEWAY,
         }
 
@@ -936,7 +939,7 @@ class DataWorkflow(ABC):
         and again on the unprocessed file at the stack stage,
         so a file written before a check existed is judged by the code as it is now.
         The checks, in order, are the shared ones of filters.py:
-        a dead bolometer (radiated_fraction_reason, against min_radiated_fraction),
+        a dead bolometer or more radiated than put in (radiated_fraction_reason, against min_ and max_radiated_fraction),
         then a stored-energy rise the input power cannot explain (energy_sanity_reason).
         Both clip the powers themselves, so the clipped unprocessed file reaches the same verdict.
 
@@ -947,7 +950,9 @@ class DataWorkflow(ABC):
             Why the shot is rejected, or None if it passes.
         """
         ds_shot = ds.squeeze(EPISODE_DIM, drop=True)
-        radiated_reason = radiated_fraction_reason(ds_shot, self.min_radiated_fraction)
+        radiated_reason = radiated_fraction_reason(
+            ds_shot, self.min_radiated_fraction, self.max_radiated_fraction
+        )
         if radiated_reason is not None:
             return radiated_reason
         return energy_sanity_reason(ds_shot)
