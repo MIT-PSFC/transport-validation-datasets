@@ -13,12 +13,12 @@ from transport_validation_datasets.gp_fitting.batch_io import STATUS_CULLED, STA
 from transport_validation_datasets.machine.generic import (
     MAX_HOLD_PERIODS,
     hold_onto_grid,
+    keep_longest_segment,
 )
 from transport_validation_datasets.workflow import (
     _hold_equilibrium,
     _trim_and_keep_longest,
     _trim_segment_starts,
-    keep_longest_segment,
     usable_slice_mask,
 )
 

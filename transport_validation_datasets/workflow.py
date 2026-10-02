@@ -51,6 +51,9 @@ from transport_validation_datasets.machine.generic import (
     end_of_shot_index,
     greenwald_fraction,
     hold_onto_grid,
+    keep_longest_segment,
+    kept_segments,
+    kept_span,
     reconstruction_clock_period,
     standardize_signal_attrs,
     usable_reconstructions,
@@ -2552,51 +2555,6 @@ def _boxcar_mean(signal: xr.DataArray, window: float, dt: float) -> xr.DataArray
     return signal.rolling(time=n_samples, center=True, min_periods=1).mean()
 
 
-def keep_longest_segment(
-    keep: np.ndarray, times: np.ndarray
-) -> tuple[np.ndarray, list[float]]:
-    """Clear every run of kept samples but the longest.
-
-    A run is measured from its first to its last sample, the same way kept_span measures the one left,
-    so a run of n samples on the 1 kHz grid is n - 1 milliseconds long.
-    The earliest of equally long runs is kept.
-
-    Args:
-        keep: Mask over times, True where the sample survived the filters. Not modified.
-        times: The shot's timebase [s].
-
-    Returns:
-        The mask with only the longest run left, and the lengths [s] of the runs cleared.
-    """
-    keep = np.asarray(keep, dtype=bool)
-    keep_longest = np.zeros(keep.size, dtype=bool)
-    starts, ends = _kept_segments(keep)
-    if starts.size == 0:
-        return keep_longest, []
-    run_lengths = times[ends - 1] - times[starts]
-    longest = int(np.argmax(run_lengths))
-    keep_longest[starts[longest] : ends[longest]] = True
-    dropped_lengths = np.delete(run_lengths, longest)
-    return keep_longest, dropped_lengths.tolist()
-
-
-def kept_span(keep: np.ndarray, times: np.ndarray) -> float:
-    """Time from the first to the last kept sample, for the min_pulse_length gate.
-
-    Args:
-        keep: Mask over times, True where the sample survived the filters.
-        times: The shot's timebase [s].
-
-    Returns:
-        The span [s], 0 when fewer than two samples are kept.
-    """
-    keep = np.asarray(keep, dtype=bool)
-    kept_times = times[keep]
-    if kept_times.size < 2:
-        return 0.0
-    return float(kept_times[-1] - kept_times[0])
-
-
 def _mask_spans(mask: np.ndarray, times: np.ndarray) -> list[tuple[float, float]]:
     """List the runs of a mask as time spans, for the plots.
 
@@ -2607,25 +2565,10 @@ def _mask_spans(mask: np.ndarray, times: np.ndarray) -> list[tuple[float, float]
     Returns:
         (first, last) time [s] of each run of True samples.
     """
-    starts, ends = _kept_segments(mask)
+    starts, ends = kept_segments(mask)
     return [
         (float(times[start]), float(times[end - 1])) for start, end in zip(starts, ends)
     ]
-
-
-def _kept_segments(keep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Find the runs of kept samples.
-
-    Args:
-        keep: Mask over the uniform 1 kHz grid.
-
-    Returns:
-        (starts, ends): the index of each run's first sample and one past its last.
-    """
-    # Pad with False on both sides so a run touching either end still has an edge
-    keep_padded = np.concatenate(([False], keep, [False]))
-    edges = np.diff(keep_padded.astype(np.int8))
-    return np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
 
 
 def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
@@ -2656,7 +2599,7 @@ def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
         A copy of keep with every run starting on a sample of can_start.
     """
     keep = np.asarray(keep, dtype=bool).copy()
-    starts, ends = _kept_segments(keep)
+    starts, ends = kept_segments(keep)
     for start, end in zip(starts, ends):
         startable = np.flatnonzero(can_start[start:end])
         first_startable = startable[0] if startable.size else end - start
@@ -2700,7 +2643,7 @@ def _trim_and_keep_longest(
     # Grid index of the reconstruction each grid time holds, and of the start of the run it sits in
     held_row = np.full(keep.size, -1)
     held_row[has_held] = reconstruction_kept[held_index[has_held]]
-    starts, _ = _kept_segments(keep)
+    starts, _ = kept_segments(keep)
     is_start = np.zeros(keep.size, dtype=bool)
     is_start[starts] = True
     index_if_start = np.where(is_start, np.arange(keep.size), -1)

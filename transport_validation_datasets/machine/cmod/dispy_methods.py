@@ -10,6 +10,7 @@ from disruption_py.settings import TimeSetting, TimeSettingParams
 
 from transport_validation_datasets.machine.generic import (
     cocos_from_signs,
+    injected_power_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     ohmic_power,
@@ -154,10 +155,9 @@ class CmodAeqdskMethods:
 
 
 def _injected_power(params, node: str, tree_name: str) -> np.ndarray:
-    """An injected heating power record placed on the timebase (signal_on_grid), in the record's units.
+    """An injected heating power record on the timebase (injected_power_on_grid), in the record's units.
 
-    0 outside the record and when the shot has none (that heating system did not run).
-    Mirrors POPSIM's DIII-D _injected_power.
+    0 when the shot has none (that heating system did not run).
 
     Args:
         params: disruption-py physics method parameters for the shot.
@@ -174,14 +174,7 @@ def _injected_power(params, node: str, tree_name: str) -> np.ndarray:
     except mdsExceptions.MdsException:
         params.logger.debug("no {node} record, taking 0", node=node)
         return np.zeros(len(params.times))
-    if power_time.size < 2:
-        return np.zeros(len(params.times))
-    power_on_grid = signal_on_grid(power_time, power, params.times)
-    mask_outside_record = (params.times < power_time[0]) | (
-        params.times > power_time[-1]
-    )
-    power_on_grid[mask_outside_record] = 0.0
-    return power_on_grid
+    return injected_power_on_grid(power_time, power, params.times)
 
 
 class CmodPlasmaMethods:

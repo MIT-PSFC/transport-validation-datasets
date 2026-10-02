@@ -48,8 +48,6 @@ def phi_n_closed_form(psi_n):
     return (Q0 * psi_n + (Q1 - Q0) * psi_n**2 / 2.0) / Q_TOTAL
 
 
-# The phi_n_map cases below are kept identical to POPSIM-Transport-Predictor's
-# tests/datasets/test_rho_tor_norm.py, so both repos are held to the same numbers.
 # Flux surfaces at uniform rho_pol, so psi_N = rho_pol^2 is not uniform
 PSI_N_SURFACES = np.linspace(0.0, 1.0, 41) ** 2
 
@@ -236,6 +234,41 @@ class TestPhiNMap:
 
         for qpsi in [qpsi_nan, qpsi_axis, qpsi_falling, qpsi_sign_change]:
             assert phi_n_map(PSI_N_SURFACES, qpsi, "secant") is None
+
+    def test_rising_q_matches_closed_form_and_continues_along_the_secant(self):
+        # q = 1 + 3 psi^2 gives Phi_N = (psi + psi^3) / 2 inside the LCFS
+        psi_n = np.linspace(-0.01, 1.2, 242)
+        psi_n_grid = np.linspace(0.0, 1.0, 129)
+        qpsi = 1.0 + 3.0 * psi_n_grid**2
+
+        phi_n = phi_n_map(psi_n_grid, qpsi, "secant").phi_n(psi_n)
+
+        psi_n_clipped = np.maximum(psi_n, 0.0)
+        mask_inside = psi_n_clipped <= 1.0
+        phi_n_inside = (psi_n_clipped + psi_n_clipped**3) / 2
+        np.testing.assert_allclose(
+            phi_n[mask_inside], phi_n_inside[mask_inside], atol=1e-6
+        )
+        phi_n_at_secant_start = (SECANT_PSI_N + SECANT_PSI_N**3) / 2
+        secant_slope = (1.0 - phi_n_at_secant_start) / (1.0 - SECANT_PSI_N)
+        phi_n_outside = 1.0 + secant_slope * (psi_n[~mask_inside] - 1.0)
+        np.testing.assert_allclose(phi_n[~mask_inside], phi_n_outside, rtol=1e-6)
+        assert np.all(np.diff(phi_n[psi_n >= 0]) > 0)
+
+    @pytest.mark.parametrize("sol_extension", ["secant", "tangent"])
+    def test_inverse_round_trips_across_the_lcfs(self, sol_extension):
+        psi_n = np.array([0.0, 0.03, 0.4, 0.97, 1.0, 1.05, 1.4, np.nan])
+        if sol_extension == "secant":
+            qpsi = diverted_qpsi(PSI_N_SURFACES)
+        else:
+            qpsi = log_q(PSI_N_SURFACES * 0.99)
+        phi_n_mapping = phi_n_map(PSI_N_SURFACES, qpsi, sol_extension)
+
+        phi_n = phi_n_mapping.phi_n(psi_n)
+        psi_n_back = phi_n_mapping.psi_n(phi_n)
+
+        # The inverse interpolates a dense Phi_N table inside the LCFS
+        np.testing.assert_allclose(psi_n_back, psi_n, atol=1e-7)
 
 
 class TestMapChannels:

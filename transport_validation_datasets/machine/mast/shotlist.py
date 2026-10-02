@@ -32,6 +32,8 @@ from loguru import logger
 from transport_validation_datasets.machine.generic import (
     EQ_MATCH_MAX_PERIODS,
     end_of_shot_index,
+    keep_longest_segment,
+    kept_span,
     rho_tor_norm_from_psi_n,
     signal_on_grid,
 )
@@ -43,10 +45,6 @@ from transport_validation_datasets.machine.mast.mast_dataset import (
     MissingSourceError,
     efm_flux_map,
     open_shot_sources,
-)
-from transport_validation_datasets.workflow import (
-    keep_longest_segment,
-    kept_span,
 )
 
 # FAIR-MAST shot catalog, pages of at most 100 shots
