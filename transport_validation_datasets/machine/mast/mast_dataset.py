@@ -24,6 +24,7 @@ from transport_validation_datasets import PACKAGE_ROOT
 from transport_validation_datasets.cleaning import drop_in_both
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
+    EQUILIBRIUM_HOLD_FLOOR,
     channel_rows_at_times,
     cocos_from_signs,
     make_geqdsk_dataset,
@@ -87,7 +88,7 @@ BRANCH_SMOOTH_HALFWIDTH = 0.05
 BRANCH_MIN_CHANNELS = 3
 
 # efm signal -> standardized name.
-# All 0D, interpolated onto the 1 kHz timebase.
+# All 0D, held onto the 1 kHz timebase from each reconstruction, for at least EQUILIBRIUM_HOLD_FLOOR.
 EQUILIBRIUM_SIGNALS = {
     # plasma_energy (EFM_PLASMA_ENERGY) is 3/2 the volume integral of the reconstructed pressure.
     # Not wplasmd (EFM_WPLASMD), the diamagnetic energy, built on a measured diamagnetic flux that is 0 in level 1
@@ -788,7 +789,9 @@ def _zero_d_dataset(
     eq_time = np.asarray(efm["time"].values, dtype=float)
 
     data = {
-        name: signal_on_grid(eq_time, efm[source].values, timebase)
+        name: signal_on_grid(
+            eq_time, efm[source].values, timebase, EQUILIBRIUM_HOLD_FLOOR
+        )
         for source, name in EQUILIBRIUM_SIGNALS.items()
     }
     data.update(
@@ -802,14 +805,18 @@ def _zero_d_dataset(
     ip_on_timebase = signal_on_grid(summary_time, ip, timebase)
     data["ip"] = ip_on_timebase
     # The vacuum field at the fixed reference radius bvac_r, the store's r0 (_reference_radius)
-    data["b0"] = signal_on_grid(eq_time, efm["bvac_val"].values, timebase)
+    data["b0"] = signal_on_grid(
+        eq_time, efm["bvac_val"].values, timebase, EQUILIBRIUM_HOLD_FLOOR
+    )
     # esm sits on a 20 us axis but only holds values at the reconstruction times,
-    # and signal_on_grid holds on the clock of the finite samples.
+    # and signal_on_grid holds on the clock of the finite samples, like the reconstructions themselves.
     # Some converged reconstructions have none (97 of 1446 shots, up to 25 ms in 24891),
     # and a gap longer than the hold stays NaN.
     esm_time = np.asarray(esm["time"].values, dtype=float)
     pphix = np.asarray(esm["pphix"].values, dtype=float)
-    data["power_ohm"] = signal_on_grid(esm_time, pphix, timebase)
+    data["power_ohm"] = signal_on_grid(
+        esm_time, pphix, timebase, EQUILIBRIUM_HOLD_FLOOR
+    )
     data["power_nbi"] = signal_on_grid(
         summary_time, summary["power_nbi"].values, timebase
     )

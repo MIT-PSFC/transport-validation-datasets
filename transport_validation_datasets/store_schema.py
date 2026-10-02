@@ -70,6 +70,7 @@ STORE_SIGNAL_ATTRS = {
     "n_e_gradient": {"units": "m^-3 per unit rho_tor_norm"},
     "n_e_gradient_error": {"units": "m^-3 per unit rho_tor_norm"},
     "fresh_profile": {"units": "dimensionless"},
+    "fresh_equilibrium": {"units": "dimensionless"},
 }
 STORE_SIGNALS = tuple(STORE_SIGNAL_ATTRS)
 

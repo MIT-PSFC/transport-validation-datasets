@@ -20,6 +20,7 @@ from transport_validation_datasets.machine.cmod.dispy_methods import (
     UniformTimeSetting,
 )
 from transport_validation_datasets.machine.generic import (
+    EQUILIBRIUM_HOLD_FLOOR,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
     signal_on_grid,
@@ -209,12 +210,12 @@ class CModDataWorkflow(DataWorkflow):
         """Read one shot from MDSplus, through disruption-py, into standardized signals.
 
         Four retrievals rather than one, because their native timebases differ.
-        The fast diagnostics (Ip, B0, density, powers) are sampled at the 1 kHz grid times from their own faster native data.
-        The EFIT reconstruction and Thomson scattering (native ~20 Hz) are snapped onto the grid without interpolation,
+        The fast diagnostics (Ip, B0, density, powers) are averaged over each 1 ms grid step from their own faster native data.
+        The EFIT reconstruction and Thomson scattering are snapped onto the grid without interpolation,
         so grid times between their real samples hold NaN.
-        The EFIT 0D signals (stored energy, shaping) are snapped too from a 1 kHz tree, where the snap is an exact relabeling,
-        and interpolated from a slow one (see _get_efit0d_dataset).
-        fresh_equilibrium in the stores marks the grid times a reconstruction landed on either way.
+        The EFIT 0D signals (stored energy, shaping) are held forward from each reconstruction,
+        for at least EQUILIBRIUM_HOLD_FLOOR (see _get_efit0d_dataset).
+        fresh_equilibrium in the stores marks the grid times a reconstruction landed on.
 
         All four open the EFIT tree, at least for their timebase,
         so a shot reads everything from one tree.
@@ -632,10 +633,12 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
 
     time_setting="efit" makes params.times the EFIT tree's own timebase,
     so the final interp1 in the disruption-py methods is an identity.
-    A tree on the grid's cadence is snapped onto it like the equilibrium and Thomson.
-    A slow tree (see SLOW_EFIT_PERIOD) is held forward (signal_on_grid), as MAST's 0D equilibrium signals are,
-    so the filters see a signal at every grid time and none draws on a later reconstruction.
-    Grid times outside the tree's time range hold NaN either way.
+    A tree on the grid's cadence is snapped onto it like the equilibrium and Thomson,
+    so its 0D and 2D sit on the same grid times.
+    A slow tree (see SLOW_EFIT_PERIOD) is placed straight from its own times.
+    Either way each reconstruction is then held forward (signal_on_grid) for at least EQUILIBRIUM_HOLD_FLOOR,
+    so a few missing reconstructions do not cut the shot, and none draws on a later reconstruction.
+    Grid times outside the tree's time range hold NaN.
 
     Args:
         shot: Shot number to retrieve data for.
@@ -683,13 +686,14 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     if slow_tree:
         result = _hold_onto_grid(result, timebase)
     else:
-        result = snap_to_grid(result, timebase)
+        result_snapped = snap_to_grid(result, timebase)
+        result = _hold_onto_grid(result_snapped, timebase)
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
 
 def _hold_onto_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
-    """Hold a retrieval (dim 'idx', 'time'/'shot' coords) forward onto grid_times (signal_on_grid).
+    """Hold an EFIT retrieval (dim 'idx', 'time'/'shot' coords) forward onto grid_times, at least EQUILIBRIUM_HOLD_FLOOR.
 
     Args:
         ds: Retrieval with dim 'idx' and 'time'/'shot' coords, 1D signals only.
@@ -703,7 +707,9 @@ def _hold_onto_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     shot_id = ds["shot"].values[0]
     data_vars = {}
     for name, variable in ds.data_vars.items():
-        values_on_grid = signal_on_grid(source_times, variable.values, grid_times)
+        values_on_grid = signal_on_grid(
+            source_times, variable.values, grid_times, EQUILIBRIUM_HOLD_FLOOR
+        )
         data_vars[name] = ("idx", values_on_grid, variable.attrs)
     coords = {
         "time": ("idx", grid_times),

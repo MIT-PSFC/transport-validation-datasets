@@ -195,6 +195,22 @@ class TestHeldSignalOnGrid:
         assert np.isnan(values_on_grid[33:45]).all()
         assert values_on_grid[45] == 7.0
 
+    def test_hold_floor_bridges_a_missing_sample_and_no_more(self):
+        # The source above, held for at least 10 ms, as every equilibrium signal is
+        grid = np.round(np.arange(60) * 1e-3, 3)
+        source_times = np.array([0.0, 0.005, 0.010, 0.015, 0.020, 0.025, 0.045, 0.050])
+        values = np.array([1.0, 2.0, 3.0, np.nan, 5.0, 6.0, 7.0, 8.0])
+
+        values_on_grid = signal_on_grid(source_times, values, grid, hold_floor=10e-3)
+
+        # The missing 15 ms sample is bridged by the 10 ms one
+        assert (values_on_grid[10:20] == 3.0).all()
+        assert values_on_grid[20] == 5.0
+        # The 20 ms gap after 25 ms is not, the hold ends 10 ms after it
+        assert values_on_grid[34] == 6.0
+        assert np.isnan(values_on_grid[36:45]).all()
+        assert values_on_grid[45] == 7.0
+
     def test_float64_source_on_a_float32_grid_is_held_at_its_own_grid_time(self):
         # A float32 grid time can sit just below a float64 sample at the same millisecond,
         # which must not leave it holding the sample before

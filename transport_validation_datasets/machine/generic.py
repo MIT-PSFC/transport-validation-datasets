@@ -190,6 +190,12 @@ SAMPLE_TIME_TOL = 1e-6
 # the end of the shot, or a diagnostic dropping out.
 MAX_HOLD_PERIODS = 1.5
 
+# Shortest an equilibrium reconstruction is held, whatever its clock [s].
+# Bridges the dropouts of single reconstructions (a 1 kHz EFIT failing a few slices,
+# one missing 5 ms MAST reconstruction) that would otherwise cut every equilibrium signal.
+# fresh_equilibrium still marks only the grid times a reconstruction lands on.
+EQUILIBRIUM_HOLD_FLOOR = 10e-3
+
 # How far a TS slice may sit from the reconstruction it maps through,
 # in periods of the reconstruction's own sampling.
 # Above 1 to tolerate clock jitter, low enough that nothing is borrowed across a real gap.
@@ -413,11 +419,13 @@ def hold_onto_grid(
     forward_fill: bool,
     period: float | None = None,
     max_hold_periods: float = MAX_HOLD_PERIODS,
+    hold_floor: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map every grid time onto the sample it takes its values from.
 
     Each grid time takes the most recent sample at or before it,
-    held for at most max_hold_periods sampling periods so that nothing is carried across a long gap:
+    held for at most max_hold_periods sampling periods, or hold_floor when that is longer,
+    so that nothing is carried across a long gap:
     the end of the shot, a diagnostic dropping out, or a stretch the filtering cut away.
     A sample within SAMPLE_TIME_TOL after a grid time counts as at it.
     A grid time is fresh when its sample falls in its own grid step (t - grid step, t],
@@ -432,6 +440,7 @@ def hold_onto_grid(
             spacing of sample_times, which is right when they are every
             sample there is, and wrong when they are a windowed subset.
         max_hold_periods: Longest hold, in sampling periods.
+        hold_floor: The hold reaches at least this far [s].
 
     Returns:
         (sample_index, fresh): sample_index[i] is the index of the sample
@@ -471,7 +480,8 @@ def hold_onto_grid(
             np.diff(sample_times_float64) if sample_times.size > 1 else grid_steps
         )
         period = float(np.median(sample_spacing))
-    still_held = has_previous & (age <= max_hold_periods * period)
+    max_hold = max(max_hold_periods * period, hold_floor)
+    still_held = has_previous & (age <= max_hold)
     sample_index[still_held] = previous_sample[still_held]
     return sample_index, fresh
 
@@ -494,12 +504,15 @@ def values_on_grid(sample_values: np.ndarray, sample_index: np.ndarray) -> np.nd
 
 
 def signal_on_grid(
-    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray
+    source_times: np.ndarray,
+    values: np.ndarray,
+    grid: np.ndarray,
+    hold_floor: float = 0.0,
 ) -> np.ndarray:
     """Place a 0D signal on the grid causally, so no grid value draws on a later sample.
 
     A source sampled faster than the grid is averaged over each grid step (_window_mean_on_grid).
-    A slower one is held forward from its last sample (_held_on_grid).
+    A slower one is held forward from its last sample (_held_on_grid), at least hold_floor.
     Only finite samples count.
     The source's period is the median spacing of its finite samples,
     so a fast clock populated only at a slower cadence (MAST esm) is held on that cadence.
@@ -509,6 +522,7 @@ def signal_on_grid(
         source_times: (n_source,) ascending sample times of the source [s].
         values: (n_source,) the signal at those times, NaN where missing.
         grid: The shot's 1 kHz timebase [s].
+        hold_floor: The hold of a slower source reaches at least this far [s].
 
     Returns:
         (n_grid,) the signal on the grid, NaN where it has no value.
@@ -527,26 +541,27 @@ def signal_on_grid(
         return _window_mean_on_grid(
             times_finite, values_finite, grid_float64, grid_step
         )
-    return _held_on_grid(times_finite, values_finite, grid_float64)
+    return _held_on_grid(times_finite, values_finite, grid_float64, hold_floor)
 
 
 def _held_on_grid(
-    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray
+    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray, hold_floor: float
 ) -> np.ndarray:
     """Each grid time takes the last sample at or before it (hold_onto_grid).
 
-    A sample is held for at most MAX_HOLD_PERIODS of the median sample spacing,
-    so a gap in the source stays NaN.
+    A sample is held for at most MAX_HOLD_PERIODS of the median sample spacing, or hold_floor when longer,
+    so a longer gap in the source stays NaN.
 
     Args:
         source_times: (n_source,) ascending finite sample times [s], at least two.
         values: (n_source,) the samples.
         grid: (n_grid,) the timebase [s].
+        hold_floor: The hold reaches at least this far [s].
 
     Returns:
         (n_grid,) the held signal, NaN where nothing is held.
     """
-    sample_index, _ = hold_onto_grid(grid, source_times, True)
+    sample_index, _ = hold_onto_grid(grid, source_times, True, hold_floor=hold_floor)
     return values_on_grid(values, sample_index)
 
 
