@@ -177,6 +177,28 @@ class TestHoldOntoGrid:
         assert index[3] == 0
         assert (index[4:] == -1).all()
 
+    def test_off_grid_sample_is_fresh_at_the_first_grid_time_holding_it(self):
+        # Samples between grid times, as the DIII-D and TCV records are
+        grid = grid_ms(20)
+        samples = np.array([0.0024, 0.0071, 0.0125])
+
+        index, fresh = hold_onto_grid(grid, samples, True)
+
+        assert np.flatnonzero(fresh).tolist() == [3, 8, 13]
+        assert (index[:3] == -1).all()
+        assert (index[3:8] == 0).all()
+        assert (index[8:13] == 1).all()
+
+    def test_max_hold_periods_sets_the_hold(self):
+        # Median sampling period is 5 ms, so 3 periods hold the last sample at 12 ms to 27 ms
+        grid = grid_ms(40)
+        samples = np.array([0.002, 0.007, 0.012])
+
+        index, _ = hold_onto_grid(grid, samples, True, max_hold_periods=3.0)
+
+        assert index[27] == 2
+        assert (index[28:] == -1).all()
+
     def test_float_round_off_still_counts_as_same_time(self):
         # Everything shares the 1 kHz timebase,
         # so the tolerance only has to absorb round-off

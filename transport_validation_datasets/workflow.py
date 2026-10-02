@@ -11,7 +11,6 @@ import numpy as np
 import xarray as xr
 import zarr
 from loguru import logger
-from scipy.integrate import trapezoid
 
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_validation_datasets.cleaning import (
@@ -19,6 +18,14 @@ from transport_validation_datasets.cleaning import (
     drop_rows_without_core,
 )
 from transport_validation_datasets.dataset_utils import build_tensorized_dataset
+from transport_validation_datasets.filters import (
+    ENERGY_SANITY_LEEWAY,
+    TRANSIENT_SMOOTHING_WINDOW,
+    clip_powers,
+    energy_sanity_reason,
+    radiated_fraction_reason,
+    slice_filter_mask,
+)
 from transport_validation_datasets.gp_fitting import registry
 from transport_validation_datasets.gp_fitting.batch_io import (
     FIT_MODE_SAMPLE,
@@ -48,8 +55,6 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
 from transport_validation_datasets.machine.generic import (
     MAX_HOLD_PERIODS,
     SOL_EXTENSIONS,
-    end_of_shot_index,
-    greenwald_fraction,
     hold_onto_grid,
     keep_longest_segment,
     kept_segments,
@@ -70,6 +75,10 @@ from transport_validation_datasets.provenance import (
     source_provenance,
     to_json,
 )
+from transport_validation_datasets.store_schema import (
+    DATASET_0D_SIGNALS,
+    apply_signal_attrs,
+)
 from transport_validation_datasets.windows import (
     in_any_window,
     pool_windows,
@@ -79,13 +88,6 @@ from transport_validation_datasets.windows import (
     window_centers,
     window_membership,
 )
-
-# Width of the centered boxcar applied before the transient thresholds are checked [s].
-TRANSIENT_SMOOTHING_WINDOW = 5e-3
-
-# How far a shot's stored-energy rise may exceed the heating energy put in before it is rejected.
-# The 5 percent covers integration error and EFIT noise, see DataWorkflow.shot_rejection_reason.
-ENERGY_SANITY_LEEWAY = 1.05
 
 # Shots per staged batch when fitting locally: one, so a slow serial run can
 # resume shot by shot. Cluster runs use ClusterFitConfig.shots_per_batch.
@@ -108,27 +110,6 @@ USABLE_FIT_STATUSES = (STATUS_OK, STATUS_REPAIRED)
 # In it11 no C-Mod slice goes above 0.25 and 99 percent of MAST slices stay below 0.15.
 FLAT_TE_EDGE_RATIO = 0.4
 
-# Unprocessed signals carried into the internal dataset. The union over every
-# device: a signal the device does not have comes through as NaN, so all the
-# devices' datasets share one schema.
-DATASET_0D_SIGNALS = (
-    "ip",
-    "b0",
-    "energy_mhd",
-    "beta_tor_norm",
-    "n_e_line_average",
-    "minor_radius",
-    "geometric_axis_r",
-    "elongation",
-    "triangularity_upper",
-    "triangularity_lower",
-    "power_ohm",
-    "power_radiated",
-    "power_nbi",
-    "power_ic",
-    "power_lh",
-    "power_ec",
-)
 
 # GEQDSK block, everything needed to rebuild the equilibrium of a slice.
 # See machine.generic.make_geqdsk_dataset. The five that are constant in time
@@ -775,7 +756,7 @@ class DataWorkflow(ABC):
                 )
                 self.record_failed_shot(shot, self.filter_rejection_note())
                 continue
-            ds_unprocessed = _clip_powers(ds_unprocessed)
+            ds_unprocessed = clip_powers(ds_unprocessed)
             # What pulled the shot and what this package was when it did.
             # The source's own stamp is rewritten, see provenance.SOURCE_ATTR_KEYS.
             ds_unprocessed.attrs = {
@@ -815,62 +796,33 @@ class DataWorkflow(ABC):
         """
         shot = ds_input.shot.values[0]
         times = ds_input["time"].values
-        dt = float(np.median(np.diff(times)))
-        ds_filter_inputs = _filter_inputs(ds_input)
+        ds_shot = ds_input.squeeze(EPISODE_DIM, drop=True)
 
-        # 0: Cut end_margin before the plasma ends
-        ip_magnitude = ds_filter_inputs["ip"]
-        if "shot" in ip_magnitude.dims:
-            ip_magnitude = ip_magnitude.max(dim="shot")
-        end_cut_index = end_of_shot_index(
-            ip_magnitude.values, times, self.min_filter["ip"], self.end_margin
+        # 0 to 2: The end of the shot, the 0D checks and the transients, see slice_filter_mask
+        slice_filter = slice_filter_mask(
+            ds_shot,
+            times,
+            self.min_filter,
+            self.max_filter,
+            self.transient_filter,
+            self.end_margin,
         )
-        if end_cut_index is None:
+        if slice_filter is None:
             logger.warning(
                 f"Shot {shot} rejected: |ip| never reaches {self.min_filter['ip']:g} A"
             )
             self._plot_unprocessed(ds_input, shot, None, None, None)
             return None
+        filtered_mask, transient_time_mask, end_cut_index = slice_filter
         end_margin_time = float(times[np.clip(end_cut_index, 0, times.size - 1)])
-        mask_before_end = np.arange(times.size) < end_cut_index
-        valid_mask = xr.DataArray(mask_before_end, coords={"time": times}, dims="time")
-
-        # 1: Every 0D signal finite, the min_filter and max_filter signals inside their thresholds
-        for signal in DATASET_0D_SIGNALS:
-            valid_mask = valid_mask & np.isfinite(ds_input[signal])
-        for signal, threshold in self.min_filter.items():
-            valid_mask = valid_mask & (ds_filter_inputs[signal] >= threshold)
-        for signal, threshold in self.max_filter.items():
-            valid_mask = valid_mask & (ds_filter_inputs[signal] <= threshold)
-
-        # 2: Cut the transients out as gaps, a transient_filter signal above its threshold.
-        # Each signal is smoothed by a centered boxcar, so that sporadic noise spikes on their own do not trip it.
-        # Step 3 keeps the longest stretch around the gaps.
-        transient_mask = xr.zeros_like(valid_mask)
-        for signal, threshold in self.transient_filter.items():
-            smoothed = _boxcar_mean(ds_input[signal], TRANSIENT_SMOOTHING_WINDOW, dt)
-            exceeded = smoothed > threshold
-            n_exceeded = int(exceeded.sum())
-            if n_exceeded:
-                logger.debug(
-                    f"Shot {shot}: {signal} above {threshold:g} at {n_exceeded} grid times"
-                )
-            transient_mask = transient_mask | exceeded
-        valid_mask = valid_mask & ~transient_mask
-        transient_time_mask = (
-            transient_mask.any(dim="shot")
-            if "shot" in transient_mask.dims
-            else transient_mask
-        )
-        transient_spans = _mask_spans(transient_time_mask.values, times)
+        n_transient = int(transient_time_mask.sum())
+        if n_transient:
+            logger.debug(f"Shot {shot}: transients at {n_transient} grid times")
+        transient_spans = _mask_spans(transient_time_mask, times)
 
         # 3: Start each segment where the store will have an equilibrium, then keep only the longest.
         # The store only holds the reconstructions that are kept (_hold_equilibrium),
         # so a segment's first grid times have none when the one before it is cut.
-        time_mask = (
-            valid_mask.any(dim="shot") if "shot" in valid_mask.dims else valid_mask
-        )
-        filtered_mask = time_mask.values
         if "simagx" in ds_input:
             reconstruction_usable = usable_reconstructions(ds_input)
             clock_period = reconstruction_clock_period(ds_input, times)
@@ -892,8 +844,11 @@ class DataWorkflow(ABC):
                 f"Shot {shot}: kept the longest segment, dropped {len(dropped_lengths)} shorter one(s), "
                 f"the longest {1e3 * max(dropped_lengths):.0f} ms, {1e3 * sum(dropped_lengths):.0f} ms in all"
             )
-        kept_time_mask = xr.DataArray(kept_mask, coords={"time": times}, dims="time")
-        valid_mask = valid_mask & kept_time_mask
+        valid_mask = xr.DataArray(
+            kept_mask[np.newaxis, :],
+            coords={EPISODE_DIM: ds_input[EPISODE_DIM].values, "time": times},
+            dims=(EPISODE_DIM, "time"),
+        )
 
         # Load-bearing broadcast: valid_mask carries the shot and time dims, so
         # this also gives every static quantity (the limiter contour, the fixed
@@ -975,18 +930,10 @@ class DataWorkflow(ABC):
         Runs on the filtered dataset in filter_and_plot,
         and again on the unprocessed file at the stack stage,
         so a file written before a check existed is judged by the code as it is now.
-        Every 0D signal is finite at the kept times (filter_and_plot), so no check needs to skip a NaN.
-        The checks, in order:
-        1: A mean power_radiated below min_radiated_fraction of the mean heating power.
-           Skipped when the shot has no heating power.
-        2: Energy sanity.
-           The energy_mhd rise from the first kept time to its peak
-           may not exceed ENERGY_SANITY_LEEWAY times the heating energy put in over the same span.
-           The input ignores every loss, so a larger rise means a missing or broken power record.
-           The rise rather than the peak, so energy stored before the first kept time needs no input.
-        The heating power is _heating_power,
-        which clips at 0 and counts a NaN as 0 as _clip_powers leaves them in the unprocessed file,
-        so both call sites reach the same verdict.
+        The checks, in order, are the shared ones of filters.py:
+        a dead bolometer (radiated_fraction_reason, against min_radiated_fraction),
+        then a stored-energy rise the input power cannot explain (energy_sanity_reason).
+        Both clip the powers themselves, so the clipped unprocessed file reaches the same verdict.
 
         Args:
             ds: One shot's dataset on its kept times, with standardized names.
@@ -995,44 +942,10 @@ class DataWorkflow(ABC):
             Why the shot is rejected, or None if it passes.
         """
         ds_shot = ds.squeeze(EPISODE_DIM, drop=True)
-        times = np.asarray(ds_shot[TIME_COORD].values, dtype=float)
-
-        power_heating = _heating_power(ds_shot).values
-
-        power_heating_mean = float(power_heating.mean())
-        check_radiated = self.min_radiated_fraction > 0.0 and power_heating_mean > 0.0
-        if check_radiated and "power_radiated" in ds_shot:
-            power_radiated = ds_shot["power_radiated"].clip(min=0.0)
-            power_radiated_mean = float(power_radiated.mean())
-            radiated_fraction = power_radiated_mean / power_heating_mean
-            if radiated_fraction < self.min_radiated_fraction:
-                return (
-                    f"mean power_radiated {1e-3 * power_radiated_mean:.1f} kW "
-                    f"is {100 * radiated_fraction:.1f} percent "
-                    f"of the {1e-3 * power_heating_mean:.0f} kW mean heating power, "
-                    f"below the {100 * self.min_radiated_fraction:.1f} percent floor"
-                )
-
-        if "energy_mhd" not in ds_shot:
-            return None
-        energy_mhd = np.asarray(ds_shot["energy_mhd"].values, dtype=float)
-        has_energy = np.isfinite(energy_mhd)
-        if has_energy.sum() < 2:
-            return None
-        energy_times = times[has_energy]
-        energy_stored = energy_mhd[has_energy]
-        peak = int(np.argmax(energy_stored))
-        energy_rise = energy_stored[peak] - energy_stored[0]
-        # Bridges the filter gaps, the heating did not stop while the samples were cut
-        power_to_peak = power_heating[has_energy][: peak + 1]
-        energy_input = trapezoid(power_to_peak, energy_times[: peak + 1])
-        if energy_rise > ENERGY_SANITY_LEEWAY * energy_input:
-            return (
-                f"energy_mhd rises {1e-3 * energy_rise:.1f} kJ "
-                f"from {energy_times[0]:.3f} s to {energy_times[peak]:.3f} s, "
-                f"more than the {1e-3 * energy_input:.1f} kJ of heating put in"
-            )
-        return None
+        radiated_reason = radiated_fraction_reason(ds_shot, self.min_radiated_fraction)
+        if radiated_reason is not None:
+            return radiated_reason
+        return energy_sanity_reason(ds_shot)
 
     def excluded_shot_reason(self, shot: int) -> str | None:
         """Check whether a shot is left out by number, before any of its data is looked at.
@@ -2312,9 +2225,7 @@ class DataWorkflow(ABC):
         for name, variable in ds_stacked.data_vars.items():
             if variable.dtype == np.float64:
                 ds_stacked[name] = variable.astype(np.float32)
-        for name, attrs in self.signal_attrs.items():
-            if name in ds_stacked:
-                ds_stacked[name].attrs.update(attrs)
+        apply_signal_attrs(ds_stacked, self.signal_attrs)
         standardize_signal_attrs(ds_stacked)
 
         # The sign convention of the GEQDSK block, per shot since a dataset
@@ -2478,81 +2389,6 @@ class DataWorkflow(ABC):
                 ),
             }
         )
-
-
-def _clip_powers(ds: xr.Dataset) -> xr.Dataset:
-    """Clip every power signal at zero before the unprocessed file is written.
-
-    Source power records dip negative (bolometer baseline drift on cmod's
-    power_radiated, ICRF pickup, MAST's power_nbi baseline), and no heating or
-    radiated power is physically negative. Runs after filtering so the validity
-    and transient gates still judge the values the device recorded.
-
-    Args:
-        ds: One shot's filtered dataset with standardized names.
-
-    Returns:
-        The same dataset with power signals clipped to >= 0, NaN untouched.
-    """
-    for name in DATASET_0D_SIGNALS:
-        if name.startswith("power_") and name in ds:
-            attrs = ds[name].attrs
-            ds[name] = ds[name].clip(min=0.0) + 0.0  # -0.0 -> 0.0
-            ds[name].attrs = attrs
-    return ds
-
-
-def _filter_inputs(ds: xr.Dataset) -> xr.Dataset:
-    """The signals min_filter and max_filter judge, with ip as its magnitude and the derived greenwald_fraction.
-
-    Args:
-        ds: One shot's dataset with standardized names.
-
-    Returns:
-        The dataset with ip replaced by |ip| and greenwald_fraction added.
-    """
-    ip_magnitude = abs(ds["ip"])
-    fraction = greenwald_fraction(
-        ip_magnitude, ds["minor_radius"], ds["n_e_line_average"]
-    )
-    return ds.assign(ip=ip_magnitude, greenwald_fraction=fraction)
-
-
-def _heating_power(ds: xr.Dataset) -> xr.DataArray:
-    """Sum a shot's heating power, power_ohm + power_nbi + power_ic + power_lh + power_ec [W].
-
-    Each is clipped at 0 and a NaN counts as 0, so a missing record reads as no heating.
-
-    Args:
-        ds: One shot's dataset with standardized names.
-
-    Returns:
-        The heating power on the dataset's times.
-    """
-    power_heating = xr.zeros_like(ds[TIME_COORD], dtype=float)
-    for name in ("power_ohm", "power_nbi", "power_ic", "power_lh", "power_ec"):
-        if name in ds:
-            power = ds[name].fillna(0.0).clip(min=0.0)
-            power_heating = power_heating + power
-    return power_heating
-
-
-def _boxcar_mean(signal: xr.DataArray, window: float, dt: float) -> xr.DataArray:
-    """Smooth a signal with a boxcar centered on each sample.
-
-    Args:
-        signal: The signal, on a uniform time dimension.
-        window: Width of the boxcar [s].
-        dt: The sample spacing [s].
-
-    Returns:
-        The smoothed signal, averaged over the samples present near the ends and around NaNs.
-    """
-    n_samples = max(1, round(window / dt))
-    if n_samples % 2 == 0:
-        # Odd so it stays centered on the present sample
-        n_samples += 1
-    return signal.rolling(time=n_samples, center=True, min_periods=1).mean()
 
 
 def _mask_spans(mask: np.ndarray, times: np.ndarray) -> list[tuple[float, float]]:
