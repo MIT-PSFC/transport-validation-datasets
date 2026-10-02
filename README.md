@@ -170,7 +170,6 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
 | min energy_mhd | 2.7 kJ | 5 kJ |
 | min n_e_line_average | 1e19 m^-3 | 3e18 m^-3 |
 | max greenwald_fraction | 2.0 | 2.0 |
-| max power_radiated | | 4 MW |
 | transient power_ohm | 5 MW | 5 MW |
 | transient power_radiated | 5.5 MW | 3 MW |
 | end_margin | 20 ms | 40 ms |
@@ -345,7 +344,8 @@ Every retrieval reads the EFIT tree at least for its timebase, so a shot takes t
 A tree fails when it is missing or its reconstruction is missing a node,
 and the unprocessed file records the tree it used as its `efit_tree` attribute.
 A tree slower than the 1 kHz grid (ANALYSIS reconstructs every ~20 ms) has its EFIT 0D signals held forward onto the grid (`signal_on_grid`),
-and `fresh_equilibrium` marks grid times where the reconstruction exists.
+and `fresh_equilibrium` marks grid times where a usable reconstruction lands (`usable_reconstructions`),
+while the 0D signals take every reconstruction, so they can update where it is 0.
 Shots already recorded in `01_unprocessed/failed_shots/` are not retried,
 so their records need deleting for a rebuild to try another tree.
 

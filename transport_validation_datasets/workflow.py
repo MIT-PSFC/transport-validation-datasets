@@ -2369,7 +2369,7 @@ class DataWorkflow(ABC):
             grid: The shot's 1 kHz timebase [s].
             fresh_profile: Grid times carrying a Thomson slice of their own,
                 or the window centers of a window-averaged shot.
-            fresh_equilibrium: Grid times carrying a reconstruction of their own.
+            fresh_equilibrium: Grid times carrying a usable reconstruction of their own (usable_reconstructions).
             fit_mode: How the profiles were fit, one of the FIT_MODE_* values.
                 Only changes what fresh_profile is described as.
 
@@ -2378,6 +2378,12 @@ class DataWorkflow(ABC):
         """
         held = (
             "1 where this grid time carries its own {}, 0 where it holds an earlier one"
+        )
+        equilibrium_description = (
+            "1 where a usable reconstruction (usable_reconstructions) lands, "
+            "0 where the reconstruction block holds an earlier one. "
+            "The 0D equilibrium signals take every reconstruction and hold for at least 10 ms, "
+            "so they can update where it is 0"
         )
         profile_description = (
             "1 at the center grid time of each averaging window, 0 across the rest "
@@ -2400,7 +2406,7 @@ class DataWorkflow(ABC):
                 "fresh_equilibrium": (
                     (EPISODE_DIM, TIME_DIM),
                     fresh_equilibrium[None].astype(np.float32),
-                    {"description": held.format("equilibrium reconstruction")},
+                    {"description": equilibrium_description},
                 ),
             }
         )
