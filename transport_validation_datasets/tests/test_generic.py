@@ -10,9 +10,9 @@ import xarray as xr
 from transport_validation_datasets.machine.generic import (
     MU0,
     cocos_from_signs,
-    held_signal_on_grid,
     make_uniform_1kHz_timebase,
     ohmic_power,
+    signal_on_grid,
     snap_to_grid,
     trailing_boxcar_mean,
 )
@@ -182,7 +182,7 @@ class TestHeldSignalOnGrid:
         source_times = np.array([0.0, 0.005, 0.010, 0.015, 0.020, 0.025, 0.045, 0.050])
         values = np.array([1.0, 2.0, 3.0, np.nan, 5.0, 6.0, 7.0, 8.0])
 
-        values_on_grid = held_signal_on_grid(source_times, values, grid)
+        values_on_grid = signal_on_grid(source_times, values, grid)
 
         # 12 ms holds the 10 ms sample, never the 15 ms or 20 ms one
         assert values_on_grid[12] == 3.0
@@ -202,7 +202,7 @@ class TestHeldSignalOnGrid:
         source_times = np.arange(1001) * 1e-3
         values = np.arange(1001, dtype=float)
 
-        values_on_grid = held_signal_on_grid(source_times, values, grid)
+        values_on_grid = signal_on_grid(source_times, values, grid)
 
         np.testing.assert_array_equal(values_on_grid, values)
 
@@ -213,15 +213,29 @@ class TestHeldSignalOnGrid:
         values[::50] = np.arange(10.0)
         grid = np.round(np.arange(50) * 1e-3, 3)
 
-        values_on_grid = held_signal_on_grid(source_times, values, grid)
+        values_on_grid = signal_on_grid(source_times, values, grid)
 
         # Each 5 ms sample is held up to the next one
         np.testing.assert_array_equal(values_on_grid, np.repeat(np.arange(10.0), 5))
         # A lone finite sample has no period to hold for
         values_lone = np.full(500, np.nan)
         values_lone[100] = 1.0
-        values_lone_on_grid = held_signal_on_grid(source_times, values_lone, grid)
+        values_lone_on_grid = signal_on_grid(source_times, values_lone, grid)
         assert np.isnan(values_lone_on_grid).all()
+
+    def test_averages_a_faster_source_over_each_grid_step(self):
+        # 0.2 ms source on the 1 kHz grid, so grid time t takes the mean of the samples in (t - 1 ms, t]
+        grid = np.round(np.arange(10) * 1e-3, 3).astype("float32")
+        source_times = np.arange(50) * 2e-4
+        values = np.arange(50.0)
+        values[16:22] = np.nan
+
+        values_on_grid = signal_on_grid(source_times, values, grid)
+
+        # 1 ms averages samples 1 to 5, the one at 1 ms itself included, never the 1.2 ms one
+        # 4 ms has no finite sample, and 5 ms averages the finite 22 to 25
+        expected = np.array([0.0, 3.0, 8.0, 13.0, np.nan, 23.5, 28.0, 33.0, 38.0, 43.0])
+        np.testing.assert_array_equal(values_on_grid, expected)
 
 
 class TestTrailingBoxcarMean:

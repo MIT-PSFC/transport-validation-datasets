@@ -32,8 +32,8 @@ from loguru import logger
 from transport_validation_datasets.machine.generic import (
     EQ_MATCH_MAX_PERIODS,
     end_of_shot_index,
-    held_signal_on_grid,
     rho_tor_norm_from_psi_n,
+    signal_on_grid,
 )
 from transport_validation_datasets.machine.mast.mast_dataset import (
     DEFAULT_SHOTLIST_FILE,
@@ -103,7 +103,7 @@ def _ip_window(summary: xr.Dataset, timebase: np.ndarray) -> np.ndarray:
     ip_min = MASTDataWorkflow.min_filter["ip"]
     summary_time = summary["time"].values
     ip_source = np.asarray(summary["ip"].values, dtype=float)
-    ip_signed = held_signal_on_grid(summary_time, ip_source, timebase)
+    ip_signed = signal_on_grid(summary_time, ip_source, timebase)
     ip = np.abs(ip_signed)
     end_cut_index = end_of_shot_index(ip, timebase, ip_min, MASTDataWorkflow.end_margin)
     if end_cut_index is None:

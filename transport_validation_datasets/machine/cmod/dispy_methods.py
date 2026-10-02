@@ -10,11 +10,11 @@ from disruption_py.settings import TimeSetting, TimeSettingParams
 
 from transport_validation_datasets.machine.generic import (
     cocos_from_signs,
-    held_signal_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     ohmic_power,
     orient_signal,
+    signal_on_grid,
     snap_to_grid,
     trailing_boxcar_mean,
 )
@@ -25,6 +25,13 @@ _TIME_UNIT_SCALE = {"s": 1.0, "ms": 1e-3, "us": 1e-6}
 # Width of the trailing boxcar the ohmic power is smoothed with [s].
 # Unsmoothed, the loop voltage and the dW_pol/dt difference make it noise-dominated at 1 kHz.
 OHMIC_POWER_SMOOTHING_WINDOW = 5e-3
+
+# Length of the TCI chord 4 the line-integrated density nl_04 is divided by [m], as in disruption-py get_densities
+TCI_NL_04_CHORD_LENGTH = 0.6
+
+# Factor scaling the AXUV twopi_diode onto the 2pi foil bolometer, as in disruption-py get_power.
+# It was cross-calibrated in the flat-top of non-disruptive shots.
+TWOPI_DIODE_CALIBRATION = 4.5
 
 
 def _time_unit_scale(params, expression: str) -> float:
@@ -114,7 +121,7 @@ class CmodAeqdskMethods:
             rout = np.full(len(efit_time), np.nan)
 
         if not np.array_equal(params.times, efit_time):
-            rout = held_signal_on_grid(efit_time, rout, params.times)
+            rout = signal_on_grid(efit_time, rout, params.times)
         return {"rout": rout}
 
     @staticmethod
@@ -142,12 +149,144 @@ class CmodAeqdskMethods:
             betan = np.full(len(efit_time), np.nan)
 
         if not np.array_equal(params.times, efit_time):
-            betan = held_signal_on_grid(efit_time, betan, params.times)
+            betan = signal_on_grid(efit_time, betan, params.times)
         return {"betan": betan}
 
 
+def _injected_power(params, node: str, tree_name: str) -> np.ndarray:
+    """An injected heating power record placed on the timebase (signal_on_grid), in the record's units.
+
+    0 outside the record and when the shot has none (that heating system did not run).
+    Mirrors POPSIM's DIII-D _injected_power.
+
+    Args:
+        params: disruption-py physics method parameters for the shot.
+        node: MDSplus node of the power record.
+        tree_name: Tree holding it.
+
+    Returns:
+        (n_t,) the power on params.times.
+    """
+    try:
+        power, power_time = params.mds_conn.get_data_with_dims(
+            node, tree_name=tree_name
+        )
+    except mdsExceptions.MdsException:
+        params.logger.debug("no {node} record, taking 0", node=node)
+        return np.zeros(len(params.times))
+    if power_time.size < 2:
+        return np.zeros(len(params.times))
+    power_on_grid = signal_on_grid(power_time, power, params.times)
+    mask_outside_record = (params.times < power_time[0]) | (
+        params.times > power_time[-1]
+    )
+    power_on_grid[mask_outside_record] = 0.0
+    return power_on_grid
+
+
+class CmodPlasmaMethods:
+    """C-Mod magnetics and density retrievals that replace the disruption-py built-ins.
+
+    The built-ins interpolate onto the timebase.
+    These place each record causally (signal_on_grid), so no grid time draws on a later sample.
+    Every record here is sampled faster than the grid, so each grid time takes the mean of the preceding millisecond.
+    """
+
+    @staticmethod
+    @physics_method(columns=["ip"], tokamak=Tokamak.CMOD)
+    def get_plasma_current(params: PhysicsMethodParams):
+        r"""Plasma current, magnetics \ip, signed.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with ip [A] on the requested timebase.
+        """
+        ip, ip_time = params.mds_conn.get_data_with_dims(r"\ip", tree_name="magnetics")
+        ip_on_grid = signal_on_grid(ip_time, ip, params.times)
+        return {"ip": ip_on_grid}
+
+    @staticmethod
+    @physics_method(columns=["bt"], tokamak=Tokamak.CMOD)
+    def get_toroidal_field(params: PhysicsMethodParams):
+        r"""Vacuum toroidal field at 0.66 m, magnetics \btor, signed.
+
+        disruption-py reads it in get_n_equal_1_amplitude, which also needs the BP13 sensors.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with bt [T] on the requested timebase.
+        """
+        btor, btor_time = params.mds_conn.get_data_with_dims(
+            r"\btor", tree_name="magnetics"
+        )
+        btor_on_grid = signal_on_grid(btor_time, btor, params.times)
+        return {"bt": btor_on_grid}
+
+    @staticmethod
+    @physics_method(columns=["n_e"], tokamak=Tokamak.CMOD)
+    def get_line_average_density(params: PhysicsMethodParams):
+        """Line-averaged density, the TCI chord 4 line integral over TCI_NL_04_CHORD_LENGTH.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with n_e [m^-3] on the requested timebase.
+        """
+        nl_04, nl_04_time = params.mds_conn.get_data_with_dims(
+            r".tci.results:nl_04", tree_name="electrons"
+        )
+        nl_04_trace = np.squeeze(nl_04)
+        n_e = nl_04_trace / TCI_NL_04_CHORD_LENGTH
+        n_e_on_grid = signal_on_grid(nl_04_time, n_e, params.times)
+        return {"n_e": n_e_on_grid}
+
+
 class CmodPowerMethods:
-    """C-Mod power retrievals that replace stock disruption-py ones."""
+    """C-Mod power retrievals that replace the disruption-py built-ins, placed causally (signal_on_grid)."""
+
+    @staticmethod
+    @physics_method(columns=["p_rad"], tokamak=Tokamak.CMOD)
+    def get_radiated_power(params: PhysicsMethodParams):
+        r"""Radiated power, the AXUV \twopi_diode in kW scaled by TWOPI_DIODE_CALIBRATION.
+
+        NaN outside the record, where disruption-py fills 0 and hides a missing record.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with p_rad [W] on the requested timebase.
+        """
+        diode_kw, diode_time = params.mds_conn.get_data_with_dims(
+            r"\twopi_diode", tree_name="spectroscopy"
+        )
+        p_rad = diode_kw * 1e3 * TWOPI_DIODE_CALIBRATION
+        p_rad_on_grid = signal_on_grid(diode_time, p_rad, params.times)
+        return {"p_rad": p_rad_on_grid}
+
+    @staticmethod
+    @physics_method(columns=["p_icrf", "p_lh"], tokamak=Tokamak.CMOD)
+    def get_heating_powers(params: PhysicsMethodParams):
+        r"""ICRF net power (\rf_power_net, MW) and lower hybrid net power (LH \top.results:netpow, kW).
+
+        Each is 0 outside its record and on a shot without the system (_injected_power).
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with p_icrf and p_lh [W] on the requested timebase.
+        """
+        p_icrf_mw = _injected_power(params, r"\rf_power_net", "rf")
+        p_lh_kw = _injected_power(params, r"\top.results:netpow", "lh")
+        p_icrf = p_icrf_mw * 1e6
+        p_lh = p_lh_kw * 1e3
+        return {"p_icrf": p_icrf, "p_lh": p_lh}
 
     @staticmethod
     @physics_method(columns=["p_ohm"], tokamak=Tokamak.CMOD)
@@ -156,8 +295,9 @@ class CmodPowerMethods:
 
         V_loop is the flux loop voltage \top.mflux:v0 of the ANALYSIS tree and Ip the magnetics \ip.
         li and the magnetic axis radius come from the EFIT tree.
-        Every input is held forward from its last sample (held_signal_on_grid), never interpolated,
-        and the result is smoothed by a trailing OHMIC_POWER_SMOOTHING_WINDOW boxcar,
+        Every input is placed causally (signal_on_grid), never interpolated:
+        V_loop and Ip are averaged over each grid step, and li and R are held from the last reconstruction.
+        The result is smoothed by a trailing OHMIC_POWER_SMOOTHING_WINDOW boxcar,
         so no grid time draws on a later sample.
         disruption-py's get_ohmic_parameters subtracts L_i dIp/dt instead of dW_pol/dt,
         which drops the change of li and R that DIII-D EFIT poh and MAST ESM pphix include.
@@ -179,10 +319,10 @@ class CmodPowerMethods:
         )
 
         times = params.times
-        v_loop_on_grid = held_signal_on_grid(v_loop_time, v_loop, times)
-        ip_on_grid = held_signal_on_grid(ip_time, ip, times)
-        li_on_grid = held_signal_on_grid(efit_time, li, times)
-        r_axis_on_grid = held_signal_on_grid(efit_time, r_axis, times)
+        v_loop_on_grid = signal_on_grid(v_loop_time, v_loop, times)
+        ip_on_grid = signal_on_grid(ip_time, ip, times)
+        li_on_grid = signal_on_grid(efit_time, li, times)
+        r_axis_on_grid = signal_on_grid(efit_time, r_axis, times)
         p_ohm_raw = ohmic_power(
             times, ip_on_grid, v_loop_on_grid, li_on_grid, r_axis_on_grid
         )

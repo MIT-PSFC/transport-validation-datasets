@@ -26,10 +26,10 @@ from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFit
 from transport_validation_datasets.machine.generic import (
     channel_rows_at_times,
     cocos_from_signs,
-    held_signal_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
+    signal_on_grid,
     snap_to_grid,
     ts_channel_fit_rows,
 )
@@ -412,7 +412,7 @@ class MASTDataWorkflow(DataWorkflow):
         """Read one shot from the MAST stores into standardized signals.
 
         The three sources are put on the shot's 1 kHz timebase differently:
-        the 0D signals are held from their last sample (held_signal_on_grid), while the
+        the 0D signals are placed causally (signal_on_grid), while the
         equilibrium reconstruction and the Thomson slices are snapped to the
         nearest grid time without interpolation, since neither is meaningful
         interpolated. The equilibrium is written as a full GEQDSK, so only the
@@ -781,9 +781,9 @@ def _zero_d_dataset(
     esm: xr.Dataset,
     timebase: np.ndarray,
 ) -> xr.Dataset:
-    """Hold the 0D signals forward onto the timebase under standardized names.
+    """Place the 0D signals onto the timebase under standardized names.
 
-    Every signal is held from its last finite sample (held_signal_on_grid), never interpolated,
+    Every signal is placed causally (signal_on_grid), never interpolated,
     so no grid time draws on a later sample.
     Plasma current and toroidal field are stored as magnitudes, the signed
     versions live in the equilibrium signals (see _equilibrium_dataset).
@@ -802,33 +802,33 @@ def _zero_d_dataset(
     eq_time = np.asarray(efm["time"].values, dtype=float)
 
     data = {
-        name: held_signal_on_grid(eq_time, efm[source].values, timebase)
+        name: signal_on_grid(eq_time, efm[source].values, timebase)
         for source, name in EQUILIBRIUM_SIGNALS.items()
     }
     data.update(
         {
-            name: held_signal_on_grid(summary_time, summary[source].values, timebase)
+            name: signal_on_grid(summary_time, summary[source].values, timebase)
             for source, name in SUMMARY_SIGNALS.items()
         }
     )
 
     ip = np.asarray(summary["ip"].values, dtype=float)
-    ip_on_timebase = held_signal_on_grid(summary_time, ip, timebase)
+    ip_on_timebase = signal_on_grid(summary_time, ip, timebase)
     data["ip"] = np.abs(ip_on_timebase)
     # bvac_rmag is the vacuum field at the magnetic axis. Rescale it by 1/R to
     # the geometric axis, so b0 is referenced the same way as on the other
     # devices (C-Mod rout, D3D rsurf, TCV R_geom).
-    bvac_rmag = held_signal_on_grid(eq_time, efm["bvac_rmag"].values, timebase)
-    r_axis = held_signal_on_grid(eq_time, efm["magnetic_axis_r"].values, timebase)
+    bvac_rmag = signal_on_grid(eq_time, efm["bvac_rmag"].values, timebase)
+    r_axis = signal_on_grid(eq_time, efm["magnetic_axis_r"].values, timebase)
     data["b0"] = np.abs(bvac_rmag * r_axis / data["geometric_axis_r"])
     # esm sits on a 20 us axis but only holds values at the reconstruction times,
-    # and held_signal_on_grid holds on the clock of the finite samples.
+    # and signal_on_grid holds on the clock of the finite samples.
     # Some converged reconstructions have none (97 of 1446 shots, up to 25 ms in 24891),
     # and a gap longer than the hold stays NaN.
     esm_time = np.asarray(esm["time"].values, dtype=float)
     pphix = np.asarray(esm["pphix"].values, dtype=float)
-    data["power_ohm"] = held_signal_on_grid(esm_time, pphix, timebase)
-    data["power_nbi"] = held_signal_on_grid(
+    data["power_ohm"] = signal_on_grid(esm_time, pphix, timebase)
+    data["power_nbi"] = signal_on_grid(
         summary_time, summary["power_nbi"].values, timebase
     )
     # MAST has no ICRF or lower hybrid, zero where ip is valid
