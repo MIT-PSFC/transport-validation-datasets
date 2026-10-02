@@ -21,6 +21,8 @@ _PROFILES_REF = "/core_profiles/profiles_1d(itime)/electrons"
 STORE_SIGNAL_ATTRS = {
     "ip": {"units": "A", "ref": "/summary/global_quantities/ip/value"},
     "b0": {"units": "T", "ref": "/summary/global_quantities/b0/value"},
+    # Per shot, on (shot,)
+    "r0": {"units": "m", "ref": "/summary/global_quantities/r0/value"},
     "energy_mhd": {
         "units": "J",
         "ref": "/equilibrium/time_slice(itime)/global_quantities/energy_mhd",

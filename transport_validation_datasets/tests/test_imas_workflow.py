@@ -120,7 +120,7 @@ def synthetic_unprocessed(
     data_vars["ip"] = (("time",), np.full(n_t, ip0))
     data_vars["b0"] = (("time",), np.full(n_t, b0))
     return xr.Dataset(
-        data_vars=data_vars, coords={"time": time}, attrs={"cocos": cocos}
+        data_vars=data_vars, coords={"time": time}, attrs={"cocos": cocos, "r0": R0}
     )
 
 
@@ -223,6 +223,7 @@ def test_imas_export_chain_reads_back(tmp_path, ip_sign, b0_sign, psi_sign, coco
     sm = read_back("summary")
     assert np.allclose(np.asarray(sm.global_quantities.ip.value), ip_sign * 0.8e6)
     assert np.allclose(np.asarray(sm.global_quantities.b0.value), b0_sign * 5.4)
+    assert sm.global_quantities.r0.value == pytest.approx(R0)
 
     wall = read_back("wall")
     outline = wall.description_2d[0].limiter.unit[0].outline

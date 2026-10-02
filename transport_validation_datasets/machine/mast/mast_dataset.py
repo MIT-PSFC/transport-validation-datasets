@@ -130,7 +130,6 @@ REQUIRED_LEVEL1_SIGNALS = {
         "magnetic_axis_r",
         "magnetic_axis_z",
         "plasma_current_c",
-        "bvac_rmag",
         "bvac_r",
         "bvac_val",
         *EQUILIBRIUM_SIGNALS,
@@ -146,10 +145,13 @@ REQUIRED_LEVEL2_SIGNALS = {
 # Per-variable attributes
 SIGNAL_ATTRS = {
     "ip": {
-        "description": "Measured plasma current magnitude",
+        "description": "Measured plasma current, signed",
     },
     "b0": {
-        "description": "Vacuum toroidal field magnitude at geometric_axis_r",
+        "description": "Vacuum toroidal field at r0, the reconstruction's bvac_val, signed",
+    },
+    "r0": {
+        "description": "Reference major radius b0 is given at, the reconstruction's bvac_r",
     },
     "energy_mhd": {
         "description": "Stored energy from the equilibrium reconstruction, 3/2 the volume integral of its pressure",
@@ -239,7 +241,7 @@ SIGNAL_ATTRS = {
     "bcentr": {
         "description": (
             "Vacuum toroidal field at the GEQDSK reference radius rcentr, signed. "
-            "The standardized b0 is the same field referenced at geometric_axis_r."
+            "The standardized b0 is the same field held onto the 1 kHz grid, and r0 is rcentr."
         ),
         "units": "T",
         "ref": "/equilibrium/vacuum_toroidal_field/b0",
@@ -418,6 +420,8 @@ class MASTDataWorkflow(DataWorkflow):
         )
         ds = ds.set_index(idx=["shot", "time"]).unstack("idx")
         ds.attrs = dict(ds_equilibrium.attrs)
+        # Per shot like cocos, the stack stage stores it as the r0 variable
+        ds.attrs["r0"] = _reference_radius(sources.efm)
         apply_signal_attrs(ds, SIGNAL_ATTRS)
         return ds
 
@@ -631,7 +635,7 @@ def open_shot_sources(shot: int) -> ShotSources | None:
 
     Raises:
         MissingSourceError: If the shot has no store, a required group or signal,
-            plasma current, or usable Thomson slice.
+            plasma current, b0 reference radius, or usable Thomson slice.
     """
     groups = {}
     for store_path, required, level in (
@@ -657,6 +661,9 @@ def open_shot_sources(shot: int) -> ShotSources | None:
     in_shot = np.abs(ip) > SHOT_WINDOW_MIN_IP
     if in_shot.sum() < 2:
         raise MissingSourceError(f"No plasma current above {SHOT_WINDOW_MIN_IP:.0f} A.")
+    bvac_r = np.asarray(groups["efm"]["bvac_r"].values, dtype=float)
+    if not np.isfinite(bvac_r).any():
+        raise MissingSourceError("No finite efm/bvac_r, the radius b0 is given at.")
     timebase = make_uniform_1kHz_timebase(float(summary_time[in_shot][-1]))
 
     ds_thomson = _thomson_dataset(shot, groups["ayc"], timebase)
@@ -741,6 +748,19 @@ def _open_store_group(store_path: str, shot: int, group: str) -> xr.Dataset | No
         return None
 
 
+def _reference_radius(efm: xr.Dataset) -> float:
+    """The fixed major radius EFIT gives the vacuum field at, bvac_r (1.0 m), the store's r0 and the GEQDSK rcentr.
+
+    Args:
+        efm: The shot's level 1 efm group, with a finite bvac_r (open_shot_sources).
+
+    Returns:
+        The radius [m].
+    """
+    bvac_r = np.asarray(efm["bvac_r"].values, dtype=float)
+    return float(np.nanmedian(bvac_r))
+
+
 def _zero_d_dataset(
     shot: int,
     summary: xr.Dataset,
@@ -752,8 +772,7 @@ def _zero_d_dataset(
 
     Every signal is placed causally (signal_on_grid), never interpolated,
     so no grid time draws on a later sample.
-    Plasma current and toroidal field are stored as magnitudes, the signed
-    versions live in the equilibrium signals (see _equilibrium_dataset).
+    Plasma current and toroidal field keep their source sign, as on C-Mod.
 
     Args:
         shot: Shot number being read.
@@ -781,13 +800,9 @@ def _zero_d_dataset(
 
     ip = np.asarray(summary["ip"].values, dtype=float)
     ip_on_timebase = signal_on_grid(summary_time, ip, timebase)
-    data["ip"] = np.abs(ip_on_timebase)
-    # bvac_rmag is the vacuum field at the magnetic axis. Rescale it by 1/R to
-    # the geometric axis, so b0 is referenced the same way as on the other
-    # devices (C-Mod rout, D3D rsurf, TCV R_geom).
-    bvac_rmag = signal_on_grid(eq_time, efm["bvac_rmag"].values, timebase)
-    r_axis = signal_on_grid(eq_time, efm["magnetic_axis_r"].values, timebase)
-    data["b0"] = np.abs(bvac_rmag * r_axis / data["geometric_axis_r"])
+    data["ip"] = ip_on_timebase
+    # The vacuum field at the fixed reference radius bvac_r, the store's r0 (_reference_radius)
+    data["b0"] = signal_on_grid(eq_time, efm["bvac_val"].values, timebase)
     # esm sits on a 20 us axis but only holds values at the reconstruction times,
     # and signal_on_grid holds on the clock of the finite samples.
     # Some converged reconstructions have none (97 of 1446 shots, up to 25 ms in 24891),
@@ -895,8 +910,7 @@ def _equilibrium_dataset(shot: int, efm: xr.Dataset) -> xr.Dataset:
     r_grid = np.asarray(efm["gridr"].values, dtype=float)
     # EFIT's own reference radius and the vacuum field there, bvac_r (a fixed 1.0 m) and bvac_val.
     # The same pair C-Mod's EFIT writes as RZERO and BCENTR, and bcentr * rcentr equals fpol at the boundary.
-    bvac_r = np.asarray(efm["bvac_r"].values, dtype=float)
-    rcentr = float(np.nanmedian(bvac_r))
+    rcentr = _reference_radius(efm)
     bcentr = np.asarray(efm["bvac_val"].values, dtype=float)
     r_axis = np.asarray(efm["magnetic_axis_r"].values, dtype=float)
     simagx = np.asarray(efm["psi_axis"].values, dtype=float)
