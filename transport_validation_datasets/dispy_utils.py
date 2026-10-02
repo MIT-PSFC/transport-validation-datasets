@@ -9,7 +9,7 @@ from loguru import logger
 VERBOSE_LEVEL_NO = 15
 
 
-def _register_verbose_level():
+def register_verbose_level():
     """Add loguru's custom VERBOSE level and bind logger.verbose().
 
     disruption_py does this inside LogSettings.setup_logging(), which
@@ -38,7 +38,7 @@ def passive_log_settings() -> LogSettings:
     Returns:
         LogSettings that leave the caller's loguru sinks in place.
     """
-    _register_verbose_level()
+    register_verbose_level()
     return LogSettings(
         file_path=None, console_level="VERBOSE", _logging_has_been_setup=True
     )

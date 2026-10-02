@@ -177,6 +177,9 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+# Step of the uniform timebase every device is placed on [s], see make_uniform_1kHz_timebase.
+UNIFORM_TIMEBASE_DT = 1e-3
+
 # A grid time carries a sample of its own when it sits this close to one [s].
 # Only absorbs float round-off, everything shares the staged 1 kHz timebase.
 SAMPLE_TIME_TOL = 1e-6
@@ -220,11 +223,11 @@ def make_uniform_1kHz_timebase(max_time: float) -> np.ndarray:
     Returns:
         Times from 0 to max_time in 1 ms steps [s].
     """
-    last_ms = int(np.ceil(np.round(max_time * 1000, 6)))
-    times = np.round(np.arange(last_ms + 1, dtype=np.float64) * 1e-3, 3).astype(
-        "float32"
-    )
-    return times
+    steps_to_max = np.round(max_time / UNIFORM_TIMEBASE_DT, 6)
+    last_step = int(np.ceil(steps_to_max))
+    step_counts = np.arange(last_step + 1, dtype=np.float64)
+    times = np.round(step_counts * UNIFORM_TIMEBASE_DT, 3)
+    return times.astype("float32")
 
 
 def make_geqdsk_dataset(
@@ -553,6 +556,29 @@ def _window_mean_on_grid(
     return window_means
 
 
+def injected_power_on_grid(
+    record_times: np.ndarray, power: np.ndarray, grid: np.ndarray
+) -> np.ndarray:
+    """An injected heating power record placed on the grid (signal_on_grid), 0 outside the record.
+
+    A record of fewer than two samples is taken as a heating system that did not run, 0 throughout.
+
+    Args:
+        record_times: (n_record,) ascending sample times of the record [s].
+        power: (n_record,) the power, in the record's units.
+        grid: (n_grid,) the shot's 1 kHz timebase [s].
+
+    Returns:
+        (n_grid,) the power on the grid.
+    """
+    if record_times.size < 2:
+        return np.zeros(grid.size)
+    power_on_grid = signal_on_grid(record_times, power, grid)
+    mask_outside_record = (grid < record_times[0]) | (grid > record_times[-1])
+    power_on_grid[mask_outside_record] = 0.0
+    return power_on_grid
+
+
 def trailing_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.ndarray:
     """Smooth a uniformly sampled signal causally, each sample the mean of itself and those before it in the window.
 
@@ -647,6 +673,66 @@ def end_of_shot_index(
     grid_steps = np.diff(times)
     margin_steps = round(end_margin / float(np.median(grid_steps)))
     return last_plasma_idx - margin_steps + 1
+
+
+def kept_segments(keep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Find the runs of kept samples.
+
+    Args:
+        keep: Mask over the uniform 1 kHz grid.
+
+    Returns:
+        (starts, ends): the index of each run's first sample and one past its last.
+    """
+    # Pad with False on both sides so a run touching either end still has an edge
+    keep_padded = np.concatenate(([False], keep, [False]))
+    edges = np.diff(keep_padded.astype(np.int8))
+    return np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+
+
+def keep_longest_segment(
+    keep: np.ndarray, times: np.ndarray
+) -> tuple[np.ndarray, list[float]]:
+    """Clear every run of kept samples but the longest.
+
+    A run is measured from its first to its last sample, the same way kept_span measures the one left,
+    so a run of n samples on the 1 kHz grid is n - 1 milliseconds long.
+    The earliest of equally long runs is kept.
+
+    Args:
+        keep: Mask over times, True where the sample survived the filters. Not modified.
+        times: The shot's timebase [s].
+
+    Returns:
+        The mask with only the longest run left, and the lengths [s] of the runs cleared.
+    """
+    keep = np.asarray(keep, dtype=bool)
+    keep_longest = np.zeros(keep.size, dtype=bool)
+    starts, ends = kept_segments(keep)
+    if starts.size == 0:
+        return keep_longest, []
+    run_lengths = times[ends - 1] - times[starts]
+    longest = int(np.argmax(run_lengths))
+    keep_longest[starts[longest] : ends[longest]] = True
+    dropped_lengths = np.delete(run_lengths, longest)
+    return keep_longest, dropped_lengths.tolist()
+
+
+def kept_span(keep: np.ndarray, times: np.ndarray) -> float:
+    """Time from the first to the last kept sample, for the min_pulse_length gate.
+
+    Args:
+        keep: Mask over times, True where the sample survived the filters.
+        times: The shot's timebase [s].
+
+    Returns:
+        The span [s], 0 when fewer than two samples are kept.
+    """
+    keep = np.asarray(keep, dtype=bool)
+    kept_times = times[keep]
+    if kept_times.size < 2:
+        return 0.0
+    return float(kept_times[-1] - kept_times[0])
 
 
 def usable_reconstructions(ds: xr.Dataset) -> np.ndarray:
