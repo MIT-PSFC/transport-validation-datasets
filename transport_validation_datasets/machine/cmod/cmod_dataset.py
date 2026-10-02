@@ -43,7 +43,7 @@ SIGNAL_ATTRS = {
     "power_radiated": {
         "description": (
             "Total radiated power, AXUV twopi_diode x 4.5 (cross-calibrated to the 2pi foil bolometer), "
-            "mean of each 1 ms grid step, clipped at 0"
+            "mean of each 1 ms grid step, smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0"
         ),
     },
     "power_ic": {
@@ -64,7 +64,7 @@ SIGNAL_ATTRS = {
     "power_ohm": {
         "description": (
             "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
-            "mu0 R_geo li Ip^2 / 4 with R_geo the EFIT rout, causal (backward difference, trailing 5 ms boxcar), clipped at 0"
+            "mu0 R_geo li Ip^2 / 4 with R_geo the EFIT rout (backward difference), smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0"
         ),
     },
     "power_nbi": {

@@ -55,6 +55,7 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
     MAX_HOLD_PERIODS,
+    POWER_SMOOTHING_WINDOW,
     SOL_EXTENSIONS,
     hold_onto_grid,
     keep_longest_segment,
@@ -2339,6 +2340,7 @@ class DataWorkflow(ABC):
                     "bounds": self.fit_bounds,
                     "max_hold_periods": MAX_HOLD_PERIODS,
                     "equilibrium_hold_floor": EQUILIBRIUM_HOLD_FLOOR,
+                    "power_smoothing_window": POWER_SMOOTHING_WINDOW,
                 }
             ),
         }

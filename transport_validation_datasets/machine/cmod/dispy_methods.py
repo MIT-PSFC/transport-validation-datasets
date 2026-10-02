@@ -17,16 +17,12 @@ from transport_validation_datasets.machine.generic import (
     ohmic_power,
     orient_signal,
     signal_on_grid,
+    smoothed_power,
     snap_to_grid,
-    trailing_boxcar_mean,
 )
 
 # Seconds per unit of the units string an MDSplus time node reports.
 _TIME_UNIT_SCALE = {"s": 1.0, "ms": 1e-3, "us": 1e-6}
-
-# Width of the trailing boxcar the ohmic power is smoothed with [s].
-# Unsmoothed, the loop voltage and the dW_pol/dt difference make it noise-dominated at 1 kHz.
-OHMIC_POWER_SMOOTHING_WINDOW = 5e-3
 
 # Length of the TCI chord 4 the line-integrated density nl_04 is divided by [m], as in disruption-py get_densities
 TCI_NL_04_CHORD_LENGTH = 0.6
@@ -243,13 +239,18 @@ class CmodPlasmaMethods:
 
 
 class CmodPowerMethods:
-    """C-Mod power retrievals that replace the disruption-py built-ins, placed causally (signal_on_grid)."""
+    """C-Mod power retrievals that replace the disruption-py built-ins.
+
+    Each record is placed on the grid without interpolation (signal_on_grid),
+    and power_ohm and power_radiated are then smoothed non-causally (smoothed_power), as on every device.
+    """
 
     @staticmethod
     @physics_method(columns=["p_rad"], tokamak=Tokamak.CMOD)
     def get_radiated_power(params: PhysicsMethodParams):
         r"""Radiated power, the AXUV \twopi_diode in kW scaled by TWOPI_DIODE_CALIBRATION.
 
+        Averaged over each grid step, then smoothed non-causally (smoothed_power), as on every device.
         NaN outside the record, where disruption-py fills 0 and hides a missing record.
 
         Args:
@@ -263,7 +264,10 @@ class CmodPowerMethods:
         )
         p_rad = diode_kw * 1e3 * TWOPI_DIODE_CALIBRATION
         p_rad_on_grid = signal_on_grid(diode_time, p_rad, params.times)
-        return {"p_rad": p_rad_on_grid}
+        grid_steps = np.diff(params.times)
+        dt = float(np.median(grid_steps))
+        p_rad_smoothed = smoothed_power(p_rad_on_grid, dt)
+        return {"p_rad": p_rad_smoothed}
 
     @staticmethod
     @physics_method(columns=["p_icrf", "p_lh"], tokamak=Tokamak.CMOD)
@@ -287,15 +291,14 @@ class CmodPowerMethods:
     @staticmethod
     @physics_method(columns=["p_ohm"], tokamak=Tokamak.CMOD)
     def get_ohmic_power(params: PhysicsMethodParams):
-        r"""Compute the ohmic power Ip V_loop - dW_pol/dt causally (generic.ohmic_power) on the requested timebase.
+        r"""Compute the ohmic power Ip V_loop - dW_pol/dt (generic.ohmic_power) on the requested timebase.
 
         V_loop is the flux loop voltage \top.mflux:v0 of the ANALYSIS tree and Ip the magnetics \ip.
         li and the geometric major radius rout come from the EFIT tree.
         Every input is placed causally (signal_on_grid), never interpolated:
         V_loop and Ip are averaged over each grid step,
         and li and R are held from the last reconstruction, for at least EQUILIBRIUM_HOLD_FLOOR.
-        The result is smoothed by a trailing OHMIC_POWER_SMOOTHING_WINDOW boxcar,
-        so no grid time draws on a later sample.
+        The result is smoothed non-causally (smoothed_power), as on every device.
         disruption-py's get_ohmic_parameters subtracts L_i dIp/dt instead of dW_pol/dt,
         which drops the change of li and R that DIII-D EFIT poh and MAST ESM pphix include.
 
@@ -325,8 +328,9 @@ class CmodPowerMethods:
         p_ohm_raw = ohmic_power(
             times, ip_on_grid, v_loop_on_grid, li_on_grid, major_radius_on_grid
         )
-        dt = float(np.median(np.diff(times)))
-        p_ohm = trailing_boxcar_mean(p_ohm_raw, OHMIC_POWER_SMOOTHING_WINDOW, dt)
+        grid_steps = np.diff(times)
+        dt = float(np.median(grid_steps))
+        p_ohm = smoothed_power(p_ohm_raw, dt)
         return {"p_ohm": p_ohm}
 
 

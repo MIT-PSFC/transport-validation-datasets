@@ -13,8 +13,8 @@ from transport_validation_datasets.machine.generic import (
     make_uniform_1kHz_timebase,
     ohmic_power,
     signal_on_grid,
+    smoothed_power,
     snap_to_grid,
-    trailing_boxcar_mean,
 )
 
 SHOT = 12345
@@ -254,19 +254,22 @@ class TestHeldSignalOnGrid:
         np.testing.assert_array_equal(values_on_grid, expected)
 
 
-class TestTrailingBoxcarMean:
-    def test_a_later_sample_does_not_change_earlier_ones(self):
-        values = np.ones(30)
-        values_spiked = values.copy()
-        values_spiked[20] = 100.0
+class TestSmoothedPower:
+    def test_impulse_spreads_into_a_centered_triangle_and_nan_stays_nan(self):
+        # An impulse far from both ends of the record, and a missing sample elsewhere
+        values = np.zeros(401)
+        values[200] = 1.0
+        values[50] = np.nan
 
-        smoothed = trailing_boxcar_mean(values, 5e-3, 1e-3)
-        smoothed_spiked = trailing_boxcar_mean(values_spiked, 5e-3, 1e-3)
+        smoothed = smoothed_power(values, 1e-3)
 
-        np.testing.assert_array_equal(smoothed_spiked[:20], smoothed[:20])
-        # The spike enters at its own sample and leaves 5 samples later
-        assert smoothed_spiked[20] == pytest.approx((4.0 + 100.0) / 5.0)
-        assert smoothed_spiked[25] == 1.0
+        # A 50 ms window is 51 samples, so two passes give a triangle 101 samples wide
+        # with its peak 1 / 51 on the impulse, the same before it as after it
+        n_window = 51
+        offsets = np.arange(-100, 101)
+        triangle = np.clip(n_window - np.abs(offsets), 0, None) / n_window**2
+        np.testing.assert_allclose(smoothed[100:301], triangle, atol=1e-12)
+        assert np.isnan(smoothed[50])
 
 
 class TestOhmicPower:

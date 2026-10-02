@@ -177,6 +177,11 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+# Width of the centered boxcar power_ohm and power_radiated are smoothed with, applied twice [s], see smoothed_power.
+# Unsmoothed, the inductive swings of P_oh and the bolometer noise of P_rad are larger than the signals at 1 kHz.
+# DIII-D's sources come smoothed this way or more (prad_tot, EFIT poh), so the other devices match them.
+POWER_SMOOTHING_WINDOW = 50e-3
+
 # Step of the uniform timebase every device is placed on [s], see make_uniform_1kHz_timebase.
 UNIFORM_TIMEBASE_DT = 1e-3
 
@@ -622,25 +627,6 @@ def injected_power_on_grid(
     return power_on_grid
 
 
-def trailing_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.ndarray:
-    """Smooth a uniformly sampled signal causally, each sample the mean of itself and those before it in the window.
-
-    NaN samples are skipped, and the first samples average over what is there.
-
-    Args:
-        values: (n,) the signal.
-        window: Width of the boxcar [s].
-        dt: The sample spacing [s].
-
-    Returns:
-        (n,) the smoothed signal, NaN only where the whole window is.
-    """
-    n_samples = max(1, round(window / dt))
-    signal = xr.DataArray(values, dims="time")
-    smoothed = signal.rolling(time=n_samples, min_periods=1).mean()
-    return smoothed.values
-
-
 def centered_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.ndarray:
     """Smooth a uniformly sampled signal with a boxcar centered on each sample, along the last axis.
 
@@ -662,6 +648,28 @@ def centered_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.nda
     last_dim = signal.dims[-1]
     smoothed = signal.rolling({last_dim: n_samples}, center=True, min_periods=1).mean()
     return smoothed.values
+
+
+def smoothed_power(values: np.ndarray, dt: float) -> np.ndarray:
+    """Smooth a power on the uniform grid with the centered POWER_SMOOTHING_WINDOW boxcar applied twice.
+
+    The kernel is a triangle twice the window wide at its base, DIII-D's prad_tot kernel,
+    so every device's power_ohm and power_radiated carry the same smoothing.
+    It draws on samples up to one window later, so the result is not causal.
+    A NaN sample stays NaN, so a gap in the record stays a gap for the filters.
+
+    Args:
+        values: (n,) the power on the uniform grid.
+        dt: The grid step [s].
+
+    Returns:
+        (n,) the smoothed power.
+    """
+    smoothed_once = centered_boxcar_mean(values, POWER_SMOOTHING_WINDOW, dt)
+    smoothed_twice = centered_boxcar_mean(smoothed_once, POWER_SMOOTHING_WINDOW, dt)
+    mask_missing = np.isnan(values)
+    smoothed_twice[mask_missing] = np.nan
+    return smoothed_twice
 
 
 def ohmic_power(
