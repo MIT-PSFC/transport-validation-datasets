@@ -25,6 +25,11 @@ from transport_validation_datasets.store_schema import (
 # It only selects grid times, no stored value is smoothed by it.
 TRANSIENT_SMOOTHING_WINDOW = 5e-3
 
+# Margin cut before every grid time that fails a check [s], see slice_filter_mask.
+# power_ohm and power_radiated are smoothed non-causally (smoothed_power, DIII-D's sources),
+# so they rise ahead of the event that ends a segment.
+FAILURE_MARGIN = 20e-3
+
 # How far a shot's stored-energy rise may exceed the input energy put in before it is rejected.
 # The 5 percent covers integration error and EFIT noise, see energy_sanity_reason.
 ENERGY_SANITY_LEEWAY = 1.05
@@ -61,6 +66,8 @@ def slice_filter_mask(
     a DATASET_0D_SIGNALS signal that is not finite,
     a min_filter signal below its threshold or a max_filter signal above it, judged on filter_inputs,
     and a transient_filter signal above its threshold after a centered TRANSIENT_SMOOTHING_WINDOW boxcar.
+    Each grid time that fails a check before the end-of-shot cut also cuts the FAILURE_MARGIN before it,
+    so a segment that ends on a failure ends that much earlier, and one that ends at the end-of-shot cut does not.
     Keeping the longest segment of what passes is left to the caller.
 
     Args:
@@ -73,7 +80,7 @@ def slice_filter_mask(
 
     Returns:
         (mask_valid, mask_transient, end_cut_index):
-        the grid times that pass, the transients among them,
+        the grid times that pass (the failure margins cut), the transients among them,
         and the index of the first grid time the end-of-shot cut removes.
         None when |ip| never reaches its min_filter threshold.
     """
@@ -83,19 +90,20 @@ def slice_filter_mask(
     if end_cut_index is None:
         return None
     grid_index = np.arange(times.size)
-    mask_valid = grid_index < end_cut_index
+    mask_before_end = grid_index < end_cut_index
+    mask_pass = np.ones(times.size, dtype=bool)
 
     # A NaN fails every threshold
     with np.errstate(invalid="ignore"):
         for signal in DATASET_0D_SIGNALS:
             mask_finite = np.isfinite(ds[signal].values)
-            mask_valid = mask_valid & mask_finite
+            mask_pass = mask_pass & mask_finite
         for signal, threshold in min_filter.items():
             mask_above = ds_filter_inputs[signal].values >= threshold
-            mask_valid = mask_valid & mask_above
+            mask_pass = mask_pass & mask_above
         for signal, threshold in max_filter.items():
             mask_below = ds_filter_inputs[signal].values <= threshold
-            mask_valid = mask_valid & mask_below
+            mask_pass = mask_pass & mask_below
 
         # Smoothed, so that sporadic noise spikes on their own do not trip it
         grid_steps = np.diff(times)
@@ -106,8 +114,28 @@ def slice_filter_mask(
                 ds[signal].values, TRANSIENT_SMOOTHING_WINDOW, dt
             )
             mask_transient = mask_transient | (smoothed > threshold)
-    mask_valid = mask_valid & ~mask_transient
+    mask_pass = mask_pass & ~mask_transient
+    mask_failed = ~mask_pass & mask_before_end
+    margin_steps = round(FAILURE_MARGIN / dt)
+    mask_in_margin = _before_failures(mask_failed, margin_steps)
+    mask_valid = mask_before_end & mask_pass & ~mask_in_margin
     return mask_valid, mask_transient, end_cut_index
+
+
+def _before_failures(mask_failed: np.ndarray, margin_steps: int) -> np.ndarray:
+    """Mark the grid times with a failed one at most margin_steps later.
+
+    Args:
+        mask_failed: (n_t,) the grid times that fail a check.
+        margin_steps: The margin in grid steps.
+
+    Returns:
+        (n_t,) True where a failure falls in (t, t + margin_steps grid steps].
+    """
+    failures_so_far = np.cumsum(mask_failed)
+    grid_index = np.arange(mask_failed.size)
+    index_ahead = np.minimum(grid_index + margin_steps, mask_failed.size - 1)
+    return failures_so_far[index_ahead] > failures_so_far
 
 
 def input_power(ds: xr.Dataset) -> xr.DataArray:

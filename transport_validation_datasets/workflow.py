@@ -20,6 +20,7 @@ from transport_validation_datasets.cleaning import (
 from transport_validation_datasets.dataset_utils import build_tensorized_dataset
 from transport_validation_datasets.filters import (
     ENERGY_SANITY_LEEWAY,
+    FAILURE_MARGIN,
     TRANSIENT_SMOOTHING_WINDOW,
     clip_powers,
     energy_sanity_reason,
@@ -531,7 +532,7 @@ class DataWorkflow(ABC):
         A filter rejection's failure note is stamped with these (filter_rejection_note).
 
         Returns:
-            The min, max and transient filters, the transient smoothing window, the end margin,
+            The min, max and transient filters, the transient smoothing window, the failure and end margins,
             the minimum pulse length, and the thresholds of the whole-shot checks.
         """
         return {
@@ -539,6 +540,7 @@ class DataWorkflow(ABC):
             "max_filter": self.max_filter,
             "transient_filter": self.transient_filter,
             "transient_smoothing_window": TRANSIENT_SMOOTHING_WINDOW,
+            "failure_margin": FAILURE_MARGIN,
             "end_margin": self.end_margin,
             "min_pulse_length": self.min_pulse_length,
             "min_radiated_fraction": self.min_radiated_fraction,

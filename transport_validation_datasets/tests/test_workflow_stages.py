@@ -17,6 +17,7 @@ import xarray as xr
 
 import transport_validation_datasets.workflow as workflow_module
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_validation_datasets.filters import FAILURE_MARGIN
 from transport_validation_datasets.gp_fitting.batch_io import (
     FIT_MODE_SAMPLE,
     FIT_MODE_WINDOW_AVERAGE,
@@ -377,8 +378,9 @@ class TestTransientGaps:
     def test_late_spike_keeps_the_longer_stretch_before(self, tmp_path):
         times = self.kept_times(tmp_path, 0.22)
 
+        # The transient starts at 0.217 s, and FAILURE_MARGIN cuts the 20 ms before it
         assert times.min() < 1e-3
-        assert 0.21 < times.max() < 0.22
+        assert times.max() == pytest.approx(0.217 - 1e-3 - FAILURE_MARGIN)
 
 
 class TestSliceFilters:
