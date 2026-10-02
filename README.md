@@ -134,7 +134,9 @@ The reach and the hold both run on the reconstruction clock (`reconstruction_clo
 
 Unprocessed stage (`filter_and_plot`), per shot.
 Steps 2 to 4 and 8 are the filter spec every device store shares (`filters.py`).
-Every check from 2 to 4 cuts the grid times it fails out as a gap (`slice_filter_mask`):
+Every check from 2 to 4 cuts the grid times it fails out as a gap (`slice_filter_mask`).
+A failed grid time before the end-of-shot cut also cuts the 20 ms before it (`FAILURE_MARGIN`),
+since the smoothed power_ohm and power_radiated rise ahead of the event that ends a segment:
 
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
 2. End of shot (`end_of_shot_index`): the plasma ends at the last grid time with |ip| at or above its `min_filter` threshold,
