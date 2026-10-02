@@ -177,6 +177,7 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
 | max greenwald_fraction | 2.0 | 2.0 |
 | transient power_ohm | 5 MW | 5 MW |
 | transient power_radiated | 5.5 MW | 3 MW |
+| failure_margin (shared) | 20 ms | 20 ms |
 | end_margin | 20 ms | 40 ms |
 | min_pulse_length | 0.5 s | 0.2 s |
 | min_radiated_fraction | 0.01 | 0.025 |
