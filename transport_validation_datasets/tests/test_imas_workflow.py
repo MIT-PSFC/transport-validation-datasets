@@ -199,7 +199,7 @@ def test_imas_export_chain_reads_back(tmp_path, ip_sign, b0_sign, psi_sign, coco
     rho_tor = np.asarray(p1.rho_tor)
     assert np.all(np.isfinite(rho_tor)) and np.all(np.diff(rho_tor) > 0)
     assert np.asarray(eq.time_slice[0].profiles_2d[0].psi).shape == (N_GRID, N_GRID)
-    assert int(ts.boundary.type) == 0, "circular synthetic plasma is limited"
+    assert ts.boundary.type.value == 0, "circular synthetic plasma is limited"
 
     cp = read_back("core_profiles")
     assert len(cp.profiles_1d) == len(TS_TIMES)
