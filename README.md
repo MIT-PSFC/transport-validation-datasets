@@ -146,7 +146,8 @@ Every check from 2 to 4 cuts the grid times it fails out as a gap (`slice_filter
    derived for the filter and not stored.
 4. Grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold.
    The centered window only selects grid times, no stored value is smoothed by it.
-   The unprocessed plots shade the transients red.
+   The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`,
+   which POPSIM-Transport-Predictor also draws for DIII-D and TCV).
 5. The leading grid times of each segment are cut up to its first sample
    that a usable reconstruction (`usable_reconstructions`) of the same segment reaches
    within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock, at least `EQUILIBRIUM_HOLD_FLOOR`), since the store would have no equilibrium before it.

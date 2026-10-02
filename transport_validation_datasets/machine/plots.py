@@ -86,12 +86,17 @@ def plot_unprocessed_data(
 ):
     """For all the 0D signals in the dataset, plot them over time and save the figure to disk.
 
+    Both pipelines draw it for every shot, unfiltered:
+    this package for C-Mod and MAST (DataWorkflow._plot_unprocessed),
+    and POPSIM-Transport-Predictor for DIII-D and TCV (RawFileWorkflow.load_shot).
+    The time is a dimension in the former and a coordinate on time_idx in the latter, both work.
+
     One plot with several subplots, in the following groups:
 
     1: ip (in MA) and b0 on left axis, energy_mhd (in MJ) on right axis
     - Also has a vertical red line indicating the end margin time as identified by filter_and_plot
     2: n_e_line_average (in 10^20 m^-3) on left axis, beta_n (unitless) on right axis
-    - Also has green dots at the bottom for each time index where the profiles are not NaN
+    - Also has green dots at the bottom for each time a profile is measured
     3: p_oh, p_rad, p_ic, p_lh, p_nbi (all in MW)
     4: minor_radius and major_radius (both in m) on left axis, kappa, tritop, tribot (unitless) on right axis
 
@@ -191,13 +196,18 @@ def plot_unprocessed_data(
     ax_ne.set_ylabel("n_e [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_ne.set_ylim(_signal_ylim(ne_signals))
 
-    # Dots at 0 for time indices where the TS profiles have data
-    # No ts_channel dim means the TS retrieval failed and the column is all NaN
-    if "ts_channel_n_e" in ds and "ts_channel" in ds["ts_channel_n_e"].dims:
-        fresh_profiles = ds["ts_channel_n_e"].notnull().any(dim="ts_channel")
+    # Dots at 0 for the times a profile is measured:
+    # fresh_profile in a POPSIM-Transport-Predictor raw file, the Thomson channels in an unprocessed file.
+    # No ts_channel dim means the TS retrieval failed and the column is all NaN.
+    mask_profile = None
+    if "fresh_profile" in ds:
+        mask_profile = ds["fresh_profile"] == 1
+    elif "ts_channel_n_e" in ds and "ts_channel" in ds["ts_channel_n_e"].dims:
+        mask_profile = ds["ts_channel_n_e"].notnull().any(dim="ts_channel")
+    if mask_profile is not None:
         ax_ne.plot(
             time,
-            np.where(fresh_profiles, 0, np.nan),
+            np.where(mask_profile, 0, np.nan),
             color="green",
             marker="o",
             linestyle="None",
