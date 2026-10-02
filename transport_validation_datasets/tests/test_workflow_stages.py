@@ -285,16 +285,31 @@ class TestMakeUnprocessedDataFiles:
 
         assert workflow.source_reads == reads
 
-    def test_rejected_shot_refiltered_from_its_kept_pull(self, tmp_path):
-        # A filter change after a rejection reruns from the kept pull, never the source
+    def test_rejected_shot_refiltered_only_when_its_filters_change(
+        self, tmp_path, monkeypatch
+    ):
+        # A rerun under the filters that rejected a shot skips it,
+        # and a filter change reruns it from the kept pull, never the source
         workflow = make_workflow(tmp_path, shots=[1])
         workflow.min_filter = {"ip": 2e6}
         workflow.make_unprocessed_data_files()
         assert workflow.unprocessed_shots() == []
 
+        filtered_shots = []
+        filter_and_plot = workflow.filter_and_plot
+
+        def recording_filter_and_plot(ds_input):
+            filtered_shots.append(int(ds_input["shot"].values.flat[0]))
+            return filter_and_plot(ds_input)
+
+        monkeypatch.setattr(workflow, "filter_and_plot", recording_filter_and_plot)
+        workflow.make_unprocessed_data_files()
+        assert filtered_shots == []
+
         workflow.min_filter = {"ip": 1.0}
         workflow.make_unprocessed_data_files()
 
+        assert filtered_shots == [1]
         assert workflow.unprocessed_shots() == [1]
         assert workflow.source_reads == [1]
 

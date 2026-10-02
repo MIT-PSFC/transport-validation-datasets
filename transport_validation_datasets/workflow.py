@@ -538,6 +538,57 @@ class DataWorkflow(ABC):
         """
         return (self.failed_shots_dir / f"{shot}.txt").exists()
 
+    def unprocessed_filter_settings(self) -> dict:
+        """Every threshold the unprocessed stage applies (filter_and_plot, shot_rejection_reason).
+
+        A filter rejection's failure note is stamped with these (filter_rejection_note).
+
+        Returns:
+            The min, max and transient filters, the transient smoothing window, the end margin,
+            the minimum pulse length, and the thresholds of the whole-shot checks.
+        """
+        return {
+            "min_filter": self.min_filter,
+            "max_filter": self.max_filter,
+            "transient_filter": self.transient_filter,
+            "transient_smoothing_window": TRANSIENT_SMOOTHING_WINDOW,
+            "end_margin": self.end_margin,
+            "min_pulse_length": self.min_pulse_length,
+            "min_radiated_fraction": self.min_radiated_fraction,
+            "energy_sanity_leeway": ENERGY_SANITY_LEEWAY,
+        }
+
+    def filter_rejection_note(self) -> str:
+        """The failure note of a shot the current filters reject.
+
+        It carries the filter settings (unprocessed_filter_settings),
+        so a later run can tell whether the same filters would judge the shot again.
+
+        Returns:
+            The note, JSON with sorted keys, so the same settings always give the same text.
+        """
+        note = {
+            "reason": "Did not pass filtering.",
+            "filters": self.unprocessed_filter_settings(),
+        }
+        return to_json(note)
+
+    def shot_rejected_by_current_filters(self, shot: int) -> bool:
+        """Check whether the current filter settings rejected a shot on a previous run.
+
+        Args:
+            shot: Shot number to check.
+
+        Returns:
+            True if the shot's failure note is the one a rejection would write now (filter_rejection_note).
+        """
+        note_path = self.failed_shots_dir / f"{shot}.txt"
+        if not note_path.exists():
+            return False
+        note_recorded = note_path.read_text()
+        note_current = self.filter_rejection_note()
+        return note_recorded == note_current
+
     def record_failed_fit(self, shot: int, reason: str):
         """Record that a shot could not be staged for GP fitting.
 
@@ -604,8 +655,11 @@ class DataWorkflow(ABC):
 
         Every source pull is also kept unfiltered in source_data_dir.
         Resumes: shots that already have a file or are excluded (excluded_shot_reason) are skipped.
-        A shot with a kept source pull is filtered from it without touching the source,
-        even when an earlier filter rejected it, so deleting the unprocessed files reruns a filter change.
+        A shot with a kept source pull is filtered from it without touching the source.
+        A shot the current filter settings rejected on a previous run is skipped (shot_rejected_by_current_filters),
+        and a change to the settings filters it again.
+        A change to the filter code alone does not, so it needs failed_shots_dir cleared.
+        Deleting the unprocessed files reruns a filter change on the shots that passed.
         A shot that failed on an earlier run and has no kept pull is skipped.
         Source reads run prepare_workers at a time, while filtering, plotting, and writing stay on
         this thread, since they are matplotlib and netCDF work.
@@ -643,6 +697,11 @@ class DataWorkflow(ABC):
                     n_files += 1
                     continue
                 has_source_pull = (self.source_data_dir / f"{shot}.nc").exists()
+                if has_source_pull and self.shot_rejected_by_current_filters(shot):
+                    logger.info(
+                        f"Shot {shot} was rejected by the current filters on a previous run. Skipping."
+                    )
+                    continue
                 if not has_source_pull and self.shot_already_failed(shot):
                     logger.info(f"Shot {shot} failed on a previous run. Skipping.")
                     continue
@@ -711,7 +770,7 @@ class DataWorkflow(ABC):
                 logger.warning(
                     f"Shot {shot} did not pass filtering. Skipping unprocessed data file creation."
                 )
-                self.record_failed_shot(shot, "Did not pass filtering.")
+                self.record_failed_shot(shot, self.filter_rejection_note())
                 continue
             ds_unprocessed = _clip_powers(ds_unprocessed)
             # What pulled the shot and what this package was when it did.
@@ -2343,24 +2402,17 @@ class DataWorkflow(ABC):
             staging knobs the fits were made with,
             including the full fit grid the store's rho_tor_norm coordinate is cut from).
         """
+        unprocessed_filters = self.unprocessed_filter_settings()
+        filters = {
+            **unprocessed_filters,
+            "shot_blacklist": list(self.shot_blacklist),
+            "first_shot": self.first_shot,
+            "density_ratio_bounds": self.density_ratio_bounds,
+            "flat_te_edge_ratio": FLAT_TE_EDGE_RATIO,
+        }
         return {
             "device_settings": to_json(self.settings),
-            "filters": to_json(
-                {
-                    "min_filter": self.min_filter,
-                    "max_filter": self.max_filter,
-                    "transient_filter": self.transient_filter,
-                    "transient_smoothing_window": TRANSIENT_SMOOTHING_WINDOW,
-                    "end_margin": self.end_margin,
-                    "min_pulse_length": self.min_pulse_length,
-                    "shot_blacklist": list(self.shot_blacklist),
-                    "first_shot": self.first_shot,
-                    "min_radiated_fraction": self.min_radiated_fraction,
-                    "density_ratio_bounds": self.density_ratio_bounds,
-                    "energy_sanity_leeway": ENERGY_SANITY_LEEWAY,
-                    "flat_te_edge_ratio": FLAT_TE_EDGE_RATIO,
-                }
-            ),
+            "filters": to_json(filters),
             "fit_settings": to_json(
                 {
                     "rho_tor_norm_grid": self.fit_rho_tor_norm,
