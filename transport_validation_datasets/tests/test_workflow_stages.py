@@ -29,9 +29,9 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     unpack_fit_batch,
 )
 from transport_validation_datasets.machine.generic import (
+    channel_fit_rows,
     channel_rows_at_times,
     make_uniform_1kHz_timebase,
-    ts_channel_fit_rows,
 )
 from transport_validation_datasets.workflow import DataWorkflow
 
@@ -207,7 +207,7 @@ class DummyWorkflow(DataWorkflow):
         # The synthetic source stores each channel's rho_tor_norm in ts_channel_r,
         # so there is no equilibrium to map through
         rho_tor_norm = channel_rows_at_times(ds_shot["ts_channel_r"], ts_times)
-        te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
+        te_y, te_err, ne_y, ne_err = channel_fit_rows(ds_shot, ts_times)
         return ShotFitInput(
             x=rho_tor_norm,
             te_y=te_y,
@@ -596,6 +596,10 @@ class TestStageFitBatches:
         with pytest.raises(ValueError, match="average_windows"):
             make_workflow(tmp_path, shots=[1], average_windows=True)
 
+    def test_device_specific_fit_method_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="'ida'"):
+            DummyWorkflow(ds_name="dummy", data_assembly_dir=tmp_path, fit_method="ida")
+
     def test_existing_batch_in_another_mode_refused(self, tmp_path):
         plain = make_workflow(tmp_path)
         plain.make_unprocessed_data_files()
@@ -824,6 +828,19 @@ class TestStackInternalDataset:
         assert "ts_channel" not in published.dims
         assert "t_e" in published
         assert published.attrs["stripped_signals"].startswith("ts_channel")
+
+    def test_internal_only_device_refuses_publish_and_export(
+        self, tmp_path, monkeypatch
+    ):
+        workflow = make_workflow(tmp_path)
+        run_all(workflow)
+        monkeypatch.setattr(DummyWorkflow, "publishable", False)
+
+        with pytest.raises(ValueError, match="publishing is refused"):
+            workflow.publish_dataset()
+        with pytest.raises(ValueError, match="IMAS export is refused"):
+            workflow.export_to_imas()
+        assert not (workflow.stores_dir / "dummy_published.zarr").exists()
 
     def test_fit_results_in_another_mode_refused(self, tmp_path):
         plain = make_workflow(tmp_path)

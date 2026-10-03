@@ -54,6 +54,9 @@ from transport_validation_datasets.gp_fitting.zk.quality import (  # noqa: E402
     nonphysical_peak,
 )
 
+# The method's own name for its GP fit, in the description of every fitted profile
+FIT_DESCRIPTION = "Nonstationary Gibbs Kernel"
+
 # Columns of the hyps diagnostic arrays in this method's outputs.
 HYP_NAMES = ("var", "l1", "l2", "lw")
 

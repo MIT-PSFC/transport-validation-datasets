@@ -5,6 +5,7 @@ import pytest
 from loguru import logger
 
 from transport_validation_datasets.gp_fitting.registry import WORKER_MODULES
+from transport_validation_datasets.workflow import DataWorkflow
 
 logger.remove()
 logger.add(sys.stderr, colorize=True)
@@ -15,9 +16,12 @@ def linear_method(monkeypatch):
     # The linear interpolation fit method in tests/linear_worker.py, registered
     # as 'linear' for every test so the workflow stages can run in seconds.
     # Local only: the cluster dispatcher ships gp_fitting/, not tests/.
+    # Every device fit with the default GP methods takes it too.
     monkeypatch.setitem(
         WORKER_MODULES, "linear", "transport_validation_datasets.tests.linear_worker"
     )
+    gp_and_linear_methods = (*DataWorkflow.fit_methods, "linear")
+    monkeypatch.setattr(DataWorkflow, "fit_methods", gp_and_linear_methods)
 
 
 class _SyncPool:

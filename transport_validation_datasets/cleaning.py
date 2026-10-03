@@ -13,6 +13,11 @@ so they run on the staged units, before any worker normalizes.
 
 drop_rows_without_core then judges each row as it is staged, after the windows,
 since it asks what one fit will see: a variable with no channel in the core is not fit at all.
+
+A chord that crosses the magnetic axis samples each flux surface twice, on two branches
+(MAST inboard and outboard, TCV below and above the axis).
+low_side_channels splits them and branch_disagreement_errors inflates the errors where they disagree,
+which a device calls from its prepare_fit_input.
 """
 
 from dataclasses import replace
@@ -50,6 +55,37 @@ CORE_COVERAGE_RHO_TOR_NORM = 0.15
 # then outweighs its neighbours 10-50x and can pull the fitted pedestal to zero.
 DIP_RATIO = 0.35
 DIP_RHO_TOR_NORM_MAX = 0.97
+
+# The two branches of a chord can disagree:
+# kinetic profiles in spherical tokamaks are not necessarily flux functions,
+# and a reconstruction pins the flux surfaces away from the chord's crossing less precisely.
+# Where they do, each channel's error gets half the local disagreement added,
+# so both branches are consistent with a profile between them.
+# The disagreement at a channel is its value minus the other branch interpolated to its rho,
+# only between two channels of the other branch at most BRANCH_MAX_GAP apart.
+# Each channel takes the median |disagreement| of the channels of both branches within BRANCH_SMOOTH_HALFWIDTH
+# (at least BRANCH_MIN_CHANNELS of them), which keeps one spike from inflating its neighbours.
+# Pooling both branches inflates channels at the same rho alike,
+# where per branch the sparser one could keep its raw errors and steer the fit (MAST 24403 t=0.342).
+# Channels outside the overlap keep their raw errors.
+BRANCH_MAX_GAP = 0.08
+BRANCH_SMOOTH_HALFWIDTH = 0.05
+BRANCH_MIN_CHANNELS = 3
+
+# A channel whose readings sit far under their rho neighbours for most of a shot is broken for the shot,
+# a miscalibrated polychromator or a misaligned scattering volume, see persistently_low_channels.
+# Each reading is compared with the median of the other channels within PERSISTENT_HALFWIDTH, both branches pooled,
+# at rho_tor_norm under PERSISTENT_RHO_MAX, where the profile is smooth enough on that scale.
+# Calibrated on 45 TCV shots: 64529 loses six upper ne channels reading 0.06-0.57 of their neighbours in 88-100 percent of slices
+# (its Te is fine, so the DEFUSE ne fits rang through them),
+# and 11 other channel readings go in 9 shots, among them Te channel 13 of 60122 and 60181 and ne channel 9 of 74134.
+# Only low channels are judged: a high test flags good channels whose neighbourhood a low one drags down.
+PERSISTENT_HALFWIDTH = 0.05
+PERSISTENT_RHO_MAX = 0.95
+PERSISTENT_LOW_RATIO = 0.6
+PERSISTENT_MIN_FRACTION = 0.5
+PERSISTENT_MIN_SLICES = 10
+PERSISTENT_MIN_NEIGHBOURS = 3
 
 
 def clean_fit_rows(fit_input: ShotFitInput, shot: int) -> ShotFitInput:
@@ -284,3 +320,124 @@ def drop_rows_without_core(fit_input: ShotFitInput, shot: int) -> ShotFitInput:
             f"in {counts['te']} te and {counts['ne']} ne rows, not fitting them"
         )
     return replace(fit_input, **emptied)
+
+
+def low_side_channels(
+    rho_tor_norm: np.ndarray, chord_position: np.ndarray
+) -> np.ndarray:
+    """Mark the channels on the low side of the chord's crossing of the axis, slice by slice.
+
+    The branches split at the channel of lowest rho_tor_norm,
+    where the chord passes closest to the magnetic axis of the reconstruction the channels were mapped through.
+    The low side is where the channel position along the chord is below that channel's,
+    the inboard branch for a major radius, the branch below the axis for a height.
+
+    Args:
+        rho_tor_norm: (n_t, n_ch) channel positions, NaN where unmapped.
+        chord_position: (n_t, n_ch) channel positions along the chord [m].
+
+    Returns:
+        (n_t, n_ch) mask of the low side channels, False in slices with no mapped channel.
+    """
+    mapped = np.isfinite(rho_tor_norm).any(axis=1)
+    rho_filled = np.where(np.isfinite(rho_tor_norm), rho_tor_norm, np.inf)
+    i_axis = np.argmin(rho_filled, axis=1)
+    position_axis = np.take_along_axis(chord_position, i_axis[:, None], axis=1)
+    return mapped[:, None] & (chord_position < position_axis)
+
+
+def branch_disagreement_errors(
+    rho_tor_norm: np.ndarray, y: np.ndarray, err: np.ndarray, low_side: np.ndarray
+) -> np.ndarray:
+    """Inflate the errors by half the local disagreement between the two branches of a chord.
+
+    See the BRANCH_* constants for the calibration.
+    A channel with fewer than BRANCH_MIN_CHANNELS estimates within BRANCH_SMOOTH_HALFWIDTH keeps its error.
+
+    Args:
+        rho_tor_norm: (n_t, n_ch) channel positions, NaN where unmapped.
+        y: (n_t, n_ch) channel values, NaN where invalid.
+        err: (n_t, n_ch) channel errors.
+        low_side: (n_t, n_ch) mask of one branch (low_side_channels).
+
+    Returns:
+        The (n_t, n_ch) inflated errors.
+    """
+    err_out = np.array(err, dtype=float)
+    for i_time in range(y.shape[0]):
+        rho = rho_tor_norm[i_time]
+        valid = np.isfinite(rho) & np.isfinite(y[i_time])
+        is_low_side = low_side[i_time]
+        delta = np.full(rho.shape, np.nan)
+        for side in (True, False):
+            this = np.flatnonzero(valid & (is_low_side == side))
+            other = valid & (is_low_side != side)
+            if other.sum() < 2 or this.size == 0:
+                continue
+            order = np.argsort(rho[other])
+            rho_other = rho[other][order]
+            y_other = y[i_time][other][order]
+            right = np.searchsorted(rho_other, rho[this])
+            right_clipped = np.clip(right, 1, rho_other.size - 1)
+            gap = rho_other[right_clipped] - rho_other[right_clipped - 1]
+            bracketed = (right > 0) & (right < rho_other.size) & (gap <= BRANCH_MAX_GAP)
+            y_other_at_this = np.interp(rho[this], rho_other, y_other)
+            delta_this = y[i_time][this] - y_other_at_this
+            delta[this[bracketed]] = delta_this[bracketed]
+        abs_delta = np.abs(delta)
+        has_delta = np.isfinite(abs_delta)
+        disagreement = np.full(rho.shape, np.nan)
+        for k in np.flatnonzero(valid):
+            near = np.abs(rho - rho[k]) <= BRANCH_SMOOTH_HALFWIDTH
+            window = has_delta & near
+            if window.sum() >= BRANCH_MIN_CHANNELS:
+                disagreement[k] = np.median(abs_delta[window])
+        inflate = np.isfinite(disagreement)
+        err_out[i_time, inflate] = np.hypot(
+            err[i_time, inflate], 0.5 * disagreement[inflate]
+        )
+    return err_out
+
+
+def persistently_low_channels(x_rows: np.ndarray, y_rows: np.ndarray) -> np.ndarray:
+    """Find the channels that read far under their rho neighbours in most slices of a shot.
+
+    In each slice a reading inside PERSISTENT_RHO_MAX is divided by the median of the other readings
+    within PERSISTENT_HALFWIDTH of it in rho (at least PERSISTENT_MIN_NEIGHBOURS of them).
+    A channel judged in at least PERSISTENT_MIN_SLICES slices is low
+    when that ratio is under PERSISTENT_LOW_RATIO in more than PERSISTENT_MIN_FRACTION of them.
+    One variable at a time, since a broken ne calibration leaves Te alone.
+
+    Args:
+        x_rows: (n_t, n_ch) channel rho_tor_norm positions.
+        y_rows: (n_t, n_ch) channel values, NaN where invalid.
+
+    Returns:
+        (n_ch,) mask of the persistently low channels.
+    """
+    n_channels = y_rows.shape[1]
+    low_counts = np.zeros(n_channels, dtype=int)
+    judged_counts = np.zeros(n_channels, dtype=int)
+    for row in range(y_rows.shape[0]):
+        x_row = x_rows[row]
+        y_row = y_rows[row]
+        with np.errstate(invalid="ignore"):
+            mask_judged = (
+                np.isfinite(x_row) & np.isfinite(y_row) & (x_row < PERSISTENT_RHO_MAX)
+            )
+        idx_judged = np.flatnonzero(mask_judged)
+        for channel in idx_judged:
+            mask_near = (
+                np.abs(x_row[idx_judged] - x_row[channel]) <= PERSISTENT_HALFWIDTH
+            )
+            idx_near = idx_judged[mask_near & (idx_judged != channel)]
+            if idx_near.size < PERSISTENT_MIN_NEIGHBOURS:
+                continue
+            neighbour_median = np.median(y_row[idx_near])
+            judged_counts[channel] += 1
+            low_counts[channel] += (
+                y_row[channel] < PERSISTENT_LOW_RATIO * neighbour_median
+            )
+    mask_enough = judged_counts >= PERSISTENT_MIN_SLICES
+    low_fraction = low_counts / np.maximum(judged_counts, 1)
+    return mask_enough & (low_fraction > PERSISTENT_MIN_FRACTION)

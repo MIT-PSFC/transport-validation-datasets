@@ -16,6 +16,7 @@ from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_validation_datasets.cleaning import (
     clean_fit_rows,
     drop_rows_without_core,
+    low_side_channels,
 )
 from transport_validation_datasets.dataset_utils import build_tensorized_dataset
 from transport_validation_datasets.filters import (
@@ -255,6 +256,7 @@ class DataWorkflow(ABC):
     4. publish_dataset:
       derive the published copy of the internal store, with
       published_strip_signals stripped out.
+      A device whose data has no release permission (publishable False) stops at stage 3.
 
     Each stage resumes from what is already on disk, except the last two,
     which always rebuild their store. A device subclass supplies the source
@@ -374,6 +376,23 @@ class DataWorkflow(ABC):
     fit_scale_per_slice = False
     fit_bounds = default_fit_bounds()
 
+    # The fit methods (gp_fitting.registry) this device's profiles may be fit with.
+    # Any other method is refused, so a device-specific one like ida never runs on another device.
+    fit_methods: tuple[str, ...] = ("zk", "akho")
+
+    # False holds the device at its internal store, for data there is no permission to release:
+    # publish_dataset and export_to_imas refuse it.
+    publishable = True
+
+    # True when the staged readings are already a fitted profile (DIII-D IDA),
+    # so the screens for raw Thomson readings (cleaning.clean_fit_rows) are skipped.
+    prefit_profiles = False
+
+    # The channel variable whose position along the chord splits the fit plots into its two branches
+    # (cleaning.low_side_channels), with the labels of the low and the high side. None plots one group.
+    fit_plot_branch_position: str | None = None
+    fit_plot_branch_labels: tuple[str, str] = ("low side", "high side")
+
     def __init__(
         self,
         ds_name: str,
@@ -381,7 +400,7 @@ class DataWorkflow(ABC):
         shotlist_file: Path | None = None,
         max_num_shots: int | None = None,
         average_windows: bool = False,
-        fit_method: str = "zk",
+        fit_method: str | None = None,
         cluster_config: ClusterFitConfig | None = None,
         prepare_workers: int | None = None,
         settings: DeviceSettings | None = None,
@@ -401,8 +420,9 @@ class DataWorkflow(ABC):
             average_windows: Pool every Thomson point inside a time window
                 and fit each window as one profile, instead of fitting the
                 Thomson samples inside it one by one. Needs a shotlist with windows.
-            fit_method: GP fitting method name (see gp_fitting.registry). Names the
-                fit result and fit plot subdirectories, and the cluster job's worker.
+            fit_method: GP fitting method name (see gp_fitting.registry), one of the device's fit_methods.
+                Names the fit result and fit plot subdirectories, and the cluster job's worker.
+                None takes the first of fit_methods.
             cluster_config: If provided, GP profile fitting is dispatched to a SLURM
                 cluster (see gp_fitting/dispatcher.py).
                 If None, fitting runs single-threaded in this process.
@@ -414,8 +434,16 @@ class DataWorkflow(ABC):
 
         Raises:
             TypeError: If settings is not an instance of the device's settings_cls.
-            ValueError: If average_windows is set without a windowed shotlist.
+            ValueError: If fit_method is not one of the device's fit_methods,
+                or average_windows is set without a windowed shotlist.
         """
+        if fit_method is None:
+            fit_method = self.fit_methods[0]
+        if fit_method not in self.fit_methods:
+            raise ValueError(
+                f"{type(self).__name__} is fit with {list(self.fit_methods)}, "
+                f"not '{fit_method}'"
+            )
         self.ds_name = ds_name
         self.data_assembly_dir = data_assembly_dir / self.ds_name
 
@@ -1177,7 +1205,8 @@ class DataWorkflow(ABC):
         and run_gp_fitting refuses the whole staging directory when any of it
         disagrees with this run (_check_staged_batches),
         so an edited shotlist never quietly reuses fits made for other windows.
-        Every shot's per-sample rows go through cleaning.clean_fit_rows before any window pools them,
+        Every shot's per-sample rows go through cleaning.clean_fit_rows before any window pools them
+        (skipped for prefit_profiles, which are no raw readings),
         and its staged rows through cleaning.drop_rows_without_core after.
         A shot whose prepare_fit_input returns None, or that cleaning leaves nothing fittable,
         is recorded as failed and skipped on later runs.
@@ -1213,7 +1242,8 @@ class DataWorkflow(ABC):
                     self.record_failed_fit(shot, "No fittable Thomson channel data.")
                     continue
                 # Per sample, before any window pools the samples, see cleaning.py
-                fit_input = clean_fit_rows(fit_input, shot)
+                if not self.prefit_profiles:
+                    fit_input = clean_fit_rows(fit_input, shot)
                 if not fit_input.has_fittable_points():
                     self.record_failed_fit(
                         shot, "No fittable Thomson channel data after cleaning."
@@ -1432,7 +1462,8 @@ class DataWorkflow(ABC):
                 align with its staged input.
         """
         self._check_staged_batches()
-        hyp_names = getattr(registry.load_worker(self.fit_method), "HYP_NAMES", None)
+        worker = registry.load_worker(self.fit_method)
+        hyp_names = getattr(worker, "HYP_NAMES", None)
         x_star = None
         n_written = 0
         n_shots = 0
@@ -1481,7 +1512,13 @@ class DataWorkflow(ABC):
                         f"out of step. Rerun with --clean_fit_state."
                     )
                 ds = self._shot_fit_dataset(
-                    shot, so, batch_x_star, hyp_names, si.windows, si.window_index
+                    shot,
+                    so,
+                    batch_x_star,
+                    hyp_names,
+                    worker.FIT_DESCRIPTION,
+                    si.windows,
+                    si.window_index,
                 )
                 shot_path = self.fit_shots_dir / f"{shot}.nc"
                 shot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1505,6 +1542,7 @@ class DataWorkflow(ABC):
         so: ShotFitOutput,
         x_star: np.ndarray,
         hyp_names: list[str] | None,
+        fit_description: str,
         windows: np.ndarray,
         window_index: np.ndarray,
     ) -> xr.Dataset:
@@ -1523,6 +1561,8 @@ class DataWorkflow(ABC):
             so: The shot's ShotFitOutput.
             x_star: (n_x,) rho_tor_norm grid the profiles were fit on.
             hyp_names: Names of the method's hyperparameters, None if it has none.
+            fit_description: The method's own name for its GP fit (its worker's FIT_DESCRIPTION),
+                added to every profile's description.
             windows: (n_w, 2) time windows the shot was staged with [s].
             window_index: (n_t,) window of each row, -1 without windows.
 
@@ -1564,7 +1604,7 @@ class DataWorkflow(ABC):
                     ("shot", TIME_DIM, "rho_tor_norm"),
                     profile.astype(np.float32),
                     {
-                        "description": f"{extra}GP-fitted {desc} profile",
+                        "description": f"{extra}GP-fitted {desc} profile ({fit_description})",
                         "units": grad_unit,
                     },
                 )
@@ -1628,9 +1668,14 @@ class DataWorkflow(ABC):
     ) -> list | None:
         """Get the channel grouping used to color the fit plots.
 
-        Subclasses can split channels by diagnostic (C-Mod core vs edge Thomson)
-        or by position (MAST inboard vs outboard branch, which moves slice to slice).
-        The base implementation plots them as one group.
+        Subclasses can split channels by diagnostic (C-Mod core vs edge Thomson).
+        A device with a fit_plot_branch_position splits them into the two branches of its chord,
+        row by row at the lowest-rho channel as in its prepare_fit_input (cleaning.low_side_channels),
+        since the crossing of the axis moves slice to slice.
+        Each channel sits at its median position over the shot.
+        That keeps the channels' order along the chord, and serves pooled window rows as well,
+        whose columns repeat the channels once per pooled sample.
+        Without a fit_plot_branch_position every channel is one group.
 
         Args:
             shot: Shot number being plotted.
@@ -1639,7 +1684,30 @@ class DataWorkflow(ABC):
         Returns:
             (mask, color, label) triples, each mask (n_ch,) or (n_rows, n_columns), or None for a single group.
         """
-        return None
+        if self.fit_plot_branch_position is None:
+            return None
+        with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
+            position_rows = (
+                ds[self.fit_plot_branch_position]
+                .squeeze(EPISODE_DIM, drop=True)
+                .transpose("time", "ts_channel")
+                .values
+            )
+        has_position = np.isfinite(position_rows).any(axis=0)
+        position_channel = np.full(position_rows.shape[1], np.nan)
+        position_channel[has_position] = np.nanmedian(
+            position_rows[:, has_position], axis=0
+        )
+        n_rows, n_columns = fit_input.x.shape
+        n_repeats = n_columns // position_channel.size
+        position_tiled = np.tile(position_channel, (n_rows, n_repeats))
+        low_side = low_side_channels(fit_input.x, position_tiled)
+        high_side = np.isfinite(fit_input.x) & ~low_side
+        low_label, high_label = self.fit_plot_branch_labels
+        return [
+            (low_side, "tab:blue", low_label),
+            (high_side, "tab:orange", high_label),
+        ]
 
     def fit_plot_dropped_readings(self, shot: int) -> tuple | None:
         """Get the readings a device drops from every fit, to mark on the fit plots.
@@ -1833,8 +1901,10 @@ class DataWorkflow(ABC):
             stores_dir/<ds_name>_published.zarr.
 
         Raises:
-            ValueError: If there is no internal store to derive from.
+            ValueError: If the device is not publishable,
+                or there is no internal store to derive from.
         """
+        self._check_publishable("publishing")
         internal_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
         published_path = self.stores_dir / f"{self.ds_name}_published.zarr"
         if not internal_path.exists():
@@ -1874,6 +1944,21 @@ class DataWorkflow(ABC):
             f"{len(ds_published.data_vars)} variables, {len(stripped)} stripped"
         )
         return published_path
+
+    def _check_publishable(self, stage: str):
+        """Refuse a stage that releases data for a device whose data stays internal.
+
+        Args:
+            stage: The refused stage, for the message.
+
+        Raises:
+            ValueError: If the device is not publishable.
+        """
+        if not self.publishable:
+            raise ValueError(
+                f"{type(self).__name__} data has no release permission, "
+                f"its datasets stop at the internal store, so {stage} is refused"
+            )
 
     def _internal_dataset_shots(self) -> list[int]:
         """List the shots that can go into the internal dataset.
@@ -1917,9 +2002,12 @@ class DataWorkflow(ABC):
         `core_profiles` here carries electrons + a single hydrogenic main ion
         only (Zeff=1, n_D=n_e).
 
+        A device that is not publishable is refused (_check_publishable).
+
         Args:
             overwrite: Rewrite a shot's IMAS output even if it already exists.
         """
+        self._check_publishable("the IMAS export")
         from transport_validation_datasets.imas_export.scenario_export import (
             build_imas_from_shot,
             write_ids,

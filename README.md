@@ -7,14 +7,16 @@ Every device is reduced to one schema, listed under [The datasets](#the-datasets
 Signal names are IMAS-like, units are SI, and each variable carries its IMAS
 data dictionary path under its `ref` attribute in the stored files, with the
 documentation page under `url`. The per-device sources of each signal live
-next to their attributes in `machine/mast/mast_dataset.py` (`SIGNAL_ATTRS`)
-and `machine/cmod/dispy_methods.py`. The GEQDSK block's attributes are shared
-(`machine/generic.py`, `GEQDSK_SIGNAL_ATTRS`). The stack stage brings every
-variable onto that convention.
+next to their attributes in the device modules (`SIGNAL_ATTRS` of `machine/mast/mast_dataset.py`,
+`machine/tcv/tcv_dataset.py` and `machine/d3d/d3d_dataset.py`, and `machine/cmod/dispy_methods.py`).
+The GEQDSK block's attributes are shared (`machine/generic.py`, `GEQDSK_SIGNAL_ATTRS`).
+The stack stage brings every variable onto that convention.
 Each unprocessed file records the COCOS index of its GEQDSK signals in a root
 attribute `cocos`. The final dataset carries it as the per-shot variable `cocos`.
 It is identified per shot from the signs of the reconstruction's own Ip, B0, psi and q (`cocos_from_signs`).
-The psi signals are per radian for MAST and C-Mod from EFIT, while the IMAS nodes their `ref` points at hold the total flux in Wb, in COCOS 17.
+The psi signals are per radian on every device (MAST, C-Mod and DIII-D from EFIT,
+TCV from LIUQE, whose flux per 2 pi radians is rescaled),
+while the IMAS nodes their `ref` points at hold the total flux in Wb, in COCOS 17.
 
 Every file records where it came from in its root attributes.
 The unprocessed files carry the source package that pulled
@@ -31,9 +33,12 @@ stages applied, see [Filtering](#filtering)), and `fit_settings` (the fit stagin
 # Workflow
 
 1: Pull unprocessed data from source and filter down to regions of validity
-2: Perform GP profile fitting
+2: Perform GP profile fitting (DIII-D carries IDA's own GP fits onto the fit grid instead)
 3: Stack shots into the internal dataset
 4: Publish dataset, stripping the internal-only signals
+
+TCV and DIII-D data has no release permission, so those datasets stop at step 3 (`publishable` False):
+`--stage all` leaves publishing out, and the publish stage and the IMAS export refuse them.
 
 # The datasets
 
@@ -42,8 +47,8 @@ Two Zarr stores per device, under `<data_assembly_dir>/<ds_name>/04_datasets/`:
 - `<ds_name>_internal.zarr`, the store for internal use, carrying every signal
   below. Built by `DataWorkflow.stack_internal_dataset` (the stack stage).
 - `<ds_name>_published.zarr`, the store for release, derived from the internal
-  one with the device's `published_strip_signals` stripped out. Built by
-  `DataWorkflow.publish_dataset` (the publish stage).
+  one with the device's `published_strip_signals` stripped out.
+  Built by `DataWorkflow.publish_dataset` (the publish stage). C-Mod and MAST only.
 
 Shots are stacked along `shot` and NaN padded along every other dimension, so
 shots of different lengths line up. Only one shot is ever held in memory while
@@ -77,6 +82,7 @@ shot had no Thomson sample there.
 | Fitted profiles | t_e, n_e, their _error, _gradient, _gradient_error, _fit_status | (shot, time_idx, rho_tor_norm) |
 | Equilibrium | the full GEQDSK block: psirz, fpol, pres, ffprime, pprime, qpsi, rbdry, zbdry, rlim, zlim, rmagx, zmagx, simagx, sibdry, bcentr, current, rcentr, rleft, rdim, zmid, zdim | (shot, time_idx, grid) |
 | Raw Thomson channels (internal store only) | ts_channel_r, ts_channel_z, ts_channel_t_e, ts_channel_n_e, their _error | (shot, time_idx, ts_channel) |
+| IDA points, DIII-D (internal store only) | ida_psi_n, ida_t_e, ida_n_e, their _error | (shot, time_idx, ida_point) |
 
 The profiles are fit on rho_tor_norm from 0 to 1.6, so every fit anchor is on the fit grid and in the fit plots.
 The fit files, the stores and the IMAS export keep them out to rho_tor_norm 1.1.
@@ -87,10 +93,12 @@ shots of different lengths is NaN.
 The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since source records often dip negative
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
 
-Every stored value is causal, no grid time draws on a later sample,
-with two exceptions.
+Every stored value is causal, no grid time draws on a later sample, with these exceptions.
 power_ohm and power_radiated are smoothed by a centered 50 ms boxcar applied twice (`smoothed_power`),
-the kernel DIII-D's bolometer total comes with, since unsmoothed both are noise-dominated at 1 kHz.
+which is similar to DIII-D's bolometer postprocessing.
+DIII-D's are smoothed at the source (the EFIT `poh` takes +-100 ms slopes, `\bolom::prad_tot` does the boxcar),
+and TCV's `PradTot` reads smooth at its ~17 ms cadence, so it is only held causally for at least 60 ms.
+TCV's n_e_line_average has the FIR fringe jumps removed from its raw samples, which looks across each jump.
 The EFIT and Thomson slices are snapped to the nearest grid time (`snap_to_grid`), up to 0.5 ms early.
 A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, grid time t taking the mean of (t - 1 ms, t].
@@ -98,16 +106,20 @@ One sampled slower is held forward from its last finite sample for at most `MAX_
 or `EQUILIBRIUM_HOLD_FLOOR` (10 ms) when it comes from the equilibrium reconstruction and that is longer.
 Derivatives are backward differences.
 b0 is the vacuum toroidal field at the fixed major radius r0, as IMAS defines it,
-the magnetics btor at 0.66 m on C-Mod and the EFIT bvac_val at bvac_r (1.0 m) on MAST.
+the magnetics btor at 0.66 m on C-Mod, the EFIT bvac_val at bvac_r (1.0 m) on MAST,
+LIUQE's rBt / r0 at 0.88 m on TCV (DEFUSE BZERO), and mu0 144 bcoil / (2 pi r0) at 1.6955 m on DIII-D (PTDATA bcoil, EFIT's own formula).
 ip and b0 keep their source sign, the cocos variable records the convention.
 beta_tor_norm is normalized with B_geo = b0 r0 / geometric_axis_r, in beta_tor and in a B / Ip,
 not with the IMAS b0 at r0, and the IMAS export converts it.
-MAST's efm betan already uses B_geo (bvac_rgeom).
+MAST's efm betan and DIII-D's EFIT betan already use B_geo.
+TCV computes it from LIUQE's Wtot and volume, beta_tor = 2 mu0 (2 Wtot / 3 VOL) / B_geo^2 (DEFUSE BETAN normalizes by the volume-averaged field).
 C-Mod's EFIT betan takes |btaxp|, the total field at the magnetic axis,
 so it is rebuilt from betat, which uses B_geo, as betat a B_geo / Ip (`get_normalized_beta`).
-power_ohm is Ip V_loop - dW_pol/dt on both devices.
+power_ohm is Ip V_loop - dW_pol/dt on every device.
 MAST reads it from ESM (`pphix`), C-Mod computes it (`CmodPowerMethods.get_ohmic_power`)
 from the flux loop voltage and W_pol = mu0 R_geo li Ip^2 / 4, R_geo the geometric major radius (EFIT `rout`).
+TCV computes it the same way from DEFUSE `I_P`, `Vloop` (flipped onto I_P's sign), `LI` and `R_geom`,
+and DIII-D reads the DISPY EFIT's `poh`.
 
 The C-Mod 0D signals outside EFIT are read by custom methods (`CmodPlasmaMethods`, `CmodPowerMethods`),
 since the disruption-py built-ins interpolate.
@@ -147,7 +159,7 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
 
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
 2. End of shot (`end_of_shot_index`): the plasma ends at the last grid time with |ip| at or above its `min_filter` threshold,
-   and everything after `end_margin` (C-Mod 20 ms, MAST 40 ms) before that is cut.
+   and everything after `end_margin` (C-Mod 20 ms, MAST 40 ms, TCV 50 ms, DIII-D 100 ms) before that is cut.
    A shot whose |ip| never reaches the threshold is rejected.
 3. Every 0D signal must be finite, every `min_filter` signal at or above its threshold
    (ip compared as |ip|), and every `max_filter` signal at or below it, on the raw samples.
@@ -155,8 +167,7 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
    derived for the filter and not stored.
 4. Grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold.
    The centered window only selects grid times, no stored value is smoothed by it.
-   The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`,
-   which POPSIM-Transport-Predictor also draws for DIII-D and TCV).
+   The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`).
 5. The leading grid times of each segment are cut up to its first sample
    that a usable reconstruction (`usable_reconstructions`) of the same segment reaches
    within the hold (`MAX_HOLD_PERIODS` of the reconstruction clock, at least `EQUILIBRIUM_HOLD_FLOOR`), since the store would have no equilibrium before it.
@@ -164,27 +175,27 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
 6. Only the longest segment is kept, shaded green in the accepted-shot plots.
    Only the kept segment's reconstructions reach the store,
    so step 5 trims each segment as if it alone were kept, and the longest is chosen after every trim.
-7. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod 0.5 s, MAST 0.2 s).
+7. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod, TCV and DIII-D 0.5 s, MAST 0.2 s).
 8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a mean `power_radiated` below `min_radiated_fraction` of the mean input power, ohmic plus auxiliary (a dead bolometer),
-     1 percent on C-Mod and 2.5 percent on MAST,
+     1 percent on C-Mod and 2.5 percent on MAST, TCV and DIII-D,
      or above `max_radiated_fraction` of it, 1 on both, since more cannot be radiated than is put in (`radiated_fraction_reason`)
    - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point (`energy_sanity_reason`).
 
-| Threshold | C-Mod | MAST |
-| --- | --- | --- |
-| min ip | 100 kA | 210 kA |
-| min energy_mhd | 2.7 kJ | 5 kJ |
-| min n_e_line_average | 1e19 m^-3 | 3e18 m^-3 |
-| max greenwald_fraction | 2.0 | 2.0 |
-| transient power_ohm | 5 MW | 5 MW |
-| transient power_radiated | 5.5 MW | 3 MW |
-| failure_margin (shared) | 20 ms | 20 ms |
-| end_margin | 20 ms | 40 ms |
-| min_pulse_length | 0.5 s | 0.2 s |
-| min_radiated_fraction | 0.01 | 0.025 |
-| max_radiated_fraction | 1.0 | 1.0 |
-| density_ratio_bounds | 0.72-1.3 | 0.7-1.3 |
+| Threshold | C-Mod | MAST | TCV | DIII-D |
+| --- | --- | --- | --- | --- |
+| min ip | 100 kA | 210 kA | 50 kA | 200 kA |
+| min energy_mhd | 2.7 kJ | 5 kJ | 1 kJ | 10 kJ |
+| min n_e_line_average | 1e19 m^-3 | 3e18 m^-3 | 2e18 m^-3 | 5e17 m^-3 |
+| max greenwald_fraction | 2.0 | 2.0 | 2.0 | 2.0 |
+| transient power_ohm | 5 MW | 5 MW | 2 MW | 2 MW |
+| transient power_radiated | 5.5 MW | 3 MW | 5 MW | 17 MW |
+| failure_margin (shared) | 20 ms | 20 ms | 20 ms | 20 ms |
+| end_margin | 20 ms | 40 ms | 50 ms | 100 ms |
+| min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
+| min_radiated_fraction | 0.01 | 0.025 | 0.025 | 0.025 |
+| max_radiated_fraction | 1.0 | 1.0 | 1.0 | 1.0 |
+| density_ratio_bounds | 0.72-1.3 | 0.7-1.3 | 0.7-1.3 | 0.7-1.3 |
 
 The standardized source pull of every shot is kept unfiltered in `01_unprocessed/source/`.
 A rerun filters from it without touching the source.
@@ -200,6 +211,10 @@ A shot that is accepted loses its note, so the notes count only the current reje
 Fit stage: the Thomson channels map through the nearest usable reconstruction in reach,
 the Thomson screens in `cleaning.py` run on every sample before fitting,
 and the fit method's own checks give each slice a fit status.
+A channel below psi_N 1 more than 5 mm outside its reconstruction's boundary contour sits in a private flux region,
+under an X-point, so it is left unmapped (TCV's vertical chord reaches below the lower X-point, where such channels read a few eV).
+DIII-D's IDA points map through the DISPY q profile instead,
+and since they are already a fit, the Thomson screens do not run on them (`prefit_profiles`).
 
 Stack stage (`_internal_shot_dataset`), per shot:
 
@@ -214,7 +229,7 @@ Stack stage (`_internal_shot_dataset`), per shot:
    The previous slice holds over a dropped one like over any gap.
 3. The shot is dropped when its fitted density disagrees with the interferometer (`fit_rejection_reason`).
    The shot median over its slices of mean(n_e over rho_tor_norm 0-1) / `n_e_line_average`
-   must sit inside the device's `density_ratio_bounds` (C-Mod 0.72-1.3, MAST 0.7-1.3).
+   must sit inside the device's `density_ratio_bounds` (C-Mod 0.72-1.3, MAST, TCV and DIII-D 0.7-1.3).
    A shot with no slice to compare is dropped too.
    The ratio is a proxy for the chord integral, and the bounds absorb its offset on each device.
 4. The usable reconstructions are held onto the grid, as above.
@@ -242,6 +257,17 @@ indicating a large change in the Thomson density calibration.
   The hold bridges up to 10 ms of them, and longer ones are cut out as gaps.
 - **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
   It is an artifact of the EFIT basis functions.
+- **TCV density gate.** TCV Thomson ne is calibrated to the FIR interferometer, so `density_ratio_bounds` only catches a broken calibration of either.
+  A dead FIR reads ~0 and its Thomson with it (70353, 70356), which the n_e_line_average floor catches instead.
+- **TCV branches.** Below the axis Te reads 3-8 percent above the channels above it, ne a few percent.
+  The branch error inflation (`cleaning.branch_disagreement_errors`) leaves the fit between the two.
+- **TCV broken channels.** Some channels read far under their neighbours for a whole shot (64529 loses six upper ne channels),
+  and `cleaning.persistently_low_channels` drops them per variable before fitting.
+  A channel that is broken in fewer than half the slices of a shot stays, for the per-sample screens.
+- **TCV Thomson timing.** The laser fires every ~17 ms at times like 17.34 ms, which `snap_to_grid` moves to 17 ms, up to 0.5 ms early.
+- **DIII-D IDA mapping.** IDA's psi_N comes from its own reconstruction, which the files do not name,
+  while the q profile that maps it onto rho_tor_norm comes from the DISPY EFIT.
+  IDA gives no point covariance, so the gradient errors assume independent points and overestimate the error of a smooth fit.
 
 # Running
 
@@ -266,7 +292,20 @@ uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_d
 # Derive the published store from the internal one
 uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_dir \
     --stage publish
+
+# TCV, on a PSFC machine with the DEFUSE and MEQ NFS, the fits on the cluster, up to the internal store
+uv run python -m transport_validation_datasets.cli tcv /path/to/data_assembly_dir \
+    --config configs/orcd.toml,configs/$USER.user.toml
+
+# DIII-D, on omega (DIII-D data servers and /fusion), the IDA fits carried over locally, up to the internal store
+uv run python -m transport_validation_datasets.cli d3d /path/to/data_assembly_dir
 ```
+
+TCV and DIII-D stop at the internal store (see [Workflow](#workflow)).
+On omega the system MDSplus imports under numpy 1.26, the package's own lock, with Python 3.12
+(numpy 1.26 has no Python 3.13 wheel).
+Keep the venv on `/home` and only the data on `/cscratch`: a job loading a venv's compiled modules from `/cscratch` stalls for many minutes.
+Under numpy 2 disruption-py falls back to the mdsthin thin client by itself.
 
 `--help` lists every flag, and the stages resume: rerunning the same command
 picks up whatever is not on disk yet. Stack and publish are the exceptions,
@@ -303,15 +342,16 @@ venv_path = "/path/on/cluster/.venv"
 ```
 
 Keys are dataclass field names: `ClusterFitConfig` in `gp_fitting/dispatcher.py`
-for `[cluster]`, the device workflow's `settings_cls` for `[cmod]` and `[mast]`
-(`CModSettings` in `machine/cmod/cmod_dataset.py`, `MASTSettings` in `machine/mast/mast_dataset.py`).
+for `[cluster]`, the device workflow's `settings_cls` for `[cmod]`, `[mast]`, `[tcv]` and `[d3d]`
+(`CModSettings` in `machine/cmod/cmod_dataset.py`, `MASTSettings` in `machine/mast/mast_dataset.py`,
+`TCVSettings` in `machine/tcv/tcv_dataset.py`, `D3DSettings` in `machine/d3d/d3d_dataset.py`).
 A key left out keeps its default.
 A key the dataclass does not have, or a table that is neither `cluster` nor a device, is an error.
 Without a `[cluster]` table the fits run locally in the calling process, 
 and without `--config` everything keeps its default.
 Run-specific choices (`--ds_name`, `--shotlist_file`, `--stage`, `--method`, ...) stay command line flags.
 
-Both device tables take the fit anchors, the virtual observations every fit method adds to every Thomson slice.
+Every device table takes the fit anchors, the virtual observations every fit method adds to every Thomson slice.
 Each is a list of `[rho_tor_norm, value, error]` rows in the fit units, Te in keV and ne in 1e20 m^-3, gradients per unit rho_tor_norm.
 The defaults pin each profile to zero value and gradient at rho_tor_norm 1.3 to 1.6, and zero gradient at the axis.
 They sit past the SOL channels, which rho_tor_norm stretches out to ~1.25.
@@ -327,7 +367,7 @@ te_grad_anchors = [[0.0, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1], [1.5, 0.0,
 The anchors are staged into the fit batches, so changing them needs
 `--clean_fit_state` or a new `--ds_name`.
 
-Both device tables also take `pedestal_rho_tor_norm`, the pedestal location every fit uses, 1.0 by default.
+Every device table also takes `pedestal_rho_tor_norm`, the pedestal location every fit uses, 1.0 by default.
 zk places its kernel's length-scale transition there, and akho centers its mtanh there.
 One value for both Te and ne. It is staged and checked like the anchors.
 
@@ -336,7 +376,7 @@ One value for both Te and ne. It is staged and checked like the anchors.
 pedestal_rho_tor_norm = 0.95
 ```
 
-Both device tables also take `sol_extension`, how the Thomson channels outside the LCFS are placed in rho_tor_norm.
+Every device table also takes `sol_extension`, how the Thomson channels outside the LCFS are placed in rho_tor_norm.
 Inside the LCFS the normalized toroidal flux Phi_N is the integral of q over psi_N.
 q is undefined outside it, so Phi_N continues linearly in psi_N,
 with the slope from psi_N 0.95 to 1 (`"secant"`, the default) or the slope at the LCFS (`"tangent"`).
@@ -365,6 +405,26 @@ so their records need deleting for a rebuild to try another tree.
 # Opt in to the ANALYSIS fallback
 [cmod]
 efit_trees = ["EFIT21", "ANALYSIS"]
+```
+
+The `[tcv]` table takes `defuse_dir` and `meqdb_dir`, the directories of the DEFUSE exports (`TCVno{shot}.h5`)
+and of the MEQ databases holding the LIUQE reconstructions (`TCV{shot}_meqdb.mat`).
+The defaults are the PSFC NFS paths, and only shots with both are built.
+
+The `[d3d]` table takes `runtag`, the code_rundb runtag of the EFIT runs every EFIT signal comes from
+(`"DISPY"`, the 1 kHz disruption-efit, a shot without one is skipped),
+and `ida_databases`, the IDA databases in priority order (`DEFAULT_IDA_DATABASES` in `machine/d3d/d3d_dataset.py`).
+Each is a `pattern` with `{shot}` and optional `*` wildcards,
+and an optional `shotlist` file in `machine/d3d`, which limits the database to the shots on it.
+A shot is read from the first database that has a file for it, and the default shotlist is the union.
+
+```toml
+[d3d]
+runtag = "DISPY"
+ida_databases = [
+    { pattern = "/fusion/projects/results/ida-results/HBP_database/IDA_{shot}_.cdf" },
+    { pattern = "/fusion/projects/results/ida-results/TMDB_V1c/Output/IDA_{shot}_.cdf", shotlist = "HBP_shotlist_2013_2025" },
+]
 ```
 
 # Shotlists and time windows
@@ -418,5 +478,5 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 | ------ | ------ | -------- | ----- |
 | C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. |
 | MAST | Level 1 Zarr store at https://s3.echo.stfc.ac.uk/mast/level1/shots: EFM for the equilibrium (GEQDSK and 0D), ESM for the ohmic power, AYC for the Thomson profiles. The level 2 store at https://s3.echo.stfc.ac.uk/mast/level2/shots supplies only the summary signals (ip, NBI and radiated power, line averaged density) | 1671 shots from the M7-M9 campaigns, shipped with the package and built by `machine/mast/shotlist.py` | Public, anonymous, read in a thread pool (`--prepare_workers`) |
-| DIII-D | | | |
-| TCV | | | |
+| DIII-D | MDSplus through disruption-py: the 0D signals (PTDATA ip and bcoil, the DISPY EFIT a-file scalars, `\bolom::prad_tot`, pinj, echpwrc) and the full GEQDSK block of the shot's DISPY EFIT run (the 1 kHz disruption-efit, `code_rundb` runtag DISPY). Te and ne from IDA files, already GP fit on IDA's psi_N points | Every shot an IDA database of `[d3d]` serves (`find_ida_shots`) | Runs on omega. Internal store only. The `ida` fit method is the only one that serves DIII-D, and it refuses every other device |
+| TCV | DEFUSE exports (`TCVno{shot}.h5`, MATLAB v7.3, h5py): the 0D signals and the raw Thomson channels (`SIG/{Te_rho,Ne_rho}/signal/raw`, the vertical chord at R = 0.9 m). The LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`) as the full GEQDSK block (`liuqe_geqdsk_dataset`) | Every shot with both, 964 from 60001 to 82878 | Runs where the PSFC NFS is mounted. Internal store only. DEFUSE's own spline fits are not read |

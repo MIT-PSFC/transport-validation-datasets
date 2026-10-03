@@ -21,11 +21,11 @@ from transport_validation_datasets.machine.cmod.dispy_methods import (
 )
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
+    channel_fit_rows,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
     signal_on_grid,
     snap_to_grid,
-    ts_channel_fit_rows,
 )
 from transport_validation_datasets.store_schema import apply_signal_attrs
 from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
@@ -357,7 +357,7 @@ class CModDataWorkflow(DataWorkflow):
             return None
 
         ds_shot = ds.squeeze("shot", drop=True)
-        te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
+        te_y, te_err, ne_y, ne_err = channel_fit_rows(ds_shot, ts_times)
         # Before the raw validity below, so drop_in_both never takes the sound ne of a faulty Te channel
         te_y[:, self.te_faulty_channels] = np.nan
         # What each variable offers before the screens, so what they drop can be coupled
@@ -470,7 +470,7 @@ class CModDataWorkflow(DataWorkflow):
                 ds, self.settings.sol_extension
             )
             ds_shot = ds.squeeze("shot", drop=True)
-            te_y, te_err, _, _ = ts_channel_fit_rows(ds_shot, ts_times)
+            te_y, te_err, _, _ = channel_fit_rows(ds_shot, ts_times)
         faulty = self.te_faulty_channels
         return (
             ts_times,

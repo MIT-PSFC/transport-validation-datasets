@@ -1,7 +1,6 @@
 """The signals every device store shares, with their SI units and IMAS data dictionary paths.
 
-This package writes them for C-Mod and MAST,
-and POPSIM-Transport-Predictor for DIII-D and TCV.
+This package writes them for every device.
 Each device adds its own description of how a signal was measured.
 """
 

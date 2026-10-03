@@ -21,10 +21,15 @@ import xarray as xr
 from loguru import logger
 
 from transport_validation_datasets import PACKAGE_ROOT
-from transport_validation_datasets.cleaning import drop_in_both
+from transport_validation_datasets.cleaning import (
+    branch_disagreement_errors,
+    drop_in_both,
+    low_side_channels,
+)
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
+    channel_fit_rows,
     channel_rows_at_times,
     cocos_from_signs,
     make_geqdsk_dataset,
@@ -33,7 +38,7 @@ from transport_validation_datasets.machine.generic import (
     signal_on_grid,
     smoothed_power,
     snap_to_grid,
-    ts_channel_fit_rows,
+    ts_channel_dataset,
 )
 from transport_validation_datasets.store_schema import apply_signal_attrs
 from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
@@ -70,23 +75,9 @@ MAX_RELATIVE_ERROR = 1.0
 # 20 percent in Te and 7 percent in ne at rho 0.8-0.85, and 42 and 18 percent at 0.85-0.9,
 # while its own point-to-point scatter stayed below the outboard's.
 # It has 3-5 times the outboard's channels there and steered the edge fit, so it is dropped.
+# Inside it the two branches inflate each other's errors where they disagree (cleaning.branch_disagreement_errors),
+# past it only the outboard branch is left, with nothing to disagree with.
 MAX_INBOARD_RHO_TOR_NORM = 0.8
-
-# Kinetic profiles in spherical tokamaks are not necessarily flux functions,
-# and as such the inboard and outboard side can disagree.
-# Where they do, each channel's error gets half the local disagreement added,
-# so both branches are consistent with a profile between them.
-# The disagreement at a channel is its value minus the other branch interpolated to its rho,
-# only between two channels of the other branch at most BRANCH_MAX_GAP apart.
-# Each channel takes the median |disagreement| of the channels of both branches within BRANCH_SMOOTH_HALFWIDTH
-# (at least BRANCH_MIN_CHANNELS of them), which keeps one spike from inflating its neighbours.
-# Pooling both branches inflates channels at the same rho alike,
-# where per branch the sparser one could keep its raw errors and steer the fit (24403 t=0.342).
-# Channels outside the overlap keep their raw errors.
-# Past MAX_INBOARD_RHO_TOR_NORM only the outboard branch is left, with nothing to disagree with.
-BRANCH_MAX_GAP = 0.08
-BRANCH_SMOOTH_HALFWIDTH = 0.05
-BRANCH_MIN_CHANNELS = 3
 
 # efm signal -> standardized name.
 # All 0D, held onto the 1 kHz timebase from each reconstruction, for at least EQUILIBRIUM_HOLD_FLOOR.
@@ -291,6 +282,8 @@ class MASTDataWorkflow(DataWorkflow):
 
     settings_cls = MASTSettings
     signal_attrs = SIGNAL_ATTRS
+    fit_plot_branch_position = "ts_channel_r"
+    fit_plot_branch_labels = ("inboard TS", "outboard TS")
 
     min_pulse_length = 0.2
     min_filter = {
@@ -442,7 +435,7 @@ class MASTDataWorkflow(DataWorkflow):
         2: Convert to the fit units (Te [keV], ne [1e20 m^-3])
         3: Drop every channel whose Te or ne error exceeds MAX_RELATIVE_ERROR times its value
         4: Drop the inboard channels past MAX_INBOARD_RHO_TOR_NORM
-        5: Inflate the errors where the inboard and outboard branches disagree (_branch_disagreement_errors)
+        5: Inflate the errors where the inboard and outboard branches disagree (cleaning.branch_disagreement_errors)
         6: Drop the channels outside the fittable range
 
         BOTH sides of the chord are fit, the inboard side only inside MAX_INBOARD_RHO_TOR_NORM.
@@ -471,7 +464,7 @@ class MASTDataWorkflow(DataWorkflow):
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None
 
-        te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
+        te_y, te_err, ne_y, ne_err = channel_fit_rows(ds_shot, ts_times)
 
         # The read keeps only positive values with positive errors, see _thomson_dataset
         with np.errstate(invalid="ignore"):
@@ -486,7 +479,7 @@ class MASTDataWorkflow(DataWorkflow):
             )
 
         r_channel = channel_rows_at_times(ds_shot["ts_channel_r"], ts_times)
-        inboard = _inboard_channels(rho_tor_norm, r_channel)
+        inboard = low_side_channels(rho_tor_norm, r_channel)
         with np.errstate(invalid="ignore"):
             inboard_edge = inboard & (rho_tor_norm > MAX_INBOARD_RHO_TOR_NORM)
         n_inboard_edge = int((inboard_edge & np.isfinite(te_y)).sum())
@@ -496,8 +489,8 @@ class MASTDataWorkflow(DataWorkflow):
             f"Shot {shot}: dropped {n_inboard_edge} inboard channel readings past "
             f"rho_tor_norm {MAX_INBOARD_RHO_TOR_NORM:g}"
         )
-        te_err = _branch_disagreement_errors(rho_tor_norm, te_y, te_err, inboard)
-        ne_err = _branch_disagreement_errors(rho_tor_norm, ne_y, ne_err, inboard)
+        te_err = branch_disagreement_errors(rho_tor_norm, te_y, te_err, inboard)
+        ne_err = branch_disagreement_errors(rho_tor_norm, ne_y, ne_err, inboard)
 
         with np.errstate(invalid="ignore"):
             rho_tor_norm = np.where(
@@ -518,115 +511,6 @@ class MASTDataWorkflow(DataWorkflow):
             )
             return None
         return fit_input
-
-    def fit_plot_channel_groups(
-        self, shot: int, fit_input: ShotFitInput
-    ) -> list | None:
-        """Split the fit-plot channels into the inboard and outboard branches of the chord, row by row.
-
-        The rows split at their lowest-rho channel, as in prepare_fit_input (_inboard_channels).
-        Each channel sits at its median major radius over the shot.
-        That keeps the channels' order along the chord, and serves pooled window rows as well,
-        whose columns repeat the channels once per pooled sample.
-
-        Args:
-            shot: Shot number being plotted.
-            fit_input: The shot's staged fit input.
-
-        Returns:
-            (mask, color, label) triples, each mask (n_rows, n_columns).
-        """
-        with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
-            r_rows = (
-                ds["ts_channel_r"]
-                .squeeze("shot", drop=True)
-                .transpose("time", "ts_channel")
-                .values
-            )
-        has_r = np.isfinite(r_rows).any(axis=0)
-        r_channel = np.full(r_rows.shape[1], np.nan)
-        r_channel[has_r] = np.nanmedian(r_rows[:, has_r], axis=0)
-        n_rows, n_columns = fit_input.x.shape
-        r_tiled = np.tile(r_channel, (n_rows, n_columns // r_channel.size))
-        inboard = _inboard_channels(fit_input.x, r_tiled)
-        outboard = np.isfinite(fit_input.x) & ~inboard
-        return [
-            (inboard, "tab:blue", "inboard TS"),
-            (outboard, "tab:orange", "outboard TS"),
-        ]
-
-
-def _inboard_channels(rho_tor_norm: np.ndarray, r_channel: np.ndarray) -> np.ndarray:
-    """Mark the channels on the inboard branch of the chord, slice by slice.
-
-    The branches split at the channel of lowest rho_tor_norm,
-    where the chord passes closest to the magnetic axis of the same reconstruction the channels were mapped through.
-
-    Args:
-        rho_tor_norm: (n_t, n_ch) channel positions, NaN where unmapped.
-        r_channel: (n_t, n_ch) channel major radii [m].
-
-    Returns:
-        (n_t, n_ch) mask of the inboard channels, False in slices with no mapped channel.
-    """
-    mapped = np.isfinite(rho_tor_norm).any(axis=1)
-    rho_filled = np.where(np.isfinite(rho_tor_norm), rho_tor_norm, np.inf)
-    i_axis = np.argmin(rho_filled, axis=1)
-    r_axis = np.take_along_axis(r_channel, i_axis[:, None], axis=1)
-    return mapped[:, None] & (r_channel < r_axis)
-
-
-def _branch_disagreement_errors(
-    rho_tor_norm: np.ndarray, y: np.ndarray, err: np.ndarray, inboard: np.ndarray
-) -> np.ndarray:
-    """Inflate the errors by half the local disagreement between the inboard and outboard branches.
-
-    See the BRANCH_* constants for the calibration.
-    A channel with fewer than BRANCH_MIN_CHANNELS estimates within BRANCH_SMOOTH_HALFWIDTH keeps its error.
-
-    Args:
-        rho_tor_norm: (n_t, n_ch) channel positions, NaN where unmapped.
-        y: (n_t, n_ch) channel values, NaN where invalid.
-        err: (n_t, n_ch) channel errors.
-        inboard: (n_t, n_ch) inboard branch mask (_inboard_channels).
-
-    Returns:
-        The (n_t, n_ch) inflated errors.
-    """
-    err_out = np.array(err, dtype=float)
-    for i_time in range(y.shape[0]):
-        rho = rho_tor_norm[i_time]
-        valid = np.isfinite(rho) & np.isfinite(y[i_time])
-        is_inboard = inboard[i_time]
-        delta = np.full(rho.shape, np.nan)
-        for side in (True, False):
-            this = np.flatnonzero(valid & (is_inboard == side))
-            other = valid & (is_inboard != side)
-            if other.sum() < 2 or this.size == 0:
-                continue
-            order = np.argsort(rho[other])
-            rho_other = rho[other][order]
-            y_other = y[i_time][other][order]
-            right = np.searchsorted(rho_other, rho[this])
-            right_clipped = np.clip(right, 1, rho_other.size - 1)
-            gap = rho_other[right_clipped] - rho_other[right_clipped - 1]
-            bracketed = (right > 0) & (right < rho_other.size) & (gap <= BRANCH_MAX_GAP)
-            y_other_at_this = np.interp(rho[this], rho_other, y_other)
-            delta_this = y[i_time][this] - y_other_at_this
-            delta[this[bracketed]] = delta_this[bracketed]
-        abs_delta = np.abs(delta)
-        has_delta = np.isfinite(abs_delta)
-        disagreement = np.full(rho.shape, np.nan)
-        for k in np.flatnonzero(valid):
-            near = np.abs(rho - rho[k]) <= BRANCH_SMOOTH_HALFWIDTH
-            window = has_delta & near
-            if window.sum() >= BRANCH_MIN_CHANNELS:
-                disagreement[k] = np.median(abs_delta[window])
-        inflate = np.isfinite(disagreement)
-        err_out[i_time, inflate] = np.hypot(
-            err[i_time, inflate], 0.5 * disagreement[inflate]
-        )
-    return err_out
 
 
 def open_shot_sources(shot: int) -> ShotSources | None:
@@ -990,10 +874,9 @@ def _thomson_dataset(
     ne uncertainties and the per-slice radial basis (ayc re-derives it every
     pulse, and it moves by up to ~2 cm over a shot).
 
-    A channel is kept only where the value and its error are both finite and
-    positive, since the fit needs both. Slices left with no usable channel at
-    all are dropped: some shots publish every other slice empty, radial basis
-    included (shot 30097, for one).
+    Only readings with a finite, positive value and error are kept,
+    and slices left with no usable channel at all are dropped (ts_channel_dataset):
+    some shots publish every other slice empty, radial basis included (shot 30097, for one).
 
     Args:
         shot: Shot number being read.
@@ -1005,42 +888,16 @@ def _thomson_dataset(
         Dataset on dims ("idx", "ts_channel") with "time"/"shot" coords.
     """
     ts_time = np.asarray(thomson["time"].values, dtype=float)
-    in_shot = (ts_time >= timebase[0]) & (ts_time <= timebase[-1])
-    ts_time = ts_time[in_shot]
-
-    channel_data = {}
-    for source, name in (("te", "ts_channel_t_e"), ("ne", "ts_channel_n_e")):
-        values = _time_first(thomson[source])[in_shot]
-        errors = _time_first(thomson[f"{source}_error"])[in_shot]
-        with np.errstate(invalid="ignore"):
-            usable = (values > 0) & (errors > 0)
-        channel_data[name] = np.where(usable, values, np.nan)
-        channel_data[f"{name}_error"] = np.where(usable, errors, np.nan)
-
-    r_channel = _time_first(thomson["radius"])[in_shot]
-    has_data = np.isfinite(channel_data["ts_channel_t_e"]) | np.isfinite(
-        channel_data["ts_channel_n_e"]
-    )
-    keep = has_data.any(axis=1)
-    n_empty = int((~keep).sum())
-    if n_empty:
-        logger.debug(f"Shot {shot}: dropping {n_empty} empty Thomson slices")
-
-    return xr.Dataset(
-        data_vars={
-            "ts_channel_r": (("idx", "ts_channel"), r_channel[keep]),
-            "ts_channel_z": (
-                ("idx", "ts_channel"),
-                np.full(r_channel[keep].shape, TS_CHANNEL_Z),
-            ),
-            **{
-                name: (("idx", "ts_channel"), values[keep])
-                for name, values in channel_data.items()
-            },
-        },
-        coords={
-            "time": ("idx", ts_time[keep]),
-            "shot": ("idx", np.repeat(shot, int(keep.sum()))),
-            "ts_channel": np.arange(r_channel.shape[1]),
-        },
+    r_rows = _time_first(thomson["radius"])
+    z_rows = np.full(r_rows.shape, TS_CHANNEL_Z)
+    return ts_channel_dataset(
+        shot,
+        ts_time,
+        r_rows,
+        z_rows,
+        te=_time_first(thomson["te"]),
+        te_error=_time_first(thomson["te_error"]),
+        ne=_time_first(thomson["ne"]),
+        ne_error=_time_first(thomson["ne_error"]),
+        timebase=timebase,
     )
