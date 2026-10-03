@@ -1,7 +1,6 @@
 """The filter spec every device store shares.
 
-This package applies it to C-Mod and MAST (DataWorkflow.filter_and_plot and shot_rejection_reason),
-and POPSIM-Transport-Predictor to DIII-D and TCV (RawFileWorkflow.filter_ds and cull_shot).
+DataWorkflow.filter_and_plot and shot_rejection_reason apply it to every device.
 """
 
 import numpy as np

@@ -21,6 +21,9 @@ from transport_validation_datasets.gp_fitting.worker_base import run_worker_cli
 # The constant 1-sigma error every fitted point and gradient gets.
 FIT_STD = 0.05
 
+# The method's own name for its fit, in the description of every fitted profile
+FIT_DESCRIPTION = "Linear interpolation test stand-in"
+
 
 def fit_batch(batch: FitBatch, num_workers: int = 1) -> dict[int, ShotFitOutput]:
     """Interpolate every row of every shot in the batch onto x_star.

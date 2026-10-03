@@ -49,6 +49,9 @@ from transport_validation_datasets.gp_fitting.worker_base import (  # noqa: E402
     run_worker_cli,
 )
 
+# The method's own name for its GP fit, in the description of every fitted profile
+FIT_DESCRIPTION = "Polynomial/Tanh + GP corrections"
+
 # The value anchors join the analytic pre-fit with their errors inflated by this factor,
 # so they nudge its SOL level rather than deform its shape.
 # The GP stage sees them at full weight.

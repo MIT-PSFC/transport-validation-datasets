@@ -8,7 +8,7 @@ carries the user-specific paths. The tables:
 
     [cluster]   SLURM dispatch of the fit stage, fields of gp_fitting.dispatcher.ClusterFitConfig.
                 If this section is absent, the fits run locally.
-    [<device>]  Settings of a device's workflow ([cmod], [mast]),
+    [<device>]  Settings of a device's workflow ([cmod], [mast], [tcv], [d3d]),
                 to modify the fields of the workflow's settings_cls.
                 If this section is absent, the device's workflow uses its defaults.
                 One file may hold the tables of several devices,

@@ -84,11 +84,16 @@ def circular_shot(
     nan_qpsi_rows=(),
     n_t=40,
     flux_sign=1.0,
+    boundary_radius_fraction=1.0,
 ):
     # One shot on a 1 kHz grid, circular reconstructions at eq_rows and Thomson at ts_rows.
     # psi_axis is 0 and psi_boundary is flux_sign, so psirz is flux_sign psi_N.
     # flux_sign -1 has psi decreasing outward with a negative q, as on MAST.
+    # The boundary contour is the psi_N = 1 circle scaled by boundary_radius_fraction.
     time = np.arange(n_t) * 1e-3
+    contour_angle = np.linspace(0.0, 2.0 * np.pi, 64, endpoint=False)
+    rbdry = np.full((n_t, contour_angle.size), np.nan)
+    zbdry = np.full((n_t, contour_angle.size), np.nan)
     psirz = np.full((n_t, R_GRID.size, Z_GRID.size), np.nan)
     simagx = np.full(n_t, np.nan)
     sibdry = np.full(n_t, np.nan)
@@ -99,6 +104,9 @@ def circular_shot(
         sibdry[row] = flux_sign
         if row not in nan_qpsi_rows:
             qpsi[row] = flux_sign * QPSI
+        contour_radius = boundary_radius_fraction * minor_radius
+        rbdry[row] = R0 + contour_radius * np.cos(contour_angle)
+        zbdry[row] = contour_radius * np.sin(contour_angle)
     channel_shape = (n_t, channel_r.size)
     ts_r = np.full(channel_shape, np.nan)
     ts_z = np.full(channel_shape, np.nan)
@@ -114,6 +122,8 @@ def circular_shot(
             "simagx": ("time", simagx),
             "sibdry": ("time", sibdry),
             "qpsi": (("time", "psi_idx"), qpsi),
+            "rbdry": (("time", "boundary_idx"), rbdry),
+            "zbdry": (("time", "boundary_idx"), zbdry),
             "ts_channel_r": (ts_dims, ts_r),
             "ts_channel_z": (ts_dims, ts_z),
             "ts_channel_t_e": (ts_dims, ts_te),
@@ -317,6 +327,31 @@ class TestMapChannels:
         np.testing.assert_allclose(rho_tor_norm[0], expected, atol=1e-4)
         np.testing.assert_allclose(rho_tor_norm[1], expected, atol=1e-4)
         assert np.isnan(rho_tor_norm[2]).all()
+
+    def test_channel_outside_the_boundary_below_separatrix_flux_is_unmapped(self):
+        # A contour at 0.8 of the psi_N = 1 circle stands in for the LCFS around an X-point:
+        # the channel at psi_N 0.81 (0.9 of the radius) lies outside it, like a channel under an X-point,
+        # while the ones inside the contour and the SOL channel still map
+        minor_radius = 0.3
+        channel_psi_n = np.array([0.1, 0.4, 0.81, 1.2])
+        channel_r = R0 + minor_radius * np.sqrt(channel_psi_n)
+        channel_z = np.zeros(channel_psi_n.size)
+        ds = circular_shot(
+            [10],
+            [minor_radius],
+            [10],
+            channel_r,
+            channel_z,
+            boundary_radius_fraction=0.8,
+        )
+
+        _, rho_tor_norm = map_ts_channels_to_rho_tor_norm(ds, "secant")
+
+        expected = rho_tor_norm_from_psi_n(channel_psi_n, QPSI, "secant")
+        np.testing.assert_allclose(
+            rho_tor_norm[0, [0, 1, 3]], expected[[0, 1, 3]], atol=1e-4
+        )
+        assert np.isnan(rho_tor_norm[0, 2])
 
 
 # Where the comparison caches its trimmed inputs and writes its figures

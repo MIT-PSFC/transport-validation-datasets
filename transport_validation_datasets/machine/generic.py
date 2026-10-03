@@ -5,6 +5,7 @@ import numpy as np
 import xarray as xr
 from eqdsk.cocos import identify_cocos
 from loguru import logger
+from matplotlib.path import Path as PolygonPath
 from scipy.integrate import cumulative_simpson
 from scipy.interpolate import CubicHermiteSpline, RegularGridInterpolator
 from scipy.special import xlogy
@@ -209,6 +210,10 @@ EQUILIBRIUM_HOLD_FLOOR = 10e-3
 # in periods of the reconstruction's own sampling.
 # Above 1 to tolerate clock jitter, low enough that nothing is borrowed across a real gap.
 EQ_MATCH_MAX_PERIODS = 1.5
+
+# A channel below psi_N 1 this far outside its reconstruction's boundary contour is in a private flux region [m],
+# see map_ts_channels_to_rho_tor_norm. The TCV ones sit 5-15 cm below the contour.
+PRIVATE_FLUX_MARGIN = 5e-3
 
 # How Phi_N continues past the LCFS, see phi_n_map.
 SOL_EXTENSIONS = ("secant", "tangent")
@@ -419,6 +424,73 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     return ds.assign_coords(
         time=("idx", grid_times),
         shot=("idx", np.repeat(shot_id, len(grid_times))),
+    )
+
+
+def ts_channel_dataset(
+    shot: int,
+    ts_time: np.ndarray,
+    r_rows: np.ndarray,
+    z_rows: np.ndarray,
+    te: np.ndarray,
+    te_error: np.ndarray,
+    ne: np.ndarray,
+    ne_error: np.ndarray,
+    timebase: np.ndarray,
+) -> xr.Dataset:
+    """Collect Thomson channel readings on their native timebase, ready for snap_to_grid.
+
+    A reading is kept only where the value and its error are both finite and positive, since the fit needs both.
+    Slices outside the timebase and slices left with no usable reading are dropped.
+
+    Args:
+        shot: Shot number.
+        ts_time: (n_t,) Thomson sample times [s].
+        r_rows: (n_t, n_ch) channel major radii [m].
+        z_rows: (n_t, n_ch) channel heights [m].
+        te: (n_t, n_ch) electron temperature readings [eV].
+        te_error: (n_t, n_ch) their 1-sigma errors [eV].
+        ne: (n_t, n_ch) electron density readings [m^-3].
+        ne_error: (n_t, n_ch) their 1-sigma errors [m^-3].
+        timebase: Uniform 1 kHz timebase of the shot [s].
+
+    Returns:
+        Dataset on dims ("idx", "ts_channel") with "time"/"shot" coords.
+    """
+    ts_time = np.asarray(ts_time, dtype=float)
+    in_shot = (ts_time >= timebase[0]) & (ts_time <= timebase[-1])
+    channel_data = {}
+    for name, values, errors in (
+        ("ts_channel_t_e", te, te_error),
+        ("ts_channel_n_e", ne, ne_error),
+    ):
+        values_in_shot = np.asarray(values, dtype=float)[in_shot]
+        errors_in_shot = np.asarray(errors, dtype=float)[in_shot]
+        with np.errstate(invalid="ignore"):
+            usable = (values_in_shot > 0) & (errors_in_shot > 0)
+        channel_data[name] = np.where(usable, values_in_shot, np.nan)
+        channel_data[f"{name}_error"] = np.where(usable, errors_in_shot, np.nan)
+    channel_data["ts_channel_r"] = np.asarray(r_rows, dtype=float)[in_shot]
+    channel_data["ts_channel_z"] = np.asarray(z_rows, dtype=float)[in_shot]
+
+    has_te = np.isfinite(channel_data["ts_channel_t_e"])
+    has_ne = np.isfinite(channel_data["ts_channel_n_e"])
+    keep = (has_te | has_ne).any(axis=1)
+    n_empty = int((~keep).sum())
+    if n_empty:
+        logger.debug(f"Shot {shot}: dropping {n_empty} empty Thomson slices")
+    ts_time_kept = ts_time[in_shot][keep]
+    n_channels = channel_data["ts_channel_r"].shape[1]
+    return xr.Dataset(
+        data_vars={
+            name: (("idx", "ts_channel"), values[keep])
+            for name, values in channel_data.items()
+        },
+        coords={
+            "time": ("idx", ts_time_kept),
+            "shot": ("idx", np.repeat(shot, ts_time_kept.size)),
+            "ts_channel": np.arange(n_channels),
+        },
     )
 
 
@@ -1190,16 +1262,16 @@ def map_ts_channels_to_rho_tor_norm(
     Only times with at least one finite TS value are mapped.
     The equilibrium is not necessarily reconstructed at each of those times
     (EFIT21 on C-Mod is native 1 kHz, but ANALYSIS runs on a ~20 ms clock),
-    so each TS slice maps through the usable reconstruction (usable_reconstructions) nearest in time,
-    accepted within EQ_MATCH_MAX_PERIODS of the reconstruction clock's period.
-    The clock counts the unusable reconstructions too,
-    so a slice whose nearest reconstruction is unusable can map through a neighbour of it.
+    so each TS slice maps through the usable reconstruction nearest in time (nearest_usable_reconstructions).
     A slice with no usable reconstruction in reach keeps a NaN row,
     and the fit-staging min-points gate then skips it.
+    A channel below psi_N 1 outside that reconstruction's boundary contour sits in a private flux region,
+    under an X-point, where the flux labels a cold divertor plasma rather than the core, so it is left unmapped.
+    TCV's vertical chord reaches below the lower X-point, where such channels read a few eV.
 
     Args:
         ds_shot: One shot's unprocessed dataset with standardized names
-            (ts_channel_r/z, ts_channel_t_e/n_e, psirz, simagx, sibdry, qpsi, r_grid, z_grid).
+            (ts_channel_r/z, ts_channel_t_e/n_e, psirz, simagx, sibdry, qpsi, rbdry, zbdry, r_grid, z_grid).
         sol_extension: How Phi_N continues outside the LCFS, one of SOL_EXTENSIONS.
 
     Returns:
@@ -1221,29 +1293,17 @@ def map_ts_channels_to_rho_tor_norm(
     qpsi = ds_shot["qpsi"].transpose("time", "psi_idx").values
     ts_r = ds_shot["ts_channel_r"].transpose("time", "ts_channel").values
     ts_z = ds_shot["ts_channel_z"].transpose("time", "ts_channel").values
+    rbdry = ds_shot["rbdry"].transpose("time", "boundary_idx").values
+    zbdry = ds_shot["zbdry"].transpose("time", "boundary_idx").values
     r_grid = ds_shot["r_grid"].values
     z_grid = ds_shot["z_grid"].values
 
-    # Each TS slice maps through the usable reconstruction nearest in time,
-    # in reach of the reconstruction clock, unusable reconstructions included.
-    all_times = ds_shot["time"].values
-    usable = usable_reconstructions(ds_shot)
-    eq_rows = np.flatnonzero(usable)
-    eq_times = all_times[eq_rows]
-    eq_period = reconstruction_clock_period(ds_shot, all_times)
-    eq_tol = EQ_MATCH_MAX_PERIODS * eq_period
-
+    eq_index = nearest_usable_reconstructions(ds_shot, ts_times)
     rho_tor_norm = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
-    n_no_equilibrium = 0
     for i, ts_idx in enumerate(ts_idxs):
-        if eq_rows.size == 0:
-            n_no_equilibrium += 1
+        eq_idx = int(eq_index[i])
+        if eq_idx < 0:
             continue
-        nearest = int(np.argmin(np.abs(eq_times - ts_times[i])))
-        if abs(eq_times[nearest] - ts_times[i]) > eq_tol:
-            n_no_equilibrium += 1
-            continue
-        eq_idx = int(eq_rows[nearest])
         psi_range = sibdry[eq_idx] - simagx[eq_idx]
         qpsi_slice = qpsi[eq_idx]
         psi_n_grid = (psirz[eq_idx] - simagx[eq_idx]) / psi_range
@@ -1253,12 +1313,18 @@ def map_ts_channels_to_rho_tor_norm(
         interp = RegularGridInterpolator(
             (r_grid, z_grid), psi_n_grid, bounds_error=False, fill_value=np.nan
         )
+        channel_positions = np.column_stack([ts_r[ts_idx], ts_z[ts_idx]])
         with np.errstate(invalid="ignore"):
-            psi_n_ch = interp(np.column_stack([ts_r[ts_idx], ts_z[ts_idx]]))
+            psi_n_ch = interp(channel_positions)
+        private_flux = _private_flux_channels(
+            channel_positions, psi_n_ch, rbdry[eq_idx], zbdry[eq_idx]
+        )
+        psi_n_ch[private_flux] = np.nan
         rho_tor_norm[i, :] = rho_tor_norm_from_psi_n(
             psi_n_ch, qpsi_slice, sol_extension
         )
 
+    n_no_equilibrium = int((eq_index < 0).sum())
     if n_no_equilibrium:
         logger.debug(
             f"No usable equilibrium at {n_no_equilibrium} of {ts_idxs.size} TS slices"
@@ -1266,38 +1332,146 @@ def map_ts_channels_to_rho_tor_norm(
     return ts_times, rho_tor_norm
 
 
-def channel_rows_at_times(data: xr.DataArray, ts_times: np.ndarray) -> np.ndarray:
-    """Take the rows of a (time, ts_channel) variable at the TS slice times.
+def _distance_to_contour(points: np.ndarray, contour: np.ndarray) -> np.ndarray:
+    """Distance of each point to a closed contour, the nearest of its segments.
 
     Args:
-        data: Channel variable carrying a "time" coordinate.
-        ts_times: TS slice times [s], as returned by map_ts_channels_to_rho_tor_norm.
+        points: (n, 2) points (R, Z) [m].
+        contour: (n_c, 2) contour vertices, closed back to the first.
+
+    Returns:
+        (n,) distances [m].
+    """
+    segment_start = contour
+    segment_end = np.roll(contour, -1, axis=0)
+    segment = segment_end - segment_start
+    segment_length_squared = np.maximum(np.sum(segment**2, axis=1), 1e-30)
+    offset = points[:, np.newaxis, :] - segment_start[np.newaxis, :, :]
+    projection = np.sum(offset * segment[np.newaxis, :, :], axis=2)
+    fraction = np.clip(projection / segment_length_squared, 0.0, 1.0)
+    nearest = (
+        segment_start[np.newaxis] + fraction[..., np.newaxis] * segment[np.newaxis]
+    )
+    separation = points[:, np.newaxis, :] - nearest
+    distance_to_segments = np.sqrt(np.sum(separation**2, axis=2))
+    return distance_to_segments.min(axis=1)
+
+
+def _private_flux_channels(
+    channel_positions: np.ndarray,
+    psi_n_channels: np.ndarray,
+    r_boundary: np.ndarray,
+    z_boundary: np.ndarray,
+) -> np.ndarray:
+    """Mark the channels below psi_N 1 that lie outside the boundary contour, in a private flux region.
+
+    A channel within PRIVATE_FLUX_MARGIN of the contour is not marked,
+    since the contour polygon cuts inside the curved LCFS and a channel on it reads psi_N just under 1.
+    A contour point that is not finite or sits at R <= 0 is padding (C-Mod pads rbbbs with zeros).
+    A reconstruction with fewer than 3 contour points marks nothing.
+
+    Args:
+        channel_positions: (n_ch, 2) channel (R, Z) [m].
+        psi_n_channels: (n_ch,) channel psi_N, NaN where unknown.
+        r_boundary: (n_bdry,) boundary contour major radii [m].
+        z_boundary: (n_bdry,) boundary contour heights [m].
+
+    Returns:
+        (n_ch,) mask of the private flux channels.
+    """
+    private_flux = np.zeros(psi_n_channels.shape, dtype=bool)
+    mask_contour = np.isfinite(r_boundary) & np.isfinite(z_boundary) & (r_boundary > 0)
+    if mask_contour.sum() < 3:
+        return private_flux
+    contour = np.column_stack([r_boundary[mask_contour], z_boundary[mask_contour]])
+    with np.errstate(invalid="ignore"):
+        below_separatrix_flux = psi_n_channels < 1.0
+    candidates = np.flatnonzero(
+        below_separatrix_flux & np.isfinite(channel_positions).all(axis=1)
+    )
+    if candidates.size == 0:
+        return private_flux
+    candidate_positions = channel_positions[candidates]
+    boundary_polygon = PolygonPath(contour)
+    inside = boundary_polygon.contains_points(candidate_positions)
+    distance = _distance_to_contour(candidate_positions, contour)
+    private_flux[candidates] = ~inside & (distance > PRIVATE_FLUX_MARGIN)
+    return private_flux
+
+
+def nearest_usable_reconstructions(
+    ds_shot: xr.Dataset, sample_times: np.ndarray
+) -> np.ndarray:
+    """Find the reconstruction each profile sample maps through.
+
+    Each sample takes the usable reconstruction (usable_reconstructions) nearest in time,
+    accepted within EQ_MATCH_MAX_PERIODS of the reconstruction clock's period.
+    The clock counts the unusable reconstructions too,
+    so a sample whose nearest reconstruction is unusable can map through a neighbour of it.
+
+    Args:
+        ds_shot: One shot's dataset with the GEQDSK block on its time axis.
+        sample_times: (n,) sample times [s].
+
+    Returns:
+        (n,) index along the time axis of each sample's reconstruction, -1 where none is in reach.
+    """
+    if "shot" in ds_shot.dims:
+        ds_shot = ds_shot.squeeze("shot", drop=True)
+    sample_times = np.asarray(sample_times, dtype=float)
+    eq_index = np.full(sample_times.size, -1, dtype=int)
+    usable = usable_reconstructions(ds_shot)
+    eq_rows = np.flatnonzero(usable)
+    if eq_rows.size == 0:
+        return eq_index
+    all_times = np.asarray(ds_shot["time"].values, dtype=float)
+    eq_times = all_times[eq_rows]
+    eq_period = reconstruction_clock_period(ds_shot, all_times)
+    eq_tol = EQ_MATCH_MAX_PERIODS * eq_period
+    eq_distance = np.abs(eq_times[np.newaxis, :] - sample_times[:, np.newaxis])
+    nearest = np.argmin(eq_distance, axis=1)
+    sample_rows = np.arange(sample_times.size)
+    nearest_distance = eq_distance[sample_rows, nearest]
+    in_reach = nearest_distance <= eq_tol
+    eq_index[in_reach] = eq_rows[nearest[in_reach]]
+    return eq_index
+
+
+def channel_rows_at_times(data: xr.DataArray, times: np.ndarray) -> np.ndarray:
+    """Take the rows of a (time, channel) variable at the given grid times.
+
+    Args:
+        data: Variable on "time" and one channel dimension, carrying a "time" coordinate.
+        times: Grid times [s], e.g. the TS slice times of map_ts_channels_to_rho_tor_norm.
 
     Returns:
         The (n_t, n_ch) rows at those times.
     """
-    values = data.transpose("time", "ts_channel").values
-    return values[np.isin(data["time"].values, ts_times)]
+    channel_dims = [dim for dim in data.dims if dim != "time"]
+    values = data.transpose("time", *channel_dims).values
+    return values[np.isin(data["time"].values, times)]
 
 
-def ts_channel_fit_rows(
-    ds_shot: xr.Dataset, ts_times: np.ndarray
+def channel_fit_rows(
+    ds_shot: xr.Dataset, times: np.ndarray, prefix: str = "ts_channel"
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Read the TS channel rows at the slice times, converted to the fit units.
+    """Read the profile readings at the given times, converted to the fit units.
 
-    The unprocessed files are SI (Te [eV], ne [m^-3]); the fits and every
-    device's cleaning threshold are calibrated in Te [keV] and ne [1e20 m^-3].
+    The unprocessed files are SI (Te [eV], ne [m^-3]),
+    the fits and every device's cleaning threshold are calibrated in Te [keV] and ne [1e20 m^-3].
 
     Args:
         ds_shot: One shot's unprocessed dataset, shot dim squeezed out.
-        ts_times: TS slice times [s].
+        times: Grid times of the profile samples [s].
+        prefix: Name prefix of the reading variables, f"{prefix}_t_e" and so on.
+            The Thomson channels by default, DIII-D's IDA points are "ida".
 
     Returns:
         (te_y, te_err, ne_y, ne_err), each (n_t, n_ch) in the fit units.
     """
     rows = {
         name: np.asarray(
-            channel_rows_at_times(ds_shot[f"ts_channel_{name}"], ts_times), float
+            channel_rows_at_times(ds_shot[f"{prefix}_{name}"], times), float
         )
         for name in ("t_e", "t_e_error", "n_e", "n_e_error")
     }

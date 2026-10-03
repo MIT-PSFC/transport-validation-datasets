@@ -87,10 +87,7 @@ def plot_unprocessed_data(
 ):
     """For all the 0D signals in the dataset, plot them over time and save the figure to disk.
 
-    Both pipelines draw it for every shot, unfiltered:
-    this package for C-Mod and MAST (DataWorkflow._plot_unprocessed),
-    and POPSIM-Transport-Predictor for DIII-D and TCV (RawFileWorkflow.load_shot).
-    The time is a dimension in the former and a coordinate on time_idx in the latter, both work.
+    DataWorkflow._plot_unprocessed draws it for every shot, unfiltered.
 
     One plot with several subplots, in the following groups:
 
@@ -195,14 +192,15 @@ def plot_unprocessed_data(
     ax_ne.set_ylabel("n_e [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_ne.set_ylim(_signal_ylim(ne_signals))
 
-    # Dots at 0 for the times a profile is measured:
-    # fresh_profile in a POPSIM-Transport-Predictor raw file, the Thomson channels in an unprocessed file.
-    # No ts_channel dim means the TS retrieval failed and the column is all NaN.
+    # Dots at 0 for the times a profile is measured, a Thomson sample or a DIII-D IDA slice.
+    # No channel dim means the retrieval failed and the column is all NaN.
     mask_profile = None
-    if "fresh_profile" in ds:
-        mask_profile = ds["fresh_profile"] == 1
-    elif "ts_channel_n_e" in ds and "ts_channel" in ds["ts_channel_n_e"].dims:
-        mask_profile = ds["ts_channel_n_e"].notnull().any(dim="ts_channel")
+    for reading, channel_dim in (
+        ("ts_channel_n_e", "ts_channel"),
+        ("ida_n_e", "ida_point"),
+    ):
+        if reading in ds and channel_dim in ds[reading].dims:
+            mask_profile = ds[reading].notnull().any(dim=channel_dim)
     if mask_profile is not None:
         ax_ne.plot(
             time,

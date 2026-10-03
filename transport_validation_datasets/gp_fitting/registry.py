@@ -14,6 +14,7 @@ from types import ModuleType
 WORKER_MODULES: dict[str, str] = {
     "zk": "transport_validation_datasets.gp_fitting.worker_zk",
     "akho": "transport_validation_datasets.gp_fitting.worker_akho",
+    "ida": "transport_validation_datasets.gp_fitting.worker_ida",
 }
 
 
