@@ -189,11 +189,15 @@ UNIFORM_TIMEBASE_DT = 1e-3
 # Only absorbs float round-off, everything shares the staged 1 kHz timebase.
 SAMPLE_TIME_TOL = 1e-6
 
-# How long a slowly sampled signal (a fitted profile, an equilibrium, a 0D signal slower than the grid)
+# How long an equilibrium or a 0D signal slower than the grid
 # is held forward onto the 1 kHz timebase, in periods of its own sampling.
 # Above 1 to tolerate jitter in the sampling, low enough that nothing is carried across a real gap:
 # the end of the shot, or a diagnostic dropping out.
 MAX_HOLD_PERIODS = 1.5
+
+# Longest a fitted profile slice is held forward onto the 1 kHz timebase on every device, whatever its cadence [s].
+# Long enough to bridge dropped Thomson slices and burst-mode gaps, fresh_profile marks the slices themselves.
+PROFILE_MAX_HOLD = 100e-3
 
 # Shortest an equilibrium reconstruction is held, whatever its clock [s].
 # Bridges the dropouts of single reconstructions (a 1 kHz EFIT failing a few slices,
@@ -425,6 +429,7 @@ def hold_onto_grid(
     period: float | None = None,
     max_hold_periods: float = MAX_HOLD_PERIODS,
     hold_floor: float = 0.0,
+    max_hold_time: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map every grid time onto the sample it takes its values from.
 
@@ -432,6 +437,7 @@ def hold_onto_grid(
     held for at most max_hold_periods sampling periods, or hold_floor when that is longer,
     so that nothing is carried across a long gap:
     the end of the shot, a diagnostic dropping out, or a stretch the filtering cut away.
+    max_hold_time sets the longest hold directly instead, whatever the sampling period.
     A sample within SAMPLE_TIME_TOL after a grid time counts as at it.
     A grid time is fresh when its sample falls in its own grid step (t - grid step, t],
     so each sample is fresh at the first grid time that holds it, on the grid or between grid times.
@@ -446,6 +452,7 @@ def hold_onto_grid(
             sample there is, and wrong when they are a windowed subset.
         max_hold_periods: Longest hold, in sampling periods.
         hold_floor: The hold reaches at least this far [s].
+        max_hold_time: Longest hold [s], replaces max_hold_periods and hold_floor when given.
 
     Returns:
         (sample_index, fresh): sample_index[i] is the index of the sample
@@ -477,15 +484,17 @@ def hold_onto_grid(
     if not forward_fill:
         sample_index[fresh] = previous_sample[fresh]
         return sample_index, fresh
-
-    # One sample on its own has no period to hold for,
-    # so it only fills the grid step it sits on
-    if period is None:
-        sample_spacing = (
-            np.diff(sample_times_float64) if sample_times.size > 1 else grid_steps
-        )
-        period = float(np.median(sample_spacing))
-    max_hold = max(max_hold_periods * period, hold_floor)
+    if max_hold_time is not None:
+        max_hold = max_hold_time
+    else:
+        # One sample on its own has no period to hold for,
+        # so it only fills the grid step it sits on
+        if period is None:
+            sample_spacing = (
+                np.diff(sample_times_float64) if sample_times.size > 1 else grid_steps
+            )
+            period = float(np.median(sample_spacing))
+        max_hold = max(max_hold_periods * period, hold_floor)
     still_held = has_previous & (age <= max_hold)
     sample_index[still_held] = previous_sample[still_held]
     return sample_index, fresh

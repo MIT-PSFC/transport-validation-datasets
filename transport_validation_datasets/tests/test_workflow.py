@@ -200,6 +200,22 @@ class TestHoldOntoGrid:
         assert index[27] == 2
         assert (index[28:] == -1).all()
 
+    def test_max_hold_time_caps_the_hold_whatever_the_period(self):
+        # The profile hold on a 5 ms clock: the 48 ms gap after 12 ms is bridged,
+        # the 190 ms gap after 60 ms is held 100 ms into, and the last sample holds 100 ms
+        grid = grid_ms(400)
+        samples = np.array([0.002, 0.007, 0.012, 0.060, 0.250])
+
+        index, fresh = hold_onto_grid(grid, samples, True, max_hold_time=0.1)
+
+        assert (index[:2] == -1).all()
+        assert (index[12:60] == 2).all()
+        assert (index[60:160] == 3).all()
+        assert (index[161:250] == -1).all()
+        assert (index[250:350] == 4).all()
+        assert (index[351:] == -1).all()
+        assert np.flatnonzero(fresh).tolist() == [2, 7, 12, 60, 250]
+
     def test_float_round_off_still_counts_as_same_time(self):
         # Everything shares the 1 kHz timebase,
         # so the tolerance only has to absorb round-off

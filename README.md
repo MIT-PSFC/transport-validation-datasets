@@ -59,9 +59,11 @@ A shotlist with time windows keeps only the grid times inside them, so there `ti
 Profiles arrive one per Thomson sample and equilibria on the reconstruction
 clock, both far slower than 1 kHz, so both are held forward over the grid times
 that follow them and `fresh_profile` / `fresh_equilibrium` mark the grid times
-that carry a sample of their own. A sample is held for at most
-`MAX_HOLD_PERIODS` of its own sampling period, so nothing is carried across the
-end of the shot or a diagnostic dropping out.
+that carry a sample of their own.
+A profile is held for at most `PROFILE_MAX_HOLD` (100 ms) on every device, whatever its Thomson cadence,
+so dropped slices and burst-mode gaps are bridged and `fresh_profile` tells a fresh profile from a held one.
+An equilibrium is held for at most `MAX_HOLD_PERIODS` of its own sampling period,
+so it is not carried across a reconstruction dropping out.
 An equilibrium reconstruction, and every 0D signal taken from one, is held for at least `EQUILIBRIUM_HOLD_FLOOR` (10 ms),
 so a few missing reconstructions do not cut the shot. By default the slices
 the stack stage screens out (see [Filtering](#filtering)) are ignored, as though the

@@ -58,6 +58,7 @@ from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
     MAX_HOLD_PERIODS,
     POWER_SMOOTHING_WINDOW,
+    PROFILE_MAX_HOLD,
     SOL_EXTENSIONS,
     hold_onto_grid,
     keep_longest_segment,
@@ -1754,8 +1755,9 @@ class DataWorkflow(ABC):
                 as though the shot had no Thomson sample there.
                 False places every slice on the grid, all-NaN profiles included.
             forward_fill: Hold each fitted profile and each equilibrium forward
-                over the grid times that follow it, for at most
-                MAX_HOLD_PERIODS of their own sampling period. False leaves the
+                over the grid times that follow it, a profile for at most
+                PROFILE_MAX_HOLD, an equilibrium for at most
+                MAX_HOLD_PERIODS of its own sampling period. False leaves the
                 grid times between samples NaN.
             extend_existing: Append the shots that are not in the existing
                 store yet, instead of replacing it. The shots already in it are
@@ -2153,16 +2155,8 @@ class DataWorkflow(ABC):
                     f"unprocessed file are out of step, refit the shot."
                 )
         else:
-            # The fits of a windowed run only cover the Thomson samples inside the
-            # windows, so the hold period comes from every sample in the file,
-            # not from the fitted slice times with the inter-window gaps in them
-            period = (
-                _sample_period(ds_unprocessed, grid)
-                if fit_mode == FIT_MODE_WINDOW_SAMPLE
-                else None
-            )
             slice_index, fresh_profile = hold_onto_grid(
-                grid, slice_times, forward_fill, period
+                grid, slice_times, forward_fill, max_hold_time=PROFILE_MAX_HOLD
             )
             if not fresh_profile.any():
                 raise ValueError(
@@ -2355,6 +2349,7 @@ class DataWorkflow(ABC):
                     "scale_per_slice": self.fit_scale_per_slice,
                     "bounds": self.fit_bounds,
                     "max_hold_periods": MAX_HOLD_PERIODS,
+                    "profile_max_hold": PROFILE_MAX_HOLD,
                     "equilibrium_hold_floor": EQUILIBRIUM_HOLD_FLOOR,
                     "power_smoothing_window": POWER_SMOOTHING_WINDOW,
                 }
@@ -2585,36 +2580,6 @@ def _fit_windows(ds_fit: xr.Dataset) -> np.ndarray:
         without windows.
     """
     return window_bounds(json.loads(ds_fit.attrs["windows"]))
-
-
-def _sample_period(ds_unprocessed: xr.Dataset, grid: np.ndarray) -> float | None:
-    """Median spacing of a shot's Thomson samples, from its unprocessed file.
-
-    Args:
-        ds_unprocessed: The shot's unprocessed dataset, on the grid, with
-            its time coordinate already dropped.
-        grid: The shot's 1 kHz timebase [s].
-
-    Returns:
-        The period [s], or None when the file holds fewer than two samples
-        (the caller then falls back to hold_onto_grid's own estimate).
-    """
-    if "ts_channel_t_e" not in ds_unprocessed or "ts_channel_n_e" not in ds_unprocessed:
-        return None
-    has_sample = (
-        (
-            ds_unprocessed["ts_channel_t_e"].notnull()
-            | ds_unprocessed["ts_channel_n_e"].notnull()
-        )
-        .any(dim="ts_channel")
-        .squeeze(EPISODE_DIM, drop=True)
-        .transpose(TIME_COORD)
-        .values
-    )
-    sample_times = grid[has_sample]
-    if sample_times.size < 2:
-        return None
-    return float(np.median(np.diff(sample_times)))
 
 
 def _place_windows_on_grid(
