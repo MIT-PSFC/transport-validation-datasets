@@ -332,7 +332,11 @@ class MASTDataWorkflow(DataWorkflow):
     # The rest of the "early campaign shots with known problems" list this
     # inherited from the older MAST workflow had no recorded reasons, passed
     # both the store probe and the filtering, and was dropped the same day.
+    # 27430 and 28049 have P_rad flat at 1.80 and 1.72 MW (min = median) over the whole shot, a stuck bolometer.
+    # Their radiated fraction (~0.48) passes the cuts, the 2026-10 0D autocheck found them.
     shot_blacklist = [
+        27430,
+        28049,
         28938,
         28976,
         28988,
