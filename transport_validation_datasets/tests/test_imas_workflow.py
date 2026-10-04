@@ -26,13 +26,13 @@ pytest.importorskip("eqdsk")
 from transport_validation_datasets.gp_fitting.batch_io import STATUS_OK  # noqa: E402
 from transport_validation_datasets.imas_export.scenario_export import (  # noqa: E402
     DD_VERSION,
-    _sigma_bp,
     _target_cocos,
     build_imas_from_shot,
     write_ids,
 )
 from transport_validation_datasets.machine.generic import (  # noqa: E402
     rho_tor_norm_from_psi_n,
+    sigma_bp,
 )
 from transport_validation_datasets.workflow import (  # noqa: E402
     DATASET_EQUILIBRIUM_SIGNALS,
@@ -184,13 +184,13 @@ def test_imas_export_chain_reads_back(tmp_path, ip_sign, b0_sign, psi_sign, coco
         with imas.DBEntry(str(path), "r") as entry:
             return entry.get(name)
 
-    sigma_bp = _sigma_bp(_target_cocos(DD_VERSION))
+    sigma_bp_target = sigma_bp(_target_cocos(DD_VERSION))
 
     eq = read_back("equilibrium")
     assert np.allclose(np.asarray(eq.time), EQ_TIMES)
     ts = eq.time_slice[0]
     dpsi = float(ts.global_quantities.psi_boundary - ts.global_quantities.psi_axis)
-    assert np.sign(dpsi) == sigma_bp * ip_sign, "psi direction off target COCOS"
+    assert np.sign(dpsi) == sigma_bp_target * ip_sign, "psi direction off target COCOS"
     assert np.sign(float(ts.global_quantities.ip)) == ip_sign
     p1 = ts.profiles_1d
     # sigma_rho_theta_phi is +1 in COCOS 11 and 17

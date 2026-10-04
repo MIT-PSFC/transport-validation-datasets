@@ -7,8 +7,8 @@ Every device is reduced to one schema, listed under [The datasets](#the-datasets
 Signal names are IMAS-like, units are SI, and each variable carries its IMAS
 data dictionary path under its `ref` attribute in the stored files, with the
 documentation page under `url`. The per-device sources of each signal live
-next to their attributes in the device modules (`SIGNAL_ATTRS` of `machine/mast/mast_dataset.py`,
-`machine/tcv/tcv_dataset.py` and `machine/d3d/d3d_dataset.py`, and `machine/cmod/dispy_methods.py`).
+next to their attributes in the device modules (`SIGNAL_ATTRS` of `machine/cmod/cmod_dataset.py`,
+`machine/mast/mast_dataset.py`, `machine/tcv/tcv_dataset.py` and `machine/d3d/d3d_dataset.py`).
 The GEQDSK block's attributes are shared (`machine/generic.py`, `GEQDSK_SIGNAL_ATTRS`).
 The stack stage brings every variable onto that convention.
 Each unprocessed file records the COCOS index of its GEQDSK signals in a root
@@ -33,11 +33,14 @@ stages applied, see [Filtering](#filtering)), and `fit_settings` (the fit stagin
 # Workflow
 
 1: Pull unprocessed data from source and filter down to regions of validity
+
 2: Perform GP profile fitting (DIII-D carries IDA's own GP fits onto the fit grid instead)
+
 3: Stack shots into the internal dataset
+
 4: Publish dataset, stripping the internal-only signals
 
-TCV and DIII-D data has no release permission, so those datasets stop at step 3 (`publishable` False):
+TCV and DIII-D data has no release permission (yet), so those datasets stop at step 3 (`publishable` False):
 `--stage all` leaves publishing out, and the publish stage and the IMAS export refuse them.
 
 # The datasets
@@ -62,17 +65,13 @@ and the `time` variable carries the times themselves.
 A shotlist with time windows keeps only the grid times inside them, so there `time` jumps between windows.
 
 Profiles arrive one per Thomson sample and equilibria on the reconstruction
-clock, both far slower than 1 kHz, so both are held forward over the grid times
-that follow them and `fresh_profile` / `fresh_equilibrium` mark the grid times
-that carry a sample of their own.
+clock, which can be slower than 1 kHz or missing for certain timesteps, so both are held forward over the grid times
+that follow them and `fresh_profile` / `fresh_equilibrium` mark the grid times that carry a sample of their own.
 A profile is held for at most `PROFILE_MAX_HOLD` (100 ms) on every device, whatever its Thomson cadence,
-so dropped slices and burst-mode gaps are bridged and `fresh_profile` tells a fresh profile from a held one.
-An equilibrium is held for at most `MAX_HOLD_PERIODS` of its own sampling period,
-so it is not carried across a reconstruction dropping out.
+so dropped slices are bridged and `fresh_profile` tells a fresh profile from a held one.
 An equilibrium reconstruction, and every 0D signal taken from one, is held for at least `EQUILIBRIUM_HOLD_FLOOR` (10 ms),
 so a few missing reconstructions do not cut the shot.
-The slices the stack stage screens out (see [Filtering](#filtering)) are held over, as though the
-shot had no Thomson sample there.
+The slices the stack stage screens out (see [Filtering](#filtering)) are held over, as though the shot had no Thomson sample there.
 
 | Group | Signals | Dimensions |
 | ------ | ------ | ------ |
@@ -84,7 +83,7 @@ shot had no Thomson sample there.
 | Raw Thomson channels (internal store only) | ts_channel_r, ts_channel_z, ts_channel_t_e, ts_channel_n_e, their _error | (shot, time_idx, ts_channel) |
 | IDA points, DIII-D (internal store only) | ida_psi_n, ida_t_e, ida_n_e, their _error | (shot, time_idx, ida_point) |
 
-The profiles are fit on rho_tor_norm from 0 to 1.6, so every fit anchor is on the fit grid and in the fit plots.
+The profiles are fit on rho_tor_norm from 0 to 1.6, so every fit anchor (synthetic points far in the SOL to force the fit to be at least somewhat reasonable) is on the fit grid and in the fit plots.
 The fit files, the stores and the IMAS export keep them out to rho_tor_norm 1.1.
 
 The heating powers are the launched powers (IMAS `power_launched_*`), not the absorbed ones.
@@ -92,17 +91,18 @@ A heating system the device does not have is zero, so the devices share
 one schema. Everything is float32, flags included, because the padding between
 shots of different lengths is NaN.
 The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since source records often dip negative
-(bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
+(bolometer baseline drift, channel pickup), and no heating or radiated power should be physically negative.
 
-Every stored value is causal, no grid time draws on a later sample, with these exceptions.
+Every stored value is causal, no grid time draws on a later sample, with these exceptions:
 power_ohm and power_radiated are smoothed by a centered 50 ms boxcar applied twice (`smoothed_power`),
-DIII-D's bolometer postprocessing.
+similar to DIII-D's bolometer postprocessing.
 DIII-D's `\bolom::prad_tot` is smoothed that way at the source,
 and TCV's `PradTot` reads smooth at its ~17 ms cadence, so it is only held causally for at least 60 ms.
 TCV's n_e_line_average has the FIR fringe jumps removed from its raw samples, which looks across each jump.
 The EFIT and Thomson slices are snapped to the nearest grid time (`snap_to_grid`), up to 0.5 ms early.
 The Thomson channels map onto rho_tor_norm through the nearest usable reconstruction within `EQ_MATCH_MAX_PERIODS` of the
 reconstruction clock on either side, so the profile coordinate can take a reconstruction up to 1.5 periods later than the slice.
+
 A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, grid time t taking the mean of (t - 1 ms, t].
 One sampled slower is held forward from its last finite sample for at most `MAX_HOLD_PERIODS` of its own sampling period,
@@ -135,22 +135,6 @@ A shot whose median power_ohm over the kept times is negative is rejected (`ohmi
 n_e_line_average is the IMAS line average, the interferometer line integral over the chord length inside the plasma:
 on C-Mod the TCI chord 4 `nl_04` over EFIT's `rco2v` for that chord (49 to 61 cm over a shot, held like the EFIT 0D signals),
 on DIII-D the EFIT density with the PCS `dssdenest` where the tree has none.
-
-The C-Mod 0D signals outside EFIT are read by custom methods (`CmodPlasmaMethods`, `CmodPowerMethods`),
-since the disruption-py built-ins interpolate.
-Every one of their records is faster than the grid, so each grid time takes the mean of the preceding millisecond.
-Sample periods, checked on 5 shots from 2012 to 2016:
-
-| Signal | Node (tree) | Period [ms] |
-| --- | --- | --- |
-| ip, b0 | `\ip`, `\btor` (magnetics) | 0.2 from -0.1 to 2.2 s, 10 outside |
-| n_e_line_average | `.tci.results:nl_04` (electrons) over `\efit_aeqdsk:rco2v` | 0.5 |
-| power_radiated | `\twopi_diode` (spectroscopy) | 0.333 |
-| power_ic | `\rf_power_net` (rf) | 0.1 |
-| power_lh | `\top.results:netpow` (lh) | 0.04 |
-
-power_ic and power_lh are 0 outside their records and on shots without the system.
-power_radiated is NaN outside its record.
 
 # Filtering
 
@@ -500,6 +484,6 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 | Device | Source | Shotlist | Notes |
 | ------ | ------ | -------- | ----- |
 | C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. |
-| MAST | Level 1 Zarr store at https://s3.echo.stfc.ac.uk/mast/level1/shots: EFM for the equilibrium (GEQDSK and 0D), ESM for the ohmic power, AYC for the Thomson profiles. The level 2 store at https://s3.echo.stfc.ac.uk/mast/level2/shots supplies only the summary signals (ip, NBI and radiated power, line averaged density) | 1671 shots from the M7-M9 campaigns, shipped with the package and built by `machine/mast/shotlist.py` | Public, anonymous, read in a thread pool (`--prepare_workers`) |
+| MAST | Level 1 Zarr store at https://s3.echo.stfc.ac.uk/mast/level1/shots: EFM for the equilibrium (GEQDSK and 0D, from which power_ohm is computed), AYC for the Thomson profiles. The level 2 store at https://s3.echo.stfc.ac.uk/mast/level2/shots supplies only the summary signals (ip, NBI and radiated power, line averaged density) | 1671 shots from the M7-M9 campaigns, shipped with the package and built by `machine/mast/shotlist.py` | Public, anonymous, read in a thread pool (`--prepare_workers`) |
 | DIII-D | MDSplus through disruption-py: the 0D signals (PTDATA ip and bcoil, the DISPY EFIT a-file scalars, `\bolom::prad_tot`, pinj, echpwrc) and the full GEQDSK block of the shot's DISPY EFIT run (the 1 kHz disruption-efit, `code_rundb` runtag DISPY). Te and ne from IDA files, already GP fit on IDA's psi_N points | Every shot an IDA database of `[d3d]` serves (`find_ida_shots`) | Runs on omega. Internal store only. The `ida` fit method is the only one that serves DIII-D, and it refuses every other device |
 | TCV | DEFUSE exports (`TCVno{shot}.h5`, MATLAB v7.3, h5py): the 0D signals and the raw Thomson channels (`SIG/{Te_rho,Ne_rho}/signal/raw`, the vertical chord at R = 0.9 m). The LIUQE reconstructions of the MEQ databases (`TCV{shot}_meqdb.mat`) as the full GEQDSK block (`liuqe_geqdsk_dataset`) | Every shot with both, 964 from 60001 to 82878 | Runs where the PSFC NFS is mounted. Internal store only. DEFUSE's own spline fits are not read |

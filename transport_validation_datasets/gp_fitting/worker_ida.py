@@ -29,6 +29,11 @@ from transport_validation_datasets.gp_fitting.worker_base import run_worker_cli
 
 # The method's own name for its GP fit, in the description of every fitted profile
 FIT_DESCRIPTION = "IDA"
+# The gradient error is not a fit uncertainty, so its description says what it is ({desc} is the profile)
+GRADIENT_ERROR_DESCRIPTION = (
+    "Stand-in uncertainty of the d/drho_tor_norm gradient of the IDA {desc} profile, "
+    "10 percent of |gradient| with a floor, since IDA gives no point covariance"
+)
 
 
 # Stand-in gradient error, fraction of |gradient| and the floor per variable [keV and 1e20 m^-3 per unit rho_tor_norm].

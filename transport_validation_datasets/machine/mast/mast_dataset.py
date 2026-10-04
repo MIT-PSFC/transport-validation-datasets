@@ -143,7 +143,7 @@ REQUIRED_LEVEL2_SIGNALS = {
 # Per-variable attributes
 SIGNAL_ATTRS = {
     "ip": {
-        "description": "Measured plasma current, signed",
+        "description": "Measured plasma current, the level 2 summary ip, signed",
     },
     "b0": {
         "description": "Vacuum toroidal field at r0, the reconstruction's bvac_val, signed",
@@ -162,7 +162,7 @@ SIGNAL_ATTRS = {
         ),
     },
     "n_e_line_average": {
-        "description": "Line averaged electron density",
+        "description": "Line-averaged electron density, the level 2 summary line_average_n_e",
     },
     "power_radiated": {
         "description": "Total radiated power from the poloidal bolometer array (ABM_PRAD_POL), smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0",
@@ -643,7 +643,7 @@ def _zero_d_dataset(
 
     Every signal is placed causally (signal_on_grid), never interpolated,
     so no grid time draws on a later sample,
-    and power_radiated is then smoothed non-causally (smoothed_power), as on every device.
+    and power_radiated is then smoothed non-causally (smoothed_power), the DIII-D prad_tot kernel.
     power_ohm comes from the GEQDSK block (DataWorkflow.add_ohmic_power).
     Plasma current and toroidal field keep their source sign, as on C-Mod.
 
@@ -687,7 +687,7 @@ def _zero_d_dataset(
     data["beta_tor_norm"] = signal_on_grid(
         eq_time, beta_tor_norm_eq, timebase, EQUILIBRIUM_HOLD_FLOOR
     )
-    # Smoothed non-causally, as on every device
+    # Smoothed non-causally, the DIII-D prad_tot kernel
     data["power_radiated"] = smoothed_power(data["power_radiated"], UNIFORM_TIMEBASE_DT)
     data["power_nbi"] = signal_on_grid(
         summary_time, summary["power_nbi"].values, timebase
