@@ -28,6 +28,10 @@ HYP_START_SHORT_CORE = np.array([2.0, 0.3, 0.5, 0.2])
 # Bounds define the optimizer's random-restart ranges (drawn uniform in log10)
 # bounds_for replaces the var bounds and the l1 bounds with the variable's FitBounds.
 HYP_BOUNDS = np.array([[1.0e-2, 0.4, 0.05, 0.05], [2.0e1, 0.7, 0.5, 0.2]])
+# A hyperparameter within this fraction of its log10 range of a bound counts as pinned (pinned_hyperparams).
+# 2 percent of the range tells a bound-hugging fit from an interior optimum
+# that happens to converge near a bound.
+PINNED_MARGIN_LOG10_FRACTION = 0.02
 
 
 class Tanh_WarpingFunction(_WarpingFunction):
@@ -151,7 +155,7 @@ def pinned_hyperparams(hyps: np.ndarray, kbounds: np.ndarray) -> bool:
     The length-scale ceilings are excluded, because a retry typically re-lands on them.
     They are regularization (see HYP_BOUNDS), and most fits rest on them.
 
-    The margin is measured in log10 space, matching how restarts are drawn.
+    The margin (PINNED_MARGIN_LOG10_FRACTION) is measured in log10 space, matching how restarts are drawn.
     var and lw span 2-3 decades, so a fraction of the raw range is huge in log
     terms and would flag converged interior optima as pinned.
 
@@ -164,7 +168,7 @@ def pinned_hyperparams(hyps: np.ndarray, kbounds: np.ndarray) -> bool:
     """
     lo, hi = kbounds[0], kbounds[1]
     log_lo, log_hi, log_hyps = np.log10(lo), np.log10(hi), np.log10(hyps)
-    margin = 0.02 * (log_hi - log_lo)
+    margin = PINNED_MARGIN_LOG10_FRACTION * (log_hi - log_lo)
     pinned_lo = log_hyps <= log_lo + margin
     pinned_hi = log_hyps >= log_hi - margin
     pinned_hi[1:] = False  # length-scale ceilings

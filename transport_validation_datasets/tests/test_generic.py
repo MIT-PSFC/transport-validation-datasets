@@ -6,12 +6,17 @@ Synthetic arrays only, no MDSplus and no network, so these run anywhere.
 import numpy as np
 import pytest
 import xarray as xr
+from scipy.integrate import quad
 
 from transport_validation_datasets.machine.generic import (
     MU0,
     cocos_from_signs,
+    energy_mhd_from_normalized_beta,
+    lcfs_voltage,
     make_uniform_1kHz_timebase,
+    normalized_beta,
     ohmic_power,
+    poloidal_field_energy,
     signal_on_grid,
     smoothed_power,
     snap_to_grid,
@@ -273,19 +278,137 @@ class TestSmoothedPower:
 
 
 class TestOhmicPower:
-    def test_current_ramp_matches_the_backward_difference_closed_form(self):
-        # Linear Ip ramp at fixed li and R, so dW_pol/dt over one step is
-        # mu0 R li / 4 * dIp/dt * (Ip_n + Ip_n-1)
+    def test_quadratic_w_pol_matches_the_backward_difference_closed_form(self):
+        # W_pol = k t^2, so its backward difference over one step is k (t_n + t_n-1)
         times = np.arange(10) * 1e-3
-        ip_ramp_rate = 2e6
-        ip = 5e5 + ip_ramp_rate * times
+        current = 5e5 + 2e6 * times
         v_loop = np.full(times.size, 1.5)
-        li = np.full(times.size, 1.2)
-        major_radius = np.full(times.size, 0.68)
+        w_pol_rate = 3e7
+        w_pol = w_pol_rate * times**2
 
-        p_ohm = ohmic_power(times, ip, v_loop, li, major_radius)
+        p_ohm = ohmic_power(times, current, v_loop, w_pol)
 
-        dw_pol_dt = MU0 * 0.68 * 1.2 / 4.0 * ip_ramp_rate * (ip[1:] + ip[:-1])
-        expected = ip[1:] * v_loop[1:] - dw_pol_dt
+        dw_pol_dt = w_pol_rate * (times[1:] + times[:-1])
+        expected = current[1:] * v_loop[1:] - dw_pol_dt
         assert np.isnan(p_ohm[0])
         np.testing.assert_allclose(p_ohm[1:], expected, rtol=1e-12)
+
+    def test_lcfs_voltage_follows_the_cocos_sign_of_psi(self):
+        # psi_boundary falling 1 mWb/rad per ms is 2 pi V through the boundary,
+        # positive for sigma_Bp < 0 (COCOS 3, 7) and negative for sigma_Bp > 0 (COCOS 1, 5)
+        times = np.array([0.0, 1e-3, 2e-3])
+        sibdry = np.array([0.0, -1e-3, -2e-3])
+
+        v_cocos_3 = lcfs_voltage(times, sibdry, 3)
+        v_cocos_1 = lcfs_voltage(times, sibdry, 1)
+
+        assert np.isnan(v_cocos_3[0]) and np.isnan(v_cocos_1[0])
+        np.testing.assert_allclose(v_cocos_3[1:], 2 * np.pi)
+        np.testing.assert_allclose(v_cocos_1[1:], -2 * np.pi)
+
+
+class TestPoloidalFieldEnergy:
+    def test_circular_quadratic_flux_matches_the_quadrature_reference(self):
+        # psi = psi_axis + c r^2 on a circle of radius a about (R0, 0), so |grad psi| = 2 c r
+        # and W = (pi / mu0) int 4 c^2 r^2 / R dR dZ = (pi / mu0) 4 c^2 int_0^a 2 pi r^3 / sqrt(R0^2 - r^2) dr
+        major_radius = 0.9
+        minor_radius = 0.25
+        curvature = 0.4
+        psi_axis = -0.1
+        r_grid = np.linspace(
+            major_radius - 1.4 * minor_radius, major_radius + 1.4 * minor_radius, 281
+        )
+        z_grid = np.linspace(-1.4 * minor_radius, 1.4 * minor_radius, 281)
+        r_mesh, z_mesh = np.meshgrid(r_grid, z_grid, indexing="ij")
+        distance_squared = (r_mesh - major_radius) ** 2 + z_mesh**2
+        psirz = psi_axis + curvature * distance_squared
+        theta = np.linspace(0.0, 2 * np.pi, 361)
+        r_boundary = major_radius + minor_radius * np.cos(theta)
+        z_boundary = minor_radius * np.sin(theta)
+        sibdry = psi_axis + curvature * minor_radius**2
+
+        energy = poloidal_field_energy(
+            psirz[np.newaxis],
+            r_grid,
+            z_grid,
+            np.array([psi_axis]),
+            np.array([sibdry]),
+            r_boundary[np.newaxis],
+            z_boundary[np.newaxis],
+        )
+
+        def integrand(distance):
+            return 2 * np.pi * distance**3 / np.sqrt(major_radius**2 - distance**2)
+
+        radial_integral, _ = quad(integrand, 0.0, minor_radius)
+        expected = np.pi / MU0 * 4 * curvature**2 * radial_integral
+        np.testing.assert_allclose(energy[0], expected, rtol=0.02)
+
+    def test_padding_and_missing_contours(self):
+        r_grid = np.linspace(0.5, 1.5, 21)
+        z_grid = np.linspace(-0.5, 0.5, 21)
+        psirz = np.zeros((2, 21, 21))
+        r_boundary = np.full((2, 5), np.nan)
+        z_boundary = np.full((2, 5), np.nan)
+        r_boundary[0, :2] = [0.9, 1.1]
+        z_boundary[0, :2] = [0.0, 0.0]
+
+        energy = poloidal_field_energy(
+            psirz, r_grid, z_grid, np.zeros(2), np.ones(2), r_boundary, z_boundary
+        )
+
+        assert np.isnan(energy).all()
+
+
+class TestNormalizedBeta:
+    ENERGY_MHD = 1.2e4
+    VOLUME = 1.25
+    MINOR_RADIUS = 0.21
+    B0 = -1.41
+    IP = -2.9e5
+
+    def test_closed_form(self):
+        pressure_mean = 2.0 * self.ENERGY_MHD / (3.0 * self.VOLUME)
+        beta_tor = 2.0 * MU0 * pressure_mean / self.B0**2
+        expected = (
+            100.0 * beta_tor * self.MINOR_RADIUS * abs(self.B0) / (abs(self.IP) / 1e6)
+        )
+
+        beta_tor_norm = normalized_beta(
+            np.array([self.ENERGY_MHD]),
+            self.VOLUME,
+            self.MINOR_RADIUS,
+            self.B0,
+            self.IP,
+        )
+
+        np.testing.assert_allclose(beta_tor_norm, expected)
+
+    def test_sign_invariance_and_round_trip(self):
+        energy_mhd = np.array([self.ENERGY_MHD])
+        beta_both_negative = normalized_beta(
+            energy_mhd, self.VOLUME, self.MINOR_RADIUS, self.B0, self.IP
+        )
+        beta_both_positive = normalized_beta(
+            energy_mhd, self.VOLUME, self.MINOR_RADIUS, -self.B0, -self.IP
+        )
+        beta_mixed = normalized_beta(
+            energy_mhd, self.VOLUME, self.MINOR_RADIUS, self.B0, -self.IP
+        )
+        np.testing.assert_allclose(beta_both_positive, beta_both_negative)
+        np.testing.assert_allclose(beta_mixed, beta_both_negative)
+
+        energy_back = energy_mhd_from_normalized_beta(
+            beta_both_negative, self.VOLUME, self.MINOR_RADIUS, self.B0, self.IP
+        )
+        np.testing.assert_allclose(energy_back, energy_mhd)
+
+    def test_zero_current_is_not_finite(self):
+        beta_tor_norm = normalized_beta(
+            np.array([self.ENERGY_MHD]),
+            self.VOLUME,
+            self.MINOR_RADIUS,
+            self.B0,
+            np.array([0.0]),
+        )
+        assert not np.isfinite(beta_tor_norm).any()

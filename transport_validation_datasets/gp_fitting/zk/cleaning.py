@@ -239,8 +239,8 @@ def _remove_loo_outliers(
             gutting it further only produces worse fits.
         ref_hyperparams: LOO kernel hyperparameters (the slice's own
             rough-optimized shape); falls back to the generic start values if
-            None. Held fixed across iterations - refitting each pass would be
-            the old cost back.
+            None. Held fixed across iterations, refitting each pass would cost
+            an optimizer run per dropped point.
 
     Returns:
         (x, y, err) with the outliers removed.

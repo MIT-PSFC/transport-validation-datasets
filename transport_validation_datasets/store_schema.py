@@ -27,7 +27,7 @@ STORE_SIGNAL_ATTRS = {
         "ref": "/equilibrium/time_slice(itime)/global_quantities/energy_mhd",
     },
     "beta_tor_norm": {
-        "units": "dimensionless",
+        "units": "1",
         "ref": "/equilibrium/time_slice(itime)/global_quantities/beta_tor_norm",
         "normalization": (
             "100 beta_tor a |b0| / |Ip|[MA] with beta_tor = 2 mu0 <p> / b0^2, "
@@ -45,15 +45,15 @@ STORE_SIGNAL_ATTRS = {
         "ref": "/equilibrium/time_slice(itime)/boundary/geometric_axis/r",
     },
     "elongation": {
-        "units": "dimensionless",
+        "units": "1",
         "ref": "/equilibrium/time_slice(itime)/boundary/elongation",
     },
     "triangularity_upper": {
-        "units": "dimensionless",
+        "units": "1",
         "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_upper",
     },
     "triangularity_lower": {
-        "units": "dimensionless",
+        "units": "1",
         "ref": "/equilibrium/time_slice(itime)/boundary/triangularity_lower",
     },
     "power_ohm": {"units": "W", "ref": "/summary/global_quantities/power_ohm/value"},
@@ -73,10 +73,28 @@ STORE_SIGNAL_ATTRS = {
     "n_e_error": {"units": "m^-3", "ref": f"{_PROFILES_REF}/density_error_upper"},
     "n_e_gradient": {"units": "m^-3 per unit rho_tor_norm"},
     "n_e_gradient_error": {"units": "m^-3 per unit rho_tor_norm"},
-    "fresh_profile": {"units": "dimensionless"},
-    "fresh_equilibrium": {"units": "dimensionless"},
+    "fresh_profile": {"units": "1"},
+    "fresh_equilibrium": {"units": "1"},
 }
 STORE_SIGNALS = tuple(STORE_SIGNAL_ATTRS)
+
+# The raw Thomson channel readings of the internal stores, their SI units and IMAS paths.
+# Each device adds its own description of the diagnostic.
+_TS_CHANNEL_REF = "/thomson_scattering/channel(i1)"
+TS_CHANNEL_SIGNAL_ATTRS = {
+    "ts_channel_r": {"units": "m", "ref": f"{_TS_CHANNEL_REF}/position/r"},
+    "ts_channel_z": {"units": "m", "ref": f"{_TS_CHANNEL_REF}/position/z"},
+    "ts_channel_t_e": {"units": "eV", "ref": f"{_TS_CHANNEL_REF}/t_e/data"},
+    "ts_channel_t_e_error": {
+        "units": "eV",
+        "ref": f"{_TS_CHANNEL_REF}/t_e/data_error_upper",
+    },
+    "ts_channel_n_e": {"units": "m^-3", "ref": f"{_TS_CHANNEL_REF}/n_e/data"},
+    "ts_channel_n_e_error": {
+        "units": "m^-3",
+        "ref": f"{_TS_CHANNEL_REF}/n_e/data_error_upper",
+    },
+}
 
 # Every 0D signal of a store, finite at every stored time (the finite filter of every device)
 DATASET_0D_SIGNALS = (
@@ -107,7 +125,8 @@ def apply_signal_attrs(ds: xr.Dataset, device_attrs: dict[str, dict]) -> xr.Data
     for name, attrs in device_attrs.items():
         if name in ds.variables:
             ds[name].attrs.update(attrs)
-    for name, attrs in STORE_SIGNAL_ATTRS.items():
-        if name in ds.variables:
-            ds[name].attrs.update(attrs)
+    for shared_attrs in (STORE_SIGNAL_ATTRS, TS_CHANNEL_SIGNAL_ATTRS):
+        for name, attrs in shared_attrs.items():
+            if name in ds.variables:
+                ds[name].attrs.update(attrs)
     return ds

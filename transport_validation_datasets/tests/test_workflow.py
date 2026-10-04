@@ -110,7 +110,7 @@ class TestHoldOntoGrid:
     def test_no_samples_means_no_grid_time_draws_on_anything(self):
         grid = grid_ms(10)
 
-        index, fresh = hold_onto_grid(grid, np.array([]), True)
+        index, fresh = hold_onto_grid(grid, np.array([]))
 
         assert (index == -1).all()
         assert not fresh.any()
@@ -119,7 +119,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(20)
         samples = np.array([0.002, 0.007, 0.012])
 
-        _, fresh = hold_onto_grid(grid, samples, True)
+        _, fresh = hold_onto_grid(grid, samples)
 
         assert np.array_equal(np.flatnonzero(fresh), [2, 7, 12])
 
@@ -127,7 +127,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(20)
         samples = np.array([0.002, 0.007, 0.012])
 
-        index, _ = hold_onto_grid(grid, samples, True)
+        index, _ = hold_onto_grid(grid, samples)
 
         assert (index[:2] == -1).all()  # nothing before the first sample
         assert (index[2:7] == 0).all()
@@ -139,7 +139,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(30)
         samples = np.array([0.002, 0.007, 0.012])
 
-        index, _ = hold_onto_grid(grid, samples, True)
+        index, _ = hold_onto_grid(grid, samples)
 
         assert index[19] == 2
         assert (index[20:] == -1).all()
@@ -151,27 +151,18 @@ class TestHoldOntoGrid:
         # The last held grid time is the last whole millisecond at or before the cutoff
         last_held = int(np.floor(1e3 * (samples[2] + MAX_HOLD_PERIODS * period) + 1e-9))
 
-        index, _ = hold_onto_grid(grid, samples, True)
+        index, _ = hold_onto_grid(grid, samples)
 
         assert index[last_held] == 2
         assert (index[last_held + 1 : 35] == -1).all()
         assert index[35] == 3
-
-    def test_without_forward_fill_only_fresh_grid_times_draw_sample(self):
-        grid = grid_ms(20)
-        samples = np.array([0.002, 0.007, 0.012])
-
-        index, fresh = hold_onto_grid(grid, samples, False)
-
-        assert np.array_equal(np.flatnonzero(index >= 0), np.flatnonzero(fresh))
-        assert np.array_equal(index[fresh], [0, 1, 2])
 
     def test_lone_sample_falls_back_to_grid_step(self):
         # One sample has no sampling period of its own, so it only covers
         # MAX_HOLD_PERIODS grid steps rather than the rest of the shot
         grid = grid_ms(20)
 
-        index, fresh = hold_onto_grid(grid, np.array([0.002]), True)
+        index, fresh = hold_onto_grid(grid, np.array([0.002]))
 
         assert np.flatnonzero(fresh).tolist() == [2]
         assert index[2] == 0
@@ -183,7 +174,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(20)
         samples = np.array([0.0024, 0.0071, 0.0125])
 
-        index, fresh = hold_onto_grid(grid, samples, True)
+        index, fresh = hold_onto_grid(grid, samples)
 
         assert np.flatnonzero(fresh).tolist() == [3, 8, 13]
         assert (index[:3] == -1).all()
@@ -195,7 +186,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(40)
         samples = np.array([0.002, 0.007, 0.012])
 
-        index, _ = hold_onto_grid(grid, samples, True, max_hold_periods=3.0)
+        index, _ = hold_onto_grid(grid, samples, max_hold_periods=3.0)
 
         assert index[27] == 2
         assert (index[28:] == -1).all()
@@ -206,7 +197,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(400)
         samples = np.array([0.002, 0.007, 0.012, 0.060, 0.250])
 
-        index, fresh = hold_onto_grid(grid, samples, True, max_hold_time=0.1)
+        index, fresh = hold_onto_grid(grid, samples, max_hold_time=0.1)
 
         assert (index[:2] == -1).all()
         assert (index[12:60] == 2).all()
@@ -222,7 +213,7 @@ class TestHoldOntoGrid:
         grid = grid_ms(10)
         samples = np.array([0.005 + 1e-9])
 
-        _, fresh = hold_onto_grid(grid, samples, True)
+        _, fresh = hold_onto_grid(grid, samples)
 
         assert np.flatnonzero(fresh).tolist() == [5]
 
@@ -257,7 +248,7 @@ class TestHoldEquilibrium:
         grid = grid_ms(20)
         ds = unprocessed_with_equilibrium(grid, [2, 7, 12])
 
-        _, fresh = _hold_equilibrium(ds, grid, True)
+        _, fresh = _hold_equilibrium(ds, grid)
 
         assert np.array_equal(np.flatnonzero(fresh), [2, 7, 12])
 
@@ -265,7 +256,7 @@ class TestHoldEquilibrium:
         grid = grid_ms(20)
         ds = unprocessed_with_equilibrium(grid, [2, 7, 12])
 
-        held, _ = _hold_equilibrium(ds, grid, True)
+        held, _ = _hold_equilibrium(ds, grid)
 
         simagx = held["simagx"].squeeze(EPISODE_DIM, drop=True).values
         assert np.isnan(simagx[:2]).all()
@@ -276,17 +267,6 @@ class TestHoldEquilibrium:
         assert (psirz[2:7] == 1.0).all()
         assert np.isnan(psirz[:2]).all()
 
-    def test_without_forward_fill_only_reconstruction_times_finite(self):
-        grid = grid_ms(20)
-        ds = unprocessed_with_equilibrium(grid, [2, 7, 12])
-
-        held, fresh = _hold_equilibrium(ds, grid, False)
-        simagx = held["simagx"].squeeze(EPISODE_DIM, drop=True).values
-
-        assert np.array_equal(
-            np.flatnonzero(np.isfinite(simagx)), np.flatnonzero(fresh)
-        )
-
     def test_unusable_reconstructions_bridged_up_to_the_hold_floor(self):
         # A 5 ms clock with no qpsi at 7 and 12 ms.
         # 1.5 clock periods are 7.5 ms, so EQUILIBRIUM_HOLD_FLOOR sets the hold,
@@ -295,7 +275,7 @@ class TestHoldEquilibrium:
         ds = unprocessed_with_equilibrium(grid, [2, 7, 12, 22], nan_qpsi=(7, 12))
         last_held = 2 + round(1e3 * EQUILIBRIUM_HOLD_FLOOR)
 
-        held, fresh = _hold_equilibrium(ds, grid, True)
+        held, fresh = _hold_equilibrium(ds, grid)
 
         simagx = held["simagx"].squeeze(EPISODE_DIM, drop=True).values
         assert np.flatnonzero(fresh).tolist() == [2, 22]
@@ -309,7 +289,7 @@ class TestHoldEquilibrium:
             {"rmagx": ((EPISODE_DIM, TIME_COORD), np.zeros((1, grid.size)))}
         )
 
-        held, fresh = _hold_equilibrium(ds, grid, True)
+        held, fresh = _hold_equilibrium(ds, grid)
 
         assert set(held) == {"rmagx"}
         assert not fresh.any()

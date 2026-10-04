@@ -25,10 +25,12 @@ HOST="$1"
 WORKDIR="$2"
 PYVER="${3:-3.12}"
 
-# Exact pin, kept in sync with pyproject.toml: the zk worker relies on
-# non-public mkgp surfaces (see zk/kernel.py), so local and remote must
-# resolve the same version.
+# Exact pins, kept in sync with uv.lock: the zk worker relies on
+# non-public mkgp surfaces (see zk/kernel.py), and the fits only match
+# a local run's when numpy and scipy are the same builds.
 MKGP_SPEC="mkgp==3.1.4"
+NUMPY_SPEC="numpy==1.26.4"
+SCIPY_SPEC="scipy==1.17.1"
 
 echo "==> Creating $WORKDIR on $HOST"
 # Only the workdir itself: each dataset makes its own <workdir>/<ds_name>/
@@ -38,7 +40,7 @@ ssh "$HOST" "mkdir -p '$WORKDIR'"
 
 echo "==> Building venv with python $PYVER (installs uv if missing)"
 # shellcheck disable=SC2087  # client-side expansion into the heredoc is
-# intended (WORKDIR/PYVER/MKGP_SPEC); remote-side variables are escaped
+# intended (WORKDIR/PYVER/*_SPEC), remote-side variables are escaped
 ssh "$HOST" bash -s <<EOF
 set -euo pipefail
 export PATH="\$HOME/.local/bin:\$PATH"
@@ -47,14 +49,14 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 cd '$WORKDIR'
 uv venv --python '$PYVER' .venv
-uv pip install --python .venv/bin/python numpy scipy '$MKGP_SPEC'
+uv pip install --python .venv/bin/python '$NUMPY_SPEC' '$SCIPY_SPEC' '$MKGP_SPEC'
 .venv/bin/python -c "import mkgp; print('mkgp OK:', mkgp.__file__)"
 EOF
 
 echo
 echo "Remote environment ready."
 echo "  venv: $WORKDIR/.venv"
-echo "  mkgp: $MKGP_SPEC (from PyPI)"
+echo "  packages: $NUMPY_SPEC $SCIPY_SPEC $MKGP_SPEC (from PyPI)"
 echo
 echo "Pass to ClusterFitConfig:"
 echo "  ssh_host='$HOST', remote_workdir='$WORKDIR', venv_path='$WORKDIR/.venv'"

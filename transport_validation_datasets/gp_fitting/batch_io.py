@@ -10,11 +10,16 @@ A slice that was skipped or culled is an all-NaN row, never a dropped one.
 Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
 """
 
+import json
 import os
-from dataclasses import dataclass, field, fields
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
+
+T = TypeVar("T")
 
 FIT_VARIABLES = ("te", "ne")
 
@@ -253,7 +258,7 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         arrays[f"{shot}:ne_err"] = np.asarray(si.ne_err, dtype=np.float32)
         arrays[f"{shot}:windows"] = np.asarray(si.windows, dtype=np.float64)
         arrays[f"{shot}:window_index"] = np.asarray(si.window_index, dtype=np.int64)
-    _atomic_savez(path, arrays)
+    atomic_write(path, lambda tmp_path: _savez(tmp_path, arrays))
 
 
 def unpack_fit_batch(path: Path | str) -> FitBatch:
@@ -263,21 +268,10 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
         path: Batch input npz path.
 
     Returns:
-        The staged batch. A bounds key absent from the file reads back that
-        FitBounds field's default.
+        The staged batch.
     """
-    with np.load(path) as data:
-        bounds = {
-            var: FitBounds(
-                **{
-                    f.name: float(data[key])
-                    for f in fields(FitBounds)
-                    if (key := f"bounds:{var}:{f.name}") in data.files
-                }
-            )
-            for var in FIT_VARIABLES
-        }
-        anchors = _unpack_anchors(data)
+
+    def read(data) -> FitBatch:
         shot_inputs = {
             shot: ShotFitInput(
                 x=data[f"{shot}:x"],
@@ -296,12 +290,48 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
             x_star=data["x_star"],
             min_points=int(data["min_points"]),
             scale_per_slice=bool(data["scale_per_slice"]),
-            bounds=bounds,
-            anchors=anchors,
+            bounds=_unpack_bounds(data),
+            anchors=_unpack_anchors(data),
             pedestal_rho_tor_norm=float(data["pedestal_rho_tor_norm"]),
             sol_extension=str(data["sol_extension"].item()),
             fit_mode=str(data["fit_mode"].item()),
         )
+
+    return _read_batch(path, read)
+
+
+def _read_batch(path: Path | str, read: Callable[[np.lib.npyio.NpzFile], T]) -> T:
+    """Open a batch npz and read what the caller asks for.
+
+    np.load is lazy, so a reader that touches only the small keys never
+    loads the channel arrays.
+
+    Args:
+        path: Batch npz path.
+        read: Reads the wanted values out of the open npz.
+
+    Returns:
+        Whatever read returns.
+    """
+    with np.load(path) as data:
+        return read(data)
+
+
+def _unpack_bounds(data) -> dict[str, FitBounds]:
+    """Read the per-variable bounds out of an open batch npz.
+
+    Args:
+        data: The open npz file.
+
+    Returns:
+        FitBounds keyed by variable name, every key must be in the file (KeyError).
+    """
+    return {
+        var: FitBounds(
+            **{f.name: float(data[f"bounds:{var}:{f.name}"]) for f in fields(FitBounds)}
+        )
+        for var in FIT_VARIABLES
+    }
 
 
 def _unpack_anchors(data) -> dict[str, FitAnchors]:
@@ -330,8 +360,7 @@ def read_batch_anchors(path: Path | str) -> dict[str, FitAnchors]:
     Returns:
         FitAnchors keyed by variable name.
     """
-    with np.load(path) as data:
-        return _unpack_anchors(data)
+    return _read_batch(path, _unpack_anchors)
 
 
 def read_batch_shots(path: Path | str) -> list[int]:
@@ -343,8 +372,7 @@ def read_batch_shots(path: Path | str) -> list[int]:
     Returns:
         Shot numbers in the batch.
     """
-    with np.load(path) as data:
-        return data["shots"].tolist()
+    return _read_batch(path, lambda data: data["shots"].tolist())
 
 
 def read_batch_windows(path: Path | str) -> dict[int, np.ndarray]:
@@ -359,8 +387,10 @@ def read_batch_windows(path: Path | str) -> dict[int, np.ndarray]:
         Per shot its (n_w, 2) window bounds [s], empty for a shot staged
         without windows.
     """
-    with np.load(path) as data:
-        return {shot: data[f"{shot}:windows"] for shot in data["shots"].tolist()}
+    return _read_batch(
+        path,
+        lambda data: {shot: data[f"{shot}:windows"] for shot in data["shots"].tolist()},
+    )
 
 
 def read_batch_setting(path: Path | str, name: str) -> str:
@@ -373,8 +403,72 @@ def read_batch_setting(path: Path | str, name: str) -> str:
     Returns:
         The setting's value, as a string.
     """
-    with np.load(path) as data:
-        return str(data[name].item())
+    return _read_batch(path, lambda data: str(data[name].item()))
+
+
+def fit_batch_settings(batch: FitBatch) -> dict[str, str]:
+    """Every fit setting of a batch as a comparable string.
+
+    The one form the staged settings and a run's settings are compared in:
+    batch_settings reads the same strings off a staged file,
+    so a run refuses a batch staged under other settings by comparing the two dicts.
+
+    Args:
+        batch: The batch, its channel data is not read.
+
+    Returns:
+        Keys fit_mode, sol_extension, pedestal_rho_tor_norm, anchors (JSON per
+        variable of the value and grad rows), bounds (JSON per variable of
+        every FitBounds field), x_star (JSON list), min_points and
+        scale_per_slice.
+    """
+    anchors = {
+        var: {
+            "value": np.asarray(batch.anchors[var].value, dtype=float).tolist(),
+            "grad": np.asarray(batch.anchors[var].grad, dtype=float).tolist(),
+        }
+        for var in FIT_VARIABLES
+    }
+    bounds = {var: asdict(batch.bounds[var]) for var in FIT_VARIABLES}
+    x_star = np.asarray(batch.x_star, dtype=float).tolist()
+    return {
+        "fit_mode": str(batch.fit_mode),
+        "sol_extension": str(batch.sol_extension),
+        "pedestal_rho_tor_norm": str(float(batch.pedestal_rho_tor_norm)),
+        "anchors": json.dumps(anchors, sort_keys=True),
+        "bounds": json.dumps(bounds, sort_keys=True),
+        "x_star": json.dumps(x_star),
+        "min_points": str(int(batch.min_points)),
+        "scale_per_slice": str(bool(batch.scale_per_slice)),
+    }
+
+
+def batch_settings(npz_path: Path | str) -> dict[str, str]:
+    """Read every fit setting of a staged batch as a comparable string (cheap).
+
+    Args:
+        npz_path: Batch input npz path.
+
+    Returns:
+        The same keys and strings fit_batch_settings gives for the batch the
+        file was packed from.
+    """
+
+    def read(data) -> dict[str, str]:
+        settings_only = FitBatch(
+            shot_inputs={},
+            x_star=data["x_star"],
+            min_points=int(data["min_points"]),
+            scale_per_slice=bool(data["scale_per_slice"]),
+            bounds=_unpack_bounds(data),
+            anchors=_unpack_anchors(data),
+            pedestal_rho_tor_norm=float(data["pedestal_rho_tor_norm"]),
+            sol_extension=str(data["sol_extension"].item()),
+            fit_mode=str(data["fit_mode"].item()),
+        )
+        return fit_batch_settings(settings_only)
+
+    return _read_batch(npz_path, read)
 
 
 def pack_fit_results(
@@ -404,7 +498,7 @@ def pack_fit_results(
             hyps = getattr(so, f"{var}_hyps")
             if hyps is not None:
                 arrays[f"{shot}:{var}_hyps"] = np.asarray(hyps, dtype=np.float32)
-    _atomic_savez(path, arrays)
+    atomic_write(path, lambda tmp_path: _savez(tmp_path, arrays))
 
 
 def unpack_fit_results(path: Path | str) -> dict[int, ShotFitOutput]:
@@ -432,16 +526,36 @@ def unpack_fit_results(path: Path | str) -> dict[int, ShotFitOutput]:
         return outputs
 
 
-def _atomic_savez(path: Path | str, arrays: dict):
-    """Write npz to a temp file then rename, so readers never see partial files.
+def atomic_write(path: Path | str, write: Callable[[Path], None]) -> Path:
+    """Write a file through a temporary neighbour and rename it into place, so no reader sees a partial file.
+
+    The temporary file is the destination's name plus ".tmp" in the same directory,
+    so the rename stays on one filesystem and a crash leaves "<name>.tmp" behind.
 
     Args:
-        path: Destination npz path.
-        arrays: Arrays to save, keyed by npz key.
+        path: Destination path.
+        write: Writes the file, called with the temporary path.
+
+    Returns:
+        The destination path.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "wb") as f:
-        np.savez(f, **arrays)
+    tmp_path = path.with_name(path.name + ".tmp")
+    write(tmp_path)
     os.replace(tmp_path, path)
+    return path
+
+
+def _savez(path: Path, arrays: dict):
+    """Save arrays as an npz at exactly path.
+
+    Through an open file, since np.savez appends .npz to a path that lacks it,
+    which the ".tmp" temporary of atomic_write does.
+
+    Args:
+        path: File to write.
+        arrays: Arrays to save, keyed by npz key.
+    """
+    with open(path, "wb") as f:
+        np.savez(f, **arrays)

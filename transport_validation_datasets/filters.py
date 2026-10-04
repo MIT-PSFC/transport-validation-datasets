@@ -9,6 +9,7 @@ from scipy.integrate import trapezoid
 
 from transport_validation_datasets import TIME_COORD
 from transport_validation_datasets.machine.generic import (
+    POWER_SMOOTHING_WINDOW,
     centered_boxcar_mean,
     end_of_shot_index,
     greenwald_fraction,
@@ -25,9 +26,9 @@ from transport_validation_datasets.store_schema import (
 TRANSIENT_SMOOTHING_WINDOW = 5e-3
 
 # Margin cut before every grid time that fails a check [s], see slice_filter_mask.
-# power_ohm and power_radiated are smoothed non-causally (smoothed_power, DIII-D's sources),
-# so they rise ahead of the event that ends a segment.
-FAILURE_MARGIN = 20e-3
+# power_ohm and power_radiated are smoothed non-causally (smoothed_power),
+# so they carry the event that ends a segment one smoothing window ahead of it.
+FAILURE_MARGIN = POWER_SMOOTHING_WINDOW
 
 # How far a shot's stored-energy rise may exceed the input energy put in before it is rejected.
 # The 5 percent covers integration error and EFIT noise, see energy_sanity_reason.
@@ -211,6 +212,31 @@ def radiated_fraction_reason(
         f"mean power_radiated {1e-3 * power_radiated_mean:.1f} kW "
         f"is {100 * radiated_fraction:.1f} percent "
         f"of the {1e-3 * power_input_mean:.0f} kW mean input power, {bound}"
+    )
+
+
+def ohmic_power_sign_reason(ds: xr.Dataset) -> str | None:
+    """Check the sign of the ohmic power, which the reconstruction's own current and flux set (generic.lcfs_voltage).
+
+    The median power_ohm over the kept times may not be negative.
+    A negative median means the block's current and boundary psi disagree in sign convention.
+    The unprocessed file is clipped at 0, so at the stack stage it always passes.
+
+    Args:
+        ds: One shot's dataset on its kept times.
+
+    Returns:
+        Why the shot is rejected, or None if it passes.
+    """
+    power_ohm = np.asarray(ds["power_ohm"].values, dtype=float)
+    if not np.isfinite(power_ohm).any():
+        return None
+    power_ohm_median = float(np.nanmedian(power_ohm))
+    if power_ohm_median >= 0.0:
+        return None
+    return (
+        f"median power_ohm {1e-3 * power_ohm_median:.0f} kW over the kept times is negative, "
+        "the reconstruction's current and boundary psi disagree in sign"
     )
 
 

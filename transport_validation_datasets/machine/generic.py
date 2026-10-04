@@ -3,12 +3,14 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 import xarray as xr
-from eqdsk.cocos import identify_cocos
+from eqdsk.cocos import COCOS, identify_cocos
 from loguru import logger
 from matplotlib.path import Path as PolygonPath
 from scipy.integrate import cumulative_simpson
 from scipy.interpolate import CubicHermiteSpline, RegularGridInterpolator
 from scipy.special import xlogy
+
+from transport_validation_datasets import TIME_COORD
 
 IMAS_DOCS_URL = "https://imas-data-dictionary.readthedocs.io/en/latest/generated/ids"
 
@@ -94,7 +96,7 @@ GEQDSK_SIGNAL_ATTRS = {
     },
     "qpsi": {
         "description": "Safety factor on the psi_idx grid",
-        "units": "dimensionless",
+        "units": "1",
         "ref": "/equilibrium/time_slice(itime)/profiles_1d/q",
     },
     "psirz": {
@@ -153,10 +155,8 @@ def imas_url(ref: str) -> str:
 def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
     """Bring every variable's attributes onto one convention, for the stores.
 
-    The GEQDSK signals and coordinates get GEQDSK_SIGNAL_ATTRS where the
-    device set nothing (files from before make_geqdsk_dataset set them),
-    a data dictionary path under "imas" (disruption-py's key) moves to "ref"
-    (this package's), and every ref without a url gets one (imas_url).
+    A data dictionary path under "imas" (disruption-py's key) moves to "ref" (this package's),
+    and every ref without a url gets one (imas_url).
     A device's own description, units, or url always win.
 
     Args:
@@ -167,8 +167,6 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
     """
     for name in list(ds.variables):
         attrs = dict(ds[name].attrs)
-        for key, value in GEQDSK_SIGNAL_ATTRS.get(name, {}).items():
-            attrs.setdefault(key, value)
         if "imas" in attrs:
             path = attrs.pop("imas")
             attrs.setdefault("ref", path)
@@ -180,11 +178,13 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
 
 # Width of the centered boxcar power_ohm and power_radiated are smoothed with, applied twice [s], see smoothed_power.
 # Unsmoothed, the inductive swings of P_oh and the bolometer noise of P_rad are larger than the signals at 1 kHz.
-# DIII-D's sources come smoothed this way or more (prad_tot, EFIT poh), so the other devices match them.
+# DIII-D's prad_tot comes smoothed this way, so every device matches it.
 POWER_SMOOTHING_WINDOW = 50e-3
 
 # Step of the uniform timebase every device is placed on [s], see make_uniform_1kHz_timebase.
 UNIFORM_TIMEBASE_DT = 1e-3
+# Decimals that pin a grid time to its step
+TIMEBASE_DECIMALS = int(round(-np.log10(UNIFORM_TIMEBASE_DT)))
 
 # A grid time carries a sample of its own when it sits this close to one [s].
 # Only absorbs float round-off, everything shares the staged 1 kHz timebase.
@@ -243,10 +243,11 @@ def make_uniform_1kHz_timebase(max_time: float) -> np.ndarray:
     Returns:
         Times from 0 to max_time in 1 ms steps [s].
     """
-    steps_to_max = np.round(max_time / UNIFORM_TIMEBASE_DT, 6)
+    # Rounded well below one step first, so float noise never adds a step
+    steps_to_max = np.round(max_time / UNIFORM_TIMEBASE_DT, TIMEBASE_DECIMALS + 3)
     last_step = int(np.ceil(steps_to_max))
     step_counts = np.arange(last_step + 1, dtype=np.float64)
-    times = np.round(step_counts * UNIFORM_TIMEBASE_DT, 3)
+    times = np.round(step_counts * UNIFORM_TIMEBASE_DT, TIMEBASE_DECIMALS)
     return times.astype("float32")
 
 
@@ -276,7 +277,7 @@ def make_geqdsk_dataset(
 ):
     """Build an Xarray dataset holding every signal needed to recreate a GEQDSK file.
 
-    FreeQDSK canonical names, COCOS 1.
+    FreeQDSK canonical names, psi per radian (COCOS 1 to 8), the convention cocos_input records.
 
     Args:
         shot_id: Shot number, repeated along 'idx' as the 'shot' coordinate.
@@ -378,28 +379,26 @@ def make_geqdsk_dataset(
 
 
 def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
-    """Snap an EFIT reconstruction (dim 'idx', 'time'/'shot' coords) onto grid_times.
+    """Snap a reconstruction (dim 'idx', 'time'/'shot' coords) onto grid_times.
 
-    Each EFIT slice goes to its nearest grid time, no interpolation, no fill.
-    The snap only absorbs sub-step jitter in the EFIT clock, so ties break toward
-    the later grid point: an EFIT at 9.5 ms on a 1 ms grid lands at 10 ms, never
-    feeding the 9 ms slice a future reconstruction. Slices further than half a
-    grid step outside the grid are dropped rather than piled onto the first or
-    last grid time, since a reconstruction from before or after the shot window
-    is not a measurement of either end of it. Grid times left with no slice come
-    back as NaN.
+    Each slice goes to its nearest grid time, no interpolation, no fill.
+    The snap only absorbs sub-step jitter in the reconstruction clock:
+    a slice up to half a step late lands on the earlier grid point, and a tie goes to the later one.
+    Two slices landing on one grid point keep the later.
+    Slices further than half a grid step outside the grid are dropped rather than piled onto the first or
+    last grid time, since a reconstruction from before or after the shot window is not a measurement of either end of it.
+    Grid times left with no slice come back as NaN.
 
     Args:
-        ds: EFIT reconstruction with dim 'idx' and 'time'/'shot' coords.
+        ds: Reconstruction with dim 'idx' and 'time'/'shot' coords.
         grid_times: Uniform timebase to snap onto [s].
 
     Returns:
-        The reconstruction on grid_times, NaN at grid times with no EFIT slice.
+        The reconstruction on grid_times, NaN at grid times with no slice.
     """
     grid_times = np.asarray(grid_times)
     step = float(np.median(np.diff(grid_times)))
-    # tol sits well below any real EFIT timing gap but far above float32
-    # round-off at the grid step
+    # Well below any real timing gap, far above float32 round-off at the grid step
     tol = 1e-4 * step
 
     shot_id = ds["shot"].values[0]
@@ -409,15 +408,15 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     ds = ds.isel(idx=in_range)
     efit_times = ds["time"].values
 
-    # Nearest grid point per EFIT slice
+    # Nearest grid point per slice
     pos = np.searchsorted(grid_times, efit_times, side="left")
     left = np.clip(pos - 1, 0, len(grid_times) - 1)
     right = np.clip(pos, 0, len(grid_times) - 1)
     take_left = (grid_times[right] - efit_times) - (efit_times - grid_times[left]) > tol
     snapped = grid_times[np.where(take_left, left, right)]
 
-    # snapped is non-decreasing (both arrays sorted), so duplicate slots are adjacent
-    # keep the last EFIT slice that lands in each, then NaN-fill the empty grid times
+    # snapped is non-decreasing (both arrays sorted), so duplicate slots are adjacent.
+    # Keep the last slice that lands in each, then NaN-fill the empty grid times
     keep = np.append(np.diff(snapped) != 0, True)[: snapped.size]
     ds = ds.drop_vars(["time", "shot"]).assign_coords(idx=snapped).isel(idx=keep)
     ds = ds.reindex(idx=grid_times).reset_index("idx", drop=True)
@@ -497,7 +496,6 @@ def ts_channel_dataset(
 def hold_onto_grid(
     grid: np.ndarray,
     sample_times: np.ndarray,
-    forward_fill: bool,
     period: float | None = None,
     max_hold_periods: float = MAX_HOLD_PERIODS,
     hold_floor: float = 0.0,
@@ -513,12 +511,10 @@ def hold_onto_grid(
     A sample within SAMPLE_TIME_TOL after a grid time counts as at it.
     A grid time is fresh when its sample falls in its own grid step (t - grid step, t],
     so each sample is fresh at the first grid time that holds it, on the grid or between grid times.
-    With forward_fill False nothing is held and only the fresh grid times come out.
 
     Args:
         grid: The shot's 1 kHz timebase [s].
         sample_times: Times of the samples to place on it [s], ascending.
-        forward_fill: Hold each sample forward until the next one.
         period: The sampling period to hold for [s]. None takes the median
             spacing of sample_times, which is right when they are every
             sample there is, and wrong when they are a windowed subset.
@@ -553,9 +549,6 @@ def hold_onto_grid(
     previous_sample_clipped = np.clip(previous_sample, 0, None)
     age = grid_float64 - sample_times_float64[previous_sample_clipped]
     fresh = has_previous & (age < grid_step - SAMPLE_TIME_TOL)
-    if not forward_fill:
-        sample_index[fresh] = previous_sample[fresh]
-        return sample_index, fresh
     if max_hold_time is not None:
         max_hold = max_hold_time
     else:
@@ -647,7 +640,7 @@ def _held_on_grid(
     Returns:
         (n_grid,) the held signal, NaN where nothing is held.
     """
-    sample_index, _ = hold_onto_grid(grid, source_times, True, hold_floor=hold_floor)
+    sample_index, _ = hold_onto_grid(grid, source_times, hold_floor=hold_floor)
     return values_on_grid(values, sample_index)
 
 
@@ -708,6 +701,44 @@ def injected_power_on_grid(
     return power_on_grid
 
 
+def held_signals_on_grid(
+    source_times: np.ndarray,
+    signals: dict[str, np.ndarray],
+    grid: np.ndarray,
+    hold_floor: float = EQUILIBRIUM_HOLD_FLOOR,
+) -> dict[str, np.ndarray]:
+    """Place the 0D signals of one reconstruction clock on the grid, each held for at least hold_floor (signal_on_grid).
+
+    Args:
+        source_times: (n_source,) ascending reconstruction times [s].
+        signals: {name: (n_source,) values on those times}.
+        grid: (n_grid,) the shot's 1 kHz timebase [s].
+        hold_floor: The hold reaches at least this far [s].
+
+    Returns:
+        {name: (n_grid,) the signal on the grid}.
+    """
+    return {
+        name: signal_on_grid(
+            source_times, np.asarray(values, dtype=float), grid, hold_floor
+        )
+        for name, values in signals.items()
+    }
+
+
+def absent_heating_powers(ip, names: tuple[str, ...]) -> dict:
+    """Zero power records for the heating systems a device does not have, NaN where ip is.
+
+    Args:
+        ip: The plasma current on the grid, an array or DataArray.
+        names: The store names of the absent heating powers.
+
+    Returns:
+        {name: ip * 0.0} for each name.
+    """
+    return {name: ip * 0.0 for name in names}
+
+
 def centered_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.ndarray:
     """Smooth a uniformly sampled signal with a boxcar centered on each sample, along the last axis.
 
@@ -753,36 +784,177 @@ def smoothed_power(values: np.ndarray, dt: float) -> np.ndarray:
     return smoothed_twice
 
 
-def ohmic_power(
-    times: np.ndarray,
-    ip: np.ndarray,
-    v_loop: np.ndarray,
-    li: np.ndarray,
-    major_radius: np.ndarray,
-) -> np.ndarray:
-    """Ohmic power P_oh = Ip V_loop - dW_pol/dt, causal.
-
-    The internal poloidal field energy is W_pol = L_i Ip^2 / 2 with L_i = mu0 R_geo li / 2,
-    R_geo the major radius of the geometric center of the boundary.
-    dW_pol/dt is a backward difference, so no sample draws on a later one,
-    and the first sample is NaN.
-    The sign of Ip and V_loop cancels as long as they share a convention.
+def sigma_bp(cocos: int) -> float:
+    """The COCOS sign of the poloidal field, sigma_Bp, which sets the sign of psi.
 
     Args:
-        times: (n,) ascending sample times [s].
-        ip: (n,) plasma current [A].
-        v_loop: (n,) loop voltage [V].
-        li: (n,) internal inductance.
-        major_radius: (n,) major radius of the geometric center of the boundary [m].
+        cocos: The COCOS index of a reconstruction, 1 to 18.
+
+    Returns:
+        +1.0 or -1.0.
+    """
+    return float(COCOS.with_index(int(cocos)).value.sign_Bp.value)
+
+
+def poloidal_field_energy(
+    psirz: np.ndarray,
+    r_grid: np.ndarray,
+    z_grid: np.ndarray,
+    simagx: np.ndarray,
+    sibdry: np.ndarray,
+    r_boundary: np.ndarray,
+    z_boundary: np.ndarray,
+) -> np.ndarray:
+    """The poloidal magnetic field energy inside the plasma of each reconstruction [J].
+
+    W_pol = int B_p^2 / (2 mu0) dV with B_p = |grad psi| / R for psi per radian and dV = 2 pi R dR dZ,
+    so W_pol = (pi / mu0) int |grad psi|^2 / R dR dZ over the grid points inside the boundary contour with psi_N < 1.
+    The gradient is the central difference on the grid.
+    A reconstruction with fewer than 3 finite contour points gives NaN.
+
+    Args:
+        psirz: (n_t, n_r, n_z) poloidal flux per radian [Wb/rad].
+        r_grid: (n_r,) grid major radii [m].
+        z_grid: (n_z,) grid heights [m].
+        simagx: (n_t,) psi at the magnetic axis.
+        sibdry: (n_t,) psi at the boundary.
+        r_boundary: (n_t, n_bdry) boundary contour major radii [m], NaN padded.
+        z_boundary: (n_t, n_bdry) boundary contour heights [m], NaN padded.
+
+    Returns:
+        (n_t,) the energy [J].
+    """
+    r_grid = np.asarray(r_grid, dtype=float)
+    z_grid = np.asarray(z_grid, dtype=float)
+    psirz = np.asarray(psirz, dtype=float)
+    simagx = np.asarray(simagx, dtype=float)
+    sibdry = np.asarray(sibdry, dtype=float)
+    dpsi_dr, dpsi_dz = np.gradient(psirz, r_grid, z_grid, axis=(1, 2))
+    grad_psi_squared = dpsi_dr**2 + dpsi_dz**2
+    r_mesh, z_mesh = np.meshgrid(r_grid, z_grid, indexing="ij")
+    grid_points = np.column_stack([r_mesh.ravel(), z_mesh.ravel()])
+    integrand = grad_psi_squared / r_mesh
+    r_step = float(np.median(np.diff(r_grid)))
+    z_step = float(np.median(np.diff(z_grid)))
+    cell_area = r_step * z_step
+    psi_range = sibdry - simagx
+    with np.errstate(invalid="ignore", divide="ignore"):
+        psi_n = (psirz - simagx[:, None, None]) / psi_range[:, None, None]
+    energy = np.full(psirz.shape[0], np.nan)
+    for index in range(psirz.shape[0]):
+        mask_contour = np.isfinite(r_boundary[index]) & np.isfinite(z_boundary[index])
+        if mask_contour.sum() < 3:
+            continue
+        contour = np.column_stack(
+            [r_boundary[index][mask_contour], z_boundary[index][mask_contour]]
+        )
+        inside_contour = PolygonPath(contour).contains_points(grid_points)
+        inside = inside_contour.reshape(r_mesh.shape) & (psi_n[index] < 1.0)
+        energy[index] = np.pi / MU0 * np.sum(integrand[index][inside]) * cell_area
+    return energy
+
+
+def lcfs_voltage(times: np.ndarray, sibdry: np.ndarray, cocos: int) -> np.ndarray:
+    """The loop voltage at the LCFS, sigma_Bp 2 pi dpsi_boundary/dt, from consecutive reconstructions.
+
+    psi is per radian, so 2 pi psi is the poloidal flux through the boundary.
+    The COCOS sign of psi (sigma_bp) makes current V_loop positive while the plasma is driven.
+    A backward difference, so no sample draws on a later one, and the first sample is NaN.
+
+    Args:
+        times: (n,) ascending reconstruction times [s].
+        sibdry: (n,) psi at the boundary [Wb/rad].
+        cocos: The COCOS index of the reconstructions.
+
+    Returns:
+        (n,) the voltage [V].
+    """
+    dpsi = np.diff(np.asarray(sibdry, dtype=float), prepend=np.nan)
+    dt = np.diff(np.asarray(times, dtype=float), prepend=np.nan)
+    return sigma_bp(cocos) * 2.0 * np.pi * dpsi / dt
+
+
+def ohmic_power(
+    times: np.ndarray,
+    current: np.ndarray,
+    v_loop: np.ndarray,
+    w_pol: np.ndarray,
+) -> np.ndarray:
+    """Ohmic power P_oh = Ip V_loop - dW_pol/dt on the reconstruction times.
+
+    dW_pol/dt is a backward difference, so no sample draws on a later one, and the first sample is NaN.
+    current and v_loop share the reconstruction's sign convention (lcfs_voltage),
+    so their product is positive while the plasma is driven.
+
+    Args:
+        times: (n,) ascending reconstruction times [s].
+        current: (n,) the reconstructed plasma current [A].
+        v_loop: (n,) the loop voltage at the LCFS [V].
+        w_pol: (n,) the poloidal field energy inside the plasma [J].
 
     Returns:
         (n,) ohmic power [W].
     """
-    w_pol = MU0 * major_radius * li * ip**2 / 4.0
-    dw_pol = np.diff(w_pol, prepend=np.nan)
-    dt = np.diff(times, prepend=np.nan)
+    dw_pol = np.diff(np.asarray(w_pol, dtype=float), prepend=np.nan)
+    dt = np.diff(np.asarray(times, dtype=float), prepend=np.nan)
     dw_pol_dt = dw_pol / dt
-    return ip * v_loop - dw_pol_dt
+    return current * v_loop - dw_pol_dt
+
+
+POWER_OHM_DESCRIPTION = (
+    "Ohmic heating power Ip V_loop - dW_pol/dt from the equilibrium reconstruction alone (ohmic_power_on_grid): "
+    "V_loop = sigma_Bp 2 pi dpsi_boundary/dt at the LCFS, W_pol the poloidal field energy inside the boundary "
+    "integrated from psirz, Ip the reconstructed current, backward differences between consecutive usable reconstructions, "
+    f"held forward for at least {1e3 * EQUILIBRIUM_HOLD_FLOOR:.0f} ms, "
+    f"then smoothed by a centered {1e3 * POWER_SMOOTHING_WINDOW:.0f} ms boxcar applied twice"
+)
+
+
+def ohmic_power_on_grid(ds_shot: xr.Dataset) -> np.ndarray:
+    """P_oh on one shot's 1 kHz grid from its GEQDSK block alone, the same way on every device.
+
+    Computed on the usable reconstructions (usable_reconstructions) from the block's own
+    psirz, sibdry and current (poloidal_field_energy, lcfs_voltage, ohmic_power),
+    held forward like every equilibrium signal (signal_on_grid with EQUILIBRIUM_HOLD_FLOOR),
+    then smoothed non-causally (smoothed_power), as power_radiated is.
+    NaN wherever no reconstruction holds.
+
+    Args:
+        ds_shot: One shot's standardized dataset on its time dimension alone,
+            with the GEQDSK block on the grid and the "cocos" attribute.
+
+    Returns:
+        (n_t,) the ohmic power [W].
+    """
+    times = np.asarray(ds_shot[TIME_COORD].values, dtype=float)
+    usable = usable_reconstructions(ds_shot)
+    reconstructed = np.flatnonzero(usable)
+    if reconstructed.size < 2:
+        return np.full(times.size, np.nan)
+    block = ds_shot.isel({TIME_COORD: reconstructed})
+    psirz = block["psirz"].transpose(TIME_COORD, "r_grid", "z_grid").values
+    r_boundary = block["rbdry"].transpose(TIME_COORD, ...).values
+    z_boundary = block["zbdry"].transpose(TIME_COORD, ...).values
+    simagx = block["simagx"].values
+    sibdry = block["sibdry"].values
+    w_pol = poloidal_field_energy(
+        psirz,
+        block["r_grid"].values,
+        block["z_grid"].values,
+        simagx,
+        sibdry,
+        r_boundary,
+        z_boundary,
+    )
+    reconstruction_times = times[reconstructed]
+    v_loop = lcfs_voltage(reconstruction_times, sibdry, ds_shot.attrs["cocos"])
+    p_ohm_raw = ohmic_power(
+        reconstruction_times, block["current"].values, v_loop, w_pol
+    )
+    p_ohm_on_grid = signal_on_grid(
+        reconstruction_times, p_ohm_raw, times, EQUILIBRIUM_HOLD_FLOOR
+    )
+    return smoothed_power(p_ohm_on_grid, UNIFORM_TIMEBASE_DT)
 
 
 def normalized_beta(energy_mhd, volume, minor_radius, b0, ip):
@@ -793,6 +965,8 @@ def normalized_beta(energy_mhd, volume, minor_radius, b0, ip):
     beta_tor_norm = 100 beta_tor a |b0| / |ip|[MA].
     b0 is the vacuum toroidal field at the fixed r0, not at the geometric axis.
     Magnitudes are taken, the signs live in the cocos variable.
+    Builtin abs and no masking, so jax arrays pass through under jit.
+    Not finite where ip or volume is 0, which the finite filter cuts.
 
     Args:
         energy_mhd: Stored energy, 3/2 the volume integral of the pressure [J].
@@ -804,12 +978,36 @@ def normalized_beta(energy_mhd, volume, minor_radius, b0, ip):
     Returns:
         beta_tor_norm [percent m T / MA], shaped like the broadcast inputs.
     """
-    pressure_mean = 2.0 * energy_mhd / (3.0 * volume)
-    b0_magnitude = np.abs(b0)
-    beta_tor = 2.0 * MU0 * pressure_mean / b0_magnitude**2
-    ip_magnitude = np.abs(ip)
-    ip_magnitude_ma = ip_magnitude / 1e6
-    return 100.0 * beta_tor * minor_radius * b0_magnitude / ip_magnitude_ma
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pressure_mean = 2.0 * energy_mhd / (3.0 * volume)
+        b0_magnitude = abs(b0)
+        beta_tor = 2.0 * MU0 * pressure_mean / b0_magnitude**2
+        ip_magnitude_ma = abs(ip) / 1e6
+        return 100.0 * beta_tor * minor_radius * b0_magnitude / ip_magnitude_ma
+
+
+def energy_mhd_from_normalized_beta(beta_tor_norm, volume, minor_radius, b0, ip):
+    """The stored energy that gives a normalized beta, the inverse of normalized_beta.
+
+    energy_mhd = 3/2 <p> volume with <p> = beta_tor b0^2 / (2 mu0)
+    and beta_tor = beta_tor_norm |ip|[MA] / (100 a |b0|).
+    Builtin abs, so jax arrays pass through under jit.
+
+    Args:
+        beta_tor_norm: Normalized beta [percent m T / MA].
+        volume: Plasma volume inside the boundary [m^3].
+        minor_radius: Minor radius of the boundary [m].
+        b0: Vacuum toroidal field at r0 [T], either sign.
+        ip: Plasma current [A], either sign.
+
+    Returns:
+        energy_mhd [J], shaped like the broadcast inputs.
+    """
+    b0_magnitude = abs(b0)
+    ip_magnitude_ma = abs(ip) / 1e6
+    beta_tor = beta_tor_norm * ip_magnitude_ma / (100.0 * minor_radius * b0_magnitude)
+    pressure_mean = beta_tor * b0_magnitude**2 / (2.0 * MU0)
+    return 1.5 * pressure_mean * volume
 
 
 def greenwald_density(ip, minor_radius):
@@ -1394,7 +1592,7 @@ def _private_flux_channels(
 
     A channel within PRIVATE_FLUX_MARGIN of the contour is not marked,
     since the contour polygon cuts inside the curved LCFS and a channel on it reads psi_N just under 1.
-    A contour point that is not finite or sits at R <= 0 is padding (C-Mod pads rbbbs with zeros).
+    A contour point that is not finite is padding.
     A reconstruction with fewer than 3 contour points marks nothing.
 
     Args:
@@ -1407,7 +1605,7 @@ def _private_flux_channels(
         (n_ch,) mask of the private flux channels.
     """
     private_flux = np.zeros(psi_n_channels.shape, dtype=bool)
-    mask_contour = np.isfinite(r_boundary) & np.isfinite(z_boundary) & (r_boundary > 0)
+    mask_contour = np.isfinite(r_boundary) & np.isfinite(z_boundary)
     if mask_contour.sum() < 3:
         return private_flux
     contour = np.column_stack([r_boundary[mask_contour], z_boundary[mask_contour]])
@@ -1517,8 +1715,7 @@ def cocos_from_signs(
 
     The shot medians of Ip, B0, psi_boundary - psi_axis and q fix sigma_Bp and sigma_rho_theta_phi
     (eqdsk.cocos.identify_cocos), with phi counterclockwise from above and psi per radian.
-    C-Mod's EFIT keeps psi increasing outward and q > 0, so its shots are COCOS 1 or 7 with the field direction.
-    MAST's EFIT has psi decreasing outward with Ip > 0, B0 < 0 and q > 0, which is COCOS 3.
+    C-Mod's EFIT and TCV's LIUQE come out COCOS 1 or 7 with the field direction, MAST's EFIT 3, DIII-D's EFIT 1 or 5.
 
     Args:
         current: (n_t,) plasma current [A].
@@ -1561,21 +1758,19 @@ def cocos_from_signs(
 def orient_signal(geqdsk_data, efit_time):
     """Orient every retrieved signal time-first and transpose psirz to (T, r, z).
 
-    No interpolation: each signal is kept on its native per-timeslice EFIT grid.
-    Quality flags and reconstructions are not meaningful when interpolated, so
-    callers must use time_setting="efit" to keep the tree's own timebase.
+    No interpolation: each signal stays on its own reconstruction times.
     Mutates and returns the dict.
 
     Returns:
         The mutated geqdsk_data dict.
     """
 
-    def _time_first(data, n_time):
+    def _time_axis_first(data, n_time):
         """Move the axis whose length equals n_time to axis 0.
 
-        Leaves 1D arrays and arrays already time-first unchanged. Used to
-        normalise the per-machine MDS layouts (some store profiles/boundary as
-        (spatial, T)).
+        Leaves 1D arrays and arrays already time-first unchanged.
+        The MDS layouts differ per machine (some store profiles and the boundary as (spatial, T)),
+        and a spatial axis of the same length as time would be mistaken for it.
 
         Returns:
             The array with time on axis 0.
@@ -1591,9 +1786,9 @@ def orient_signal(geqdsk_data, efit_time):
 
     n_time = len(efit_time)
     for param, data in geqdsk_data.items():
-        data = _time_first(data, n_time)
-        # psirz comes back (T, z, r) from MDS (dim_of order reversed vs numpy);
-        # the dataset labels dims (idx, r_grid, z_grid), so swap to (T, r, z).
+        data = _time_axis_first(data, n_time)
+        # psirz comes back (T, z, r) from MDS (dim_of order reversed against numpy).
+        # The dataset labels dims (idx, r_grid, z_grid), so swap to (T, r, z).
         if param == "psirz" and data.ndim == 3:
             data = data.transpose(0, 2, 1)
         geqdsk_data[param] = data

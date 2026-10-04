@@ -70,8 +70,8 @@ so dropped slices and burst-mode gaps are bridged and `fresh_profile` tells a fr
 An equilibrium is held for at most `MAX_HOLD_PERIODS` of its own sampling period,
 so it is not carried across a reconstruction dropping out.
 An equilibrium reconstruction, and every 0D signal taken from one, is held for at least `EQUILIBRIUM_HOLD_FLOOR` (10 ms),
-so a few missing reconstructions do not cut the shot. By default the slices
-the stack stage screens out (see [Filtering](#filtering)) are ignored, as though the
+so a few missing reconstructions do not cut the shot.
+The slices the stack stage screens out (see [Filtering](#filtering)) are held over, as though the
 shot had no Thomson sample there.
 
 | Group | Signals | Dimensions |
@@ -87,6 +87,7 @@ shot had no Thomson sample there.
 The profiles are fit on rho_tor_norm from 0 to 1.6, so every fit anchor is on the fit grid and in the fit plots.
 The fit files, the stores and the IMAS export keep them out to rho_tor_norm 1.1.
 
+The heating powers are the launched powers (IMAS `power_launched_*`), not the absorbed ones.
 A heating system the device does not have is zero, so the devices share
 one schema. Everything is float32, flags included, because the padding between
 shots of different lengths is NaN.
@@ -95,11 +96,13 @@ The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since so
 
 Every stored value is causal, no grid time draws on a later sample, with these exceptions.
 power_ohm and power_radiated are smoothed by a centered 50 ms boxcar applied twice (`smoothed_power`),
-which is similar to DIII-D's bolometer postprocessing.
-DIII-D's are smoothed at the source (the EFIT `poh` takes +-100 ms slopes, `\bolom::prad_tot` does the boxcar),
+DIII-D's bolometer postprocessing.
+DIII-D's `\bolom::prad_tot` is smoothed that way at the source,
 and TCV's `PradTot` reads smooth at its ~17 ms cadence, so it is only held causally for at least 60 ms.
 TCV's n_e_line_average has the FIR fringe jumps removed from its raw samples, which looks across each jump.
 The EFIT and Thomson slices are snapped to the nearest grid time (`snap_to_grid`), up to 0.5 ms early.
+The Thomson channels map onto rho_tor_norm through the nearest usable reconstruction within `EQ_MATCH_MAX_PERIODS` of the
+reconstruction clock on either side, so the profile coordinate can take a reconstruction up to 1.5 periods later than the slice.
 A 0D signal is never interpolated onto the 1 kHz grid (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, grid time t taking the mean of (t - 1 ms, t].
 One sampled slower is held forward from its last finite sample for at most `MAX_HOLD_PERIODS` of its own sampling period,
@@ -118,11 +121,20 @@ None of the reconstructions' own betan is IMAS's.
 C-Mod's EFIT betan takes |btaxp|, the total field at the magnetic axis,
 MAST's efm betan and DIII-D's tree betan take the vacuum field at the geometric axis,
 and DEFUSE BETAN normalizes beta_tor by the volume-averaged vacuum field.
-power_ohm is Ip V_loop - dW_pol/dt on every device.
-MAST reads it from ESM (`pphix`), C-Mod computes it (`CmodPowerMethods.get_ohmic_power`)
-from the flux loop voltage and W_pol = mu0 R_geo li Ip^2 / 4, R_geo the geometric major radius (EFIT `rout`).
-TCV computes it the same way from DEFUSE `I_P`, `Vloop` (flipped onto I_P's sign), `LI` and `R_geom`,
-and DIII-D reads the DISPY EFIT's `poh`.
+power_ohm is Ip V_loop - dW_pol/dt, computed from the equilibrium reconstruction alone the same way on every device
+(`DataWorkflow.add_ohmic_power`, `generic.ohmic_power_on_grid`):
+V_loop = sigma_Bp 2 pi dpsi_boundary/dt is the loop voltage at the LCFS from the block's `sibdry`,
+W_pol = (pi / mu0) int |grad psi|^2 / R dR dZ is the poloidal field energy inside the boundary from `psirz`
+(`poloidal_field_energy`, LIUQE's own Wp to 0.1 percent over a TCV shot),
+and Ip is the block's `current`, so the sign convention is the reconstruction's own.
+Both derivatives are backward differences between consecutive usable reconstructions,
+the result is held like every equilibrium signal and then smoothed (`smoothed_power`).
+No measured loop voltage enters: the wall flux loops (C-Mod `mflux:v0`, DIII-D `vloopb`) read 35-55 percent off the LCFS voltage at flattop on some shots,
+and no two devices' sources agreed before.
+A shot whose median power_ohm over the kept times is negative is rejected (`ohmic_power_sign_reason`).
+n_e_line_average is the IMAS line average, the interferometer line integral over the chord length inside the plasma:
+on C-Mod the TCI chord 4 `nl_04` over EFIT's `rco2v` for that chord (49 to 61 cm over a shot, held like the EFIT 0D signals),
+on DIII-D the EFIT density with the PCS `dssdenest` where the tree has none.
 
 The C-Mod 0D signals outside EFIT are read by custom methods (`CmodPlasmaMethods`, `CmodPowerMethods`),
 since the disruption-py built-ins interpolate.
@@ -132,11 +144,10 @@ Sample periods, checked on 5 shots from 2012 to 2016:
 | Signal | Node (tree) | Period [ms] |
 | --- | --- | --- |
 | ip, b0 | `\ip`, `\btor` (magnetics) | 0.2 from -0.1 to 2.2 s, 10 outside |
-| n_e_line_average | `.tci.results:nl_04` (electrons) | 0.5 |
+| n_e_line_average | `.tci.results:nl_04` (electrons) over `\efit_aeqdsk:rco2v` | 0.5 |
 | power_radiated | `\twopi_diode` (spectroscopy) | 0.333 |
 | power_ic | `\rf_power_net` (rf) | 0.1 |
 | power_lh | `\top.results:netpow` (lh) | 0.04 |
-| V_loop of power_ohm | `\top.mflux:v0` (analysis) | 0.2 |
 
 power_ic and power_lh are 0 outside their records and on shots without the system.
 power_radiated is NaN outside its record.
@@ -157,12 +168,12 @@ The reach and the hold both run on the reconstruction clock (`reconstruction_clo
 Unprocessed stage (`filter_and_plot`), per shot.
 Steps 2 to 4 and 8 are the filter spec every device store shares (`filters.py`).
 Every check from 2 to 4 cuts the grid times it fails out as a gap (`slice_filter_mask`).
-A failed grid time before the end-of-shot cut also cuts the 20 ms before it (`FAILURE_MARGIN`),
-since the smoothed power_ohm and power_radiated rise ahead of the event that ends a segment:
+A failed grid time before the end-of-shot cut also cuts the 50 ms before it (`FAILURE_MARGIN`, one `POWER_SMOOTHING_WINDOW`),
+since the smoothed power_ohm and power_radiated carry the event that ends a segment one smoothing window ahead of it:
 
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
 2. End of shot (`end_of_shot_index`): the plasma ends at the last grid time with |ip| at or above its `min_filter` threshold,
-   and everything after `end_margin` (C-Mod 20 ms, MAST 40 ms, TCV 50 ms, DIII-D 100 ms) before that is cut.
+   and everything after `end_margin` (50 ms on C-Mod, MAST and TCV, one smoothing window, 100 ms on DIII-D) before that is cut.
    A shot whose |ip| never reaches the threshold is rejected.
 3. Every 0D signal must be finite, every `min_filter` signal at or above its threshold
    (ip compared as |ip|), and every `max_filter` signal at or below it, on the raw samples.
@@ -182,8 +193,9 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
 8. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a mean `power_radiated` below `min_radiated_fraction` of the mean input power, ohmic plus auxiliary (a dead bolometer),
      1 percent on C-Mod and 2.5 percent on MAST, TCV and DIII-D,
-     or above `max_radiated_fraction` of it, 1 on both, since more cannot be radiated than is put in (`radiated_fraction_reason`)
-   - a sanity check for conservation of energy, triggered if `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point (`energy_sanity_reason`).
+     or above `max_radiated_fraction` of it, 1 on every device, since more cannot be radiated than is put in (`radiated_fraction_reason`)
+   - a negative median `power_ohm`, the reconstruction's current and boundary flux disagreeing in sign (`ohmic_power_sign_reason`)
+   - a sanity check for conservation of energy, triggered if the `energy_mhd` rise from the first kept time to its peak is greater than all input power integrated to that time point (`energy_sanity_reason`).
 
 | Threshold | C-Mod | MAST | TCV | DIII-D |
 | --- | --- | --- | --- | --- |
@@ -193,8 +205,8 @@ since the smoothed power_ohm and power_radiated rise ahead of the event that end
 | max greenwald_fraction | 2.0 | 2.0 | 2.0 | 2.0 |
 | transient power_ohm | 5 MW | 5 MW | 2 MW | 2 MW |
 | transient power_radiated | 5.5 MW | 3 MW | 5 MW | 17 MW |
-| failure_margin (shared) | 20 ms | 20 ms | 20 ms | 20 ms |
-| end_margin | 20 ms | 40 ms | 50 ms | 100 ms |
+| failure_margin (shared) | 50 ms | 50 ms | 50 ms | 50 ms |
+| end_margin | 50 ms | 50 ms | 50 ms | 100 ms |
 | min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
 | min_radiated_fraction | 0.01 | 0.025 | 0.025 | 0.025 |
 | max_radiated_fraction | 1.0 | 1.0 | 1.0 | 1.0 |
@@ -211,7 +223,7 @@ Deleting the unprocessed files (`01_unprocessed/*.nc`) reruns a filter change on
 A change to the filter code alone needs the notes deleted too.
 A shot that is accepted loses its note, so the notes count only the current rejections.
 
-Fit stage: the Thomson channels map through the nearest usable reconstruction in reach,
+Fit stage: the Thomson channels map through the nearest usable reconstruction in reach, before or after the slice,
 the Thomson screens in `cleaning.py` run on every sample before fitting,
 and the fit method's own checks give each slice a fit status.
 A channel below psi_N 1 more than 5 mm outside its reconstruction's boundary contour sits in a private flux region,
@@ -237,6 +249,8 @@ Stack stage (`_internal_shot_dataset`), per shot:
    The ratio is a proxy for the chord integral, and the bounds absorb its offset on each device.
 4. The usable reconstructions are held onto the grid, as above.
 
+Fit slices outside the unprocessed file's time span were fit before a filter change cut them and are dropped,
+so a filter change restacks on the old fits.
 `export_to_imas` runs checks 1-3 too (`_usable_shot_fit`), so the IMAS export holds the same shots as the stores.
 
 MAST starts at shot 23809 (`first_shot`).
@@ -252,12 +266,16 @@ indicating a large change in the Thomson density calibration.
   The transient filter needs P_rad above 3 MW after smoothing.
 - **MAST EFIT vertical glitches.** Single reconstructions jump zmagx and zbdry by 5-10 cm and come back at the next one,
   e.g. 24623 at 0.29-0.33 s (though this is minor, 39 reconstructions in 26 shots out of ~1000 total shots).
-- **Equilibrium gaps.** The 10 ms hold floor bridges a missing reconstruction on either device,
+- **Equilibrium gaps.** The 10 ms hold floor bridges a missing reconstruction on every device,
   but not two in a row on MAST (a 15 ms step), which still cuts every equilibrium signal.
   A Thomson slice inside a bridged gap maps through no reconstruction (it reaches only `EQ_MATCH_MAX_PERIODS`),
   so the profile before it is held there.
-- **MAST `power_ohm` gaps.** Some converged reconstructions have no `pphix` (up to 25 ms at flat-top in 24891).
-  The hold bridges up to 10 ms of them, and longer ones are cut out as gaps.
+- **power_ohm is the reconstruction's.** Its loop voltage is the boundary flux derivative of the equilibrium, not a flux loop,
+  so it carries the reconstruction's flux noise (smoothed over 50 ms) and is NaN wherever the equilibrium is.
+  On MAST it sits within 20 percent of the EFIT++ `pphix` it replaced at flattop (median 7 percent above over 7 shots),
+  on C-Mod and TCV within a few percent of the old flux-loop values.
+- **MAST summary signals.** The level 2 summary group is FAIR-MAST's own 1 kHz resampling of ip, n_e_line_average, power_radiated and power_nbi,
+  whose causality this package does not verify.
 - **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
   It is an artifact of the EFIT basis functions.
 - **TCV density gate.** TCV Thomson ne is calibrated to the FIR interferometer, so `density_ratio_bounds` only catches a broken calibration of either.
@@ -270,7 +288,9 @@ indicating a large change in the Thomson density calibration.
 - **TCV Thomson timing.** The laser fires every ~17 ms at times like 17.34 ms, which `snap_to_grid` moves to 17 ms, up to 0.5 ms early.
 - **DIII-D IDA mapping.** IDA's psi_N comes from its own reconstruction, which the files do not name,
   while the q profile that maps it onto rho_tor_norm comes from the DISPY EFIT.
-  IDA gives no point covariance, so the gradient errors assume independent points and overestimate the error of a smooth fit.
+  IDA gives no point covariance, so its gradient error is a stand-in, 10 percent of |gradient| with a floor of
+  0.1 keV and 0.05e20 m^-3 per unit rho_tor_norm (`worker_ida.GRADIENT_ERROR_FRACTION`, `GRADIENT_ERROR_FLOOR`),
+  the proportion the GP fits of the other devices show at mid radius.
 
 # Running
 

@@ -39,14 +39,51 @@ def make_fit_input() -> ShotFitInput:
 
 
 class TestReadShotlist:
-    def test_plain_file_keeps_order_drops_repeats_and_junk(self, tmp_path):
+    def test_plain_file_keeps_order_drops_repeats_and_blank_lines(self, tmp_path):
         path = tmp_path / "shots.txt"
-        path.write_text("7\n5\n5\nnot a shot\n\n")
+        path.write_text("7\n5\n\n5\n\n")
 
         shots, windows = read_shotlist(path)
 
         assert shots == [7, 5]
         assert windows is None
+
+    @pytest.mark.parametrize(
+        ("text", "message"),
+        [
+            ("7\nshot # note\n", "line 2: 'shot # note' is not a shot number"),
+            (
+                '"shot","t_start","t_end"\n5,0.1,0.2\n',
+                "line 1: .* is not a shot number",
+            ),
+            ("shot;t_start;t_end\n5;0.1;0.2\n", "line 1: .* is not a shot number"),
+            # A byte order mark hides the shot column of an otherwise windowed header
+            (
+                chr(0xFEFF) + "shot,t_start,t_end\n5,0.1,0.2\n",
+                "needs a shot or pulse_no column",
+            ),
+        ],
+    )
+    def test_unparsable_line_rejected(self, tmp_path, text, message):
+        path = tmp_path / "shots.txt"
+        path.write_text(text, encoding="utf-8")
+
+        with pytest.raises(ValueError, match=message):
+            read_shotlist(path)
+
+    def test_empty_shotlist_rejected(self, tmp_path):
+        path = tmp_path / "shots.txt"
+        path.write_text("\n\n")
+
+        with pytest.raises(ValueError, match="no shot"):
+            read_shotlist(path)
+
+    def test_csv_row_without_integer_shot_rejected(self, tmp_path):
+        path = tmp_path / "shots.csv"
+        path.write_text("shot,note\n5,fine\nx,bad\n")
+
+        with pytest.raises(ValueError, match="line 3"):
+            read_shotlist(path)
 
     def test_windowed_csv_groups_windows_per_shot_sorted_by_start(self, tmp_path):
         path = tmp_path / "shots.csv"

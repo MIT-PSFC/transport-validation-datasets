@@ -13,14 +13,15 @@ Ships to the cluster with the worker, must adhere to import rules in gp_fitting/
 """
 
 import os
+import traceback
 from dataclasses import replace
 
-# Limit BLAS threads before numpy loads so slice-level multiprocessing
-# (fit_batch num_workers) does not oversubscribe cores
-# mkgp is single-threaded, so one thread per worker is right.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
+# Pin BLAS to one thread before numpy loads, so slice-level multiprocessing
+# (fit_batch num_workers) does not oversubscribe cores and a fit never
+# depends on the thread count. mkgp is single-threaded, so one thread per worker is right.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 import numpy as np  # noqa: E402
 
@@ -61,13 +62,13 @@ FIT_DESCRIPTION = "Nonstationary Gibbs Kernel"
 HYP_NAMES = ("var", "l1", "l2", "lw")
 
 # Core length-scale floor of the smooth-rescue attempt (see _fit_variable).
-# High enough to force the optimizer out of a short-l1 basin, below the 0.7
-# ceiling (kernel.HYP_BOUNDS) so the optimizer still has a range to search.
+# High enough to force the optimizer out of a short-l1 basin.
+# The attempt is skipped when the variable's l1_max (FitBounds) leaves no range above it.
 SMOOTH_RESCUE_L1_MIN = 0.6
 
 # Amplitude floor of the amplitude-rescue attempt (see _fit_variable).
 # The data are normalized to a max of 1, so a prior amplitude of 1 matches their scale.
-# The collapsed C-Mod Te fits of tuning iteration 1 sat at var ~0.3 against ~3 for healthy ones.
+# Collapsed C-Mod Te fits sat at var ~0.3 against ~3 for healthy ones.
 AMPLITUDE_RESCUE_VAR_MIN = 1.0
 
 
@@ -86,7 +87,16 @@ def _no_fit(status: int) -> VariableFit:
 
 
 def _attempt_fit(
-    x, y, err, x_star, scale_per_slice, bounds, anchors, pedestal_rho, seed_salt=0
+    x,
+    y,
+    err,
+    x_star,
+    min_points,
+    scale_per_slice,
+    bounds,
+    anchors,
+    pedestal_rho,
+    seed_salt=0,
 ):
     """Clean, fit, and rescale one variable of one slice, once.
 
@@ -95,6 +105,7 @@ def _attempt_fit(
         y: Channel values, NaN where invalid.
         err: Channel errors.
         x_star: Target rho grid.
+        min_points: Minimum channels left after cleaning to fit.
         scale_per_slice: Normalize by the cleaned slice max before fitting.
         bounds: The variable's staged bound knobs.
         anchors: The variable's anchors, in the data's own units.
@@ -103,7 +114,8 @@ def _attempt_fit(
 
     Returns:
         (fit, std, grad, grad_std, hyps) in the data's own units, or None when
-        cleaning left nothing usable or the GP fit failed.
+        cleaning left fewer than min_points channels, the GP fit failed,
+        or any of its arrays holds a non-finite value.
         Negative slopes are physical and kept.
         The gradient is 0 only where the fit is clipped at 0 (see fit_profile).
     """
@@ -111,10 +123,16 @@ def _attempt_fit(
     if cleaned is None:
         return None
     cx, cy, cerr, scale, scaled_anchors = cleaned
+    # The leave-one-out removal can drop up to 30 percent of the channels
+    if cx.size < min_points:
+        return None
     pf = fit_profile(
         cx, cy, cerr, x_star, bounds, scaled_anchors, pedestal_rho, seed_salt=seed_salt
     )
     if pf is None:
+        return None
+    arrays = (pf.fit, pf.std, pf.grad, pf.grad_std)
+    if not all(np.isfinite(array).all() for array in arrays):
         return None
     return (
         pf.fit * scale,
@@ -166,6 +184,7 @@ def _fit_variable(
     (repair b: the LML can prefer a short-l1 basin that explains mid-profile wiggles
     by sacrificing the innermost channel cluster,
     and the floor forces the smooth basin, which the checks then judge like any other fit).
+    Skipped when the variable's l1 range does not reach above the floor.
     4: If still nonphysical, retry with the amplitude floored at AMPLITUDE_RESCUE_VAR_MIN
     (repair c: the LML can prefer a small amplitude that treats a sparse, noisy core as noise
     and leaves the fit far below it,
@@ -202,7 +221,7 @@ def _fit_variable(
     # then the smooth basin (repair b), then the amplitude floor (repair c).
     # The first clean fit returns, and the last flagged fit feeds the channel-drop repair below.
     attempts = [(0, bounds), (1, bounds)]
-    if bounds.l1_min < SMOOTH_RESCUE_L1_MIN:
+    if bounds.l1_min < SMOOTH_RESCUE_L1_MIN < bounds.l1_max:
         attempts.append((1, replace(bounds, l1_min=SMOOTH_RESCUE_L1_MIN)))
     if bounds.var_min < AMPLITUDE_RESCUE_VAR_MIN:
         attempts.append((1, replace(bounds, var_min=AMPLITUDE_RESCUE_VAR_MIN)))
@@ -214,6 +233,7 @@ def _fit_variable(
             y,
             err,
             x_star,
+            min_points,
             scale_per_slice,
             attempt_bounds,
             anchors,
@@ -243,7 +263,7 @@ def _fit_variable(
     if int(still_valid.sum()) < min_points:
         return _no_fit(STATUS_CULLED)
     result = _attempt_fit(
-        x, y, err, x_star, scale_per_slice, bounds, anchors, pedestal_rho
+        x, y, err, x_star, min_points, scale_per_slice, bounds, anchors, pedestal_rho
     )
     if result is None:
         return _no_fit(STATUS_CULLED)
@@ -251,6 +271,40 @@ def _fit_variable(
     if peak is not None or biased:
         return _no_fit(STATUS_CULLED)
     return VariableFit(*result, status=STATUS_REPAIRED)
+
+
+def _fit_variable_guarded(task: SliceTask, var: str) -> VariableFit:
+    """Fit one variable of a slice, turning any exception into STATUS_FAILED.
+
+    One slice's error must not kill the batch, the Pool would re-raise it
+    and lose every other slice's fit.
+
+    Args:
+        task: The slice's channel data and fit settings.
+        var: "te" or "ne".
+
+    Returns:
+        The variable's fit, STATUS_FAILED with the traceback printed when the fit raised.
+    """
+    try:
+        return _fit_variable(
+            task.x,
+            getattr(task, f"{var}_y"),
+            getattr(task, f"{var}_err"),
+            task.x_star,
+            task.min_points,
+            task.scale_per_slice,
+            getattr(task, f"{var}_bounds"),
+            getattr(task, f"{var}_anchors"),
+            task.pedestal_rho_tor_norm,
+        )
+    except Exception:
+        print(
+            f"[fit_worker] WARNING shot {task.shot} slice {task.i_time} {var} fit raised, "
+            f"marking it failed:\n{traceback.format_exc()}",
+            flush=True,
+        )
+        return _no_fit(STATUS_FAILED)
 
 
 def _fit_slice(task: SliceTask) -> SliceResult:
@@ -262,37 +316,12 @@ def _fit_slice(task: SliceTask) -> SliceResult:
     Returns:
         Both variables' fits for the slice.
     """
-    te = _fit_variable(
-        task.x,
-        task.te_y,
-        task.te_err,
-        task.x_star,
-        task.min_points,
-        task.scale_per_slice,
-        task.te_bounds,
-        task.te_anchors,
-        task.pedestal_rho_tor_norm,
-    )
-    ne = _fit_variable(
-        task.x,
-        task.ne_y,
-        task.ne_err,
-        task.x_star,
-        task.min_points,
-        task.scale_per_slice,
-        task.ne_bounds,
-        task.ne_anchors,
-        task.pedestal_rho_tor_norm,
-    )
+    te = _fit_variable_guarded(task, "te")
+    ne = _fit_variable_guarded(task, "ne")
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)
 
 
-def fit_batch(
-    batch: FitBatch,
-    num_workers: int = 1,
-    *,
-    max_slices_per_shot: int | None = None,
-) -> dict[int, ShotFitOutput]:
+def fit_batch(batch: FitBatch, num_workers: int = 1) -> dict[int, ShotFitOutput]:
     """Fit every (shot, time slice) in the batch with the mkgp method.
 
     Hyperparameters are optimized for each individual slice, since plasma
@@ -304,18 +333,11 @@ def fit_batch(
     Args:
         batch: Staged batch inputs.
         num_workers: Slice-level worker processes.
-        max_slices_per_shot: If set, only fit the first N time slices of each
-            shot (debug aid).
 
     Returns:
         Fitted profiles keyed by shot number.
     """
-    return map_slices(
-        _fit_slice,
-        batch,
-        num_workers=num_workers,
-        max_slices_per_shot=max_slices_per_shot,
-    )
+    return map_slices(_fit_slice, batch, num_workers=num_workers)
 
 
 def main(argv: list[str] | None = None):

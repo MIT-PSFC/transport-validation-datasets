@@ -46,12 +46,16 @@ _RSYNC_SOURCE_MISSING_CODES = {23, 24}
 # declaring the batch failed
 _MAX_OUTPUT_PULL_POLLS = 3
 # polls to tolerate a job in an unrecognized/unknown state (e.g. it vanished
-# from the queue) before treating the attempt as failed
+# from the queue) before treating the attempt as failed.
+# Only polls that reached the cluster count, an ssh outage is not a job state.
 _MAX_UNKNOWN_POLLS = 5
 # how long clean() waits for cancelled jobs to actually leave the queue before
 # it deletes their batch files (see _wait_for_jobs_to_drain)
 CLEAN_DRAIN_TIMEOUT_S = 120.0
 CLEAN_DRAIN_POLL_S = 5.0
+# The OpenSSH client's own exit code when it could not run the remote command
+# (connection or authentication failure), distinct from any remote command's exit code
+_SSH_UNREACHABLE_CODE = 255
 
 # SLURM states that mean the job will never produce output
 _TERMINAL_FAILURE_STATES = {
@@ -64,6 +68,22 @@ _TERMINAL_FAILURE_STATES = {
     "BOOT_FAIL",
     "DEADLINE",
 }
+# SLURM states of a job that is still going to run or finish, nothing to do but wait
+_ACTIVE_STATES = {
+    "RUNNING",
+    "COMPLETING",
+    "CONFIGURING",
+    "REQUEUED",
+    "REQUEUE_HOLD",
+    "SUSPENDED",
+    "STAGE_OUT",
+    "RESIZING",
+    "SIGNALING",
+}
+
+
+class ClusterUnreachableError(RuntimeError):
+    """The ssh connection to the cluster failed, so nothing is known about the jobs."""
 
 
 @dataclass
@@ -84,15 +104,13 @@ class PartitionSpec:
     constraint: str | None = None
 
 
-def parse_partition_specs(value) -> list["PartitionSpec"]:
+def parse_partition_specs(value: str) -> list["PartitionSpec"]:
     """Parse a partition spec string into PartitionSpecs.
 
     Args:
         value: Comma-separated entries of name@time_limit or
             name@time_limit@constraint, e.g.
             "sched_psfc_mit_r8@8:00:00,mit_preemptable@8:00:00@rocky8".
-            Also accepts a tuple/list of entry strings (Python Fire may
-            pre-split comma-separated arguments).
 
     Returns:
         One PartitionSpec per entry.
@@ -100,12 +118,8 @@ def parse_partition_specs(value) -> list["PartitionSpec"]:
     Raises:
         ValueError: If an entry does not match the format, or the spec is empty.
     """
-    if isinstance(value, str):
-        entries = value.split(",")
-    else:
-        entries = list(value)
     specs = []
-    for entry in entries:
+    for entry in value.split(","):
         fields = entry.strip().split("@")
         if len(fields) == 2:
             specs.append(PartitionSpec(name=fields[0], time_limit=fields[1]))
@@ -152,6 +166,13 @@ class ClusterFitConfig:
             jobs running concurrently and bound the work lost to a killed job.
         cpus_per_job: cpus-per-task for each fitting job; the worker runs this many
             slice-fit processes.
+        memory_per_node: sbatch --mem of each job, in SLURM's form ("64G", "4000M").
+            None leaves it to the partition's default.
+        poll_interval_s: Seconds between two polls of the job states.
+        job_name_prefix: First token of every job name,
+            gpfit-{ds_name}-{method}-{batch_id}-a{attempt} by default.
+            Jobs are adopted and cleaned by name, so two runs of one dataset
+            must share it, and two unrelated users of one account should not.
         max_retries: Resubmissions allowed per batch after a terminal job failure
             (TIMEOUT, PREEMPTED, OOM, ...). Each retry moves to the next partition in
             the list, wrapping around.
@@ -160,7 +181,7 @@ class ClusterFitConfig:
     """
 
     ssh_host: str
-    partitions: list[PartitionSpec] | str | tuple
+    partitions: list[PartitionSpec] | str
     remote_workdir: str
     venv_path: str
     max_concurrent_jobs: int = 8
@@ -173,9 +194,7 @@ class ClusterFitConfig:
     pending_timeout_s: float = 1800.0
 
     def __post_init__(self):
-        if not isinstance(self.partitions, list) or not all(
-            isinstance(p, PartitionSpec) for p in self.partitions
-        ):
+        if isinstance(self.partitions, str):
             self.partitions = parse_partition_specs(self.partitions)
 
 
@@ -285,6 +304,7 @@ class _SSHBackend:
     Job state resolution: squeue for active jobs, sacct for jobs that have
     left the queue, scontrol as the last resort when slurmdbd is unreachable.
     Jobs found in none of the three are omitted, which the caller reads as UNKNOWN.
+    An ssh failure (exit 255) is ClusterUnreachableError instead, nothing is known then.
     """
 
     def __init__(self, config: ClusterFitConfig, workdir: str):
@@ -346,15 +366,37 @@ class _SSHBackend:
             raise RuntimeError(f"sbatch failed for {job_name}: {result.stderr.strip()}")
         return int(result.stdout.strip().splitlines()[-1].split(";")[0])
 
-    def queued_jobs(self) -> list[tuple[str, int]]:
-        """List (name, job id) for every queued/running job of this user.
+    def _ssh_reaching_cluster(self, cmd: str):
+        """Run a command on the cluster, raising if ssh itself failed.
 
-        A list, not a name-keyed dict: two jobs can carry the same name (two
-        runs each submitting attempt 1 of the same batch), and clean() has to
-        cancel both.
+        A remote command's own non-zero exit (squeue on a job that left the
+        queue, sacct without slurmdbd) is left to the caller to read.
+
+        Args:
+            cmd: Shell command to run remotely.
 
         Returns:
-            (job name, job id) pairs.
+            The completed subprocess result.
+
+        Raises:
+            ClusterUnreachableError: If the ssh connection failed.
+        """
+        result = self._ssh(cmd)
+        if result.returncode == _SSH_UNREACHABLE_CODE:
+            raise ClusterUnreachableError(
+                f"ssh to {self._host} failed: {result.stderr.strip()}"
+            )
+        return result
+
+    def queued_jobs(self) -> dict[str, list[int]]:
+        """List the job ids of every queued/running job of this user, by job name.
+
+        Two jobs can carry the same name (two runs each submitting attempt 1
+        of the same batch), so every id of a name is kept: the adoption keeps
+        one and cancels the rest, and clean() cancels them all.
+
+        Returns:
+            Job name to its job ids.
 
         Raises:
             RuntimeError: If squeue fails.
@@ -363,11 +405,11 @@ class _SSHBackend:
         result = self._ssh(f"squeue {user_arg}-h -o {shlex.quote('%i|%j')}")
         if result.returncode != 0:
             raise RuntimeError(f"squeue failed: {result.stderr.strip()}")
-        jobs = []
+        jobs: dict[str, list[int]] = {}
         for line in result.stdout.splitlines():
             jid, _, name = line.strip().partition("|")
             if jid.isdigit() and name:
-                jobs.append((name, int(jid)))
+                jobs.setdefault(name, []).append(int(jid))
         return jobs
 
     def job_states(self, job_ids: list[int]) -> dict[int, str]:
@@ -379,14 +421,17 @@ class _SSHBackend:
         Returns:
             Job id to state mapping; ids resolvable by none of squeue, sacct,
             or scontrol are omitted (callers read that as UNKNOWN).
+            An ssh connection failure is ClusterUnreachableError instead,
+            the states are then unknown for a reason that has nothing to do with the jobs.
         """
         if not job_ids:
             return {}
         id_arg = ",".join(str(i) for i in job_ids)
         states: dict[int, str] = {}
 
-        result = self._ssh(
-            f"squeue --jobs {id_arg} -h -o {shlex.quote('%i|%T')} 2>/dev/null || true"
+        # squeue exits non-zero when an id has left the queue, only its stdout matters
+        result = self._ssh_reaching_cluster(
+            f"squeue --jobs {id_arg} -h -o {shlex.quote('%i|%T')} 2>/dev/null"
         )
         for line in result.stdout.splitlines():
             jid, _, st = line.strip().partition("|")
@@ -399,8 +444,8 @@ class _SSHBackend:
             # decorates some states ("CANCELLED by 1234"); keep the job row
             # and the bare state so it matches _TERMINAL_FAILURE_STATES.
             sacct_ids = ",".join(str(i) for i in missing)
-            result = self._ssh(
-                f"sacct -j {sacct_ids} -n -P -o JobID,State 2>/dev/null || true"
+            result = self._ssh_reaching_cluster(
+                f"sacct -j {sacct_ids} -n -P -o JobID,State 2>/dev/null"
             )
             for line in result.stdout.splitlines():
                 jid, _, st = line.strip().partition("|")
@@ -409,8 +454,8 @@ class _SSHBackend:
 
         missing = [j for j in job_ids if j not in states]
         for jid in missing:
-            result = self._ssh(
-                f"scontrol show job {jid} 2>/dev/null | tr ' ' '\\n' | grep '^JobState=' || true"
+            result = self._ssh_reaching_cluster(
+                f"scontrol show job {jid} 2>/dev/null | tr ' ' '\\n' | grep '^JobState='"
             )
             st = result.stdout.strip().partition("=")[2]
             if st:
@@ -687,14 +732,9 @@ class ClusterFitDispatcher:
         live in the dataset's own remote_workdir subdirectory.
         """
         prefix = f"{self.config.job_name_prefix}-{self.ds_name}-"
-        for name, job_id in self.backend.queued_jobs():
-            if not name.startswith(prefix):
-                continue
+        for name, job_id in self._queued_jobs_named(prefix):
             logger.info(f"Clean: cancelling job {name} (id {job_id})")
-            try:
-                self.backend.cancel(job_id)
-            except Exception as e:
-                logger.warning(f"Clean: failed to cancel job {name} (id {job_id}): {e}")
+            self._cancel_job(job_id, f"Clean: job {name}")
 
         self._wait_for_jobs_to_drain(prefix)
 
@@ -728,11 +768,7 @@ class ClusterFitDispatcher:
         """
         deadline = time.monotonic() + CLEAN_DRAIN_TIMEOUT_S
         while True:
-            remaining = [
-                (name, job_id)
-                for name, job_id in self.backend.queued_jobs()
-                if name.startswith(prefix)
-            ]
+            remaining = self._queued_jobs_named(prefix)
             if not remaining:
                 return
             if time.monotonic() >= deadline:
@@ -750,6 +786,34 @@ class ClusterFitDispatcher:
                 f"Clean: waiting for {len(remaining)} cancelled jobs to leave the queue"
             )
             time.sleep(CLEAN_DRAIN_POLL_S)
+
+    def _queued_jobs_named(self, prefix: str) -> list[tuple[str, int]]:
+        """List this user's queued jobs whose name starts with prefix.
+
+        Args:
+            prefix: Job name prefix.
+
+        Returns:
+            (job name, job id) pairs, one per job, a name repeated for duplicates.
+        """
+        return [
+            (name, job_id)
+            for name, job_ids in self.backend.queued_jobs().items()
+            if name.startswith(prefix)
+            for job_id in job_ids
+        ]
+
+    def _cancel_job(self, job_id: int, what: str):
+        """Cancel a job, logging instead of raising when scancel fails.
+
+        Args:
+            job_id: SLURM job id to cancel.
+            what: What the job is, for the warning.
+        """
+        try:
+            self.backend.cancel(job_id)
+        except Exception as e:
+            logger.warning(f"{what}: failed to cancel job {job_id}: {e}")
 
     def _push_worker_package(self):
         """Upload the gp_fitting worker package to the cluster.
@@ -811,7 +875,7 @@ class ClusterFitDispatcher:
         self.backend.ensure_dir(f"{self.remote_workdir}/logs")
 
         # Adopt jobs already in the queue from a previous run
-        queued = dict(self.backend.queued_jobs())
+        queued = self.backend.queued_jobs()
         for state in todo:
             self._adopt_queued_job(state, queued)
 
@@ -846,41 +910,42 @@ class ClusterFitDispatcher:
             state.job_id = self._submit_batch(state)
             budget -= 1
 
-    def _adopt_queued_job(self, state: BatchState, queued: dict[str, int]):
+    def _adopt_queued_job(self, state: BatchState, queued: dict[str, list[int]]):
         """Adopt a queued job from a previous run instead of resubmitting.
 
-        Job names carry an attempt suffix (-a{n}). The highest attempt wins
-        and lower-attempt stragglers are cancelled.
+        Job names carry an attempt suffix (-a{n}). The highest attempt wins,
+        its lowest job id when two runs submitted that attempt,
+        and the lower attempts and the duplicates are cancelled.
 
         Args:
             state: Batch to adopt a job for.
-            queued: Queued job names to job ids.
+            queued: Queued job names to their job ids.
         """
         candidates: list[tuple[int, int]] = []  # (attempt, job_id)
-        for name, job_id in queued.items():
+        for name, job_ids in queued.items():
             if name.startswith(f"{state.job_base_name}-a"):
                 suffix = name.removeprefix(f"{state.job_base_name}-a")
                 if suffix.isdigit():
-                    candidates.append((int(suffix), job_id))
+                    candidates.extend((int(suffix), job_id) for job_id in job_ids)
         if not candidates:
             return
         candidates.sort()
-        state.attempt, state.job_id = candidates[-1]
+        best_attempt = candidates[-1][0]
+        adopted = min(
+            job_id for attempt, job_id in candidates if attempt == best_attempt
+        )
+        state.attempt, state.job_id = best_attempt, adopted
         state.pending_since = time.monotonic()
         logger.info(
             f"Batch {state.batch_id}: found existing job {state.job_id} "
             f"(attempt {state.attempt}) in queue, not resubmitting"
         )
-        for _, stale_id in candidates[:-1]:
-            logger.info(
-                f"Batch {state.batch_id}: cancelling stale lower-attempt job {stale_id}"
-            )
-            try:
-                self.backend.cancel(stale_id)
-            except Exception as e:
-                logger.warning(
-                    f"Batch {state.batch_id}: failed to cancel stale job {stale_id}: {e}"
-                )
+        for attempt, stale_id in candidates:
+            if stale_id == adopted:
+                continue
+            kind = "duplicate" if attempt == best_attempt else "stale lower-attempt"
+            logger.info(f"Batch {state.batch_id}: cancelling {kind} job {stale_id}")
+            self._cancel_job(stale_id, f"Batch {state.batch_id}")
 
     def _render_script(self, state: BatchState, part: PartitionSpec) -> str:
         """Render the sbatch script of one batch attempt.
@@ -917,6 +982,11 @@ class ClusterFitDispatcher:
             "",
             f"source '{self.config.venv_path}/bin/activate'",
             f"export PYTHONPATH={workdir}/pkg",
+            # One BLAS thread per slice-fit process, the slice pool is the parallelism
+            *(
+                f"export {name}={value}"
+                for name, value in registry.WORKER_THREAD_ENV.items()
+            ),
             "",
             f"srun python -m {self.worker_module} {workdir}/{state.input_path.name} "
             f"{workdir}/{state.output_path.name} --num-workers {self.config.cpus_per_job}",
@@ -958,13 +1028,20 @@ class ClusterFitDispatcher:
         ]
         if not active:
             return
-        states = self.backend.job_states([b.job_id for b in active])
+        try:
+            states = self.backend.job_states([b.job_id for b in active])
+        except ClusterUnreachableError as e:
+            # Nothing is known about any job, so no job's unknown-poll count moves
+            logger.warning(
+                f"Could not poll the job states, trying again next poll: {e}"
+            )
+            return
         for state in active:
             slurm_state = states.get(state.job_id, "UNKNOWN")
             if slurm_state == "PENDING":
                 self._check_pending_timeout(state)
                 continue
-            if slurm_state in ("RUNNING", "COMPLETING", "CONFIGURING"):
+            if slurm_state in _ACTIVE_STATES:
                 state.pending_since = None
                 continue
             # Terminal or unknown: the output file is the source of truth
@@ -1002,9 +1079,12 @@ class ClusterFitDispatcher:
                     )
             else:
                 # UNKNOWN (e.g. the job vanished from the queue): tolerate a
-                # few polls, then treat the attempt as failed
+                # few polls, then treat the attempt as failed.
+                # Cancelled first, in case it is alive after all: two jobs
+                # writing the same output would race.
                 state.unknown_polls += 1
                 if state.unknown_polls >= _MAX_UNKNOWN_POLLS:
+                    self._cancel_job(state.job_id, f"Batch {state.batch_id}")
                     local_log = self._pull_job_log(state)
                     self._handle_failure(
                         state,
@@ -1064,12 +1144,7 @@ class ClusterFitDispatcher:
             f"Batch {state.batch_id}: job {state.job_id} PENDING for {elapsed:.0f}s "
             f"on {old_part}, cancelling and falling back to {new_part}"
         )
-        try:
-            self.backend.cancel(state.job_id)
-        except Exception as e:
-            logger.warning(
-                f"Batch {state.batch_id}: failed to cancel job {state.job_id}: {e}"
-            )
+        self._cancel_job(state.job_id, f"Batch {state.batch_id}")
         state.reset_for_resubmit()
         if state.pending_hops >= len(self.config.partitions):
             logger.warning(
