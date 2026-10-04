@@ -14,6 +14,7 @@ from transport_validation_datasets.machine.generic import (
     injected_power_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
+    normalized_beta,
     ohmic_power,
     orient_signal,
     signal_on_grid,
@@ -136,12 +137,12 @@ class CmodAeqdskMethods:
     @staticmethod
     @physics_method(columns=["betan"], tokamak=Tokamak.CMOD)
     def get_normalized_beta(params: PhysicsMethodParams):
-        """Retrieve the normalized beta with B_geo, the vacuum field at the geometric center rout.
+        """Retrieve the normalized beta as IMAS defines it, with the vacuum field b0 at r0 (normalized_beta).
 
-        EFIT's betat already normalizes with that field, 2 mu0 <p> / B_geo^2.
-        Its betan node does not, since it multiplies by |btaxp|, the total field at the magnetic axis.
-        So betan is rebuilt here as betat a B_geo / Ip[MA], the convention every store holds,
-        with B_geo = |bcentr| rcencm / rout, the vacuum field at rcencm carried out as 1/R.
+        Built from EFIT's own stored energy and volume, wplasm = 3/2 <p> vout.
+        bcentr is the vacuum field at rcencm, the fixed 0.66 m the store's r0 is.
+        EFIT's betat normalizes with the vacuum field at rout instead,
+        and its betan node multiplies by |btaxp|, the total field at the magnetic axis.
 
         Args:
             params: disruption-py physics method parameters for the shot.
@@ -150,18 +151,14 @@ class CmodAeqdskMethods:
             Dict with betan [percent m T / MA] on the requested timebase.
         """
         efit_time = efit_times_in_seconds(params, r"\efit_aeqdsk:time")
-        betat = _aeqdsk_node(params, r"\efit_aeqdsk:betat", efit_time)  # [percent]
+        energy_mhd = _aeqdsk_node(params, r"\efit_aeqdsk:wplasm", efit_time)  # [J]
+        volume = _aeqdsk_node(params, r"\efit_aeqdsk:vout/1e6", efit_time)  # [m^3]
         minor_radius = _aeqdsk_node(params, r"\efit_aeqdsk:aout/100", efit_time)  # [m]
         b_center = _aeqdsk_node(params, r"\efit_aeqdsk:bcentr", efit_time)  # [T]
-        r_center = _aeqdsk_node(params, r"\efit_aeqdsk:rcencm/100", efit_time)  # [m]
-        r_geo = _aeqdsk_node(params, r"\efit_aeqdsk:rout/100", efit_time)  # [m]
-        ip_ma = _aeqdsk_node(params, r"\efit_aeqdsk:cpasma/1e6", efit_time)  # [MA]
+        ip = _aeqdsk_node(params, r"\efit_aeqdsk:cpasma", efit_time)  # [A]
 
-        b_center_magnitude = np.abs(b_center)
-        ip_magnitude_ma = np.abs(ip_ma)
         with np.errstate(divide="ignore", invalid="ignore"):
-            b_geo = b_center_magnitude * r_center / r_geo
-            betan = betat * minor_radius * b_geo / ip_magnitude_ma
+            betan = normalized_beta(energy_mhd, volume, minor_radius, b_center, ip)
 
         if not np.array_equal(params.times, efit_time):
             betan = signal_on_grid(

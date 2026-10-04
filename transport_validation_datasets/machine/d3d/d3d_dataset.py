@@ -113,7 +113,11 @@ SIGNAL_ATTRS = {
     "r0": {"description": "Reference major radius b0 is given at, the EFIT rzero"},
     "energy_mhd": {"description": "Stored energy from the 1 kHz DISPY EFIT (wmhd)"},
     "beta_tor_norm": {
-        "description": "Normalized toroidal beta from the 1 kHz DISPY EFIT (betan), with B_geo, the vacuum field at rout",
+        "description": (
+            "Normalized toroidal beta as IMAS defines it, 100 beta_tor aminor |bcentr| / |ipmhd|[MA] with beta_tor = 2 mu0 <p> / bcentr^2, "
+            "<p> = 2 wmhd / (3 volume) of the 1 kHz DISPY EFIT and bcentr the vacuum field at rcentr = r0, "
+            "not the tree betan, which normalizes with the vacuum field at rout"
+        ),
     },
     "n_e_line_average": {
         "description": "Line-averaged electron density from the DISPY EFIT tree (density), else the PCS estimate (PTDATA dssdenest)",

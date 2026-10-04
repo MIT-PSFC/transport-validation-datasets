@@ -24,6 +24,7 @@ from transport_validation_datasets.machine.generic import (
     injected_power_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
+    normalized_beta,
     orient_signal,
     signal_on_grid,
     snap_to_grid,
@@ -197,8 +198,9 @@ class D3DMethods:
 
     # Store geometry
     BOUNDARY_NODES = ["aminor", "rsurf", "kappa", "tritop", "tribot"]
-    # Store EFIT scalars, under the column names of the built-in get_efit_parameters
-    EFIT_SCALAR_NODES = {"wmhd": "wmhd", "beta_n": "betan"}
+    # A-eqdsk nodes the normalized beta is built from (normalized_beta): stored energy [J], volume [m^3],
+    # minor radius [m], the vacuum field bcentr at rcentr = R0 [T] and the reconstructed current [A]
+    NORMALIZED_BETA_NODES = ["wmhd", "volume", "aminor", "bcentr", "ipmhd"]
 
     @staticmethod
     @physics_method(columns=["ip"], tokamak=Tokamak.D3D)
@@ -245,7 +247,9 @@ class D3DMethods:
     def get_efit_scalars(params: PhysicsMethodParams):
         """Stored energy and normalized beta of the DISPY EFIT, held over the invalid slices (_efit_slices).
 
-        The nodes of the built-in get_efit_parameters, which interpolates them.
+        wmhd is the node of the built-in get_efit_parameters, which interpolates it.
+        beta_n is built as IMAS defines it from the reconstruction's own energy and volume (normalized_beta),
+        not read from the tree betan, which normalizes with the vacuum field at rout.
 
         Args:
             params: disruption-py physics method parameters for the shot.
@@ -253,14 +257,23 @@ class D3DMethods:
         Returns:
             {"wmhd", "beta_n": (n_t,)} on the timebase.
         """
-        scalar_nodes = list(D3DMethods.EFIT_SCALAR_NODES.values())
-        efit_time, signals = _efit_signals(params, scalar_nodes)
-        return {
-            column: signal_on_grid(
-                efit_time, signals[node], params.times, EQUILIBRIUM_HOLD_FLOOR
+        efit_time, signals = _efit_signals(params, D3DMethods.NORMALIZED_BETA_NODES)
+        energy_mhd = signals["wmhd"]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            beta_n = normalized_beta(
+                energy_mhd,
+                signals["volume"],
+                signals["aminor"],
+                signals["bcentr"],
+                signals["ipmhd"],
             )
-            for column, node in D3DMethods.EFIT_SCALAR_NODES.items()
-        }
+        energy_mhd_on_grid = signal_on_grid(
+            efit_time, energy_mhd, params.times, EQUILIBRIUM_HOLD_FLOOR
+        )
+        beta_n_on_grid = signal_on_grid(
+            efit_time, beta_n, params.times, EQUILIBRIUM_HOLD_FLOOR
+        )
+        return {"wmhd": energy_mhd_on_grid, "beta_n": beta_n_on_grid}
 
     @staticmethod
     @physics_method(columns=["n_e_line_average"], tokamak=Tokamak.D3D)

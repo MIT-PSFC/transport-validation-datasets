@@ -157,7 +157,10 @@ class _StubEfitScalarConnection:
             "atime": np.arange(100.0, 201.0),
             "chisq": np.full(n_slices, 5.0),
             "wmhd": np.arange(n_slices, dtype=float),
-            "betan": np.full(n_slices, 2.0),
+            "volume": np.full(n_slices, 20.0),
+            "aminor": np.full(n_slices, 0.6),
+            "bcentr": np.full(n_slices, -2.0),
+            "ipmhd": np.full(n_slices, 1.2e6),
         }
         self.nodes["chisq"][20] = 100.0
 

@@ -25,11 +25,11 @@ from transport_validation_datasets.cleaning import (
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
-    MU0,
     channel_fit_rows,
     channel_rows_at_times,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
+    normalized_beta,
     ohmic_power,
     signal_on_grid,
     smoothed_power,
@@ -96,10 +96,9 @@ HOLD_FLOORS_S = {
 
 # DEFUSE signals power_ohm is computed from (ohmic_power), DEFUSE POHM has no documented definition
 OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "R_geom")
-# DEFUSE signals beta_tor_norm is computed from (_normalized_beta) in the B_geo convention of every store.
-# DEFUSE BETAN normalizes beta_tor by the volume-averaged vacuum field and multiplies by |BZERO| at r0,
-# which reads a median 5.6 percent below it.
-NORMALIZED_BETA_SOURCES = ("Wtot", "VOL", "a_minor", "R_geom", "BZERO", "I_P")
+# DEFUSE signals beta_tor_norm is computed from (normalized_beta), as IMAS defines it with BZERO at r0.
+# DEFUSE BETAN normalizes beta_tor by the volume-averaged vacuum field instead, which reads 5-7 percent low.
+NORMALIZED_BETA_SOURCES = ("Wtot", "VOL", "a_minor", "BZERO", "I_P")
 # DEFUSE Vloop has the opposite sign convention to I_P:
 # Ip * Vloop is negative at flat-top on all 39 shots checked, of both current polarities
 DEFUSE_VLOOP_SIGN = -1.0
@@ -157,8 +156,8 @@ SIGNAL_ATTRS = {
     "energy_mhd": {"description": "Stored energy on the LIUQE timebase (DEFUSE Wtot)"},
     "beta_tor_norm": {
         "description": (
-            "Normalized toroidal beta with B_geo, 100 beta_tor a B_geo / Ip[MA] with beta_tor = 2 mu0 <p> / B_geo^2, "
-            "<p> = 2 Wtot / (3 VOL) and B_geo = |BZERO| r0 / R_geom (DEFUSE Wtot, VOL, a_minor, R_geom, BZERO, I_P), "
+            "Normalized toroidal beta as IMAS defines it, 100 beta_tor a |b0| / |Ip|[MA] with beta_tor = 2 mu0 <p> / b0^2, "
+            "<p> = 2 Wtot / (3 VOL) and b0 = BZERO at r0 (DEFUSE Wtot, VOL, a_minor, BZERO, I_P), "
             "not DEFUSE BETAN"
         ),
     },
@@ -372,7 +371,7 @@ class TCVDataWorkflow(DataWorkflow):
         del liuqe
         ds_equilibrium = snap_to_grid(ds_equilibrium_liuqe, timebase)
         ds_thomson = snap_to_grid(ds_thomson_native, timebase)
-        ds_0d = _zero_d_dataset(shot, signals, r0, timebase)
+        ds_0d = _zero_d_dataset(shot, signals, timebase)
 
         ds = xr.merge(
             [ds_0d, ds_equilibrium, ds_thomson], compat="no_conflicts", join="outer"
@@ -506,7 +505,7 @@ def _thomson_dataset(
 
 
 def _zero_d_dataset(
-    shot: int, signals: dict[str, DefuseSignal], r0: float, timebase: np.ndarray
+    shot: int, signals: dict[str, DefuseSignal], timebase: np.ndarray
 ) -> xr.Dataset:
     """Place the DEFUSE 0D signals onto the timebase under standardized names.
 
@@ -519,7 +518,6 @@ def _zero_d_dataset(
     Args:
         shot: Shot number being read.
         signals: The DEFUSE 0D signals, every REQUIRED_DEFUSE_SIGNALS among them.
-        r0: Major radius BZERO is the vacuum field at [m].
         timebase: Uniform 1 kHz timebase [s].
 
     Returns:
@@ -548,7 +546,9 @@ def _zero_d_dataset(
         store_name: placed[raw_name] for store_name, raw_name in ZERO_D_SOURCES.items()
     }
     data["power_ohm"] = _ohmic_power(timebase, placed)
-    data["beta_tor_norm"] = _normalized_beta(placed, r0)
+    data["beta_tor_norm"] = normalized_beta(
+        placed["Wtot"], placed["VOL"], placed["a_minor"], placed["BZERO"], placed["I_P"]
+    )
     for store_name, raw_names in HEATING_SOURCES_MW.items():
         power_MW = np.zeros(timebase.size)
         for raw_name in raw_names:
@@ -588,29 +588,6 @@ def _ohmic_power(timebase: np.ndarray, placed: dict[str, np.ndarray]) -> np.ndar
     time_steps = np.diff(timebase)
     dt = float(np.median(time_steps))
     return smoothed_power(p_ohm_raw, dt)
-
-
-def _normalized_beta(placed: dict[str, np.ndarray], r0: float) -> np.ndarray:
-    """Normalized toroidal beta with B_geo, from the LIUQE signals and I_P on the timebase.
-
-    beta_tor = 2 mu0 <p> / B_geo^2 with the volume-averaged pressure <p> = 2 Wtot / (3 VOL),
-    and beta_N = 100 beta_tor a B_geo / Ip[MA], the convention every store holds.
-    B_geo = |BZERO| r0 / R_geom carries LIUQE's vacuum field at r0 out to the geometric axis.
-
-    Args:
-        placed: DEFUSE signals on the timebase, by DEFUSE name.
-        r0: Major radius BZERO is the vacuum field at [m].
-
-    Returns:
-        (n_t,) normalized beta.
-    """
-    pressure_mean = 2.0 * placed["Wtot"] / (3.0 * placed["VOL"])
-    b_center_magnitude = np.abs(placed["BZERO"])
-    b_geo = b_center_magnitude * r0 / placed["R_geom"]
-    beta_tor = 2.0 * MU0 * pressure_mean / b_geo**2
-    ip_magnitude = np.abs(placed["I_P"])
-    ip_magnitude_ma = ip_magnitude / 1e6
-    return 100.0 * beta_tor * placed["a_minor"] * b_geo / ip_magnitude_ma
 
 
 def _sharp_shift_samples(density: np.ndarray, n_sharp: int) -> np.ndarray:
