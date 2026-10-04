@@ -60,7 +60,8 @@ SIGNAL_ATTRS = {
     },
     "beta_tor_norm": {
         "description": (
-            "Normalized toroidal beta with B_geo, EFIT betat aout B_geo / |cpasma| with B_geo = |bcentr| rcencm / rout, "
+            "Normalized toroidal beta as IMAS defines it, 100 beta_tor aout |bcentr| / |cpasma| with beta_tor = 2 mu0 <p> / bcentr^2, "
+            "<p> = 2 wplasm / (3 vout) and bcentr the vacuum field at rcencm = r0, "
             "not the EFIT betan node, which takes |btaxp|"
         ),
     },
@@ -658,7 +659,7 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     """
     efit0d_signals = [
         "wmhd",  # Total stored energy (C-Mod has no consistent fast particle measurement, so this is all we've got)
-        "betan",  # Normalized beta with B_geo, rebuilt from betat (CmodAeqdskMethods.get_normalized_beta)
+        "betan",  # Normalized beta as IMAS defines it, from wplasm and vout (CmodAeqdskMethods.get_normalized_beta)
         "a_minor",  # Plasma minor radius
         "kappa",  # Plasma elongation
         "tritop",  # Top triangularity

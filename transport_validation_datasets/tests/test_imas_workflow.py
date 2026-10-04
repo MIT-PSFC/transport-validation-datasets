@@ -41,8 +41,7 @@ from transport_validation_datasets.workflow import (  # noqa: E402
 )
 
 R0, A_MINOR = 0.68, 0.22
-# The store holds beta_tor_norm with B_geo, at this geometric axis
-BETA_TOR_NORM_B_GEO, R_GEO = 1.2, 0.70
+BETA_TOR_NORM = 1.2
 N_PSI = 33
 N_GRID = 33
 N_BDRY = 64
@@ -121,8 +120,7 @@ def synthetic_unprocessed(
     assert set(data_vars) == set(DATASET_EQUILIBRIUM_SIGNALS)
     data_vars["ip"] = (("time",), np.full(n_t, ip0))
     data_vars["b0"] = (("time",), np.full(n_t, b0))
-    data_vars["beta_tor_norm"] = (("time",), np.full(n_t, BETA_TOR_NORM_B_GEO))
-    data_vars["geometric_axis_r"] = (("time",), np.full(n_t, R_GEO))
+    data_vars["beta_tor_norm"] = (("time",), np.full(n_t, BETA_TOR_NORM))
     return xr.Dataset(
         data_vars=data_vars, coords={"time": time}, attrs={"cocos": cocos, "r0": R0}
     )
@@ -228,9 +226,9 @@ def test_imas_export_chain_reads_back(tmp_path, ip_sign, b0_sign, psi_sign, coco
     assert np.allclose(np.asarray(sm.global_quantities.ip.value), ip_sign * 0.8e6)
     assert np.allclose(np.asarray(sm.global_quantities.b0.value), b0_sign * 5.4)
     assert sm.global_quantities.r0.value == pytest.approx(R0)
-    # Normalized with b0 at r0 in IMAS, B_geo / b0 = r0 / R_geo times the stored value
+    # The store already normalizes with b0 at r0 as IMAS does, so it is written as is
     beta_tor_norm_imas = np.asarray(sm.global_quantities.beta_tor_norm.value)
-    assert np.allclose(beta_tor_norm_imas, BETA_TOR_NORM_B_GEO * R0 / R_GEO)
+    assert np.allclose(beta_tor_norm_imas, BETA_TOR_NORM)
 
     wall = read_back("wall")
     outline = wall.description_2d[0].limiter.unit[0].outline

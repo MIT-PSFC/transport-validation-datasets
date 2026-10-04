@@ -549,38 +549,24 @@ def build_summary(factory, time, signals, r0):
             DATASET_0D_SIGNALS entry cannot be dropped silently.
         r0: The reference major radius b0 is given at [m], a constant of the shot.
 
-    beta_tor_norm is stored with B_geo = b0 r0 / geometric_axis_r (store_schema),
-    and IMAS normalizes it with b0 at r0.
-    beta_N goes as 1 / B at fixed pressure, so it is written times B_geo / b0 = r0 / geometric_axis_r.
-
     Returns:
         The validated `summary` IDS.
 
     Raises:
-        ValueError: If a signal name has no `_SUMMARY_SIGNAL_PATHS` entry,
-            or beta_tor_norm comes without geometric_axis_r.
+        ValueError: If a signal name has no `_SUMMARY_SIGNAL_PATHS` entry.
     """
     unknown = sorted(set(signals) - set(_SUMMARY_SIGNAL_PATHS))
     if unknown:
         raise ValueError(f"No summary IDS field mapped for 0D signal(s) {unknown}")
-    signals_imas = dict(signals)
-    if "beta_tor_norm" in signals:
-        if "geometric_axis_r" not in signals:
-            raise ValueError(
-                "beta_tor_norm needs geometric_axis_r to go from B_geo to the IMAS b0 at r0"
-            )
-        geometric_axis_r = np.asarray(signals["geometric_axis_r"], dtype=float)
-        beta_tor_norm_b_geo = np.asarray(signals["beta_tor_norm"], dtype=float)
-        signals_imas["beta_tor_norm"] = beta_tor_norm_b_geo * r0 / geometric_axis_r
 
     sm = factory.summary()
     sm.ids_properties.homogeneous_time = 1
     sm.time = np.asarray(time, dtype=float)
     sm.global_quantities.r0.value = float(r0)
     for name, (group, field) in _SUMMARY_SIGNAL_PATHS.items():
-        if name not in signals_imas:
+        if name not in signals:
             continue
-        values = np.asarray(signals_imas[name], dtype=float)
+        values = np.asarray(signals[name], dtype=float)
         if not np.any(np.isfinite(values)):
             continue
         getattr(getattr(sm, group), field).value = values

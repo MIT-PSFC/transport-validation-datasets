@@ -785,6 +785,33 @@ def ohmic_power(
     return ip * v_loop - dw_pol_dt
 
 
+def normalized_beta(energy_mhd, volume, minor_radius, b0, ip):
+    """Normalized toroidal beta as IMAS defines it, from a reconstruction's stored energy and volume.
+
+    beta_tor = 2 mu0 <p> / b0^2 with the volume-averaged pressure <p> = 2 energy_mhd / (3 volume),
+    since energy_mhd = 3/2 int p dV.
+    beta_tor_norm = 100 beta_tor a |b0| / |ip|[MA].
+    b0 is the vacuum toroidal field at the fixed r0, not at the geometric axis.
+    Magnitudes are taken, the signs live in the cocos variable.
+
+    Args:
+        energy_mhd: Stored energy, 3/2 the volume integral of the pressure [J].
+        volume: Plasma volume inside the boundary [m^3].
+        minor_radius: Minor radius of the boundary [m].
+        b0: Vacuum toroidal field at r0 [T], either sign.
+        ip: Plasma current [A], either sign.
+
+    Returns:
+        beta_tor_norm [percent m T / MA], shaped like the broadcast inputs.
+    """
+    pressure_mean = 2.0 * energy_mhd / (3.0 * volume)
+    b0_magnitude = np.abs(b0)
+    beta_tor = 2.0 * MU0 * pressure_mean / b0_magnitude**2
+    ip_magnitude = np.abs(ip)
+    ip_magnitude_ma = ip_magnitude / 1e6
+    return 100.0 * beta_tor * minor_radius * b0_magnitude / ip_magnitude_ma
+
+
 def greenwald_density(ip, minor_radius):
     """The Greenwald density n_GW = Ip / (pi a^2), in 1e20 m^-3, MA and m.
 

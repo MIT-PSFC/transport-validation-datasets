@@ -35,6 +35,7 @@ from transport_validation_datasets.machine.generic import (
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
+    normalized_beta,
     signal_on_grid,
     smoothed_power,
     snap_to_grid,
@@ -85,7 +86,6 @@ EQUILIBRIUM_SIGNALS = {
     # plasma_energy (EFM_PLASMA_ENERGY) is 3/2 the volume integral of the reconstructed pressure.
     # Not wplasmd (EFM_WPLASMD), the diamagnetic energy, built on a measured diamagnetic flux that is 0 in level 1
     "plasma_energy": "energy_mhd",
-    "betan": "beta_tor_norm",
     "minor_radius": "minor_radius",
     "elongation": "elongation",
     "triang_upper": "triangularity_upper",
@@ -123,6 +123,7 @@ REQUIRED_LEVEL1_SIGNALS = {
         "magnetic_axis_r",
         "magnetic_axis_z",
         "plasma_current_c",
+        "plasma_volume",
         "bvac_r",
         "bvac_val",
         *EQUILIBRIUM_SIGNALS,
@@ -151,8 +152,9 @@ SIGNAL_ATTRS = {
     },
     "beta_tor_norm": {
         "description": (
-            "Normalized toroidal beta from the reconstruction (betan), with B_geo, "
-            "the vacuum field at the geometric axis (bvac_rgeom), whatever the efm metadata says"
+            "Normalized toroidal beta as IMAS defines it, 100 beta_tor a |b0| / |Ip|[MA] with beta_tor = 2 mu0 <p> / b0^2, "
+            "<p> = 2 plasma_energy / (3 plasma_volume) and b0 = bvac_val at bvac_r (efm minor_radius, plasma_current_c), "
+            "not the efm betan, which normalizes with bvac_rgeom, the vacuum field at the geometric axis"
         ),
     },
     "n_e_line_average": {
@@ -699,8 +701,18 @@ def _zero_d_dataset(
     ip_on_timebase = signal_on_grid(summary_time, ip, timebase)
     data["ip"] = ip_on_timebase
     # The vacuum field at the fixed reference radius bvac_r, the store's r0 (_reference_radius)
-    data["b0"] = signal_on_grid(
-        eq_time, efm["bvac_val"].values, timebase, EQUILIBRIUM_HOLD_FLOOR
+    b0_eq = np.asarray(efm["bvac_val"].values, dtype=float)
+    data["b0"] = signal_on_grid(eq_time, b0_eq, timebase, EQUILIBRIUM_HOLD_FLOOR)
+    # On the reconstruction times from its own energy, volume, shape, field and current, then held like them
+    energy_mhd_eq = np.asarray(efm["plasma_energy"].values, dtype=float)
+    volume_eq = np.asarray(efm["plasma_volume"].values, dtype=float)
+    minor_radius_eq = np.asarray(efm["minor_radius"].values, dtype=float)
+    ip_eq = np.asarray(efm["plasma_current_c"].values, dtype=float)
+    beta_tor_norm_eq = normalized_beta(
+        energy_mhd_eq, volume_eq, minor_radius_eq, b0_eq, ip_eq
+    )
+    data["beta_tor_norm"] = signal_on_grid(
+        eq_time, beta_tor_norm_eq, timebase, EQUILIBRIUM_HOLD_FLOOR
     )
     # esm sits on a 20 us axis but only holds values at the reconstruction times,
     # and signal_on_grid holds on the clock of the finite samples, like the reconstructions themselves.

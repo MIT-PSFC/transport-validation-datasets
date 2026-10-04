@@ -26,14 +26,13 @@ STORE_SIGNAL_ATTRS = {
         "units": "J",
         "ref": "/equilibrium/time_slice(itime)/global_quantities/energy_mhd",
     },
-    # IMAS normalizes beta_tor_norm with b0 at r0, every store with B_geo, as the study and TORAX use it.
-    # The IMAS export converts it (scenario_export.build_summary).
     "beta_tor_norm": {
         "units": "dimensionless",
         "ref": "/equilibrium/time_slice(itime)/global_quantities/beta_tor_norm",
         "normalization": (
-            "100 beta_tor a B_geo / Ip[MA] with beta_tor = 2 mu0 <p> / B_geo^2, "
-            "B_geo = b0 r0 / geometric_axis_r the vacuum field at the geometric axis, not the IMAS b0 at r0"
+            "100 beta_tor a |b0| / |Ip|[MA] with beta_tor = 2 mu0 <p> / b0^2, "
+            "<p> = 2 energy_mhd / (3 V) from the reconstruction's own stored energy and plasma volume, "
+            "b0 the vacuum field at r0 as IMAS defines it"
         ),
     },
     "n_e_line_average": {"units": "m^-3", "ref": "/summary/line_average/n_e/value"},

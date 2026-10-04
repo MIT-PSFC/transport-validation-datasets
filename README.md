@@ -109,12 +109,15 @@ b0 is the vacuum toroidal field at the fixed major radius r0, as IMAS defines it
 the magnetics btor at 0.66 m on C-Mod, the EFIT bvac_val at bvac_r (1.0 m) on MAST,
 LIUQE's rBt / r0 at 0.88 m on TCV (DEFUSE BZERO), and mu0 144 bcoil / (2 pi r0) at 1.6955 m on DIII-D (PTDATA bcoil, EFIT's own formula).
 ip and b0 keep their source sign, the cocos variable records the convention.
-beta_tor_norm is normalized with B_geo = b0 r0 / geometric_axis_r, in beta_tor and in a B / Ip,
-not with the IMAS b0 at r0, and the IMAS export converts it.
-MAST's efm betan and DIII-D's EFIT betan already use B_geo.
-TCV computes it from LIUQE's Wtot and volume, beta_tor = 2 mu0 (2 Wtot / 3 VOL) / B_geo^2 (DEFUSE BETAN normalizes by the volume-averaged field).
+beta_tor_norm is normalized as IMAS defines it, 100 beta_tor a |b0| / |Ip|[MA] with beta_tor = 2 mu0 <p> / b0^2 and b0 at r0.
+Every device builds it the same way (`generic.normalized_beta`),
+from the reconstruction's own stored energy and volume, <p> = 2 W / (3 V), with its own a, b0 and Ip:
+EFIT wplasm, vout, aout, bcentr and cpasma on C-Mod, efm plasma_energy, plasma_volume, minor_radius, bvac_val and plasma_current_c on MAST,
+DEFUSE Wtot, VOL, a_minor, BZERO and I_P on TCV, and the DISPY EFIT wmhd, volume, aminor, bcentr and ipmhd on DIII-D.
+None of the reconstructions' own betan is IMAS's.
 C-Mod's EFIT betan takes |btaxp|, the total field at the magnetic axis,
-so it is rebuilt from betat, which uses B_geo, as betat a B_geo / Ip (`get_normalized_beta`).
+MAST's efm betan and DIII-D's tree betan take the vacuum field at the geometric axis,
+and DEFUSE BETAN normalizes beta_tor by the volume-averaged vacuum field.
 power_ohm is Ip V_loop - dW_pol/dt on every device.
 MAST reads it from ESM (`pphix`), C-Mod computes it (`CmodPowerMethods.get_ohmic_power`)
 from the flux loop voltage and W_pol = mu0 R_geo li Ip^2 / 4, R_geo the geometric major radius (EFIT `rout`).
