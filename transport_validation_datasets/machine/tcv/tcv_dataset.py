@@ -25,14 +25,14 @@ from transport_validation_datasets.cleaning import (
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
+    absent_heating_powers,
     channel_fit_rows,
     channel_rows_at_times,
+    injected_power_on_grid,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
     normalized_beta,
-    ohmic_power,
     signal_on_grid,
-    smoothed_power,
     snap_to_grid,
     ts_channel_dataset,
 )
@@ -80,7 +80,6 @@ LIUQE_SOURCES = (
     "KAPPA",
     "DELTA_TOP",
     "DELTA_BOTTOM",
-    "LI",
     "BZERO",
 )
 # PradTot follows the Thomson cadence (~17 ms) but often skips one or two samples (33-50 ms steps),
@@ -94,19 +93,12 @@ HOLD_FLOORS_S = {
     "PradTot": PRAD_TOT_HOLD_FLOOR_S,
 }
 
-# DEFUSE signals power_ohm is computed from (ohmic_power), DEFUSE POHM has no documented definition
-OHMIC_POWER_SOURCES = ("I_P", "Vloop", "LI", "R_geom")
 # DEFUSE signals beta_tor_norm is computed from (normalized_beta), as IMAS defines it with BZERO at r0.
 # DEFUSE BETAN normalizes beta_tor by the volume-averaged vacuum field instead, which reads 5-7 percent low.
 NORMALIZED_BETA_SOURCES = ("Wtot", "VOL", "a_minor", "BZERO", "I_P")
-# DEFUSE Vloop has the opposite sign convention to I_P:
-# Ip * Vloop is negative at flat-top on all 39 shots checked, of both current polarities
-DEFUSE_VLOOP_SIGN = -1.0
 # Every DEFUSE 0D signal a shot needs
 REQUIRED_DEFUSE_SIGNALS = tuple(
-    dict.fromkeys(
-        [*ZERO_D_SOURCES.values(), *OHMIC_POWER_SOURCES, *NORMALIZED_BETA_SOURCES]
-    )
+    dict.fromkeys([*ZERO_D_SOURCES.values(), *NORMALIZED_BETA_SOURCES])
 )
 # Every DEFUSE 0D signal read from an export, the heating systems optional
 DEFUSE_SIGNALS = (
@@ -114,15 +106,14 @@ DEFUSE_SIGNALS = (
     *(raw_name for raw_names in HEATING_SOURCES_MW.values() for raw_name in raw_names),
 )
 
-# The timebase ends at the last time the plasma current magnitude exceeds this [A]
-IP_TIMEBASE_MIN_A = 50e3
-
 # Fringe jumps of the FIR interferometer, removed from the raw NEavg samples (_remove_fringe_jumps).
 # Smallest level shift read as a fringe jump [m^-3]. The clean jumps in 185 shots are 1.1-2.5e19.
 FRINGE_JUMP_MIN_M3 = 1e19
 # A fringe jump completes within a few raw samples, and no real density change is that fast.
 # So a jump is looked for between the medians of this long on either side of each sample [s].
 FRINGE_SHARP_WINDOW_S = 0.25e-3
+# Fewest samples a fringe median window takes, so a slow record still has a median
+FRINGE_MIN_WINDOW_SAMPLES = 3
 # Sharp shifts closer together than this are one episode, such as a dropout and its recovery [s]
 FRINGE_EPISODE_GAP_S = 5e-3
 # The levels on either side of an episode are the medians from FRINGE_SETTLE_S to FRINGE_LEVEL_WINDOW_S away from it,
@@ -182,13 +173,6 @@ SIGNAL_ATTRS = {
     "triangularity_lower": {
         "description": "Lower triangularity of the plasma boundary, LIUQE (DEFUSE DELTA_BOTTOM)",
     },
-    "power_ohm": {
-        "description": (
-            "Ohmic heating power, Ip * V_loop minus the rate of change of the internal poloidal magnetic energy "
-            "mu0 R_geo li Ip^2 / 4 (DEFUSE I_P, Vloop, LI, R_geom, backward difference), "
-            "smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0"
-        ),
-    },
     "power_radiated": {
         "description": (
             "Total radiated power including the divertor, bolometry (DEFUSE PradTot on its ~17 ms cadence, "
@@ -207,33 +191,21 @@ SIGNAL_ATTRS = {
     },
     "ts_channel_r": {
         "description": "Major radius of the TS channel scattering volumes, the vertical laser chord (DEFUSE los/rchord)",
-        "units": "m",
-        "ref": "/thomson_scattering/channel(i1)/position/r",
     },
     "ts_channel_z": {
         "description": "Height of the TS channel scattering volumes (DEFUSE los/zchord)",
-        "units": "m",
-        "ref": "/thomson_scattering/channel(i1)/position/z",
     },
     "ts_channel_n_e": {
         "description": "Electron density measured by TS channels, calibrated to the FIR interferometer (DEFUSE Ne_rho raw)",
-        "units": "m^-3",
-        "ref": "/thomson_scattering/channel(i1)/n_e/data",
     },
     "ts_channel_n_e_error": {
         "description": "Electron density uncertainty of the TS channels (DEFUSE Ne_rho raw error_bar)",
-        "units": "m^-3",
-        "ref": "/thomson_scattering/channel(i1)/n_e/data_error_upper",
     },
     "ts_channel_t_e": {
         "description": "Electron temperature measured by TS channels (DEFUSE Te_rho raw)",
-        "units": "eV",
-        "ref": "/thomson_scattering/channel(i1)/t_e/data",
     },
     "ts_channel_t_e_error": {
         "description": "Electron temperature uncertainty of the TS channels (DEFUSE Te_rho raw error_bar)",
-        "units": "eV",
-        "ref": "/thomson_scattering/channel(i1)/t_e/data_error_upper",
     },
     "bcentr": {
         "description": (
@@ -294,7 +266,6 @@ class TCVDataWorkflow(DataWorkflow):
 
     # GP fit staging knobs, C-Mod's to start with, each slice normalized to a max of 1
     fit_min_points = 10
-    fit_scale_per_slice = True
     fit_bounds = {
         "te": FitBounds(l1_min=0.35, var_min=1.0),
         "ne": FitBounds(l1_min=0.55, l1_max=1.0, var_min=1.0),
@@ -341,12 +312,12 @@ class TCVDataWorkflow(DataWorkflow):
         if missing:
             self.record_failed_shot(shot, f"Missing DEFUSE signals {missing}.")
             return None
+        # The timebase ends at the last time the plasma current magnitude passes the ip filter
         ip = signals["I_P"]
-        mask_ip_valid = np.abs(ip.values) > IP_TIMEBASE_MIN_A
+        ip_min = self.min_filter["ip"]
+        mask_ip_valid = np.abs(ip.values) > ip_min
         if not mask_ip_valid.any():
-            self.record_failed_shot(
-                shot, f"|I_P| never exceeds {IP_TIMEBASE_MIN_A:.0f} A."
-            )
+            self.record_failed_shot(shot, f"|I_P| never exceeds {ip_min:.0f} A.")
             return None
         ip_end_time = float(ip.time[mask_ip_valid].max())
         timebase = make_uniform_1kHz_timebase(ip_end_time)
@@ -511,8 +482,8 @@ def _zero_d_dataset(
 
     Every signal is placed causally (signal_on_grid), never interpolated, so no grid time draws on a later sample,
     the LIUQE signals and PradTot held for at least their HOLD_FLOORS_S.
-    The fringe jumps of NEavg are removed from its raw samples first (_remove_fringe_jumps, non-causal),
-    and power_ohm is smoothed non-causally (smoothed_power), as on every device.
+    The fringe jumps of NEavg are removed from its raw samples first (_remove_fringe_jumps, non-causal).
+    power_ohm comes from the LIUQE block (DataWorkflow.add_ohmic_power).
     Plasma current and toroidal field keep their source sign.
 
     Args:
@@ -545,19 +516,21 @@ def _zero_d_dataset(
     data = {
         store_name: placed[raw_name] for store_name, raw_name in ZERO_D_SOURCES.items()
     }
-    data["power_ohm"] = _ohmic_power(timebase, placed)
     data["beta_tor_norm"] = normalized_beta(
         placed["Wtot"], placed["VOL"], placed["a_minor"], placed["BZERO"], placed["I_P"]
     )
+    # Each record is 0 outside its span and NaN in its gaps (injected_power_on_grid), a system a shot lacks is 0
     for store_name, raw_names in HEATING_SOURCES_MW.items():
         power_MW = np.zeros(timebase.size)
         for raw_name in raw_names:
-            if raw_name in placed:
-                power_MW = power_MW + np.nan_to_num(placed[raw_name])
+            if raw_name in signals:
+                record = signals[raw_name]
+                power_MW = power_MW + injected_power_on_grid(
+                    record.time, record.values, timebase
+                )
         data[store_name] = power_MW * 1e6
-    # TCV has no ICRF or lower hybrid, zero where ip is valid
-    data["power_ic"] = data["ip"] * 0.0
-    data["power_lh"] = data["ip"] * 0.0
+    # TCV has no ICRF or lower hybrid
+    data.update(absent_heating_powers(data["ip"], ("power_ic", "power_lh")))
 
     return xr.Dataset(
         data_vars={name: ("idx", values) for name, values in data.items()},
@@ -566,28 +539,6 @@ def _zero_d_dataset(
             "shot": ("idx", np.repeat(shot, timebase.size)),
         },
     )
-
-
-def _ohmic_power(timebase: np.ndarray, placed: dict[str, np.ndarray]) -> np.ndarray:
-    """Ohmic power Ip V_loop - dW_pol/dt (ohmic_power) from the DEFUSE signals on the timebase.
-
-    Vloop is flipped onto the sign convention of I_P (DEFUSE_VLOOP_SIGN),
-    and the result is smoothed non-causally (smoothed_power), as on C-Mod and MAST.
-
-    Args:
-        timebase: Uniform 1 kHz timebase [s].
-        placed: DEFUSE signals on the timebase, by DEFUSE name.
-
-    Returns:
-        (n_t,) ohmic power [W].
-    """
-    v_loop = DEFUSE_VLOOP_SIGN * placed["Vloop"]
-    p_ohm_raw = ohmic_power(
-        timebase, placed["I_P"], v_loop, placed["LI"], placed["R_geom"]
-    )
-    time_steps = np.diff(timebase)
-    dt = float(np.median(time_steps))
-    return smoothed_power(p_ohm_raw, dt)
 
 
 def _sharp_shift_samples(density: np.ndarray, n_sharp: int) -> np.ndarray:
@@ -681,7 +632,7 @@ def _remove_fringe_jumps(
     sample_steps = np.diff(sample_time)
     sample_step = float(np.median(sample_steps))
     n_sharp_window = round(FRINGE_SHARP_WINDOW_S / sample_step)
-    n_sharp = max(3, n_sharp_window)
+    n_sharp = max(FRINGE_MIN_WINDOW_SAMPLES, n_sharp_window)
     if density.size < 2 * n_sharp + 1:
         return density_corrected, None
     idx_sharp = _sharp_shift_samples(density, n_sharp)

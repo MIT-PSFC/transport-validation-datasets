@@ -23,7 +23,6 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     FIT_MODE_WINDOW_AVERAGE,
     FIT_MODE_WINDOW_SAMPLE,
     STATUS_OK,
-    STATUS_SKIPPED,
     ShotFitInput,
     read_batch_setting,
     unpack_fit_batch,
@@ -754,7 +753,7 @@ class TestStackInternalDataset:
         )
         assert "center" in store["fresh_profile"].attrs["description"]
 
-    def test_unfit_slices_dropped_by_default_and_kept_on_request(self, tmp_path):
+    def test_unfit_slices_are_held_over(self, tmp_path):
         workflow = make_workflow(tmp_path, shots=[1])
         workflow.broken_samples = {1: 3}  # the sample at 0.07 s has 2 channels
         workflow.make_unprocessed_data_files()
@@ -768,13 +767,6 @@ class TestStackInternalDataset:
         # Held from the 0.05 s sample, as though there were no sample at 0.07 s
         assert np.isfinite(dropped["t_e"].values[i, at]).all()
         assert dropped["t_e_fit_status"].values[i, at] == STATUS_OK
-
-        kept = xr.open_zarr(
-            workflow.stack_internal_dataset(drop_unfit_slices=False), consolidated=True
-        )
-        assert int(kept["fresh_profile"].values[i, : times.size].sum()) == 15
-        assert kept["t_e_fit_status"].values[i, at] == STATUS_SKIPPED
-        assert np.isnan(kept["t_e"].values[i, at]).all()
 
     def test_check_added_after_unprocessed_stage_drops_shot(self, tmp_path):
         workflow = make_workflow(tmp_path)

@@ -365,7 +365,7 @@ def _profiles_on_psi_n_grid(
     return values_grid
 
 
-def _time_first(values: np.ndarray, mask_time_missing: np.ndarray) -> np.ndarray:
+def _liuqe_time_first(values: np.ndarray, mask_time_missing: np.ndarray) -> np.ndarray:
     """A LIUQE array with its time axis moved first, NaN at the missing times.
 
     Args:
@@ -426,16 +426,16 @@ def liuqe_geqdsk_dataset(liuqe: dict[str, np.ndarray], shot: int) -> xr.Dataset:
 
     # Fx is (z, r, t), the block takes (t, r, z)
     flux_r_z = np.transpose(liuqe["Fx"], (1, 0, 2))
-    flux_time_first = _time_first(flux_r_z, mask_no_boundary)
+    flux_time_first = _liuqe_time_first(flux_r_z, mask_no_boundary)
     psirz = flux_time_first * flux_scale
     psirz_single = psirz.astype(np.float32)
-    flux_axis = _time_first(liuqe["FA"], mask_no_boundary)
-    flux_boundary = _time_first(liuqe["FB"], mask_no_boundary)
+    flux_axis = _liuqe_time_first(liuqe["FA"], mask_no_boundary)
+    flux_boundary = _liuqe_time_first(liuqe["FB"], mask_no_boundary)
     simagx = flux_axis * flux_scale
     sibdry = flux_boundary * flux_scale
-    current = _time_first(liuqe["Ip"], mask_no_boundary)
+    current = _liuqe_time_first(liuqe["Ip"], mask_no_boundary)
     rcentr = liuqe["r0"]
-    vacuum_field_times_r0 = _time_first(liuqe["rBt"], mask_no_boundary)
+    vacuum_field_times_r0 = _liuqe_time_first(liuqe["rBt"], mask_no_boundary)
     bcentr = vacuum_field_times_r0 / rcentr
     cocos = cocos_from_signs(current, bcentr, simagx, sibdry, qpsi)
     return make_geqdsk_dataset(
@@ -443,15 +443,15 @@ def liuqe_geqdsk_dataset(liuqe: dict[str, np.ndarray], shot: int) -> xr.Dataset:
         times=times,
         r_grid=r_grid,
         z_grid=z_grid,
-        rmagx=_time_first(liuqe["rA"], mask_no_boundary),
-        zmagx=_time_first(liuqe["zA"], mask_no_boundary),
+        rmagx=_liuqe_time_first(liuqe["rA"], mask_no_boundary),
+        zmagx=_liuqe_time_first(liuqe["zA"], mask_no_boundary),
         simagx=simagx,
         sibdry=sibdry,
         bcentr=bcentr,
         current=current,
         psirz=psirz_single,
-        rbdry=_time_first(liuqe["rB_lcfs"], mask_no_boundary),
-        zbdry=_time_first(liuqe["zB_lcfs"], mask_no_boundary),
+        rbdry=_liuqe_time_first(liuqe["rB_lcfs"], mask_no_boundary),
+        zbdry=_liuqe_time_first(liuqe["zB_lcfs"], mask_no_boundary),
         cocos_input=cocos,
         rcentr=rcentr,
         rlim=liuqe["rl"],

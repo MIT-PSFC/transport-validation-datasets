@@ -93,10 +93,10 @@ def plot_unprocessed_data(
 
     1: ip (in MA) and b0 on left axis, energy_mhd (in MJ) on right axis
     - Also has a vertical red line indicating the end margin time as identified by filter_and_plot
-    2: n_e_line_average (in 10^20 m^-3) on left axis, beta_n (unitless) on right axis
+    2: n_e_line_average (in 10^20 m^-3) on left axis, beta_tor_norm on right axis
     - Also has green dots at the bottom for each time a profile is measured
-    3: p_oh, p_rad, p_ic, p_lh, p_nbi (all in MW)
-    4: minor_radius and major_radius (both in m) on left axis, kappa, tritop, tribot (unitless) on right axis
+    3: power_ohm, power_radiated, power_ic, power_lh, power_nbi, power_ec (all in MW)
+    4: minor_radius and geometric_axis_r (both in m) on left axis, elongation and the triangularities on right axis
 
     For each signal, include dashed lines at its min_filter and max_filter thresholds,
     and on the density the n_e_line_average a greenwald_fraction max_filter allows
@@ -327,7 +327,7 @@ def _panel_ylim(
     computed across the whole shot so every page shares the same axis.
     The readings count so a fit that passes under its data shows as such.
     They are the staged ones, already through the cleaning screens,
-    which in tuning iteration 7 raised the top over the fit's by at most 1.85x.
+    which raise the top over the fit's by at most 1.85x.
 
     Args:
         fit_mean: (n_t, n_x) fitted profiles of the plotted slices.

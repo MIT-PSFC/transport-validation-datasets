@@ -106,7 +106,7 @@ class TestMakeUnprocessedDataFiles:
 
     def test_efit_tree_fallback(self):
         # A missing first tree falls through to ANALYSIS, which reconstructs every ~20 ms.
-        # Its EFIT 0D signals are interpolated onto the grid, so the shot still passes the filter,
+        # Its EFIT 0D signals are held onto the grid, so the shot still passes the filter,
         # while the reconstruction itself stays on its own grid times.
         test_dir = self.test_dir / "test_efit_tree_fallback"
         shot = 1160712015
@@ -165,9 +165,9 @@ class TestPrepareFitInput:
 
         with xr.open_dataset(workflow.unprocessed_data_dir / f"{shot}.nc") as ds:
             fit_input = workflow.prepare_fit_input(shot, ds)
+            (channel,) = workflow.te_faulty_channels(ds.squeeze("shot", drop=True))
         dropped_time, _, dropped_by_var = workflow.fit_plot_dropped_readings(shot)
 
-        (channel,) = workflow.te_faulty_channels
         te_dropped = np.isfinite(dropped_by_var["te"][0][:, 0])
         ne_kept = np.isfinite(fit_input.ne_y[:, channel])
         assert np.array_equal(dropped_time, fit_input.time)

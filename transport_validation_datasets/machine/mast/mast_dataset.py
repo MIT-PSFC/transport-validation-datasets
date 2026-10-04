@@ -3,7 +3,6 @@
 Most of it comes out of the level 1 store: https://s3.echo.stfc.ac.uk/mast/level1/shots/{shot}.zarr
 - efm: the EFIT reconstruction, as the full GEQDSK block and the 0D equilibrium signals.
   Its flux map also places the Thomson channels in rho_tor_norm.
-- esm: the ohmic power.
 - ayc: the Thomson profiles, see _thomson_dataset.
 The level 2 store (https://s3.echo.stfc.ac.uk/mast/level2/shots/{shot}.zarr)
 only supplies the summary signals: ip, power_nbi, n_e_line_average and power_radiated.
@@ -29,9 +28,13 @@ from transport_validation_datasets.cleaning import (
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
+    POWER_SMOOTHING_WINDOW,
+    UNIFORM_TIMEBASE_DT,
+    absent_heating_powers,
     channel_fit_rows,
     channel_rows_at_times,
     cocos_from_signs,
+    held_signals_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
@@ -72,7 +75,7 @@ MAX_FIT_RHO_TOR_NORM = 1.1
 MAX_RELATIVE_ERROR = 1.0
 
 # Past this rho the inboard branch departs from the outboard one systematically, not as scatter.
-# Over the 100 shots of tuning iteration 5 the inboard read high by a median of
+# Over 100 shots the inboard read high by a median of
 # 20 percent in Te and 7 percent in ne at rho 0.8-0.85, and 42 and 18 percent at 0.85-0.9,
 # while its own point-to-point scatter stayed below the outboard's.
 # It has 3-5 times the outboard's channels there and steered the edge fit, so it is dropped.
@@ -126,9 +129,10 @@ REQUIRED_LEVEL1_SIGNALS = {
         "plasma_volume",
         "bvac_r",
         "bvac_val",
+        # Without q nothing maps onto rho_tor_norm and the COCOS cannot be identified
+        "qpsi_c",
         *EQUILIBRIUM_SIGNALS,
     ),
-    "esm": ("pphix",),
 }
 # summary/power_nbi is required rather than zero filled: nothing in the archive
 # can tell a shot whose beams were off from one whose beam record is missing.
@@ -159,12 +163,6 @@ SIGNAL_ATTRS = {
     },
     "n_e_line_average": {
         "description": "Line averaged electron density",
-    },
-    "power_ohm": {
-        "description": (
-            "Ohmic heating power, Ip * V_loop at the LCFS minus the rate of change of the stored poloidal magnetic energy "
-            "(ESM_PPHIX), smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0"
-        ),
     },
     "power_radiated": {
         "description": "Total radiated power from the poloidal bolometer array (ABM_PRAD_POL), smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0",
@@ -202,39 +200,27 @@ SIGNAL_ATTRS = {
             "ayc radial basis is re-derived for every laser pulse and moves by "
             "up to ~2 cm over a shot"
         ),
-        "units": "m",
-        "ref": "/thomson_scattering/channel(i1)/position/r",
     },
     "ts_channel_z": {
         "description": "Height of TS channel measurement locations",
-        "units": "m",
-        "ref": "/thomson_scattering/channel(i1)/position/z",
     },
     "ts_channel_n_e": {
         "description": "Electron density measured by TS channels",
-        "units": "m^-3",
-        "ref": "/thomson_scattering/channel(i1)/n_e/data",
     },
     "ts_channel_n_e_error": {
         "description": (
             "Electron density uncertainty from the ayc spectral fit, typically "
             "3-10% of the value"
         ),
-        "units": "m^-3",
-        "ref": "/thomson_scattering/channel(i1)/n_e/data_error_upper",
     },
     "ts_channel_t_e": {
         "description": "Electron temperature measured by TS channels",
-        "units": "eV",
-        "ref": "/thomson_scattering/channel(i1)/t_e/data",
     },
     "ts_channel_t_e_error": {
         "description": (
             "Electron temperature uncertainty from the ayc spectral fit, "
             "typically 5-20% of the value"
         ),
-        "units": "eV",
-        "ref": "/thomson_scattering/channel(i1)/t_e/data_error_upper",
     },
     "bcentr": {
         "description": (
@@ -266,7 +252,6 @@ class ShotSources:
     Attributes:
         summary: The level 2 summary group.
         efm: The level 1 efm group, the equilibrium reconstruction.
-        esm: The level 1 esm group, for the ohmic power.
         ds_thomson: The usable Thomson slices inside the shot window,
             on their own timebase (see _thomson_dataset).
         timebase: The shot's uniform 1 kHz timebase [s].
@@ -274,7 +259,6 @@ class ShotSources:
 
     summary: xr.Dataset
     efm: xr.Dataset
-    esm: xr.Dataset
     ds_thomson: xr.Dataset
     timebase: np.ndarray
 
@@ -290,8 +274,8 @@ class MASTDataWorkflow(DataWorkflow):
     min_pulse_length = 0.2
     min_filter = {
         "ip": 210e3,
-        # 5 kJ of plasma_energy cuts about what 10 kJ of the old wmhd did (median ratio 2.1),
-        # 1.9 percent of the times iteration 12 kept, mostly ramp phases
+        # 5 kJ of plasma_energy cuts about what 10 kJ of the diamagnetic wplasmd would (median ratio 2.1),
+        # 1.9 percent of the kept times, mostly ramp phases
         "energy_mhd": 5e3,
         # A broken interferometer record. The lowest kept value in a 40-shot sample is 6e18,
         # and 1e19 would cut 6 percent of the kept time where Thomson agrees with the interferometer.
@@ -308,10 +292,10 @@ class MASTDataWorkflow(DataWorkflow):
         "power_ohm": 5.0e6,
         "power_radiated": 3.0e6,
     }
-    # MAST's ip record runs through the current quench, so a small ip cutoff
-    # still lets disruption transients in. Has to be longer than C-Mod's 20 ms.
-    end_margin = 0.04
-    # Shots radiate a median 10 percent of their heating power (it11 store, from 23809 on).
+    # MAST's ip record runs through the current quench, so a small ip cutoff still lets disruption transients in.
+    # One smoothing window, so the smoothed powers never carry the quench (POWER_SMOOTHING_WINDOW).
+    end_margin = POWER_SMOOTHING_WINDOW
+    # Shots radiate a median 10 percent of their heating power (from 23809 on).
     # 12 shots sit below 1 percent with MW of input, a dead bolometer, and the next lowest is at 3.75 percent.
     min_radiated_fraction = 0.025
     # More radiated than put in. The highest in a 40-shot sample is 0.34.
@@ -320,15 +304,10 @@ class MASTDataWorkflow(DataWorkflow):
     first_shot = 23809
     # From 23809 on, 23990 sits at 0.13 and the next lowest shot at 0.75, the highest at 1.10
     density_ratio_bounds = (0.7, 1.3)
-    # Shots the validity filtering rejects outright (checked 2026-08-20 by
-    # running them through the pipeline), skipped here to save the processing.
-    # 29430 is the worst of them: its bolometer is broken, the raw radiated
-    # power spans -2.2 to +40.5 MW while MAST input power stays below 5 MW.
-    # The rest of the "early campaign shots with known problems" list this
-    # inherited from the older MAST workflow had no recorded reasons, passed
-    # both the store probe and the filtering, and was dropped the same day.
-    # 27430 and 28049 have P_rad flat at 1.80 and 1.72 MW (min = median) over the whole shot, a stuck bolometer.
-    # Their radiated fraction (~0.48) passes the cuts, the 2026-10 0D autocheck found them.
+    # Shots the filters reject outright, skipped here to save the processing.
+    # 29430: broken bolometer, the raw radiated power spans -2.2 to +40.5 MW while the input power stays below 5 MW.
+    # 27430 and 28049: P_rad flat at 1.80 and 1.72 MW (min = median) over the whole shot, a stuck bolometer
+    # whose radiated fraction (~0.48) passes the cuts.
     shot_blacklist = [
         27430,
         28049,
@@ -346,7 +325,6 @@ class MASTDataWorkflow(DataWorkflow):
     # A 1/60 step puts 1.0 and 1.1 on the grid.
     fit_rho_tor_norm = np.linspace(0.0, 1.6, 97)
     fit_min_points = 10
-    fit_scale_per_slice = True
     # Both variables share the same bounds on MAST:
     # - l1 floor 0.2: MAST cores carry structure a longer scale smooths away,
     #   e.g. a hollow Te in the current ramp or a flat core with a knee at rho ~0.45
@@ -413,9 +391,7 @@ class MASTDataWorkflow(DataWorkflow):
             return None
 
         timebase = sources.timebase
-        ds_0d = _zero_d_dataset(
-            shot, sources.summary, sources.efm, sources.esm, timebase
-        )
+        ds_0d = _zero_d_dataset(shot, sources.summary, sources.efm, timebase)
         ds_equilibrium_efit = _equilibrium_dataset(shot, sources.efm)
         ds_equilibrium = snap_to_grid(ds_equilibrium_efit, timebase)
         ds_thomson = snap_to_grid(sources.ds_thomson, timebase)
@@ -487,10 +463,11 @@ class MASTDataWorkflow(DataWorkflow):
         n_inboard_edge = int((inboard_edge & np.isfinite(te_y)).sum())
         te_y = np.where(inboard_edge, np.nan, te_y)
         ne_y = np.where(inboard_edge, np.nan, ne_y)
-        logger.info(
-            f"Shot {shot}: dropped {n_inboard_edge} inboard channel readings past "
-            f"rho_tor_norm {MAX_INBOARD_RHO_TOR_NORM:g}"
-        )
+        if n_inboard_edge:
+            logger.info(
+                f"Shot {shot}: dropped {n_inboard_edge} inboard channel readings past "
+                f"rho_tor_norm {MAX_INBOARD_RHO_TOR_NORM:g}"
+            )
         te_err = branch_disagreement_errors(rho_tor_norm, te_y, te_err, inboard)
         ne_err = branch_disagreement_errors(rho_tor_norm, ne_y, ne_err, inboard)
 
@@ -570,7 +547,6 @@ def open_shot_sources(shot: int) -> ShotSources | None:
     return ShotSources(
         summary=summary,
         efm=groups["efm"],
-        esm=groups["esm"],
         ds_thomson=ds_thomson,
         timebase=timebase,
     )
@@ -593,17 +569,17 @@ def _store_path_exists(path: str) -> bool:
     """Check whether a path exists in the public MAST buckets.
 
     Separates a shot or group that was never published (a permanent failure
-    worth recording) from an S3 hiccup (worth retrying on the next run).
+    worth recording) from an S3 hiccup, which raises and is retried on the next run.
 
     Args:
         path: Bucket-qualified path, e.g. "mast/level2/shots/30097.zarr".
 
     Returns:
-        True if the path exists, False if it does not or cannot be listed.
+        True if the path exists, False if it does not.
     """
     try:
         return bool(_s3().ls(path, detail=False))
-    except Exception:
+    except FileNotFoundError:
         return False
 
 
@@ -661,21 +637,20 @@ def _zero_d_dataset(
     shot: int,
     summary: xr.Dataset,
     efm: xr.Dataset,
-    esm: xr.Dataset,
     timebase: np.ndarray,
 ) -> xr.Dataset:
     """Place the 0D signals onto the timebase under standardized names.
 
     Every signal is placed causally (signal_on_grid), never interpolated,
     so no grid time draws on a later sample,
-    and power_ohm and power_radiated are then smoothed non-causally (smoothed_power), as on every device.
+    and power_radiated is then smoothed non-causally (smoothed_power), as on every device.
+    power_ohm comes from the GEQDSK block (DataWorkflow.add_ohmic_power).
     Plasma current and toroidal field keep their source sign, as on C-Mod.
 
     Args:
         shot: Shot number being read.
         summary: The level 2 summary group.
         efm: The level 1 efm group.
-        esm: The level 1 esm group.
         timebase: Uniform 1 kHz timebase [s].
 
     Returns:
@@ -684,12 +659,10 @@ def _zero_d_dataset(
     summary_time = summary["time"].values
     eq_time = np.asarray(efm["time"].values, dtype=float)
 
-    data = {
-        name: signal_on_grid(
-            eq_time, efm[source].values, timebase, EQUILIBRIUM_HOLD_FLOOR
-        )
-        for source, name in EQUILIBRIUM_SIGNALS.items()
+    equilibrium_signals = {
+        name: efm[source].values for source, name in EQUILIBRIUM_SIGNALS.items()
     }
+    data = held_signals_on_grid(eq_time, equilibrium_signals, timebase)
     data.update(
         {
             name: signal_on_grid(summary_time, summary[source].values, timebase)
@@ -714,27 +687,13 @@ def _zero_d_dataset(
     data["beta_tor_norm"] = signal_on_grid(
         eq_time, beta_tor_norm_eq, timebase, EQUILIBRIUM_HOLD_FLOOR
     )
-    # esm sits on a 20 us axis but only holds values at the reconstruction times,
-    # and signal_on_grid holds on the clock of the finite samples, like the reconstructions themselves.
-    # Some converged reconstructions have none (97 of 1446 shots, up to 25 ms in 24891),
-    # and a gap longer than the hold stays NaN.
-    esm_time = np.asarray(esm["time"].values, dtype=float)
-    pphix = np.asarray(esm["pphix"].values, dtype=float)
-    power_ohm_on_grid = signal_on_grid(
-        esm_time, pphix, timebase, EQUILIBRIUM_HOLD_FLOOR
-    )
-    # The powers are smoothed non-causally, as on every device
-    grid_steps = np.diff(timebase)
-    dt = float(np.median(grid_steps))
-    data["power_ohm"] = smoothed_power(power_ohm_on_grid, dt)
-    data["power_radiated"] = smoothed_power(data["power_radiated"], dt)
+    # Smoothed non-causally, as on every device
+    data["power_radiated"] = smoothed_power(data["power_radiated"], UNIFORM_TIMEBASE_DT)
     data["power_nbi"] = signal_on_grid(
         summary_time, summary["power_nbi"].values, timebase
     )
-    # MAST has no ICRF or lower hybrid, zero where ip is valid
-    data["power_ic"] = data["ip"] * 0.0
-    data["power_lh"] = data["ip"] * 0.0
-    data["power_ec"] = data["ip"] * 0.0
+    # MAST has no ICRF, lower hybrid or ECH
+    data.update(absent_heating_powers(data["ip"], ("power_ic", "power_lh", "power_ec")))
 
     return xr.Dataset(
         data_vars={name: ("idx", values) for name, values in data.items()},
@@ -745,7 +704,7 @@ def _zero_d_dataset(
     )
 
 
-def _time_first(data: xr.DataArray) -> np.ndarray:
+def _time_major(data: xr.DataArray) -> np.ndarray:
     """Read a (dim, time) store variable as a (time, dim) float array.
 
     Args:
@@ -779,7 +738,7 @@ def _optional_rows(
     if name not in source:
         logger.warning(f"Shot {shot}: no {name} in the store, staging it as NaN")
         return np.full(shape, np.nan)
-    return _time_first(source[name])
+    return _time_major(source[name])
 
 
 def efm_flux_map(efm: xr.Dataset) -> xr.DataArray:
@@ -900,16 +859,16 @@ def _thomson_dataset(
         Dataset on dims ("idx", "ts_channel") with "time"/"shot" coords.
     """
     ts_time = np.asarray(thomson["time"].values, dtype=float)
-    r_rows = _time_first(thomson["radius"])
+    r_rows = _time_major(thomson["radius"])
     z_rows = np.full(r_rows.shape, TS_CHANNEL_Z)
     return ts_channel_dataset(
         shot,
         ts_time,
         r_rows,
         z_rows,
-        te=_time_first(thomson["te"]),
-        te_error=_time_first(thomson["te_error"]),
-        ne=_time_first(thomson["ne"]),
-        ne_error=_time_first(thomson["ne_error"]),
+        te=_time_major(thomson["te"]),
+        te_error=_time_major(thomson["te_error"]),
+        ne=_time_major(thomson["ne"]),
+        ne_error=_time_major(thomson["ne_error"]),
         timebase=timebase,
     )

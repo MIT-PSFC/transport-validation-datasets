@@ -1,15 +1,26 @@
 """Fit-method registry: map a method string to its worker module.
 
 The method string is how a fitting method is selected everywhere:
-locally (run_batch_file) and on the cluster,
+locally (run_batch_file, run_worker_subprocess) and on the cluster,
 where the dispatcher composes the job command from worker_module():
 
     srun python -m {worker_module(method)} in.npz out.npz --num-workers N
 """
 
 import importlib
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
+
+# One BLAS thread per fit process, the same pin the cluster job script exports
+# (dispatcher._render_script) and the worker modules set before importing numpy.
+WORKER_THREAD_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+}
 
 WORKER_MODULES: dict[str, str] = {
     "zk": "transport_validation_datasets.gp_fitting.worker_zk",
@@ -54,28 +65,48 @@ def load_worker(method: str) -> ModuleType:
     return importlib.import_module(worker_module(method))
 
 
-def run_batch_file(
-    method: str,
-    input_path: Path | str,
-    output_path: Path | str,
-    num_workers: int = 1,
-):
-    """Fit one staged batch file locally, writing its result file.
+def run_batch_file(method: str, input_path: Path | str, output_path: Path | str):
+    """Fit one staged batch file in this process, serially, writing its result file.
 
-    This is the serial local path; it reads the same staged npz a cluster job
-    would, so the zk worker's data-derived seeding gives bit-identical
-    results in both modes. Never fit from in-memory data instead. Side effect:
-    the zk worker reseeds this process's global numpy RNG per fit.
+    It reads the same staged npz a cluster job would, and the zk worker seeds
+    its restarts from the data, so the fits match a cluster run's as far as
+    the numpy and scipy builds agree (bootstrap_remote.sh pins the cluster's versions).
+    Never fit from in-memory data instead. Side effects: the zk worker reseeds
+    this process's global numpy RNG per fit, and numpy keeps whatever BLAS
+    thread count this process started with, run_worker_subprocess pins it.
 
     Args:
         method: Fitting method name.
         input_path: Batch input npz.
         output_path: Batch result npz to write.
-        num_workers: Slice-level worker processes; local runs use 1.
     """
     from transport_validation_datasets.gp_fitting import batch_io
 
     worker = load_worker(method)
     batch = batch_io.unpack_fit_batch(input_path)
-    outputs = worker.fit_batch(batch, num_workers=num_workers)
+    outputs = worker.fit_batch(batch, num_workers=1)
     batch_io.pack_fit_results(output_path, outputs, batch.x_star)
+
+
+def run_worker_subprocess(
+    method: str, in_path: Path | str, out_path: Path | str
+) -> subprocess.CompletedProcess:
+    """Fit one staged batch file in a fresh worker process, as a cluster job would.
+
+    Runs `python -m {worker_module(method)} in out` with this interpreter and
+    WORKER_THREAD_ENV set, so the worker pins its BLAS threads before numpy
+    loads, which an import into an already-running process cannot do.
+    The worker picks its slice-level worker count from SLURM_CPUS_PER_TASK or the cpu count.
+
+    Args:
+        method: Fitting method name.
+        in_path: Batch input npz.
+        out_path: Batch result npz to write.
+
+    Returns:
+        The completed process. A non-zero worker exit raises
+        subprocess.CalledProcessError (check=True).
+    """
+    env = os.environ | WORKER_THREAD_ENV
+    command = [sys.executable, "-m", worker_module(method), str(in_path), str(out_path)]
+    return subprocess.run(command, env=env, check=True)

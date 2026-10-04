@@ -21,7 +21,7 @@ from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 
-from transport_validation_datasets.dispy_utils import passive_log_settings
+from transport_validation_datasets.dispy_utils import empty_result, passive_log_settings
 from transport_validation_datasets.gp_fitting.batch_io import ShotFitInput
 from transport_validation_datasets.machine.d3d.dispy_methods import (
     R0,
@@ -37,6 +37,7 @@ from transport_validation_datasets.machine.d3d.ida import (
     ida_dataset,
 )
 from transport_validation_datasets.machine.generic import (
+    absent_heating_powers,
     channel_fit_rows,
     channel_rows_at_times,
     nearest_usable_reconstructions,
@@ -50,9 +51,8 @@ from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 ZERO_D_RUN_METHODS = [
     "get_plasma_current",  # ip
     "get_toroidal_field",  # b0
-    "get_efit_scalars",  # wmhd, beta_n
+    "get_efit_scalars",  # wmhd, beta_tor_norm
     "get_line_average_density",  # n_e_line_average
-    "get_ohmic_power",  # p_ohm
     "get_radiated_power",  # p_rad
     "get_heating_powers",  # p_nbi, p_ech
     "get_boundary_parameters",  # aminor, rsurf, kappa, tritop, tribot
@@ -62,14 +62,13 @@ ZERO_D_SOURCES = {
     "ip": "ip",
     "b0": "b0",
     "energy_mhd": "wmhd",
-    "beta_tor_norm": "beta_n",
+    "beta_tor_norm": "beta_tor_norm",
     "n_e_line_average": "n_e_line_average",
     "minor_radius": "aminor",
     "geometric_axis_r": "rsurf",
     "elongation": "kappa",
     "triangularity_upper": "tritop",
     "triangularity_lower": "tribot",
-    "power_ohm": "p_ohm",
     "power_radiated": "p_rad",
     "power_nbi": "p_nbi",
     "power_ec": "p_ech",
@@ -137,12 +136,6 @@ SIGNAL_ATTRS = {
     "triangularity_lower": {
         "description": "Lower triangularity of the plasma boundary, DISPY EFIT tribot",
     },
-    "power_ohm": {
-        "description": (
-            "Ohmic heating power from the 1 kHz DISPY EFIT (poh = Ip V_surf - dW_pol/dt), "
-            "its derivatives centered least-squares slopes over +-100 ms (non-causal), clipped at 0"
-        ),
-    },
     "power_radiated": {
         "description": (
             "Total radiated power including the divertor, bolometer analysis prad_tot (4 ms), "
@@ -161,7 +154,7 @@ SIGNAL_ATTRS = {
     },
     "ida_psi_n": {
         "description": "Normalized poloidal flux of the IDA profile points, of IDA's own reconstruction",
-        "units": "dimensionless",
+        "units": "1",
     },
     "ida_t_e": {
         "description": "IDA electron temperature fit on its psi_n points",
@@ -296,16 +289,18 @@ class D3DDataWorkflow(DataWorkflow):
             source: name for name, source in ZERO_D_SOURCES.items() if source != name
         }
         ds = ds.rename(rename)
-        # DIII-D's ICRF is unused in these campaigns and it has no lower hybrid, zero where ip is valid
-        ds["power_ic"] = ds["ip"] * 0.0
-        ds["power_lh"] = ds["ip"] * 0.0
-        ds.attrs = {
-            "cocos": ds_equilibrium.attrs["cocos"],
-            # Per shot like cocos, the stack stage stores it as the r0 variable
-            "r0": R0,
-            "efit_runtag": self.settings.runtag,
-            "ida_database": str(ida_path.parent),
-        }
+        # DIII-D's ICRF is unused in these campaigns and it has no lower hybrid
+        ds = ds.assign(absent_heating_powers(ds["ip"], ("power_ic", "power_lh")))
+        # Added to disruption-py's source stamp, not in place of it
+        ds.attrs.update(
+            {
+                "cocos": ds_equilibrium.attrs["cocos"],
+                # Per shot like cocos, the stack stage stores it as the r0 variable
+                "r0": R0,
+                "efit_runtag": self.settings.runtag,
+                "ida_database": str(ida_path.parent),
+            }
+        )
         apply_signal_attrs(ds, SIGNAL_ATTRS)
         return ds
 
@@ -429,7 +424,7 @@ def _retrieve(
         log_settings=passive_log_settings(),
         num_processes=1,
     )
-    if "shot" not in result or "time" not in result or result["time"].size == 0:
+    if empty_result(result):
         return None
     return result.set_index(idx=["shot", "time"]).unstack("idx")
 

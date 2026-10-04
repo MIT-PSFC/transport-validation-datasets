@@ -10,20 +10,21 @@ from disruption_py.core.physics_method.decorator import physics_method
 from disruption_py.core.physics_method.params import PhysicsMethodParams
 from disruption_py.inout.mds import mdsExceptions
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings import TimeSetting, TimeSettingParams
+from disruption_py.settings import TimeSettingParams
 from disruption_py.settings.nickname_setting import (
     NicknameSetting,
     NicknameSettingParams,
 )
 from loguru import logger
 
+from transport_validation_datasets.dispy_utils import (
+    UniformTimebaseSetting,
+    assemble_geqdsk_dataset,
+    injected_power,
+)
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
     MU0,
-    cocos_from_signs,
-    injected_power_on_grid,
-    make_geqdsk_dataset,
-    make_uniform_1kHz_timebase,
     normalized_beta,
     orient_signal,
     signal_on_grid,
@@ -93,24 +94,38 @@ class DispyEfitNicknameSetting(NicknameSetting):
         return efit_tree
 
 
-class Uniform1kHzTimeSetting(TimeSetting):
+class Uniform1kHzTimeSetting(UniformTimebaseSetting):
     """Uniform 1 kHz timebase [s] from 0 to the end of the EFIT.
 
-    Raises when the EFIT is slower than 1 kHz, the mark of a reconstruction that is not DISPY.
+    Raises when the EFIT is slower than 1 kHz or a single slice, the marks of a reconstruction that is not DISPY.
     """
 
-    def _get_times(self, params: TimeSettingParams) -> np.ndarray:
-        efit_time_ms = params.mds_conn.get_data(
-            r"\efit_a_eqdsk:atime", tree_name="_efit_tree"
+    def efit_end_time(self, params: TimeSettingParams) -> float:
+        """The last a-file time of the DISPY EFIT [s].
+
+        Args:
+            params: Parameters needed to retrieve the timebase.
+
+        Returns:
+            The end time [s].
+
+        Raises:
+            ValueError: If the EFIT has a single slice or a median step above EFIT_MAX_STEP_MS.
+        """
+        efit_time_ms = np.atleast_1d(
+            params.mds_conn.get_data(r"\efit_a_eqdsk:atime", tree_name="_efit_tree")
         )
+        if efit_time_ms.size < 2:
+            raise ValueError(
+                f"Shot {params.shot_id}: {efit_time_ms.size} EFIT slice, not a 1 kHz reconstruction"
+            )
         efit_steps_ms = np.diff(efit_time_ms)
         efit_step_median_ms = np.median(efit_steps_ms)
         if efit_step_median_ms > EFIT_MAX_STEP_MS:
             raise ValueError(
                 f"Shot {params.shot_id}: median EFIT step {efit_step_median_ms:.1f} ms, not a 1 kHz reconstruction"
             )
-        efit_end = float(np.max(efit_time_ms)) / 1e3
-        return make_uniform_1kHz_timebase(efit_end)
+        return float(np.max(efit_time_ms)) / 1e3
 
 
 def _efit_slices(params: PhysicsMethodParams) -> tuple[np.ndarray, np.ndarray]:
@@ -155,36 +170,6 @@ def _efit_signals(
         values[~mask_valid] = np.nan
         signals[node] = values
     return efit_time, signals
-
-
-def _injected_power(
-    params: PhysicsMethodParams, node: str, tree_name: str
-) -> np.ndarray:
-    """An injected heating power record on the timebase (injected_power_on_grid), in the record's units.
-
-    0 when the shot has none (that heating system did not run).
-
-    Args:
-        params: disruption-py physics method parameters for the shot.
-        node: MDSplus node of the power record.
-        tree_name: Tree holding it.
-
-    Returns:
-        (n_t,) the power on the timebase.
-    """
-    try:
-        power, power_time_ms = params.mds_conn.get_data_with_dims(
-            node, tree_name=tree_name
-        )
-    except mdsExceptions.MdsException:
-        params.logger.debug("no {node} record, taking 0", node=node)
-        return np.zeros(len(params.times))
-    # echpwrc can end with a stray t = 0 sample
-    if power_time_ms.size > 1 and power_time_ms[-1] == 0:
-        power_time_ms = power_time_ms[:-1]
-        power = power[:-1]
-    power_time = power_time_ms / 1e3
-    return injected_power_on_grid(power_time, power, params.times)
 
 
 class D3DMethods:
@@ -243,24 +228,25 @@ class D3DMethods:
         return {"b0": bcoil_on_timebase * BCOIL_TO_B0}
 
     @staticmethod
-    @physics_method(columns=["wmhd", "beta_n"], tokamak=Tokamak.D3D)
+    @physics_method(columns=["wmhd", "beta_tor_norm"], tokamak=Tokamak.D3D)
     def get_efit_scalars(params: PhysicsMethodParams):
         """Stored energy and normalized beta of the DISPY EFIT, held over the invalid slices (_efit_slices).
 
         wmhd is the node of the built-in get_efit_parameters, which interpolates it.
-        beta_n is built as IMAS defines it from the reconstruction's own energy and volume (normalized_beta),
-        not read from the tree betan, which normalizes with the vacuum field at rout.
+        beta_tor_norm is built as IMAS defines it from the reconstruction's own energy and volume (normalized_beta),
+        not read from the tree betan, which normalizes with the vacuum field at rout
+        and which disruption-py's built-in serves under the column name beta_n.
 
         Args:
             params: disruption-py physics method parameters for the shot.
 
         Returns:
-            {"wmhd", "beta_n": (n_t,)} on the timebase.
+            {"wmhd", "beta_tor_norm": (n_t,)} on the timebase.
         """
         efit_time, signals = _efit_signals(params, D3DMethods.NORMALIZED_BETA_NODES)
         energy_mhd = signals["wmhd"]
         with np.errstate(divide="ignore", invalid="ignore"):
-            beta_n = normalized_beta(
+            beta_tor_norm = normalized_beta(
                 energy_mhd,
                 signals["volume"],
                 signals["aminor"],
@@ -270,10 +256,10 @@ class D3DMethods:
         energy_mhd_on_grid = signal_on_grid(
             efit_time, energy_mhd, params.times, EQUILIBRIUM_HOLD_FLOOR
         )
-        beta_n_on_grid = signal_on_grid(
-            efit_time, beta_n, params.times, EQUILIBRIUM_HOLD_FLOOR
+        beta_tor_norm_on_grid = signal_on_grid(
+            efit_time, beta_tor_norm, params.times, EQUILIBRIUM_HOLD_FLOOR
         )
-        return {"wmhd": energy_mhd_on_grid, "beta_n": beta_n_on_grid}
+        return {"wmhd": energy_mhd_on_grid, "beta_tor_norm": beta_tor_norm_on_grid}
 
     @staticmethod
     @physics_method(columns=["n_e_line_average"], tokamak=Tokamak.D3D)
@@ -305,28 +291,6 @@ class D3DMethods:
         density_time = density_time_ms / 1e3
         n_e_line_average = signal_on_grid(density_time, density, params.times)
         return {"n_e_line_average": n_e_line_average}
-
-    @staticmethod
-    @physics_method(columns=["p_ohm"], tokamak=Tokamak.D3D)
-    def get_ohmic_power(params: PhysicsMethodParams):
-        """Ohmic power [W] from the DISPY EFIT: poh = Ip V_surf - dW_pol/dt, with V_surf = -2 pi dpsi_bdy/dt.
-
-        EFIT takes both derivatives as centered least-squares slopes over +-100 ms,
-        so poh is smoothed non-causally at the source and is not smoothed further.
-        Replaces the built-in get_ohmic_parameters,
-        whose 20 kHz vloopb with a 0.55 ms median filter is noise at 1 kHz.
-
-        Args:
-            params: disruption-py physics method parameters for the shot.
-
-        Returns:
-            {"p_ohm": (n_t,)} on the timebase.
-        """
-        efit_time, signals = _efit_signals(params, ["poh"])
-        p_ohm = signal_on_grid(
-            efit_time, signals["poh"], params.times, EQUILIBRIUM_HOLD_FLOOR
-        )
-        return {"p_ohm": p_ohm}
 
     @staticmethod
     @physics_method(columns=["p_rad"], tokamak=Tokamak.D3D)
@@ -366,9 +330,9 @@ class D3DMethods:
         Returns:
             {"p_nbi", "p_ech": (n_t,)} on the timebase.
         """
-        p_nbi_kW = _injected_power(params, r"\top.nb:pinj", "d3d")
+        p_nbi_kW = injected_power(params, r"\top.nb:pinj", "d3d", time_scale=1e-3)
         p_nbi = p_nbi_kW * 1e3
-        p_ech = _injected_power(params, r"\top.ech.total:echpwrc", "rf")
+        p_ech = injected_power(params, r"\top.ech.total:echpwrc", "rf", time_scale=1e-3)
         return {"p_nbi": p_nbi, "p_ech": p_ech}
 
     @staticmethod
@@ -418,10 +382,16 @@ class D3DMethods:
             r"\top.results.geqdsk:rzero", tree_name="_efit_tree"
         )
         rcentr = float(np.nanmedian(rcentr_slices))
-        limiter = params.mds_conn.get_data(
-            r"\top.results.geqdsk:lim", tree_name="_efit_tree"
+        limiter = np.asarray(
+            params.mds_conn.get_data(
+                r"\top.results.geqdsk:lim", tree_name="_efit_tree"
+            ),
+            dtype=float,
         )
-        limiter_rows = np.asarray(limiter, dtype=float).reshape(-1, 2)
+        # (n, 2) rows of R and Z, whichever way the tree lays them out
+        if limiter.ndim == 2 and limiter.shape[0] == 2 and limiter.shape[1] != 2:
+            limiter = limiter.T
+        limiter_rows = limiter.reshape(-1, 2)
 
         # Every one of these is needed to build a GEQDSK.
         # A missing node raises here, and disruption-py fills this method's columns with NaN.
@@ -435,24 +405,16 @@ class D3DMethods:
         for values in geqdsk_data.values():
             values[~mask_valid] = np.nan
 
-        cocos_input = cocos_from_signs(
-            geqdsk_data["current"],
-            geqdsk_data["bcentr"],
-            geqdsk_data["simagx"],
-            geqdsk_data["sibdry"],
-            geqdsk_data["qpsi"],
-            params.logger,
-        )
         geqdsk_data["psirz"] = geqdsk_data["psirz"].astype(np.float32)
-        ds_geqdsk = make_geqdsk_dataset(
-            shot_id=params.shot_id,
-            times=efit_time,
-            r_grid=r_grid,
-            z_grid=z_grid,
-            cocos_input=cocos_input,
-            rcentr=rcentr,
-            rlim=limiter_rows[:, 0],
-            zlim=limiter_rows[:, 1],
-            **geqdsk_data,
+        ds_geqdsk = assemble_geqdsk_dataset(
+            params.shot_id,
+            efit_time,
+            r_grid,
+            z_grid,
+            rcentr,
+            geqdsk_data,
+            limiter_rows[:, 0],
+            limiter_rows[:, 1],
+            params.logger,
         )
         return snap_to_grid(ds_geqdsk, params.times)

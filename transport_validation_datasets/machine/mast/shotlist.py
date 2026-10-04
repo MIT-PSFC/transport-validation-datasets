@@ -31,9 +31,12 @@ from loguru import logger
 
 from transport_validation_datasets.machine.generic import (
     EQ_MATCH_MAX_PERIODS,
+    MIN_PSI_RANGE,
     end_of_shot_index,
+    geqdsk_psi_n_grid,
     keep_longest_segment,
     kept_span,
+    mappable_q_profiles,
     rho_tor_norm_from_psi_n,
     signal_on_grid,
 )
@@ -141,6 +144,8 @@ def _chord_rho_tor_norm_min(
     mask_on_chord = (r_grid >= np.nanmin(ts_r)) & (r_grid <= np.nanmax(ts_r))
     psi_n_chord = (psi_chord[:, mask_on_chord] - psi_axis[:, None]) / psi_range[:, None]
     qpsi = np.asarray(efm["qpsi_c"].transpose("time", "psi_norm").values, dtype=float)
+    # A q profile that changes sign has no Phi_N map (phi_n_map)
+    q_mappable = mappable_q_profiles(geqdsk_psi_n_grid(qpsi.shape[1]), qpsi)
     sol_extension = MASTSettings().sol_extension
 
     rho_min = np.full(eq_time.size, np.nan)
@@ -148,9 +153,9 @@ def _chord_rho_tor_norm_min(
         if (
             not mask_on_chord.any()
             or not np.isfinite(psi_range[i])
-            or np.abs(psi_range[i]) < 1e-10
+            or np.abs(psi_range[i]) < MIN_PSI_RANGE
             or not np.all(np.isfinite(psi_n_chord[i]))
-            or not np.all(np.isfinite(qpsi[i]))
+            or not q_mappable[i]
         ):
             continue
         psi_n_min = psi_n_chord[i].min()
@@ -217,11 +222,7 @@ def _scan_shot(shot: int) -> dict | None:
     if pulse_length < MASTDataWorkflow.min_pulse_length:
         return {**row, "reason": "Plasma current window too short."}
 
-    try:
-        eq_time, rho_min = _chord_rho_tor_norm_min(sources.efm, sources.ds_thomson)
-    except Exception as e:
-        logger.warning(f"Shot {shot}: failed to read the equilibrium: {e}")
-        return None
+    eq_time, rho_min = _chord_rho_tor_norm_min(sources.efm, sources.ds_thomson)
     if not np.isfinite(rho_min).any():
         # Also where qpsi_c is NaN
         return {**row, "reason": "No usable reconstruction on the chord."}

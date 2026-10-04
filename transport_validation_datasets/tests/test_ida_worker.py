@@ -9,7 +9,11 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     ShotFitInput,
     default_fit_bounds,
 )
-from transport_validation_datasets.gp_fitting.worker_ida import fit_batch
+from transport_validation_datasets.gp_fitting.worker_ida import (
+    GRADIENT_ERROR_FLOOR,
+    GRADIENT_ERROR_FRACTION,
+    fit_batch,
+)
 
 X_STAR = np.linspace(0.0, 1.6, 81)
 # IDA points stop at rho_tor_norm 1.2, inside the fit grid
@@ -58,10 +62,19 @@ def test_parabola_carried_with_errors_and_nan_past_the_points():
     interior = (X_STAR > 0.0) & (X_STAR < 1.15)
     te_gradient_expected = -2.0 * X_STAR[interior]
     assert np.allclose(output.te_grad[0, interior], te_gradient_expected, atol=1e-3)
-    # Independent errors: sqrt(2) sigma over the central-difference span
-    x_step = X_STAR[1] - X_STAR[0]
-    gradient_error_expected = np.sqrt(2.0) * POINT_ERROR / (2.0 * x_step)
+    # The stand-in: a tenth of |gradient|, floored, so the floor binds inside x = 0.5 and the fraction outside
+    gradient_error_expected = np.maximum(
+        GRADIENT_ERROR_FRACTION * np.abs(output.te_grad[0, interior]),
+        GRADIENT_ERROR_FLOOR["te"],
+    )
     assert np.allclose(output.te_grad_std[0, interior], gradient_error_expected)
+    assert (
+        output.te_grad_std[0, interior & (X_STAR < 0.4)] == GRADIENT_ERROR_FLOOR["te"]
+    ).all()
+    assert (
+        output.te_grad_std[0, interior & (X_STAR > 0.6)] > GRADIENT_ERROR_FLOOR["te"]
+    ).all()
+    assert np.isnan(output.te_grad_std[0, ~inside]).all()
 
 
 def test_row_with_too_few_points_is_skipped():

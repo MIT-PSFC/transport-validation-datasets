@@ -36,12 +36,17 @@ MAX_HYP_RETRIES = 2
 # The cleaning module's rough reference fit runs fewer (only an outlier-judging reference).
 NRESTARTS = 8
 # mkgp's default optimizer, gradient ascent in log10 space with a gain of 1e-5,
-# stops once a step changes the LML by under the 1e-2 tolerance.
+# stops once a step changes the LML by under OPTIMIZER_LML_TOLERANCE.
 # Adam scales each step per hyperparameter, so every one moves ~eta decades a step.
 # On 60 sampled MAST probe slices it reached a higher LML on 44 and a lower one on 6,
-# at ~1.4x the fit time (scratch/agent/tune_fitting/optimizer_compare.py).
+# at ~1.4x the fit time.
 OPTIMIZER_METHOD = "adam"
 OPTIMIZER_SPARS = [1.0e-2, 0.9, 0.999]  # eta, beta1, beta2
+# The ascent stops once a step changes the LML by less than this (mkgp epsilon).
+OPTIMIZER_LML_TOLERANCE = 1.0e-2
+# Weight of mkgp's kernel-complexity penalty in the LML (mkgp regpar, its default).
+# Kept explicit so the fit does not move with mkgp's default.
+LML_COMPLEXITY_PENALTY = 1.0
 # Ascents from good starts converge in 30-60 adam steps.
 # Random restarts from poor ones crawl to mkgp's cap of 500 without reaching a better LML,
 # and set the fit time. A cap of 100 found the same hyperparameters on 4 MAST slices in a third of the time.
@@ -144,10 +149,11 @@ def run_gp(
         )
 
     # The short-core start has no random restarts, so it runs once, outside the reseeded attempts
+    # A NaN LML never becomes the best, a NaN fit is no fit
     best_gp, best_lml = None, -np.inf
     gp_short = _fit_from_start(data, kbounds, pedestal_rho, HYP_START_SHORT_CORE, 0)
     lml_short = None if gp_short is None else gp_short.get_gp_lml()
-    if lml_short is not None:
+    if lml_short is not None and np.isfinite(lml_short):
         best_gp, best_lml = gp_short, lml_short
     for attempt in range(1 + hyp_retries):
         # Seed the random restarts from the fit's own inputs,
@@ -159,7 +165,7 @@ def run_gp(
         if gp is None:
             continue
         lml = gp.get_gp_lml()
-        if lml is not None and lml > best_lml:
+        if lml is not None and np.isfinite(lml) and lml > best_lml:
             best_gp, best_lml = gp, lml
         if best_gp is None:
             continue
@@ -194,7 +200,7 @@ def _fit_from_start(
     xdata, ydata, yerr, grad_bc, x_eval = data
     gp = GaussianProcess()
     kernel = build_kernel(pedestal_rho, start)
-    gp.set_kernel(kernel=kernel, kbounds=kbounds, regpar=1.0)
+    gp.set_kernel(kernel=kernel, kbounds=kbounds, regpar=LML_COMPLEXITY_PENALTY)
     gp.set_raw_data(
         xdata=xdata,
         ydata=ydata,
@@ -205,7 +211,7 @@ def _fit_from_start(
     )
     gp.set_conditioner(condnum=MKGP_BLEND_DX)
     gp.set_search_parameters(
-        epsilon=1.0e-2,
+        epsilon=OPTIMIZER_LML_TOLERANCE,
         method=OPTIMIZER_METHOD,
         spars=OPTIMIZER_SPARS,
         maxiter=OPTIMIZER_MAXITER,
@@ -316,7 +322,6 @@ def fit_profile(
             hyperparams=hyps_out,
             optimize=False,
             extra_grad_bc=mono_bc,
-            seed_salt=seed_salt,
         )
         if gp_mono is None:
             break

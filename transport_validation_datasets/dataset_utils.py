@@ -21,124 +21,92 @@ def build_tensorized_dataset(
     zarr_path: Path | str,
     time_dim: str,
     episode_dim: str,
-    extend_existing: bool = False,
-    episodes_per_chunk: int | None = None,
+    dim_sizes: dict[str, int],
     mb_per_chunk: int | None = 10,
-    dim_sizes: dict[str, int] | None = None,
 ) -> xr.Dataset:
     """Build a tensorized multi-episode dataset from one-episode datasets.
 
     process_fn is called on one identifier at a time and returns that episode's
     dataset (or None to skip it). Each returned episode is appended to the Zarr
     store immediately, so peak memory is one episode, not the whole dataset.
-    An episode that raises is logged and skipped, not fatal: a single unreadable
-    shot does not lose the rest of the run.
+    An episode that raises is logged with its traceback and skipped, not fatal:
+    a single unreadable shot does not lose the rest of the run.
 
     Args:
         process_fn: Turns one identifier into that episode's dataset, or None
             to skip the episode.
         identifiers: Episode identifiers, passed to process_fn one by one.
-        zarr_path: Path of the Zarr store to write, must end in .zarr.
+        zarr_path: Path of the Zarr store to write, must end in .zarr and not exist.
         time_dim: Name of the per-episode time dimension.
         episode_dim: Name of the dimension episodes are stacked along.
-        extend_existing: Append to the store at zarr_path if it already exists,
-            instead of refusing to touch it.
-        episodes_per_chunk: Episodes per storage chunk, the same for every variable.
-            Mutually exclusive with mb_per_chunk.
-            None with mb_per_chunk None leaves the chunking alone.
-        mb_per_chunk: Target size of each variable's chunks.
-            Each variable gets its own episodes per chunk from its own size per episode,
-            so a 0D signal packs many more episodes into a chunk than a 2D map.
-            Mutually exclusive with episodes_per_chunk.
         dim_sizes: Upper bound per non-episode dimension. Every episode is
             padded to these sizes before being written, so the store never has
             to be extended (which rewrites the chunks of every episode already
             written). Slack is trimmed during the rechunking pass.
+        mb_per_chunk: Target size of each variable's chunks.
+            Each variable gets its own episodes per chunk from its own size per episode,
+            so a 0D signal packs many more episodes into a chunk than a 2D map.
+            None leaves the chunking alone.
 
     Returns:
         The assembled dataset, opened from the finished store.
 
     Raises:
-        ValueError: If zarr_path does not end in .zarr, if it exists and
-            extend_existing is False, or if both chunking options were given.
+        ValueError: If zarr_path does not end in .zarr or already exists.
+        RuntimeError: If no episode was written.
     """
     zarr_path = Path(zarr_path)
     if zarr_path.suffix != ".zarr":
         raise ValueError(f"zarr_path must end with .zarr, got {zarr_path}")
-    if zarr_path.exists() and not extend_existing:
-        raise ValueError(
-            f"Zarr store at {zarr_path} already exists and extend_existing is False. "
-            "Remove it or pass extend_existing=True."
-        )
-    if mb_per_chunk is not None and episodes_per_chunk is not None:
-        raise ValueError("Pass either mb_per_chunk or episodes_per_chunk, not both.")
+    if zarr_path.exists():
+        raise ValueError(f"Zarr store at {zarr_path} already exists, remove it first.")
 
     zarr_path.parent.mkdir(parents=True, exist_ok=True)
 
     n_written = 0
-    # Size of time_dim in the store, tracked here so every episode does not
-    # have to reopen the store to find it.
-    store_time_dim_size = None
+    n_skipped = 0
     for identifier in identifiers:
         try:
             ds = process_fn(identifier)
-        except Exception as exception:
-            logger.warning(f"Error processing {identifier}: {exception}")
+        except Exception:
+            logger.opt(exception=True).warning(
+                f"Error processing {identifier}, skipping it"
+            )
+            n_skipped += 1
             continue
         if ds is None:
             continue
 
-        add_to_zarr_store(
-            ds,
-            zarr_path,
-            time_dim,
-            episode_dim,
-            store_time_dim_size=store_time_dim_size,
-            dim_sizes=dim_sizes,
-        )
-        if store_time_dim_size is None:
-            store_time_dim_size = xr.open_zarr(zarr_path, consolidated=True).sizes[
-                time_dim
-            ]
-        else:
-            store_time_dim_size = max(store_time_dim_size, ds.sizes[time_dim])
+        add_to_zarr_store(ds, zarr_path, time_dim, episode_dim, dim_sizes)
         n_written += 1
         del ds
 
+    if n_skipped:
+        logger.warning(f"Skipped {n_skipped} episodes that raised while processing")
     if n_written == 0:
-        logger.warning(f"No episodes were written to {zarr_path}")
-        if extend_existing and zarr_path.exists():
-            return xr.open_zarr(zarr_path, consolidated=None)
-        return xr.Dataset()
+        raise RuntimeError(f"No episodes were written to {zarr_path}")
 
     logger.info(f"Wrote {n_written} episodes to {zarr_path}, now chunking it")
     ds = xr.open_zarr(zarr_path, consolidated=True)
+    if mb_per_chunk is None:
+        return ds
 
-    # Drop the padding slack left by dim_sizes. Only worth doing when a
-    # rechunking pass is going to rewrite the store anyway.
-    if dim_sizes is not None and (
-        mb_per_chunk is not None or episodes_per_chunk is not None
-    ):
-        for dim in dim_sizes:
-            if dim in ds.dims and dim != episode_dim:
-                ds = trim_trailing_nan_slices(ds, dim)
+    # Drop the padding slack left by dim_sizes, the rechunking pass rewrites the store anyway
+    for dim in dim_sizes:
+        if dim in ds.dims and dim != episode_dim:
+            ds = trim_trailing_nan_slices(ds, dim)
 
-    if mb_per_chunk is not None or episodes_per_chunk is not None:
-        chunk_specs = episode_chunk_specs(
-            ds, episode_dim, mb_per_chunk, episodes_per_chunk
-        )
+    chunk_specs = episode_chunk_specs(ds, episode_dim, mb_per_chunk)
 
-        # Write the rechunked store beside the old one, then swap, so a crash
-        # mid-rewrite leaves the original store intact.
-        tmp_path = zarr_path.with_suffix(".zarr.tmp")
-        if tmp_path.exists():
-            shutil.rmtree(tmp_path)
-        write_rechunked_store(ds, tmp_path, episode_dim, chunk_specs)
-        ds.close()
-        shutil.rmtree(zarr_path)
-        os.rename(tmp_path, zarr_path)
-
-    zarr.consolidate_metadata(zarr_path)
+    # Write the rechunked store beside the old one, then swap, so a crash
+    # mid-rewrite leaves the original store intact.
+    tmp_path = zarr_path.with_suffix(".zarr.tmp")
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+    write_rechunked_store(ds, tmp_path, episode_dim, chunk_specs)
+    ds.close()
+    shutil.rmtree(zarr_path)
+    os.rename(tmp_path, zarr_path)
     return xr.open_zarr(zarr_path, consolidated=True)
 
 
@@ -180,51 +148,31 @@ def trim_trailing_nan_slices(ds: xr.Dataset, dim: str) -> xr.Dataset:
     return ds
 
 
-def extend_zarr_along_dim(zarr_path: Path | str, dim: str, n_extend: int):
-    """Extend an existing Zarr store along one dimension, NaN padding the new slots.
-
-    Args:
-        zarr_path: Path of the Zarr store.
-        dim: Dimension to extend.
-        n_extend: Number of slots to add.
-    """
-    ds = xr.open_zarr(zarr_path, consolidated=True)
-    ds = ds.pad({dim: (0, n_extend)})
-    ds_padding = ds.isel({dim: slice(-n_extend, None)})
-    # Pulled into memory to keep dask out of the append path
-    ds_padding = ds_padding.compute()
-    ds_padding.to_zarr(
-        zarr_path, mode="a-", append_dim=dim, consolidated=True, align_chunks=True
-    )
-
-
 def add_to_zarr_store(
     ds: xr.Dataset,
     zarr_path: Path | str,
     time_dim: str,
     episode_dim: str,
-    store_time_dim_size: int | None = None,
-    dim_sizes: dict[str, int] | None = None,
+    dim_sizes: dict[str, int],
 ):
     """Append one episode to a Zarr store, creating the store if it is not there.
 
-    The episode is NaN padded (or the store extended) so that every non-episode
-    dimension lines up with what is already in the store.
+    The episode is NaN padded so that every non-episode dimension lines up
+    with what is already in the store, the store itself is never extended.
 
     Args:
         ds: One episode's dataset.
         zarr_path: Path of the Zarr store.
         time_dim: Name of the per-episode time dimension.
         episode_dim: Name of the dimension episodes are stacked along.
-        store_time_dim_size: Size of time_dim in the store, if the caller is
-            already tracking it. None reads it from the store instead.
         dim_sizes: Upper bound per non-episode dimension, see
             build_tensorized_dataset.
 
     Raises:
         ValueError: If ds holds more than one episode, exceeds a dim_sizes
-            bound, carries a dimension the store does not have, or does not
-            carry exactly the store's variables.
+            bound or the store's size of a dimension, carries a dimension the
+            store does not have, does not carry exactly the store's variables,
+            or gives a non-episode coordinate other values than the store holds.
     """
     zarr_path = Path(zarr_path)
 
@@ -254,61 +202,90 @@ def add_to_zarr_store(
             ds[var] = ds[var].expand_dims(episode_dim)
 
     # Pad up to the caller's upper bounds so the store never needs extending
-    if dim_sizes:
-        pad_to_bound = {}
-        for dim, target_size in dim_sizes.items():
-            if dim not in ds.dims or dim == episode_dim:
-                continue
-            if ds.sizes[dim] > target_size:
-                raise ValueError(
-                    f"Dimension {dim} has size {ds.sizes[dim]}, over the dim_sizes "
-                    f"bound of {target_size}. dim_sizes must cover the largest episode."
-                )
-            if ds.sizes[dim] < target_size:
-                pad_to_bound[dim] = (0, target_size - ds.sizes[dim])
-        ds = _pad(ds, pad_to_bound)
+    pad_to_bound = {}
+    for dim, target_size in dim_sizes.items():
+        if dim not in ds.dims or dim == episode_dim:
+            continue
+        if ds.sizes[dim] > target_size:
+            raise ValueError(
+                f"Dimension {dim} has size {ds.sizes[dim]}, over the dim_sizes "
+                f"bound of {target_size}. dim_sizes must cover the largest episode."
+            )
+        if ds.sizes[dim] < target_size:
+            pad_to_bound[dim] = (0, target_size - ds.sizes[dim])
+    ds = _pad(ds, pad_to_bound)
 
     if not zarr_path.exists():
         logger.info(f"Creating Zarr store at {zarr_path}")
+        # consolidated=True writes the consolidated metadata on close, every append below does the same
         ds.to_zarr(zarr_path, mode="w", consolidated=True)
         return
 
-    ds_store = xr.open_zarr(zarr_path, consolidated=True)
+    with xr.open_zarr(zarr_path, consolidated=True) as ds_store:
+        # Appending a variable the store does not have creates it with a single
+        # episode, leaving conflicting episode-dim sizes that break every later open
+        store_vars = set(ds_store.data_vars)
+        ds_vars = set(ds.data_vars)
+        if ds_vars != store_vars:
+            raise ValueError(
+                f"Variable mismatch with the store at {zarr_path}: "
+                f"missing from the episode {sorted(store_vars - ds_vars)}, "
+                f"new in the episode {sorted(ds_vars - store_vars)}. "
+                "Every episode must carry the same variables."
+            )
 
-    # Appending a variable the store does not have creates it with a single
-    # episode, leaving conflicting episode-dim sizes that break every later open
-    store_vars = set(ds_store.data_vars)
-    ds_vars = set(ds.data_vars)
-    if ds_vars != store_vars:
-        raise ValueError(
-            f"Variable mismatch with the store at {zarr_path}: "
-            f"missing from the episode {sorted(store_vars - ds_vars)}, "
-            f"new in the episode {sorted(ds_vars - store_vars)}. "
-            "Every episode must carry the same variables."
-        )
-
-    pad_dims = {}
-    extend_dims = {}
-    for dim in set(ds.dims) - {episode_dim}:
-        if dim not in ds_store.dims:
-            raise ValueError(f"Dimension {dim} is not in the store at {zarr_path}.")
-        if dim == time_dim and store_time_dim_size is not None:
-            store_dim_size = store_time_dim_size
-        else:
+        pad_dims = {}
+        for dim in set(ds.dims) - {episode_dim}:
+            if dim not in ds_store.dims:
+                raise ValueError(f"Dimension {dim} is not in the store at {zarr_path}.")
             store_dim_size = ds_store.sizes[dim]
-        if ds.sizes[dim] < store_dim_size:
-            pad_dims[dim] = (0, store_dim_size - ds.sizes[dim])
-        elif ds.sizes[dim] > store_dim_size:
-            extend_dims[dim] = ds.sizes[dim] - store_dim_size
-
-    for dim, n_extend in extend_dims.items():
-        extend_zarr_along_dim(zarr_path, dim, n_extend)
-    ds = _pad(ds, pad_dims)
+            if ds.sizes[dim] > store_dim_size:
+                raise ValueError(
+                    f"Dimension {dim} has size {ds.sizes[dim]}, over the store's "
+                    f"{store_dim_size} at {zarr_path}. dim_sizes must cover the largest episode."
+                )
+            if ds.sizes[dim] < store_dim_size:
+                pad_dims[dim] = (0, store_dim_size - ds.sizes[dim])
+        ds = _pad(ds, pad_dims)
+        _check_coordinates_match(ds, ds_store, episode_dim, zarr_path)
 
     # a- appends only to the variables that carry episode_dim
     ds.to_zarr(zarr_path, mode="a-", append_dim=episode_dim, consolidated=True)
-    # Stale consolidated metadata breaks later opens, so re-consolidate every time
-    zarr.consolidate_metadata(zarr_path)
+
+
+def _check_coordinates_match(
+    ds: xr.Dataset, ds_store: xr.Dataset, episode_dim: str, zarr_path: Path
+):
+    """Refuse an episode whose non-episode coordinates differ from the store's.
+
+    An append never rewrites a coordinate without the episode dimension,
+    so an episode on another grid (an R grid, a rho_tor_norm grid) would be
+    stored under the first episode's values, silently misplacing it.
+    Compared after padding, so the episode's grid must match the store's slot for slot.
+
+    Args:
+        ds: The padded episode.
+        ds_store: The open store.
+        episode_dim: Name of the dimension episodes are stacked along.
+        zarr_path: Path of the store, for the message.
+
+    Raises:
+        ValueError: If a coordinate differs (NaN padding counts as equal to NaN).
+    """
+    for name in ds.coords:
+        if name == episode_dim or name not in ds_store.coords:
+            continue
+        episode_values = np.asarray(ds[name].values)
+        store_values = np.asarray(ds_store[name].values)
+        if episode_values.dtype.kind in "fc" and store_values.dtype.kind in "fc":
+            same = np.array_equal(episode_values, store_values, equal_nan=True)
+        else:
+            same = np.array_equal(episode_values, store_values)
+        if not same:
+            raise ValueError(
+                f"Coordinate {name} of the episode differs from the store's at {zarr_path}. "
+                "Every episode must sit on the store's grids."
+            )
 
 
 def _set_integer_fill_values(ds: xr.Dataset) -> xr.Dataset:
@@ -369,8 +346,7 @@ def _pad(ds: xr.Dataset, pad_widths: dict[str, tuple[int, int]]) -> xr.Dataset:
 def episode_chunk_specs(
     ds: xr.Dataset,
     episode_dim: str,
-    mb_per_chunk: float | None = None,
-    episodes_per_chunk: int | None = None,
+    mb_per_chunk: float,
 ) -> dict[Hashable, dict[str, int]]:
     """Chunk sizes for every variable, chunking across episodes only.
 
@@ -382,8 +358,6 @@ def episode_chunk_specs(
         episode_dim: Name of the dimension episodes are stacked along.
         mb_per_chunk: Target size of each variable's chunks,
             divided by the variable's own size per episode.
-        episodes_per_chunk: Episodes per chunk, the same for every variable.
-            Used only when mb_per_chunk is None.
 
     Returns:
         Chunk size per dimension, per variable, for zarr_chunk.
@@ -392,12 +366,9 @@ def episode_chunk_specs(
     chunk_specs = {}
     var_names_by_episodes_per_chunk = {}
     for name in ds.data_vars:
-        if mb_per_chunk is not None:
-            mb_per_episode = ds[name].nbytes / n_episodes / (1024 * 1024)
-            var_episodes_per_chunk = int(mb_per_chunk / mb_per_episode)
-            var_episodes_per_chunk = min(max(1, var_episodes_per_chunk), n_episodes)
-        else:
-            var_episodes_per_chunk = episodes_per_chunk
+        mb_per_episode = ds[name].nbytes / n_episodes / (1024 * 1024)
+        var_episodes_per_chunk = int(mb_per_chunk / mb_per_episode)
+        var_episodes_per_chunk = min(max(1, var_episodes_per_chunk), n_episodes)
         chunk_specs[name] = dict(ds[name].sizes) | {episode_dim: var_episodes_per_chunk}
         var_names_by_episodes_per_chunk.setdefault(var_episodes_per_chunk, []).append(
             name
@@ -436,9 +407,9 @@ def write_rechunked_store(
     ds.to_zarr(zarr_path, mode="w-", consolidated=True, compute=False)
     n_episodes = ds.sizes[episode_dim]
     for name, chunk_spec in chunk_specs.items():
-        episodes_per_chunk = chunk_spec[episode_dim]
-        for start in range(0, n_episodes, episodes_per_chunk):
-            region = slice(start, min(start + episodes_per_chunk, n_episodes))
+        chunk_episodes = chunk_spec[episode_dim]
+        for start in range(0, n_episodes, chunk_episodes):
+            region = slice(start, min(start + chunk_episodes, n_episodes))
             variable_block = ds[name].variable.isel({episode_dim: region})
             variable_block = variable_block.compute()
             ds_block = xr.Dataset({name: variable_block})

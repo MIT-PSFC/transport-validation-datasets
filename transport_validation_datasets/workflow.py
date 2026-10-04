@@ -1,5 +1,4 @@
 import json
-import os
 import shutil
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +25,7 @@ from transport_validation_datasets.filters import (
     clip_powers,
     energy_sanity_reason,
     mask_spans,
+    ohmic_power_sign_reason,
     radiated_fraction_reason,
     slice_filter_mask,
 )
@@ -42,10 +42,11 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     FitBatch,
     ShotFitInput,
     ShotFitOutput,
+    atomic_write,
+    batch_settings,
     default_fit_bounds,
+    fit_batch_settings,
     pack_fit_batch,
-    read_batch_anchors,
-    read_batch_setting,
     read_batch_shots,
     read_batch_windows,
     unpack_fit_batch,
@@ -58,6 +59,7 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
     MAX_HOLD_PERIODS,
+    POWER_OHM_DESCRIPTION,
     POWER_SMOOTHING_WINDOW,
     PROFILE_MAX_HOLD,
     SOL_EXTENSIONS,
@@ -65,6 +67,7 @@ from transport_validation_datasets.machine.generic import (
     keep_longest_segment,
     kept_segments,
     kept_span,
+    ohmic_power_on_grid,
     reconstruction_clock_period,
     standardize_signal_attrs,
     usable_reconstructions,
@@ -110,11 +113,19 @@ RHO_TOR_NORM_DEFINITION = (
 # The fit files, the stores and the IMAS export keep only the grid up to here.
 STORED_RHO_TOR_NORM_MAX = 1.1
 
+# How _check_batch names the fit settings of batch_io.batch_settings in its messages
+FIT_SETTING_NAMES = {
+    "fit_mode": "fit mode",
+    "sol_extension": "SOL extension",
+    "pedestal_rho_tor_norm": "pedestal location",
+    "x_star": "fit grid",
+}
+
 # Per-slice fit statuses that count as a usable profile, see gp_fitting.batch_io.
 USABLE_FIT_STATUSES = (STATUS_OK, STATUS_REPAIRED)
 
 # A slice whose fitted te at the LCFS is above this fraction of its peak is unusable, see usable_slice_mask.
-# In it11 no C-Mod slice goes above 0.25 and 99 percent of MAST slices stay below 0.15.
+# No C-Mod slice goes above 0.25 and 99 percent of MAST slices stay below 0.15.
 FLAT_TE_EDGE_RATIO = 0.4
 
 
@@ -242,6 +253,7 @@ class DataWorkflow(ABC):
 
     1. make_unprocessed_data_files:
       pull each shot from the device's source (get_source_dataset),
+      derive power_ohm from its equilibrium block (add_ohmic_power),
       filter it down to the regions of validity (filter_and_plot),
       and write one netCDF plus one plot per shot.
     2. run_gp_fitting:
@@ -275,7 +287,7 @@ class DataWorkflow(ABC):
         """Minimum thresholds, a grid time where a listed signal is below its threshold is cut out as a gap.
 
         ip is compared as its magnitude, and its threshold also sets the end of the shot (end_of_shot_index).
-        The signals are those of _filter_inputs.
+        The signals are those of filters.filter_inputs.
 
         Returns:
             Thresholds for signals, e.g. {"ip": 1e5}.
@@ -287,7 +299,7 @@ class DataWorkflow(ABC):
         """Maximum thresholds on the raw samples, a grid time where a listed signal is above its threshold is cut out as a gap.
 
         For records that are broken or extreme, unlike the smoothed transient_filter.
-        The signals are those of _filter_inputs, greenwald_fraction included.
+        The signals are those of filters.filter_inputs, greenwald_fraction included.
 
         Returns:
             Thresholds for signals, e.g. {"greenwald_fraction": 2.0}.
@@ -373,7 +385,7 @@ class DataWorkflow(ABC):
     # GP fit staging knobs
     fit_rho_tor_norm = np.linspace(0.0, 1.6, 81)
     fit_min_points = 10
-    fit_scale_per_slice = False
+    fit_scale_per_slice = True
     fit_bounds = default_fit_bounds()
 
     # The fit methods (gp_fitting.registry) this device's profiles may be fit with.
@@ -435,7 +447,7 @@ class DataWorkflow(ABC):
         Raises:
             TypeError: If settings is not an instance of the device's settings_cls.
             ValueError: If fit_method is not one of the device's fit_methods,
-                or average_windows is set without a windowed shotlist.
+                or average_windows is set without a windowed shotlist or on a prefit_profiles device.
         """
         if fit_method is None:
             fit_method = self.fit_methods[0]
@@ -480,10 +492,10 @@ class DataWorkflow(ABC):
         # sit side by side rather than overwriting each other.
         self.fit_shots_dir = self.fit_results_dir / fit_method
         self.fit_plots_dir = self.fit_results_dir / "ts_fits" / fit_method
-        # Optional; only touched by export_to_imas(), which needs the
+        # Only touched by export_to_imas(), which needs the
         # `imas` extra (imas-python, eqdsk). One subdirectory
         # per shot, scoped by fit method like fit_shots_dir, since the
-        # exported profiles/Zeff/impurity composition all derive from that
+        # exported profiles, Zeff and impurity composition all derive from that
         # method's fit output.
         self.imas_export_dir = self.data_assembly_dir / "imas_export" / fit_method
 
@@ -523,8 +535,12 @@ class DataWorkflow(ABC):
 
         if average_windows and self.shot_windows is None:
             raise ValueError(
-                "average_windows needs a shotlist with time windows (a CSV with t_start and t_end columns),"
+                "average_windows needs a shotlist with time windows (a CSV with t_start and t_end columns), "
                 "there is nothing to average over without them"
+            )
+        if average_windows and self.prefit_profiles:
+            raise ValueError(
+                f"{type(self).__name__} stages fitted profiles, which cannot be pooled over a window"
             )
         if self.shot_windows is None:
             self.fit_mode = FIT_MODE_SAMPLE
@@ -654,7 +670,8 @@ class DataWorkflow(ABC):
         """Read one shot from the device's source into standardized signals.
 
         Everything the datasets need, under the standardized names, on
-        the shot's uniform 1 kHz timebase. Filtering, plotting, and writing are
+        the shot's uniform 1 kHz timebase, except power_ohm, which add_ohmic_power
+        derives from the GEQDSK block. Filtering, plotting, and writing are
         make_unprocessed_data_files' job.
 
         Args:
@@ -667,6 +684,31 @@ class DataWorkflow(ABC):
             the shot; a transient read failure should only be logged, so that
             the next run retries it.
         """
+
+    def add_ohmic_power(self, ds_standardized: xr.Dataset) -> xr.Dataset:
+        """Set power_ohm from the GEQDSK block (ohmic_power_on_grid), the same way on every device.
+
+        Replaces whatever the source gave, so a kept source pull is recomputed too.
+        A dataset without the block keeps the source's power_ohm.
+
+        Args:
+            ds_standardized: One shot's standardized dataset on (shot, time).
+
+        Returns:
+            The same dataset with power_ohm set.
+        """
+        if "psirz" not in ds_standardized:
+            return ds_standardized
+        ds_shot = ds_standardized.squeeze(EPISODE_DIM, drop=True)
+        power_ohm = ohmic_power_on_grid(ds_shot)
+        template = ds_standardized["ip"]
+        ds_standardized["power_ohm"] = xr.DataArray(
+            power_ohm.reshape(template.shape).astype(template.dtype), dims=template.dims
+        )
+        apply_signal_attrs(
+            ds_standardized, {"power_ohm": {"description": POWER_OHM_DESCRIPTION}}
+        )
+        return ds_standardized
 
     def make_unprocessed_data_files(self):
         """Pull data from source and filter down to regions of validity.
@@ -787,11 +829,11 @@ class DataWorkflow(ABC):
                     **source_provenance(ds_standardized.attrs),
                     **pull_provenance(),
                 }
-                self.source_data_dir.mkdir(parents=True, exist_ok=True)
-                ds_standardized.to_netcdf(source_pull_paths[shot])
+                atomic_write(source_pull_paths[shot], ds_standardized.to_netcdf)
             else:
                 ds_standardized = xr.load_dataset(source_pull_paths[shot])
                 logger.info(f"Shot {shot}: filtering the kept source pull")
+            ds_standardized = self.add_ohmic_power(ds_standardized)
             ds_unprocessed = self.filter_and_plot(ds_standardized)
             if ds_unprocessed is None:
                 logger.warning(
@@ -800,13 +842,11 @@ class DataWorkflow(ABC):
                 self.record_failed_shot(shot, self.filter_rejection_note())
                 continue
             ds_unprocessed = clip_powers(ds_unprocessed)
-            # What pulled the shot, the code that read it (pull_*), and what this package is now.
-            # The source's own stamp is rewritten, see provenance.SOURCE_ATTR_KEYS.
-            ds_unprocessed.attrs = {
-                **source_provenance(ds_unprocessed.attrs),
-                **build_provenance(),
-            }
-            ds_unprocessed.to_netcdf(self.unprocessed_data_dir / f"{shot}.nc")
+            # What pulled the shot, the code that read it (pull_*), and what this package is now
+            ds_unprocessed.attrs = {**ds_unprocessed.attrs, **build_provenance()}
+            atomic_write(
+                self.unprocessed_data_dir / f"{shot}.nc", ds_unprocessed.to_netcdf
+            )
             # A note from a run whose filters rejected the shot would miscount the rejections
             (self.failed_shots_dir / f"{shot}.txt").unlink(missing_ok=True)
             logger.info(f"Created unprocessed data file for shot {shot}.")
@@ -896,8 +936,7 @@ class DataWorkflow(ABC):
         )
 
         # Load-bearing broadcast: valid_mask carries the shot and time dims, so
-        # this also gives every static quantity (the limiter contour, the fixed
-        # grid extents, C-Mod's fixed channel positions) a time axis.
+        # this also gives every static quantity (the limiter contour, the fixed grid extents) a time axis.
         # The internal dataset carries them per slice like everything else, and
         # _hold_equilibrium indexes them by grid time.
         ds_filtered = ds_input.where(valid_mask, drop=True)
@@ -977,6 +1016,7 @@ class DataWorkflow(ABC):
         so a file written before a check existed is judged by the code as it is now.
         The checks, in order, are the shared ones of filters.py:
         a dead bolometer or more radiated than put in (radiated_fraction_reason, against min_ and max_radiated_fraction),
+        a negative ohmic power (ohmic_power_sign_reason),
         then a stored-energy rise the input power cannot explain (energy_sanity_reason).
         Both clip the powers themselves, so the clipped unprocessed file reaches the same verdict.
 
@@ -992,6 +1032,9 @@ class DataWorkflow(ABC):
         )
         if radiated_reason is not None:
             return radiated_reason
+        sign_reason = ohmic_power_sign_reason(ds_shot)
+        if sign_reason is not None:
+            return sign_reason
         return energy_sanity_reason(ds_shot)
 
     def excluded_shot_reason(self, shot: int) -> str | None:
@@ -1022,7 +1065,7 @@ class DataWorkflow(ABC):
         Each slice's ratio is the mean of the fitted n_e over rho_tor_norm in [0, 1]
         over n_e_line_average at the slice time.
         The shot median of the ratios must lie inside density_ratio_bounds.
-        The mean over rho stands in for the chord integral, whose geometry neither device records.
+        The mean over rho stands in for the chord integral, whose geometry no device records.
         Its offset from 1 depends on the chord and the profile shapes, which the per-device bounds absorb.
 
         Args:
@@ -1147,18 +1190,7 @@ class DataWorkflow(ABC):
         if self.cluster_config is None:
             self._fit_batches_local(batches)
         else:
-            from transport_validation_datasets.gp_fitting.dispatcher import (
-                ClusterFitDispatcher,
-            )
-
-            dispatcher = ClusterFitDispatcher(
-                self.cluster_config,
-                self.ds_name,
-                self.fit_batches_dir,
-                self.fit_method,
-                self.fit_job_logs_dir,
-            )
-            dispatcher.run(batches)
+            self._dispatcher().run(batches)
         self.write_fit_results()
         if not skip_plots:
             self.plot_fit_results(max_pages=max_pages)
@@ -1170,30 +1202,50 @@ class DataWorkflow(ABC):
         untouched. This method's fit result files and fit plots are deleted
         too: both are rebuilt from the new fits, and the plots would otherwise
         survive the rebuild (plot_fit_results skips shots whose PDF exists).
+        The staging failure notes go too, so a staging change is tried on every shot again.
         With a cluster_config this also cancels the dataset's queued jobs and
         clears its remote batch files, which a from-scratch cluster fit needs:
         otherwise the next run adopts the cancelled jobs or pulls back the
         leftover results (see ClusterFitDispatcher.clean).
         """
         if self.cluster_config is not None:
-            from transport_validation_datasets.gp_fitting.dispatcher import (
-                ClusterFitDispatcher,
-            )
-
-            dispatcher = ClusterFitDispatcher(
-                self.cluster_config,
-                self.ds_name,
-                self.fit_batches_dir,
-                self.fit_method,
-                self.fit_job_logs_dir,
-            )
-            dispatcher.clean()
+            self._dispatcher().clean()
         elif self.fit_batches_dir.exists():
             shutil.rmtree(self.fit_batches_dir)
-        for out_dir in (self.fit_shots_dir, self.fit_plots_dir):
+        for out_dir in (self.fit_shots_dir, self.fit_plots_dir, self.failed_fits_dir):
             if out_dir.exists():
                 shutil.rmtree(out_dir)
         logger.info(f"Cleaned fit staging state in {self.fit_batches_dir}")
+
+    def _dispatcher(self):
+        """The cluster dispatcher of this dataset's fits, see gp_fitting.dispatcher.
+
+        Returns:
+            A ClusterFitDispatcher on cluster_config.
+        """
+        from transport_validation_datasets.gp_fitting.dispatcher import (
+            ClusterFitDispatcher,
+        )
+
+        return ClusterFitDispatcher(
+            self.cluster_config,
+            self.ds_name,
+            self.fit_batches_dir,
+            self.fit_method,
+            self.fit_job_logs_dir,
+        )
+
+    def _staged_batch_paths(self) -> list[Path]:
+        """The staged batch inputs in fit_batches_dir, sorted, the result files left out.
+
+        Returns:
+            The batch input npz paths.
+        """
+        return [
+            in_path
+            for in_path in sorted(self.fit_batches_dir.glob("batch_*.npz"))
+            if "_out_" not in in_path.name
+        ]
 
     def stage_fit_batches(self, shots: list[int]) -> dict[str, list[int]]:
         """Stage fit inputs for the given shots into batch npz files.
@@ -1255,20 +1307,7 @@ class DataWorkflow(ABC):
                 shot_inputs[shot] = drop_rows_without_core(fit_input, shot)
             if not shot_inputs:
                 continue
-            pack_fit_batch(
-                in_path,
-                FitBatch(
-                    shot_inputs=shot_inputs,
-                    x_star=self.fit_rho_tor_norm,
-                    min_points=self.fit_min_points,
-                    scale_per_slice=self.fit_scale_per_slice,
-                    bounds=self.fit_bounds,
-                    anchors=self.fit_anchors,
-                    pedestal_rho_tor_norm=self.settings.pedestal_rho_tor_norm,
-                    sol_extension=self.settings.sol_extension,
-                    fit_mode=self.fit_mode,
-                ),
-            )
+            pack_fit_batch(in_path, self._fit_batch(shot_inputs))
             batches[batch_id] = sorted(shot_inputs)
             logger.info(f"Staged batch {batch_id} with {len(shot_inputs)} shots")
         return batches
@@ -1278,8 +1317,7 @@ class DataWorkflow(ABC):
 
         The dataset name, salted with the fit mode when windows are in play,
         so a windowed run never lines up with a per-sample batch of the same
-        shots, neither a local file nor a result or queued job on the
-        cluster. Plain per-sample runs keep the ids they always had.
+        shots, neither a local file nor a result or queued job on the cluster.
 
         Returns:
             The name to plan batches under.
@@ -1307,46 +1345,55 @@ class DataWorkflow(ABC):
                 "or build the dataset under another ds_name."
             )
 
+    def _fit_batch(self, shot_inputs: dict[int, ShotFitInput]) -> FitBatch:
+        """A batch of staged shots under this run's fit settings.
+
+        Args:
+            shot_inputs: Per-shot fit inputs, empty for the settings alone.
+
+        Returns:
+            The batch to pack or to compare settings against.
+        """
+        return FitBatch(
+            shot_inputs=shot_inputs,
+            x_star=self.fit_rho_tor_norm,
+            min_points=self.fit_min_points,
+            scale_per_slice=self.fit_scale_per_slice,
+            bounds=self.fit_bounds,
+            anchors=self.fit_anchors,
+            pedestal_rho_tor_norm=self.settings.pedestal_rho_tor_norm,
+            sol_extension=self.settings.sol_extension,
+            fit_mode=self.fit_mode,
+        )
+
     def _check_batch(self, in_path: Path, batch_id: str):
-        """Refuse a staged batch built with another fit mode, SOL extension, pedestal location, or anchors than this run's.
+        """Refuse a staged batch built with any fit setting other than this run's (batch_io.batch_settings).
 
         Args:
             in_path: The batch input npz.
             batch_id: The batch id, for the message.
         """
         where = f"Batch {batch_id}"
-        staged_mode = read_batch_setting(in_path, "fit_mode")
-        self._check_run_setting("fit mode", staged_mode, self.fit_mode, where)
-        staged_extension = read_batch_setting(in_path, "sol_extension")
-        run_extension = self.settings.sol_extension
-        self._check_run_setting("SOL extension", staged_extension, run_extension, where)
-        # As floats, so a TOML integer matches the float the batch stores
-        staged_pedestal_raw = read_batch_setting(in_path, "pedestal_rho_tor_norm")
-        staged_pedestal = str(float(staged_pedestal_raw))
-        run_pedestal = str(float(self.settings.pedestal_rho_tor_norm))
-        self._check_run_setting(
-            "pedestal location", staged_pedestal, run_pedestal, where
-        )
-        staged_anchors = read_batch_anchors(in_path)
-        staged_anchors_json = _anchors_json(staged_anchors)
-        run_anchors_json = _anchors_json(self.fit_anchors)
-        self._check_run_setting("anchors", staged_anchors_json, run_anchors_json, where)
+        staged = batch_settings(in_path)
+        run = fit_batch_settings(self._fit_batch({}))
+        for key, run_value in run.items():
+            name = FIT_SETTING_NAMES.get(key, key)
+            self._check_run_setting(name, staged[key], run_value, where)
 
     def _check_staged_batches(self):
         """Refuse a staging directory that does not match this run.
 
         Every batch input in fit_batches_dir is checked,
         because write_fit_results and the stack stage sweep them all:
-        its fit mode, SOL extension, pedestal location, and anchors must be this run's,
+        every fit setting (fit mode, SOL extension, pedestal location, anchors, bounds, fit grid,
+        min_points, scale_per_slice) must be this run's,
         and in a windowed run every shot must have the same windows it was staged with.
         An edited shotlist stops here, before any fit runs or any result is written.
-        A batch in another mode, with another SOL extension, pedestal location, other anchors or windows,
+        A batch built with another setting or other windows,
         or holding a shot the shotlist no longer lists raises ValueError
         (_check_batch, _check_windows_match).
         """
-        for in_path in sorted(self.fit_batches_dir.glob("batch_*.npz")):
-            if "_out_" in in_path.name:
-                continue
+        for in_path in self._staged_batch_paths():
             batch_id = in_path.stem.removeprefix("batch_")
             self._check_batch(in_path, batch_id)
             if self.shot_windows is None:
@@ -1422,7 +1469,7 @@ class DataWorkflow(ABC):
         return self.fit_batches_dir / f"batch_{batch_id}_out_{self.fit_method}.npz"
 
     def _fit_batches_local(self, batches: dict[str, list[int]]):
-        """Fit staged batches serially in this process, one at a time.
+        """Fit staged batches one at a time, each in a fresh worker process as a cluster job would (run_worker_subprocess).
 
         Args:
             batches: Mapping of batch id to shots, from stage_fit_batches.
@@ -1435,7 +1482,7 @@ class DataWorkflow(ABC):
                 f"Fitting batch {batch_id} ({batches[batch_id]}) locally "
                 f"({i + 1}/{len(batches)})"
             )
-            registry.run_batch_file(
+            registry.run_worker_subprocess(
                 self.fit_method, self._batch_in_path(batch_id), out_path
             )
 
@@ -1467,9 +1514,7 @@ class DataWorkflow(ABC):
         x_star = None
         n_written = 0
         n_shots = 0
-        for in_path in sorted(self.fit_batches_dir.glob("batch_*.npz")):
-            if "_out_" in in_path.name:
-                continue
+        for in_path in self._staged_batch_paths():
             batch_id = in_path.stem.removeprefix("batch_")
             out_path = self._batch_out_path(batch_id)
             if not out_path.exists():
@@ -1520,11 +1565,7 @@ class DataWorkflow(ABC):
                     si.windows,
                     si.window_index,
                 )
-                shot_path = self.fit_shots_dir / f"{shot}.nc"
-                shot_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = shot_path.with_suffix(".nc.tmp")
-                ds.to_netcdf(tmp_path)
-                os.replace(tmp_path, shot_path)
+                atomic_write(self.fit_shots_dir / f"{shot}.nc", ds.to_netcdf)
                 n_written += 1
 
         if n_shots == 0:
@@ -1739,9 +1780,7 @@ class DataWorkflow(ABC):
         Args:
             max_pages: Maximum number of pages to plot per shot. None plots all.
         """
-        for in_path in sorted(self.fit_batches_dir.glob("batch_*.npz")):
-            if "_out_" in in_path.name:
-                continue
+        for in_path in self._staged_batch_paths():
             batch_id = in_path.stem.removeprefix("batch_")
             out_path = self._batch_out_path(batch_id)
             if not out_path.exists():
@@ -1787,49 +1826,19 @@ class DataWorkflow(ABC):
                 )
                 logger.info(f"Plotted {n_pages} fit pages for shot {shot}")
 
-    def stack_internal_dataset(
-        self,
-        mb_per_chunk: int | None = 50,
-        drop_unfit_slices: bool = True,
-        forward_fill: bool = True,
-        extend_existing: bool = False,
-    ) -> Path:
-        """Stack the unprocessed data and the fit results into the internal dataset.
+    def stack_internal_dataset(self, mb_per_chunk: int | None = 50) -> Path:
+        """Stack every shot's unprocessed and fitted data into the internal Zarr store.
 
-        One tensorized Zarr store at stores_dir/<ds_name>_internal.zarr,
-        holding every shot that has both an unprocessed data file and a fit
-        result file. Shots are stacked along EPISODE_DIM and NaN padded along
-        every other dimension, so shots of different lengths still line up.
-        Only one shot is held in memory at a time.
-
-        The store carries every signal needed for internal analysis.
-
-        The timebase is the unprocessed data's uniform 1 kHz grid. TIME_DIM is
-        the grid ordinal, so shots of different lengths can be padded to a
-        common size, and the TIME_COORD variable carries the times themselves.
-        The fitted profiles come one per Thomson sample and the equilibria on
-        the reconstruction clock, (might be slower than 1 kHz), so they are held
-        forward onto the grid with the fresh_profile and fresh_equilibrium
-        flags marking the grid times that carry a recent sample.
-
-        With a windowed shotlist only the grid times inside the windows are
-        kept, and a window-averaged profile fills its whole window with
-        fresh_profile marking the window center.
+        Every shot with both an unprocessed data file and a fit result file of this
+        fit method is placed on its 1 kHz grid (_internal_shot_dataset):
+        the usable fitted profiles (usable_slice_mask) held forward for at most PROFILE_MAX_HOLD
+        and the equilibria for at most MAX_HOLD_PERIODS of their own sampling period,
+        with fresh_profile and fresh_equilibrium marking the grid times that carry a sample of their own.
+        An existing store is replaced.
 
         Args:
             mb_per_chunk: Target size of each variable's storage chunks,
                 chunked along EPISODE_DIM only. None leaves the chunking alone.
-            drop_unfit_slices: Ignore the slices usable_slice_mask rejects,
-                as though the shot had no Thomson sample there.
-                False places every slice on the grid, all-NaN profiles included.
-            forward_fill: Hold each fitted profile and each equilibrium forward
-                over the grid times that follow it, a profile for at most
-                PROFILE_MAX_HOLD, an equilibrium for at most
-                MAX_HOLD_PERIODS of its own sampling period. False leaves the
-                grid times between samples NaN.
-            extend_existing: Append the shots that are not in the existing
-                store yet, instead of replacing it. The shots already in it are
-                left as they are, so this does not pick up refitted shots.
 
         Returns:
             Path of the Zarr store.
@@ -1848,21 +1857,8 @@ class DataWorkflow(ABC):
 
         zarr_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
         if zarr_path.exists():
-            if not extend_existing:
-                logger.warning(
-                    f"Replacing the existing internal dataset at {zarr_path}"
-                )
-                shutil.rmtree(zarr_path)
-            else:
-                with xr.open_zarr(zarr_path, consolidated=True) as ds_store:
-                    in_store = {int(shot) for shot in ds_store[EPISODE_DIM].values}
-                shots = [shot for shot in shots if shot not in in_store]
-                logger.info(
-                    f"{len(in_store)} shots are already in {zarr_path}, "
-                    f"appending the {len(shots)} that are not"
-                )
-                if not shots:
-                    return zarr_path
+            logger.warning(f"Replacing the existing internal dataset at {zarr_path}")
+            shutil.rmtree(zarr_path)
 
         # Bound every non-episode dimension up front so that no shot ever has to
         # extend the store, which would rewrite the chunks of every shot in it.
@@ -1870,14 +1866,11 @@ class DataWorkflow(ABC):
         logger.info(f"Internal dataset dimension bounds: {dim_sizes}")
 
         ds = build_tensorized_dataset(
-            process_fn=lambda shot: self._internal_shot_dataset(
-                shot, drop_unfit_slices, forward_fill
-            ),
+            process_fn=self._internal_shot_dataset,
             identifiers=shots,
             zarr_path=zarr_path,
             time_dim=TIME_DIM,
             episode_dim=EPISODE_DIM,
-            extend_existing=extend_existing,
             mb_per_chunk=mb_per_chunk,
             dim_sizes=dim_sizes,
         )
@@ -2129,37 +2122,40 @@ class DataWorkflow(ABC):
         return sizes
 
     def _usable_shot_fit(
-        self,
-        shot: int,
-        ds_unprocessed: xr.Dataset,
-        ds_fit: xr.Dataset,
-        drop_unfit_slices: bool,
+        self, shot: int, ds_unprocessed: xr.Dataset, ds_fit: xr.Dataset
     ) -> xr.Dataset | None:
         """Run the whole-shot checks of the stores on a shot's files and keep its usable slices.
 
         The stack stage and export_to_imas both go through here, so they leave out the same shots.
         The checks, in order:
         shot_rejection_reason on the unprocessed file,
-        at least one slice left (usable_slice_mask),
+        at least one slice left inside the unprocessed grid span (usable_slice_mask),
         and fit_rejection_reason on the slices left.
+        Fit slices outside the grid span were fit before a filter change cut them, and are dropped,
+        so a filter change restacks on the old fits.
         A rejected shot is logged with its reason.
 
         Args:
             shot: Shot number, for the log.
             ds_unprocessed: The shot's unprocessed dataset.
             ds_fit: The shot's fit result dataset.
-            drop_unfit_slices: Keep only the slices usable_slice_mask accepts. False keeps every slice.
 
         Returns:
             The fit dataset cut to the kept slices, or None when a check rejects the shot.
         """
         rejection_reason = self.shot_rejection_reason(ds_unprocessed)
         if rejection_reason is None:
-            keep = (
-                usable_slice_mask(ds_fit)
-                if drop_unfit_slices
-                else np.ones(ds_fit.sizes[TIME_DIM], dtype=bool)
+            grid_times = np.asarray(ds_unprocessed[TIME_COORD].values, dtype=float)
+            slice_times = ds_fit[TIME_COORD].squeeze(EPISODE_DIM, drop=True).values
+            in_grid_span = (slice_times >= np.nanmin(grid_times)) & (
+                slice_times <= np.nanmax(grid_times)
             )
+            n_outside = int((~in_grid_span).sum())
+            if n_outside:
+                logger.info(
+                    f"Shot {shot}: dropping {n_outside} fit slices outside the unprocessed grid span"
+                )
+            keep = in_grid_span & usable_slice_mask(ds_fit)
             ds_fit = ds_fit.isel({TIME_DIM: np.flatnonzero(keep)})
             if keep.any():
                 rejection_reason = self.fit_rejection_reason(ds_fit, ds_unprocessed)
@@ -2170,17 +2166,13 @@ class DataWorkflow(ABC):
             return None
         return ds_fit
 
-    def _internal_shot_dataset(
-        self, shot: int, drop_unfit_slices: bool, forward_fill: bool
-    ) -> xr.Dataset | None:
+    def _internal_shot_dataset(self, shot: int) -> xr.Dataset | None:
         """Build one shot's contribution to the internal dataset.
 
-        Internal dataset is on a 1 kHz timebase from the unprocessed dataset.
-        The fitted profiles are sampled far more slowly than that (one per Thomson sample).
-        In addition, on some devices the equilibria are sampled more slowly
-        and on some devices the equilibrium is too, so both are held forward
-        onto the grid and the fresh flags mark which grid times carry a sample
-        of their own.
+        The internal dataset is on the unprocessed dataset's 1 kHz timebase.
+        The fitted profiles are sampled far more slowly (one per Thomson sample),
+        and on some devices the equilibria are too, so both are held forward
+        onto the grid and the fresh flags mark which grid times carry a sample of their own.
 
         A shot fit with time windows is placed on its full grid first, then
         cut down to the grid times inside the windows, so an equilibrium from
@@ -2190,10 +2182,6 @@ class DataWorkflow(ABC):
 
         Args:
             shot: Shot number.
-            drop_unfit_slices: Ignore the slices usable_slice_mask rejects,
-                as though the shot had no Thomson sample there.
-            forward_fill: Hold profiles and equilibria forward onto the grid
-                times between their samples.
 
         Returns:
             The shot's dataset, or None when _usable_shot_fit rejects it.
@@ -2210,7 +2198,7 @@ class DataWorkflow(ABC):
         # The full window list, before the unusable rows go:
         # a window whose every fit was culled still bounds the stored grid
         windows = _fit_windows(ds_fit)
-        ds_fit = self._usable_shot_fit(shot, ds_unprocessed, ds_fit, drop_unfit_slices)
+        ds_fit = self._usable_shot_fit(shot, ds_unprocessed, ds_fit)
         if ds_fit is None:
             return None
         # A per-method fit diagnostic, kept in the fit files but left out of
@@ -2234,7 +2222,7 @@ class DataWorkflow(ABC):
 
         if fit_mode == FIT_MODE_WINDOW_AVERAGE:
             slice_index, fresh_profile = _place_windows_on_grid(
-                grid, windows, window_index, forward_fill, shot
+                grid, windows, window_index, shot
             )
             if not fresh_profile.any():
                 raise ValueError(
@@ -2244,7 +2232,7 @@ class DataWorkflow(ABC):
                 )
         else:
             slice_index, fresh_profile = hold_onto_grid(
-                grid, slice_times, forward_fill, max_hold_time=PROFILE_MAX_HOLD
+                grid, slice_times, max_hold_time=PROFILE_MAX_HOLD
             )
             if not fresh_profile.any():
                 raise ValueError(
@@ -2263,25 +2251,9 @@ class DataWorkflow(ABC):
                 ).any(axis=1)
                 slice_index[held & ~shared] = -1
 
-        data_vars = {}
-        missing = []
-        for name in DATASET_0D_SIGNALS:
-            if name in ds_unprocessed:
-                data_vars[name] = ds_unprocessed[name]
-            else:
-                # Kept as NaN so every device's dataset has one schema
-                missing.append(name)
-                data_vars[name] = xr.DataArray(
-                    np.full((1, grid.size), np.nan, dtype=np.float32),
-                    dims=(EPISODE_DIM, TIME_DIM),
-                    attrs={"description": f"{name}, not available on this device"},
-                )
-        if missing:
-            logger.debug(f"Shot {shot}: filling {missing} with NaN, not on this device")
+        data_vars = {name: ds_unprocessed[name] for name in DATASET_0D_SIGNALS}
 
-        equilibrium, fresh_equilibrium = _hold_equilibrium(
-            ds_unprocessed, grid, forward_fill
-        )
+        equilibrium, fresh_equilibrium = _hold_equilibrium(ds_unprocessed, grid)
         data_vars.update(equilibrium)
 
         # Every other unprocessed signal (the raw Thomson channels) comes
@@ -2387,8 +2359,6 @@ class DataWorkflow(ABC):
         the list of its values.
         Composed of this build's stamp and this package's state now
         (build_stamp, build_provenance), and the run configuration (_run_config_attrs).
-        Unprocessed files from before the source stamp was rewritten are rewritten here,
-        so the store never carries disruption-py's working-directory commit.
 
         Args:
             zarr_path: The internal store, complete and consolidated.
@@ -2399,7 +2369,7 @@ class DataWorkflow(ABC):
         per_shot = []
         for shot in shots:
             with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_file:
-                per_shot.append(source_provenance(ds_file.attrs))
+                per_shot.append(dict(ds_file.attrs))
         # cocos and r0 are per shot, the store carries them as variables
         attrs.update(
             merge_shot_attrs(per_shot, exclude=(*SOURCE_VOLATILE_KEYS, "cocos", "r0"))
@@ -2449,7 +2419,7 @@ class DataWorkflow(ABC):
         grid: np.ndarray,
         fresh_profile: np.ndarray,
         fresh_equilibrium: np.ndarray,
-        fit_mode: str = FIT_MODE_SAMPLE,
+        fit_mode: str,
     ) -> xr.Dataset:
         """Build the per-shot time variable and the freshness flags.
 
@@ -2473,8 +2443,8 @@ class DataWorkflow(ABC):
         equilibrium_description = (
             "1 where a usable reconstruction (usable_reconstructions) lands, "
             "0 where the reconstruction block holds an earlier one. "
-            "The 0D equilibrium signals take every reconstruction and hold for at least 10 ms, "
-            "so they can update where it is 0"
+            "The 0D equilibrium signals take every reconstruction and hold for at least "
+            f"{1e3 * EQUILIBRIUM_HOLD_FLOOR:.0f} ms, so they can update where it is 0"
         )
         profile_description = (
             "1 at the center grid time of each averaging window, 0 across the rest "
@@ -2572,7 +2542,6 @@ def _trim_and_keep_longest(
     held_index, _ = hold_onto_grid(
         times,
         times[reconstruction_kept],
-        True,
         clock_period,
         hold_floor=EQUILIBRIUM_HOLD_FLOOR,
     )
@@ -2674,7 +2643,6 @@ def _place_windows_on_grid(
     grid: np.ndarray,
     windows: np.ndarray,
     window_index: np.ndarray,
-    forward_fill: bool,
     shot: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map every grid time onto the window-averaged profile it takes its values from.
@@ -2683,7 +2651,6 @@ def _place_windows_on_grid(
     the window draws from it, and the one nearest the window center is
     flagged fresh. Where windows overlap, a grid time draws from the holding
     window whose center is nearest (the earlier one on a tie).
-    With forward_fill False only the center times draw.
     A window with no grid time left in the unprocessed file (the filtering cut it away)
     is logged and its profile left out.
 
@@ -2691,7 +2658,6 @@ def _place_windows_on_grid(
         grid: The shot's 1 kHz timebase [s].
         windows: (n_w, 2) window bounds [s], sorted by start.
         window_index: (n_rows,) window of each kept fit row.
-        forward_fill: Fill the whole window, not only its center.
         shot: Shot number, for the log lines.
 
     Returns:
@@ -2719,7 +2685,7 @@ def _place_windows_on_grid(
         fresh[members[np.argmin(np.abs(grid[members] - centers[row]))]] = True
     distance = np.where(member, np.abs(grid[:, None] - centers[None, :]), np.inf)
     nearest = distance.argmin(axis=1)
-    draws = np.isfinite(distance.min(axis=1)) if forward_fill else fresh
+    draws = np.isfinite(distance.min(axis=1))
     sample_index[draws] = nearest[draws]
     return sample_index, fresh
 
@@ -2741,23 +2707,6 @@ def _fit_anchors(settings: DeviceSettings) -> dict[str, FitAnchors]:
         grad = np.asarray(grad_rows, dtype=float).reshape(-1, 3)
         anchors[var] = FitAnchors(value=value, grad=grad)
     return anchors
-
-
-def _anchors_json(anchors: dict[str, FitAnchors]) -> str:
-    """Serialize fit anchors for comparison and messages.
-
-    Args:
-        anchors: FitAnchors keyed by variable name.
-
-    Returns:
-        The anchors as a JSON string.
-    """
-    return json.dumps(
-        {
-            var: {"value": a.value.tolist(), "grad": a.grad.tolist()}
-            for var, a in anchors.items()
-        }
-    )
 
 
 def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
@@ -2786,7 +2735,7 @@ def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
 
 
 def _hold_equilibrium(
-    ds_unprocessed: xr.Dataset, grid: np.ndarray, forward_fill: bool
+    ds_unprocessed: xr.Dataset, grid: np.ndarray
 ) -> tuple[dict[str, xr.DataArray], np.ndarray]:
     """Place a shot's equilibria on its 1 kHz grid.
 
@@ -2798,12 +2747,12 @@ def _hold_equilibrium(
     so a few missing reconstructions are bridged.
     An unusable reconstruction (usable_reconstructions) is treated as missing,
     so the previous one holds over it and it is not fresh.
+    A shot with no usable reconstruction gets an all-NaN block.
 
     Args:
         ds_unprocessed: The shot's unprocessed dataset, on the grid, with
             its time coordinate already dropped.
         grid: The shot's 1 kHz timebase [s].
-        forward_fill: Hold each reconstruction forward until the next one.
 
     Returns:
         (equilibrium, fresh): the GEQDSK variables on the grid, and the
@@ -2818,10 +2767,14 @@ def _hold_equilibrium(
     clock_period = reconstruction_clock_period(ds_unprocessed, grid)
     usable = usable_reconstructions(ds_unprocessed)
     reconstructed = np.flatnonzero(usable)
+    if reconstructed.size == 0:
+        logger.warning("No usable reconstruction, the equilibrium block is NaN")
+        nothing_held = xr.DataArray(np.zeros(grid.size, dtype=bool), dims=TIME_COORD)
+        ds_held = ds_unprocessed[names].where(nothing_held)
+        return {name: ds_held[name] for name in names}, np.zeros(grid.size, dtype=bool)
     reconstruction_index, fresh = hold_onto_grid(
         grid,
         grid[reconstructed],
-        forward_fill,
         clock_period,
         hold_floor=EQUILIBRIUM_HOLD_FLOOR,
     )

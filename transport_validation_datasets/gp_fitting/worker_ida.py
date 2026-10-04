@@ -6,7 +6,9 @@ and the profile and its error are interpolated onto x_star.
 Inside the IDA points the interpolation holds the innermost value at the axis,
 past the outermost point it is NaN.
 The gradient is the finite difference on x_star.
-IDA gives no point covariance, so its gradient error assumes independent points.
+IDA gives no point covariance, so the gradient error is a stand-in:
+GRADIENT_ERROR_FRACTION of |gradient| with a GRADIENT_ERROR_FLOOR per variable,
+the proportion the GP fits of the other devices show at mid radius.
 The anchors and bounds of the batch are ignored, they shape GP fits made here.
 The workflow refuses this method on any device other than DIII-D (DataWorkflow.fit_methods).
 
@@ -29,27 +31,25 @@ from transport_validation_datasets.gp_fitting.worker_base import run_worker_cli
 FIT_DESCRIPTION = "IDA"
 
 
-def gradient_error(errors: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """Error of the central-difference gradient along the last axis, with independent point errors.
+# Stand-in gradient error, fraction of |gradient| and the floor per variable [keV and 1e20 m^-3 per unit rho_tor_norm].
+# The C-Mod GP fits give grad_err / |grad| of 0.15 (Te) and 0.10 (ne) at mid radius,
+# near-axis medians of 0.36 keV and 0.065e20 and edge tenth percentiles of 0.10 keV and 0.11e20.
+GRADIENT_ERROR_FRACTION = 0.10
+GRADIENT_ERROR_FLOOR = {"te": 0.1, "ne": 0.05}
 
-    sigma_i = sqrt(sigma_{i+1}^2 + sigma_{i-1}^2) / (x_{i+1} - x_{i-1}),
-    and the endpoints copy their neighbour's error.
+
+def stand_in_gradient_error(gradient: np.ndarray, floor: float) -> np.ndarray:
+    """A gradient error of GRADIENT_ERROR_FRACTION of |gradient|, at least floor, NaN where the gradient is.
 
     Args:
-        errors: (..., n_x) 1-sigma errors of the values on x.
-        x: (n_x,) increasing grid, at least 3 points.
+        gradient: (..., n_x) the fitted gradient.
+        floor: The smallest error [same units as gradient].
 
     Returns:
         (..., n_x) 1-sigma errors of the gradient.
     """
-    errors_squared = errors**2
-    x_spacing = x[2:] - x[:-2]
-    errors_squared_sum = errors_squared[..., 2:] + errors_squared[..., :-2]
-    gradient_errors = np.full_like(errors, np.nan, dtype=float)
-    gradient_errors[..., 1:-1] = np.sqrt(errors_squared_sum) / x_spacing
-    gradient_errors[..., 0] = gradient_errors[..., 1]
-    gradient_errors[..., -1] = gradient_errors[..., -2]
-    return gradient_errors
+    gradient_error = np.maximum(GRADIENT_ERROR_FRACTION * np.abs(gradient), floor)
+    return np.where(np.isfinite(gradient), gradient_error, np.nan)
 
 
 def fit_batch(batch: FitBatch, num_workers: int = 1) -> dict[int, ShotFitOutput]:
@@ -90,9 +90,10 @@ def fit_batch(batch: FitBatch, num_workers: int = 1) -> dict[int, ShotFitOutput]
                 profile_error = np.interp(x_star, x_points, err_points, right=np.nan)
                 getattr(shot_output, f"{var}_fit")[row] = profile
                 getattr(shot_output, f"{var}_std")[row] = profile_error
-                getattr(shot_output, f"{var}_grad")[row] = np.gradient(profile, x_star)
-                getattr(shot_output, f"{var}_grad_std")[row] = gradient_error(
-                    profile_error, x_star
+                gradient = np.gradient(profile, x_star)
+                getattr(shot_output, f"{var}_grad")[row] = gradient
+                getattr(shot_output, f"{var}_grad_std")[row] = stand_in_gradient_error(
+                    gradient, GRADIENT_ERROR_FLOOR[var]
                 )
                 getattr(shot_output, f"{var}_status")[row] = STATUS_OK
         outputs[shot] = shot_output

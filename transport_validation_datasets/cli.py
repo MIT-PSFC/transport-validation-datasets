@@ -175,7 +175,7 @@ class DatasetCLI:
         prepare_workers: int | None = None,
         config: Path | str | None = None,
     ):
-        """Build the MAST dataset, sourced from the public level 2 Zarr store.
+        """Build the MAST dataset, sourced from the public level 1 and level 2 Zarr stores.
 
         Args:
             data_assembly_dir: Directory holding the intermediate files, plots,
