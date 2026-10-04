@@ -228,7 +228,7 @@ class TestHeldSignalOnGrid:
         np.testing.assert_array_equal(values_on_grid, values)
 
     def test_holds_on_the_clock_of_the_finite_samples(self):
-        # A 0.1 ms clock populated only every 5 ms, as the MAST esm group stores pphix
+        # A 0.1 ms clock populated only every 5 ms
         source_times = np.arange(500) * 1e-4
         values = np.full(500, np.nan)
         values[::50] = np.arange(10.0)

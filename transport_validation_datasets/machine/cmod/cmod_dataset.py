@@ -43,7 +43,10 @@ SIGNAL_ATTRS = {
         "description": "Plasma current, magnetics ip (Rogowski coil), signed, mean of each 1 ms grid step",
     },
     "n_e_line_average": {
-        "description": "Line-averaged electron density, TCI chord 4 (nl_04 / 0.6 m), mean of each 1 ms grid step",
+        "description": (
+            "Line-averaged electron density, TCI chord 4 line integral nl_04 (mean of each 1 ms grid step) "
+            "over its in-plasma length, the EFIT rco2v of that chord held from the last reconstruction"
+        ),
     },
     "power_radiated": {
         "description": (
@@ -61,7 +64,7 @@ SIGNAL_ATTRS = {
         "description": "Vacuum toroidal field at r0, magnetics btor, signed, mean of each 1 ms grid step",
     },
     "r0": {
-        "description": "Reference major radius btor is quoted at, the EFIT RZERO",
+        "description": "Reference major radius btor is quoted at, the fixed 0.66 m where EFIT quotes bcentr (RZERO)",
     },
     "beta_tor_norm": {
         "description": (
@@ -87,7 +90,7 @@ SIGNAL_ATTRS = {
 SLOW_EFIT_PERIOD = 1.5e-3
 
 # Major radius the magnetics btor is quoted at, the store's r0 [m].
-# btor, less its pre-shot baseline, matches EFIT bcentr to 0.9996-0.9999,
+# The raw btor, with no pre-shot baseline subtracted, matches EFIT bcentr to 0.9991-0.9998 (median of 6 shots),
 # and EFIT quotes bcentr at rcentr, stored as RZERO = 0.66 m.
 R0 = 0.66
 

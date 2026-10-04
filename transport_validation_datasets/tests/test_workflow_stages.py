@@ -177,6 +177,10 @@ class DummyWorkflow(DataWorkflow):
     def get_shotlist_from_source(self) -> list[int]:
         return [1, 2]
 
+    def add_ohmic_power(self, ds_standardized: xr.Dataset) -> xr.Dataset:
+        # The synthetic source has no GEQDSK block to derive power_ohm from, it carries its own
+        return ds_standardized
+
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         self.source_reads.append(shot)
         if shot == UNREADABLE_SHOT:

@@ -689,16 +689,13 @@ class DataWorkflow(ABC):
         """Set power_ohm from the GEQDSK block (ohmic_power_on_grid), the same way on every device.
 
         Replaces whatever the source gave, so a kept source pull is recomputed too.
-        A dataset without the block keeps the source's power_ohm.
 
         Args:
-            ds_standardized: One shot's standardized dataset on (shot, time).
+            ds_standardized: One shot's standardized dataset on (shot, time), with its GEQDSK block.
 
         Returns:
             The same dataset with power_ohm set.
         """
-        if "psirz" not in ds_standardized:
-            return ds_standardized
         ds_shot = ds_standardized.squeeze(EPISODE_DIM, drop=True)
         power_ohm = ohmic_power_on_grid(ds_shot)
         template = ds_standardized["ip"]
@@ -1562,6 +1559,7 @@ class DataWorkflow(ABC):
                     batch_x_star,
                     hyp_names,
                     worker.FIT_DESCRIPTION,
+                    getattr(worker, "GRADIENT_ERROR_DESCRIPTION", None),
                     si.windows,
                     si.window_index,
                 )
@@ -1584,6 +1582,7 @@ class DataWorkflow(ABC):
         x_star: np.ndarray,
         hyp_names: list[str] | None,
         fit_description: str,
+        gradient_error_description: str | None,
         windows: np.ndarray,
         window_index: np.ndarray,
     ) -> xr.Dataset:
@@ -1604,6 +1603,8 @@ class DataWorkflow(ABC):
             hyp_names: Names of the method's hyperparameters, None if it has none.
             fit_description: The method's own name for its GP fit (its worker's FIT_DESCRIPTION),
                 added to every profile's description.
+            gradient_error_description: The worker's own description of its gradient error (GRADIENT_ERROR_DESCRIPTION),
+                a template on the profile name, None for a GP fit's own uncertainty.
             windows: (n_w, 2) time windows the shot was staged with [s].
             window_index: (n_t,) window of each row, -1 without windows.
 
@@ -1641,11 +1642,14 @@ class DataWorkflow(ABC):
                 )
                 fit_rows = getattr(so, f"{var}_{suffix}")
                 profile = fit_rows[None, :, stored] * si_factor
+                description = f"{extra}GP-fitted {desc} profile ({fit_description})"
+                if suffix == "grad_std" and gradient_error_description is not None:
+                    description = gradient_error_description.format(desc=desc)
                 data_vars[f"{name}{out_suffix}"] = (
                     ("shot", TIME_DIM, "rho_tor_norm"),
                     profile.astype(np.float32),
                     {
-                        "description": f"{extra}GP-fitted {desc} profile ({fit_description})",
+                        "description": description,
                         "units": grad_unit,
                     },
                 )
@@ -1666,7 +1670,7 @@ class DataWorkflow(ABC):
         time_description = (
             "Time window centers"
             if self.fit_mode == FIT_MODE_WINDOW_AVERAGE
-            else "Thomson slice times"
+            else "Profile slice times (Thomson, IDA on DIII-D)"
         )
         coords = {
             "shot": [shot],
@@ -1832,7 +1836,7 @@ class DataWorkflow(ABC):
         Every shot with both an unprocessed data file and a fit result file of this
         fit method is placed on its 1 kHz grid (_internal_shot_dataset):
         the usable fitted profiles (usable_slice_mask) held forward for at most PROFILE_MAX_HOLD
-        and the equilibria for at most MAX_HOLD_PERIODS of their own sampling period,
+        and the equilibria for at most MAX_HOLD_PERIODS of their own sampling period, at least EQUILIBRIUM_HOLD_FLOOR,
         with fresh_profile and fresh_equilibrium marking the grid times that carry a sample of their own.
         An existing store is replaced.
 
@@ -2024,7 +2028,7 @@ class DataWorkflow(ABC):
             with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_file:
                 unprocessed_ds = ds_file.load()
             # The shots the stores leave out stay out of the export too
-            fit_ds = self._usable_shot_fit(shot, unprocessed_ds, fit_ds, True)
+            fit_ds = self._usable_shot_fit(shot, unprocessed_ds, fit_ds)
             if fit_ds is None:
                 n_rejected += 1
                 continue
@@ -2428,7 +2432,7 @@ class DataWorkflow(ABC):
 
         Args:
             grid: The shot's 1 kHz timebase [s].
-            fresh_profile: Grid times carrying a Thomson slice of their own,
+            fresh_profile: Grid times carrying a profile slice of their own,
                 or the window centers of a window-averaged shot.
             fresh_equilibrium: Grid times carrying a usable reconstruction of their own (usable_reconstructions).
             fit_mode: How the profiles were fit, one of the FIT_MODE_* values.
@@ -2443,14 +2447,14 @@ class DataWorkflow(ABC):
         equilibrium_description = (
             "1 where a usable reconstruction (usable_reconstructions) lands, "
             "0 where the reconstruction block holds an earlier one. "
-            "The 0D equilibrium signals take every reconstruction and hold for at least "
+            "The 0D equilibrium signals are placed from their own reconstruction samples and hold for at least "
             f"{1e3 * EQUILIBRIUM_HOLD_FLOOR:.0f} ms, so they can update where it is 0"
         )
         profile_description = (
             "1 at the center grid time of each averaging window, 0 across the rest "
             "of the window, which holds the same window-averaged profile"
             if fit_mode == FIT_MODE_WINDOW_AVERAGE
-            else held.format("Thomson slice")
+            else held.format("profile slice (a Thomson slice, an IDA slice on DIII-D)")
         )
         return xr.Dataset(
             {

@@ -178,7 +178,8 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
 
 # Width of the centered boxcar power_ohm and power_radiated are smoothed with, applied twice [s], see smoothed_power.
 # Unsmoothed, the inductive swings of P_oh and the bolometer noise of P_rad are larger than the signals at 1 kHz.
-# DIII-D's prad_tot comes smoothed this way, so every device matches it.
+# DIII-D's prad_tot comes smoothed this way, and every other power_ohm and power_radiated matches it,
+# except TCV's PradTot, which is only held over its skipped samples.
 POWER_SMOOTHING_WINDOW = 50e-3
 
 # Step of the uniform timebase every device is placed on [s], see make_uniform_1kHz_timebase.
@@ -594,7 +595,7 @@ def signal_on_grid(
     A slower one is held forward from its last sample (_held_on_grid), at least hold_floor.
     Only finite samples count.
     The source's period is the median spacing of its finite samples,
-    so a fast clock populated only at a slower cadence (MAST esm) is held on that cadence.
+    so a fast clock populated only at a slower cadence is held on that cadence.
     Fewer than two finite samples have no period, and give all NaN.
 
     Args:
@@ -766,7 +767,7 @@ def smoothed_power(values: np.ndarray, dt: float) -> np.ndarray:
     """Smooth a power on the uniform grid with the centered POWER_SMOOTHING_WINDOW boxcar applied twice.
 
     The kernel is a triangle twice the window wide at its base, DIII-D's prad_tot kernel,
-    so every device's power_ohm and power_radiated carry the same smoothing.
+    so power_ohm on every device and power_radiated on C-Mod, MAST and DIII-D carry the same smoothing.
     It draws on samples up to one window later, so the result is not causal.
     A NaN sample stays NaN, so a gap in the record stays a gap for the filters.
 
@@ -906,7 +907,7 @@ POWER_OHM_DESCRIPTION = (
     "V_loop = sigma_Bp 2 pi dpsi_boundary/dt at the LCFS, W_pol the poloidal field energy inside the boundary "
     "integrated from psirz, Ip the reconstructed current, backward differences between consecutive usable reconstructions, "
     f"held forward for at least {1e3 * EQUILIBRIUM_HOLD_FLOOR:.0f} ms, "
-    f"then smoothed by a centered {1e3 * POWER_SMOOTHING_WINDOW:.0f} ms boxcar applied twice"
+    f"then smoothed by a centered {1e3 * POWER_SMOOTHING_WINDOW:.0f} ms boxcar applied twice (non-causal), clipped at 0"
 )
 
 

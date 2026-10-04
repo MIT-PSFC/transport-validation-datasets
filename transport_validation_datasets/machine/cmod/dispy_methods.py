@@ -255,7 +255,7 @@ class CmodPowerMethods:
     """C-Mod power retrievals that replace the disruption-py built-ins.
 
     Each record is placed on the grid without interpolation (signal_on_grid),
-    and power_radiated is then smoothed non-causally (smoothed_power), as on every device.
+    and power_radiated is then smoothed non-causally (smoothed_power), the DIII-D prad_tot kernel.
     """
 
     @staticmethod
@@ -263,7 +263,7 @@ class CmodPowerMethods:
     def get_radiated_power(params: PhysicsMethodParams):
         r"""Radiated power, the AXUV \twopi_diode in kW scaled by TWOPI_DIODE_CALIBRATION.
 
-        Averaged over each grid step, then smoothed non-causally (smoothed_power), as on every device.
+        Averaged over each grid step, then smoothed non-causally (smoothed_power), the DIII-D prad_tot kernel.
         NaN outside the record, where disruption-py fills 0 and hides a missing record.
 
         Args:

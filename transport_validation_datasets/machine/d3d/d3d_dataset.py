@@ -109,7 +109,9 @@ SIGNAL_ATTRS = {
     "b0": {
         "description": "Vacuum toroidal field at r0, mu0 144 bcoil / (2 pi r0) from the TF coil current (PTDATA bcoil)",
     },
-    "r0": {"description": "Reference major radius b0 is given at, the EFIT rzero"},
+    "r0": {
+        "description": "Reference major radius b0 is given at, the fixed 1.6955 m where EFIT quotes bcentr (rcentr)"
+    },
     "energy_mhd": {"description": "Stored energy from the 1 kHz DISPY EFIT (wmhd)"},
     "beta_tor_norm": {
         "description": (

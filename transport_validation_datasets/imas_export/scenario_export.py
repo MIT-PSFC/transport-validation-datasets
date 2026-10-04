@@ -67,6 +67,7 @@ from transport_validation_datasets.imas_export.geqdsk_writer import write_geqdsk
 from transport_validation_datasets.machine.generic import (
     cumulative_q_integral,
     psi_n_from_rho_tor_norm,
+    sigma_bp,
     usable_reconstructions,
 )
 
@@ -107,19 +108,6 @@ def _target_cocos(dd_version: str) -> int:
         17 for DD 4.0 and later, 11 before.
     """
     return 11 if int(str(dd_version).split(".", 1)[0]) < 4 else 17
-
-
-def _sigma_bp(cocos: int) -> int:
-    """Get the sigma_Bp of a COCOS index, for the phi integral.
-
-    Args:
-        cocos: COCOS index.
-
-    Returns:
-        -1 for the conventions whose psi decreases along Ip (3, 4, 7, 8,
-        and their e_Bp=1 partners 13, 14, 17, 18), +1 for the rest.
-    """
-    return -1 if cocos % 10 in (3, 4, 7, 8) else 1
 
 
 # core_profiles' one ion species (see build_core_profiles):
@@ -276,7 +264,7 @@ class _EquilibriumTimeDerived:
     psi_boundary: float
 
 
-def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
+def _populate_equilibrium_time_slice(ts, eqi, sigma_bp_target: float):
     """Fills one `equilibrium.time_slice[i]` from one equilibrium reconstruction.
 
     `eqi` is an `eqdsk.EQDSKInterface` already converted to target-COCOS.
@@ -286,7 +274,7 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     own q profile -- in the e_Bp=1 conventions
     `dphi/dpsi = sigma_Bp * sigma_rho_theta_phi * q`, and both IMAS targets
     (11 and 17) have `sigma_rho_theta_phi = +1`, so
-    `phi = sigma_bp * integral(q dpsi)` on the file's own uniform psi grid)
+    `phi = sigma_bp_target * integral(q dpsi)` on the file's own uniform psi grid)
     and the
     diverted/limited classification (`_diverted`). Derived flux-surface
     geometry (area/volume, `r_inboard`/`r_outboard`, `j_phi`, shaping, the
@@ -296,7 +284,7 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     Args:
         ts: The `equilibrium.time_slice[i]` node to fill.
         eqi: `eqdsk.EQDSKInterface`, target-COCOS.
-        sigma_bp: sigma_Bp of the target COCOS (see _sigma_bp), setting the
+        sigma_bp_target: sigma_Bp of the target COCOS (generic.sigma_bp), setting the
             sign of the phi integral.
 
     Returns:
@@ -320,10 +308,10 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     bcentr = float(eqi.bcentre)
     # dphi/dpsi = sigma_Bp * sigma_rho_theta_phi * q in the e_Bp=1 (11-18) conventions,
     # and both IMAS targets (11, 17) have sigma_rho_theta_phi = +1,
-    # so phi = sigma_bp * integral(q dpsi).
+    # so phi = sigma_bp_target * integral(q dpsi).
     # That lands phi on the sign of B0, its physical direction, for either field polarity under either target.
     q_integral = cumulative_q_integral(psi_norm, qpsi)
-    phi = sigma_bp * (psi_boundary - psi_axis) * q_integral
+    phi = sigma_bp_target * (psi_boundary - psi_axis) * q_integral
     # rho_tor needs a reference field to carry units of meters; phi and
     # bcentr share a sign, so the ratio is positive. A zero vacuum field is
     # nonphysical, but fall back to the dimensionless sqrt(psi_norm) rather
@@ -392,7 +380,7 @@ def build_equilibrium(
     """
     if target_cocos is None:
         target_cocos = _target_cocos(DD_VERSION)
-    sigma_bp = _sigma_bp(target_cocos)
+    sigma_bp_target = sigma_bp(target_cocos)
     eq = factory.equilibrium()
     eq.ids_properties.homogeneous_time = 1
     eq.time = np.asarray(times, dtype=float)
@@ -409,7 +397,7 @@ def build_equilibrium(
             to_cocos=target_cocos,
         )
         ts = eq.time_slice[i]
-        derived = _populate_equilibrium_time_slice(ts, eqi, sigma_bp)
+        derived = _populate_equilibrium_time_slice(ts, eqi, sigma_bp_target)
         derived_by_time[t] = derived
         bcentr_per_time[i] = derived.bcentr
         if eqi_first is None:
