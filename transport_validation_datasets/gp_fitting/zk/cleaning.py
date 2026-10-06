@@ -1,37 +1,23 @@
 """Channel cleaning for the zk method: one entry point, fixed order.
 
-clean_channels runs every screen in sequence:
+The GP-free screens (error-bar outliers, isolated spikes) already ran when the batch was staged,
+see transport_validation_datasets.cleaning, so every method sees the same data.
+clean_channels runs what needs a GP, in sequence:
 1. drop NaN points
-2. drop error-bar outliers (isolated huge-error channels)
-3. drop isolated value spikes (neighbor-disagreement test)
-4. compute the per-slice scale from the cleaned survivors and normalize
-5. rough reference fit on the normalized data
-6. leave-one-out outlier removal judged against that reference
+2. compute the per-slice scale from the staged survivors and normalize
+3. rough reference fit on the normalized data
+4. leave-one-out outlier removal judged against that reference
 
-Each screen keeps its own threshold and logic - each encodes a documented,
-audited failure class - but they run exactly once, in one place. The scale is
-computed after the spike filter so a single misfired high-value channel
-cannot set the scale itself, squashing the rest of the real profile toward
-~0 before it ever reaches outlier removal (and making that channel look like
-the profile's own peak instead of the spike it is).
+The scale comes from data the staging screens already cleaned,
+so a single misfired high-value channel cannot set it,
+squashing the rest of the real profile toward ~0 before it ever reaches outlier removal.
 """
 
 import numpy as np
 
-from transport_validation_datasets.gp_fitting.batch_io import FitBounds
-from transport_validation_datasets.gp_fitting.zk.gp import VALUE_BC, run_gp
+from transport_validation_datasets.gp_fitting.batch_io import FitAnchors, FitBounds
+from transport_validation_datasets.gp_fitting.zk.gp import run_gp
 from transport_validation_datasets.gp_fitting.zk.kernel import build_kernel
-
-# An isolated channel whose error bar is many times its rho-neighbors' poisons
-# the heteroscedastic noise model: the HSGP error kernel smooths error bars in
-# rho, so one huge-error channel inflates the effective noise of every channel
-# near it and the fit goes slack across that region.
-# The comparison is on ABSOLUTE errors: a relative-to-value rule flags low-value SOL
-# points (large relative error is normal there), while the absolute ratio
-# leaves them alone and MAST's uniform fractional errors almost never trip it
-_ERR_OUTLIER_FACTOR = 5.0
-_ERR_OUTLIER_HALFWIDTH = 0.1
-_ERR_OUTLIER_MIN_NEIGHBORS = 3
 
 # Optimizer restarts for the rough reference fit. Its result is only an
 # outlier-judging reference (discarded afterwards), so it runs a reduced
@@ -44,8 +30,10 @@ def clean_channels(
     y: np.ndarray,
     err: np.ndarray,
     fit_bounds: FitBounds,
+    anchors: FitAnchors,
+    pedestal_rho: float,
     scale_per_slice: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, FitAnchors] | None:
     """Clean one slice's channels and normalize them for fitting.
 
     Runs the screens in the fixed order described in the module docstring.
@@ -55,21 +43,20 @@ def clean_channels(
         y: Channel values, NaN where invalid.
         err: Channel errors.
         fit_bounds: The variable's staged bound knobs (for the rough fit).
+        anchors: The variable's anchors, in the data's own units.
+        pedestal_rho: The kernel's length-scale transition center, for the rough fit and the leave-one-out.
         scale_per_slice: Normalize by the cleaned slice max before fitting, to
             prevent amplitude collapse when channels do not cover the full
             radial range.
 
     Returns:
-        (x, y, err, scale) with y and err divided by scale, or None when no
-        valid data remains or the scale is degenerate.
+        (x, y, err, scale, anchors) with y, err, and the anchors divided by scale,
+        or None when no valid data remains or the scale is degenerate.
     """
     valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
     if not valid.any():
         return None
     x, y, err = x[valid], y[valid], err[valid]
-
-    x, y, err = _remove_error_outliers(x, y, err)
-    x, y, err = _remove_local_outliers(x, y, err)
 
     scale = 1.0
     if scale_per_slice:
@@ -81,102 +68,17 @@ def clean_channels(
     err = np.asarray(err, dtype=float) / scale
     x = np.asarray(x, dtype=float)
 
-    rough_hyps = _rough_hyperparameters(x, y, err, fit_bounds)
-    x, y, err = _remove_loo_outliers(x, y, err, ref_hyperparams=rough_hyps)
-    return x, y, err, scale
-
-
-def _remove_local_outliers(x, y, err, sigma_neighbor=2.0, sigma_local=3.0):
-    """Drop points that disagree with both immediate rho-neighbors.
-
-    A point is dropped only when its neighbors agree with each other:
-    independent of any GP fit or hyperparameters, unlike the LOO removal. A GP
-    reference fit (however it is built - generic or self-tuned) can be
-    flexible enough to bend down and absorb a single bad point along with its
-    genuinely-consistent neighbors, which is exactly what let a near-zero
-    misfired channel escape the LOO removal on a C-Mod Te slice (a short core
-    length scale dove down to chase it instead of the reference flagging it).
-    Comparing a point only to its immediate left/right neighbors in rho
-    catches an isolated single-channel spike regardless of how flexible the
-    eventual fit is allowed to be.
-
-    A point (not the first or last, by rho) is dropped when its neighbors
-    agree with each other (within sigma_neighbor combined sigma) but it
-    disagrees with their average (by more than sigma_local combined sigma). A
-    genuine trend - where the neighbors themselves disagree - never trips
-    this, since the neighbor-agreement precondition fails first.
-
-    Args:
-        x: Channel rho positions (NaN-free).
-        y: Channel values.
-        err: Channel errors.
-        sigma_neighbor: Combined-sigma window for neighbor agreement.
-        sigma_local: Combined-sigma threshold for the point's disagreement.
-
-    Returns:
-        (x, y, err) with the spikes removed, sorted by rho when any were.
-    """
-    n = x.size
-    if n < 3:
-        return x, y, err
-    order = np.argsort(x)
-    xs, ys, es = x[order], y[order], err[order]
-
-    y_left, y_right = ys[:-2], ys[2:]
-    e_left, e_right = es[:-2], es[2:]
-    y_mid, e_mid = ys[1:-1], es[1:-1]
-
-    neighbors_agree = np.abs(y_left - y_right) <= sigma_neighbor * np.sqrt(
-        e_left**2 + e_right**2
+    anchors = anchors.scaled(scale)
+    rough_hyps = _rough_hyperparameters(x, y, err, fit_bounds, anchors, pedestal_rho)
+    x, y, err = _remove_loo_outliers(
+        x, y, err, anchors.value, pedestal_rho, ref_hyperparams=rough_hyps
     )
-    neighbor_mean = 0.5 * (y_left + y_right)
-    neighbor_mean_err = 0.5 * np.sqrt(e_left**2 + e_right**2)
-    point_disagrees = np.abs(y_mid - neighbor_mean) > sigma_local * np.sqrt(
-        e_mid**2 + neighbor_mean_err**2
-    )
-
-    drop = np.zeros(n, dtype=bool)
-    drop[1:-1] = neighbors_agree & point_disagrees
-    if not drop.any():
-        return x, y, err
-    keep = ~drop
-    return xs[keep], ys[keep], es[keep]
+    return x, y, err, scale, anchors
 
 
-def _remove_error_outliers(x, y, err):
-    """Drop points whose error bar dwarfs the local error level.
-
-    A point is dropped when its error exceeds _ERR_OUTLIER_FACTOR times the
-    median error of its rho-neighbors (within _ERR_OUTLIER_HALFWIDTH, and only
-    when at least _ERR_OUTLIER_MIN_NEIGHBORS are there to define a local error
-    level). See the constants' block comment for the calibration.
-
-    Args:
-        x: Channel rho positions (NaN-free).
-        y: Channel values.
-        err: Channel errors.
-
-    Returns:
-        (x, y, err) with the error outliers removed.
-    """
-    n = x.size
-    if n < _ERR_OUTLIER_MIN_NEIGHBORS + 1:
-        return x, y, err
-    bad = np.zeros(n, dtype=bool)
-    for i in range(n):
-        m = np.abs(x - x[i]) <= _ERR_OUTLIER_HALFWIDTH
-        m[i] = False
-        if int(m.sum()) >= _ERR_OUTLIER_MIN_NEIGHBORS and err[i] > (
-            _ERR_OUTLIER_FACTOR * np.median(err[m])
-        ):
-            bad[i] = True
-    if not bad.any():
-        return x, y, err
-    keep = ~bad
-    return x[keep], y[keep], err[keep]
-
-
-def _rough_hyperparameters(x, y, err, fit_bounds: FitBounds) -> np.ndarray | None:
+def _rough_hyperparameters(
+    x, y, err, fit_bounds: FitBounds, anchors: FitAnchors, pedestal_rho: float
+) -> np.ndarray | None:
     """Run one reduced optimize pass on (possibly still contaminated) data.
 
     Used only to get a locally-representative reference for the LOO outlier
@@ -187,17 +89,31 @@ def _rough_hyperparameters(x, y, err, fit_bounds: FitBounds) -> np.ndarray | Non
         y: Channel values (normalized).
         err: Channel errors (normalized).
         fit_bounds: The variable's staged bound knobs.
+        anchors: The variable's anchors (normalized).
+        pedestal_rho: The kernel's length-scale transition center.
 
     Returns:
-        Fitted [var, l1, l2, lw, x0], or None if the fit failed.
+        Fitted [var, l1, l2, lw], or None if the fit failed.
     """
-    gp = run_gp(x, y, err, x, fit_bounds, nrestarts=_ROUGH_NRESTARTS, hyp_retries=0)
+    gp = run_gp(
+        x,
+        y,
+        err,
+        x,
+        fit_bounds,
+        anchors,
+        pedestal_rho,
+        nrestarts=_ROUGH_NRESTARTS,
+        hyp_retries=0,
+    )
     if gp is None:
         return None
-    return np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
+    return np.asarray(gp.get_gp_kernel().hyperparameters, dtype=float)
 
 
-def _loo_standardized_residuals(x, y, err, hyperparams) -> np.ndarray | None:
+def _loo_standardized_residuals(
+    x, y, err, value_anchors, pedestal_rho, hyperparams
+) -> np.ndarray | None:
     """Compute the leave-one-out standardized residual at every data point.
 
     Uses the closed-form GP LOO identities (Rasmussen and Williams 5.12): for
@@ -207,7 +123,7 @@ def _loo_standardized_residuals(x, y, err, hyperparams) -> np.ndarray | None:
     from all the others (never from itself) in a single matrix solve, with no
     per-point or reference GP fit.
 
-    The edge value BCs (VALUE_BC) are appended as fixed training points so
+    The value anchors are appended as fixed training points so
     edge channels are judged against the same "pull to zero past the
     separatrix" constraint the real fit sees; residuals are returned for the
     real data points only.
@@ -216,6 +132,8 @@ def _loo_standardized_residuals(x, y, err, hyperparams) -> np.ndarray | None:
         x: Channel rho positions.
         y: Channel values.
         err: Channel errors.
+        value_anchors: (n_a, 3) value anchor rows (normalized).
+        pedestal_rho: The kernel's length-scale transition center.
         hyperparams: Kernel hyperparameters (length scales etc.); None uses
             the generic start values.
 
@@ -223,11 +141,11 @@ def _loo_standardized_residuals(x, y, err, hyperparams) -> np.ndarray | None:
         (n,) standardized residuals, or None if the covariance solve fails or
         is not positive definite.
     """
-    xx = np.concatenate([x, VALUE_BC[:, 0]])
-    yy = np.concatenate([y, VALUE_BC[:, 1]])
-    ee = np.concatenate([err, VALUE_BC[:, 2]])
+    xx = np.concatenate([x, value_anchors[:, 0]])
+    yy = np.concatenate([y, value_anchors[:, 1]])
+    ee = np.concatenate([err, value_anchors[:, 2]])
 
-    kernel = build_kernel(hyperparams)
+    kernel = build_kernel(pedestal_rho, hyperparams)
     try:
         K = np.asarray(kernel(xx, xx, der=0), dtype=float)
         K[np.diag_indices_from(K)] += ee**2
@@ -253,7 +171,7 @@ def _locally_corroborated(x, y, err, i, sigma_corr) -> bool:
     neighbor sits at the same value is corroborated by real data at that rho,
     so it is protected from the LOO drop; an isolated spike (high or low),
     disagreeing with both neighbors, is not. Uses immediate sorted neighbors
-    like _remove_local_outliers, but here one agreeing neighbor is enough
+    like the staging spike screen (cleaning._isolated_spikes), but here one agreeing neighbor is enough
     (that check needs both neighbors to agree with each other, which a steep
     core fails).
 
@@ -278,7 +196,15 @@ def _locally_corroborated(x, y, err, i, sigma_corr) -> bool:
 
 
 def _remove_loo_outliers(
-    x, y, err, sigma=3.0, sigma_corr=2.0, max_drop_frac=0.3, ref_hyperparams=None
+    x,
+    y,
+    err,
+    value_anchors,
+    pedestal_rho,
+    sigma=3.0,
+    sigma_corr=2.0,
+    max_drop_frac=0.3,
+    ref_hyperparams=None,
 ):
     """Drop uncorroborated LOO outliers, worst first, one at a time.
 
@@ -302,6 +228,8 @@ def _remove_loo_outliers(
         x: Channel rho positions.
         y: Channel values.
         err: Channel errors.
+        value_anchors: (n_a, 3) value anchor rows (normalized).
+        pedestal_rho: The kernel's length-scale transition center.
         sigma: LOO residual threshold; 3.0 (rather than a stricter 2.0)
             tolerates reference/data mismatch on genuinely steep slices.
         sigma_corr: Combined-sigma window for neighbor corroboration.
@@ -324,7 +252,9 @@ def _remove_loo_outliers(
     max_drop = max(1, round(max_drop_frac * n0))
     n_dropped = 0
     while x.size > 3 and n_dropped < max_drop:
-        z = _loo_standardized_residuals(x, y, err, ref_hyperparams)
+        z = _loo_standardized_residuals(
+            x, y, err, value_anchors, pedestal_rho, ref_hyperparams
+        )
         if z is None:
             break
         to_drop = None

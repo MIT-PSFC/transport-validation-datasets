@@ -746,26 +746,28 @@ class ClusterFitDispatcher:
     def _push_worker_package(self):
         """Upload the gp_fitting worker package to the cluster.
 
-        The package subtree lands under {remote_workdir}/pkg, and the job
-        script exports PYTHONPATH there, so `python -m` resolves the same
-        module path as a local run. Only worker-reachable modules ship;
-        dispatcher.py stays home (it needs loguru, which the minimal cluster
-        venv does not carry).
+        The package lands under {remote_workdir}/pkg,
+        and the job script puts that on PYTHONPATH,
+        so `python -m` resolves the same module path as a local run.
+        Every gp_fitting module and method subpackage ships except dispatcher.py,
+        which needs loguru and the cluster venv does not carry it.
         """
         import transport_validation_datasets
 
         pkg_root = Path(transport_validation_datasets.__file__).parent
+        gp_fitting_root = pkg_root / "gp_fitting"
         remote_pkg = f"{self.remote_workdir}/pkg/transport_validation_datasets"
         pushes = [(pkg_root / "__init__.py", remote_pkg)]
         pushes += [
             (p, f"{remote_pkg}/gp_fitting")
-            for p in sorted((pkg_root / "gp_fitting").glob("*.py"))
+            for p in sorted(gp_fitting_root.glob("*.py"))
             if p.name != "dispatcher.py"
         ]
-        pushes += [
-            (p, f"{remote_pkg}/gp_fitting/zk")
-            for p in sorted((pkg_root / "gp_fitting" / "zk").glob("*.py"))
-        ]
+        for subpackage_init in sorted(gp_fitting_root.glob("*/__init__.py")):
+            subpackage_dir = subpackage_init.parent
+            remote_subpackage = f"{remote_pkg}/gp_fitting/{subpackage_dir.name}"
+            subpackage_modules = sorted(subpackage_dir.glob("*.py"))
+            pushes += [(p, remote_subpackage) for p in subpackage_modules]
         for remote_dir in sorted({d for _, d in pushes}):
             self.backend.ensure_dir(remote_dir)
         for local, remote_dir in pushes:

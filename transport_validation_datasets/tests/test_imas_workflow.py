@@ -22,15 +22,18 @@ import xarray as xr
 imas = pytest.importorskip("imas")
 pytest.importorskip("eqdsk")
 
-from transport_validation_datasets.gp_fitting.batch_io import STATUS_OK
-from transport_validation_datasets.imas_export.scenario_export import (
+from transport_validation_datasets.gp_fitting.batch_io import STATUS_OK  # noqa: E402
+from transport_validation_datasets.imas_export.scenario_export import (  # noqa: E402
     DD_VERSION,
     _sigma_bp,
     _target_cocos,
     build_imas_from_shot,
     write_ids,
 )
-from transport_validation_datasets.workflow import (
+from transport_validation_datasets.machine.generic import (  # noqa: E402
+    rho_tor_norm_from_psi_n,
+)
+from transport_validation_datasets.workflow import (  # noqa: E402
     DATASET_EQUILIBRIUM_SIGNALS,
     TIME_COORD,
     TIME_DIM,
@@ -43,7 +46,9 @@ N_BDRY = 64
 N_LIM = 72
 EQ_TIMES = (0.520, 0.550, 0.580)
 TS_TIMES = (0.531, 0.561)
-N_RHO = 51
+N_RHO_TOR_NORM = 56
+SOL_EXTENSION = "secant"
+QPSI = 1.0 + 2.0 * np.linspace(0.0, 1.0, N_PSI) ** 2
 
 
 def synthetic_unprocessed(polarity: int) -> xr.Dataset:
@@ -63,7 +68,6 @@ def synthetic_unprocessed(polarity: int) -> xr.Dataset:
     eq_rows = np.isin(time, np.asarray(EQ_TIMES))
 
     psi_n = np.linspace(0.0, 1.0, N_PSI)
-    qpsi = 1.0 + 2.0 * psi_n**2
     pres = 5.0e4 * (1.0 - psi_n) + 1.0e3
     pprime = np.full(N_PSI, -5.0e4 / dpsi)
     fpol = R0 * b0 * (1.0 + 0.05 * (1.0 - psi_n))
@@ -100,7 +104,7 @@ def synthetic_unprocessed(polarity: int) -> xr.Dataset:
         "pres": (pres, ("psi_idx",)),
         "ffprime": (ffprime, ("psi_idx",)),
         "pprime": (pprime, ("psi_idx",)),
-        "qpsi": (qpsi, ("psi_idx",)),
+        "qpsi": (QPSI, ("psi_idx",)),
         "psirz": (psirz, ("r_grid", "z_grid")),
         "rbdry": (R0 + A_MINOR * np.cos(theta_b), ("boundary_idx",)),
         "zbdry": (A_MINOR * np.sin(theta_b), ("boundary_idx",)),
@@ -119,14 +123,16 @@ def synthetic_unprocessed(polarity: int) -> xr.Dataset:
 
 def synthetic_fit(shot: int) -> xr.Dataset:
     """One shot's fit-result dataset, shaped like _shot_fit_dataset saves."""
-    rho = np.linspace(0.0, 1.0, N_RHO)
+    rho_tor_norm = np.linspace(0.0, 1.1, N_RHO_TOR_NORM)
     n_slices = len(TS_TIMES)
-    te = np.tile(1400.0 * (1.0 - 0.85 * rho**2) + 60.0, (n_slices, 1))
-    ne = np.tile((0.9 - 0.7 * rho**2) * 1.0e20 + 5.0e18, (n_slices, 1))
+    te_profile = 1400.0 * np.clip(1.0 - 0.85 * rho_tor_norm**2, 0.0, None) + 60.0
+    ne_profile = (0.9 - 0.7 * rho_tor_norm**2) * 1.0e20 + 5.0e18
+    te = np.tile(te_profile, (n_slices, 1))
+    ne = np.tile(ne_profile, (n_slices, 1))
     statuses = np.full((1, n_slices), STATUS_OK, dtype=np.int8)
 
     def profile(values: np.ndarray) -> tuple:
-        return (("shot", TIME_DIM, "rho"), values[None].astype(np.float32))
+        return (("shot", TIME_DIM, "rho_tor_norm"), values[None].astype(np.float32))
 
     return xr.Dataset(
         data_vars={
@@ -140,12 +146,13 @@ def synthetic_fit(shot: int) -> xr.Dataset:
         coords={
             "shot": [shot],
             TIME_DIM: np.arange(n_slices),
-            "rho": rho,
+            "rho_tor_norm": rho_tor_norm,
             TIME_COORD: (
                 ("shot", TIME_DIM),
                 np.asarray(TS_TIMES, dtype=np.float32)[None],
             ),
         },
+        attrs={"sol_extension": SOL_EXTENSION},
     )
 
 
@@ -192,16 +199,18 @@ def test_imas_export_chain_reads_back(tmp_path, polarity):
     for i in range(len(TS_TIMES)):
         p = cp.profiles_1d[i]
         te_out = np.asarray(p.electrons.temperature)
-        assert te_out.shape == (N_RHO,) and np.all(te_out > 0)
+        assert te_out.shape == (N_RHO_TOR_NORM,) and np.all(te_out > 0)
         assert np.allclose(te_out, np.asarray(fit_ds["t_e"][0, i]), rtol=1e-6)
+        # The psi grid maps back onto the fit grid through the staging map,
+        # past the LCFS included
         grid_psi = np.asarray(p.grid.psi)
-        lo, hi = sorted(
-            (
-                float(ts.global_quantities.psi_axis),
-                float(ts.global_quantities.psi_boundary),
-            )
-        )
-        assert np.all((grid_psi >= lo - 1e-9) & (grid_psi <= hi + 1e-9))
+        psi_axis = float(ts.global_quantities.psi_axis)
+        psi_boundary = float(ts.global_quantities.psi_boundary)
+        grid_psi_n = (grid_psi - psi_axis) / (psi_boundary - psi_axis)
+        grid_rho_tor_norm = rho_tor_norm_from_psi_n(grid_psi_n, QPSI, SOL_EXTENSION)
+        fit_rho_tor_norm = fit_ds["rho_tor_norm"].values
+        assert np.allclose(grid_rho_tor_norm, fit_rho_tor_norm, atol=1e-6)
+        assert (grid_psi_n[fit_rho_tor_norm > 1.0] > 1.0).all()
 
     sm = read_back("summary")
     assert np.allclose(np.asarray(sm.global_quantities.ip.value), polarity * 0.8e6)

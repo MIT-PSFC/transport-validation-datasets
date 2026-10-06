@@ -1,7 +1,187 @@
+import re
+
 import numpy as np
 import xarray as xr
 from loguru import logger
+from scipy.integrate import cumulative_simpson
 from scipy.interpolate import RegularGridInterpolator
+
+IMAS_DOCS_URL = "https://imas-data-dictionary.readthedocs.io/en/latest/generated/ids"
+
+# Attributes of the GEQDSK block make_geqdsk_dataset builds, freeqdsk names.
+# Units are those of COCOS 1 to 8, the range efit_cocos_from_signs covers,
+# where the poloidal flux is per radian; the shot's COCOS number rides on the
+# dataset's "cocos" attribute and in the store as the per-shot cocos variable.
+# "ref" is the IMAS data dictionary path, as for every other signal.
+GEQDSK_SIGNAL_ATTRS = {
+    "rmagx": {
+        "description": "Major radius of the magnetic axis",
+        "units": "m",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/magnetic_axis/r",
+    },
+    "zmagx": {
+        "description": "Height of the magnetic axis",
+        "units": "m",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/magnetic_axis/z",
+    },
+    "simagx": {
+        "description": "Poloidal flux at the magnetic axis",
+        "units": "Wb/rad",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/psi_axis",
+    },
+    "sibdry": {
+        "description": "Poloidal flux at the plasma boundary (LCFS)",
+        "units": "Wb/rad",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/psi_boundary",
+    },
+    "bcentr": {
+        "description": "Vacuum toroidal field at rcentr, from the equilibrium reconstruction",
+        "units": "T",
+        "ref": "/equilibrium/vacuum_toroidal_field/b0",
+    },
+    "current": {
+        "description": "Plasma current from the equilibrium reconstruction",
+        "units": "A",
+        "ref": "/equilibrium/time_slice(itime)/global_quantities/ip",
+    },
+    "rcentr": {
+        "description": "Major radius bcentr is given at",
+        "units": "m",
+        "ref": "/equilibrium/vacuum_toroidal_field/r0",
+    },
+    "rleft": {
+        "description": "Major radius of the inner edge of the psirz grid, r_grid[0]",
+        "units": "m",
+    },
+    "rdim": {
+        "description": "Radial extent of the psirz grid, r_grid[-1] - r_grid[0]",
+        "units": "m",
+    },
+    "zmid": {
+        "description": "Height of the center of the psirz grid",
+        "units": "m",
+    },
+    "zdim": {
+        "description": "Vertical extent of the psirz grid, z_grid[-1] - z_grid[0]",
+        "units": "m",
+    },
+    "fpol": {
+        "description": "Poloidal current function F = R B_phi on the psi_idx grid",
+        "units": "T m",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/f",
+    },
+    "pres": {
+        "description": "Plasma pressure on the psi_idx grid",
+        "units": "Pa",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/pressure",
+    },
+    "ffprime": {
+        "description": "F dF/dpsi on the psi_idx grid",
+        "units": "T^2 m^2 rad/Wb",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/f_df_dpsi",
+    },
+    "pprime": {
+        "description": "dp/dpsi on the psi_idx grid",
+        "units": "Pa rad/Wb",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/dpressure_dpsi",
+    },
+    "qpsi": {
+        "description": "Safety factor on the psi_idx grid",
+        "units": "dimensionless",
+        "ref": "/equilibrium/time_slice(itime)/profiles_1d/q",
+    },
+    "psirz": {
+        "description": "Poloidal flux on the (r_grid, z_grid) grid",
+        "units": "Wb/rad",
+        "ref": "/equilibrium/time_slice(itime)/profiles_2d(i1)/psi",
+    },
+    "rbdry": {
+        "description": "Major radius of the plasma boundary contour points, NaN padded",
+        "units": "m",
+        "ref": "/equilibrium/time_slice(itime)/boundary/outline/r",
+    },
+    "zbdry": {
+        "description": "Height of the plasma boundary contour points, NaN padded",
+        "units": "m",
+        "ref": "/equilibrium/time_slice(itime)/boundary/outline/z",
+    },
+    "rlim": {
+        "description": "Major radius of the limiter contour points",
+        "units": "m",
+        "ref": "/wall/description_2d(i1)/limiter/unit(i2)/outline/r",
+    },
+    "zlim": {
+        "description": "Height of the limiter contour points",
+        "units": "m",
+        "ref": "/wall/description_2d(i1)/limiter/unit(i2)/outline/z",
+    },
+    # Coordinates
+    "r_grid": {"description": "Major radius of the psirz grid points", "units": "m"},
+    "z_grid": {"description": "Height of the psirz grid points", "units": "m"},
+    "psi_idx": {
+        "description": "Index on the uniform normalized poloidal flux grid of the "
+        "1D profiles, 0 at the magnetic axis to 1 at the boundary"
+    },
+    "boundary_idx": {"description": "Index along the plasma boundary contour"},
+    "limiter_idx": {"description": "Index along the limiter contour"},
+}
+
+
+def imas_url(ref: str) -> str:
+    """Documentation URL of an IMAS data dictionary path.
+
+    The form disruption-py records next to its paths: the IDS page, and an
+    anchor of the path with the array indices ((itime), (i1)) dropped.
+
+    Args:
+        ref: Data dictionary path, e.g. /equilibrium/time_slice(itime)/profiles_1d/q.
+
+    Returns:
+        The URL.
+    """
+    parts = [re.sub(r"\(.*?\)", "", part) for part in ref.strip("/").split("/")]
+    return f"{IMAS_DOCS_URL}/{parts[0]}.html#{'-'.join(parts)}"
+
+
+def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
+    """Bring every variable's attributes onto one convention, for the stores.
+
+    The GEQDSK signals and coordinates get GEQDSK_SIGNAL_ATTRS where the
+    device set nothing (files from before make_geqdsk_dataset set them),
+    a data dictionary path under "imas" (disruption-py's key) moves to "ref"
+    (this package's), and every ref without a url gets one (imas_url).
+    A device's own description, units, or url always win.
+
+    Args:
+        ds: Dataset whose variables and coordinates are updated in place.
+
+    Returns:
+        The same dataset.
+    """
+    for name in list(ds.variables):
+        attrs = dict(ds[name].attrs)
+        for key, value in GEQDSK_SIGNAL_ATTRS.get(name, {}).items():
+            attrs.setdefault(key, value)
+        if "imas" in attrs:
+            path = attrs.pop("imas")
+            attrs.setdefault("ref", path)
+        if "ref" in attrs and "url" not in attrs:
+            attrs["url"] = imas_url(attrs["ref"])
+        ds[name].attrs = attrs
+    return ds
+
+
+# How far a TS slice may sit from the reconstruction it maps through,
+# in periods of the reconstruction's own sampling.
+# Above 1 to tolerate clock jitter, low enough that nothing is borrowed across a real gap.
+# The mapping counterpart of workflow.MAX_HOLD_PERIODS, separate to avoid a circular import.
+EQ_MATCH_MAX_PERIODS = 1.5
+
+# How Phi_N continues past the LCFS, see _phi_n_table.
+SOL_EXTENSIONS = ("secant", "tangent")
+
+# The secant SOL extension takes its slope over psi_N from here to the LCFS.
+SECANT_PSI_N = 0.95
 
 
 def make_uniform_1kHz_timebase(max_time: float) -> np.ndarray:
@@ -43,6 +223,7 @@ def make_geqdsk_dataset(
     rbdry,
     zbdry,
     cocos_input,
+    rcentr,
     rlim=None,
     zlim=None,
 ):
@@ -50,10 +231,38 @@ def make_geqdsk_dataset(
 
     FreeQDSK canonical names, COCOS 1.
 
+    Args:
+        shot_id: Shot number, repeated along 'idx' as the 'shot' coordinate.
+        times: (n_t,) times of the reconstruction slices [s].
+        r_grid: (n_r,) major radii of the psi grid columns [m], which also set rleft and rdim.
+        z_grid: (n_z,) heights of the psi grid rows [m], which also set zmid and zdim.
+        rmagx: (n_t,) major radius of the magnetic axis [m].
+        zmagx: (n_t,) height of the magnetic axis [m].
+        simagx: (n_t,) poloidal flux at the magnetic axis [Wb/rad].
+        sibdry: (n_t,) poloidal flux at the plasma boundary [Wb/rad].
+        bcentr: (n_t,) vacuum toroidal field at rcentr [T].
+        current: (n_t,) plasma current [A].
+        fpol: (n_t, n_psi) poloidal current function R*B_t [m*T].
+        pres: (n_t, n_psi) plasma pressure [Pa].
+        ffprime: (n_t, n_psi) F dF/dpsi [m^2*T^2/(Wb/rad)].
+        pprime: (n_t, n_psi) dp/dpsi [Pa/(Wb/rad)].
+        qpsi: (n_t, n_psi) safety factor.
+        psirz: (n_t, n_r, n_z) poloidal flux on the (r_grid, z_grid)
+            grid [Wb/rad].
+        rbdry: (n_t, n_bdry) major radii of the boundary contour [m].
+        zbdry: (n_t, n_bdry) heights of the boundary contour [m].
+        cocos_input: COCOS convention the inputs follow, stored as the
+            dataset's 'cocos' attribute.
+        rcentr: Reference radius bcentr is quoted at [m].
+            A machine or reconstruction constant that the grid does not determine.
+        rlim: (n_lim,) major radii of the limiter contour [m].
+            Static, and stored only when zlim is given too.
+        zlim: (n_lim,) heights of the limiter contour [m].
+            Static, and stored only when rlim is given too.
+
     Returns:
         Dataset with all GEQDSK signals on dim 'idx', with 'time'/'shot' coords.
     """
-    rcentr = r_grid[len(r_grid) // 2]
     rleft = r_grid[0]
     rdim = r_grid[-1] - r_grid[0]
     zmid = z_grid[len(z_grid) // 2]
@@ -114,6 +323,9 @@ def make_geqdsk_dataset(
             "cocos": cocos_input,
         },
     )
+    for name in ds_geqdsk.variables:
+        if name in GEQDSK_SIGNAL_ATTRS:
+            ds_geqdsk[name].attrs.update(GEQDSK_SIGNAL_ATTRS[name])
 
     return ds_geqdsk
 
@@ -168,90 +380,136 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     )
 
 
-def _lcfs_crossing_radius(
-    r_from_axis: np.ndarray, psi_n_from_axis: np.ndarray
-) -> float:
-    """Find the midplane radius where psi_n first crosses 1, walking outward.
+def cumulative_q_integral(qpsi: np.ndarray) -> np.ndarray:
+    """Integrate the safety factor over normalized poloidal flux, outward from the axis.
 
-    Both arrays must be ordered starting at the axis and moving outward.
-
-    Args:
-        r_from_axis: Midplane radii, axis outward [m].
-        psi_n_from_axis: Normalized poloidal flux at those radii.
-
-    Returns:
-        The linearly interpolated crossing radius [m], or NaN if psi_n never reaches 1.
-    """
-    above = psi_n_from_axis >= 1.0
-    if not above.any():
-        return np.nan
-    idx = int(np.argmax(above))
-    if idx == 0:
-        return float(r_from_axis[0])
-    r0, r1 = float(r_from_axis[idx - 1]), float(r_from_axis[idx])
-    p0, p1 = float(psi_n_from_axis[idx - 1]), float(psi_n_from_axis[idx])
-    if p1 == p0:
-        return r1
-    r_cross = r0 + (1.0 - p0) * (r1 - r0) / (p1 - p0)
-    return r_cross
-
-
-def _refine_axis_radius(
-    r_grid: np.ndarray, psi_n_mid: np.ndarray, i_axis: int
-) -> float:
-    """Refine the magnetic axis radius from the midplane psi_n minimum.
-
-    When defining rho = (r - r_axis) / (r_lcfs - r_axis), must know where the axis is.
-    EFIT grid can be coarse (a few cm), so may get rho errors ~ 5% (worst in the core).
-    Here, use a simple 3-point parabola fit to refine the axis radius.
+    The toroidal flux is phi = integral q dpsi,
+    so this is phi in units of (psi_boundary - psi_axis),
+    and dividing it by its last value gives the normalized toroidal flux Phi_N.
 
     Args:
-        r_grid: Midplane radii [m].
-        psi_n_mid: Normalized poloidal flux along the midplane.
-        i_axis: Index of the psi_n_mid minimum.
+        qpsi: (..., n_psi) safety factor on the uniform psi_N grid from 0 to 1.
 
     Returns:
-        The refined axis radius [m].
+        (..., n_psi) integral of q dpsi_N from 0 to each grid point, starting at 0.
     """
-    r_axis = float(r_grid[i_axis])
-    if 0 < i_axis < len(r_grid) - 1:
-        p_m = psi_n_mid[i_axis - 1]
-        p_0 = psi_n_mid[i_axis]
-        p_p = psi_n_mid[i_axis + 1]
-        curv = p_m - 2 * p_0 + p_p
-        if curv > 0:
-            r_axis += (
-                0.5
-                * (p_m - p_p)
-                / curv
-                * float(r_grid[i_axis + 1] - r_grid[i_axis - 1])
-                / 2.0
-            )
-    return r_axis
+    psi_n_grid = np.linspace(0.0, 1.0, qpsi.shape[-1])
+    return cumulative_simpson(qpsi, x=psi_n_grid, initial=0.0)
 
 
-def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]:
-    """Map TS channel (R, Z) positions onto normalized minor radius per slice.
+def _phi_n_table(
+    qpsi: np.ndarray, sol_extension: str
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Tabulate Phi_N on the qpsi grid, and the slope it continues with past the LCFS.
 
-    rho is the normalized minor radius (0 = axis, 1 = LCFS),
-    each channel's psi_n (bilinear interpolation of the equilibrium's psirz at the channel position)
-    is inverted through the midplane psi_n profile at the magnetic axis height to the outboard
-    midplane radius, then normalized by the axis-to-LCFS distance.
-    Choice to use outboard midplane is arbitrary, could use any line from magnetic axis to the LCFS.
-    This one is convenient though because it is one dimension (R) and increases with psi.
+    Phi_N is the q integral normalized to 1 at the LCFS.
+    q is undefined beyond it, so there Phi_N continues linearly in psi_N,
+    with the secant slope (1 - Phi_N(SECANT_PSI_N)) / (1 - SECANT_PSI_N)
+    or the tangent slope q(1) / integral_0^1 q dpsi_N.
+
+    Args:
+        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
+        sol_extension: One of SOL_EXTENSIONS.
+
+    Returns:
+        (psi_n_grid, phi_n_grid, sol_slope): the (n_psi,) psi_N grid, Phi_N on it,
+        and dPhi_N/dpsi_N outside the LCFS.
+
+    Raises:
+        ValueError: If sol_extension is not one of SOL_EXTENSIONS.
+    """
+    q_integral = cumulative_q_integral(qpsi)
+    phi_n_grid = q_integral / q_integral[-1]
+    psi_n_grid = np.linspace(0.0, 1.0, qpsi.size)
+    if sol_extension == "secant":
+        phi_n_start = np.interp(SECANT_PSI_N, psi_n_grid, phi_n_grid)
+        sol_slope = (1.0 - phi_n_start) / (1.0 - SECANT_PSI_N)
+    elif sol_extension == "tangent":
+        sol_slope = qpsi[-1] / q_integral[-1]
+    else:
+        raise ValueError(
+            f"sol_extension must be one of {SOL_EXTENSIONS}, got {sol_extension!r}"
+        )
+    return psi_n_grid, phi_n_grid, float(sol_slope)
+
+
+def rho_tor_norm_from_psi_n(
+    psi_n: np.ndarray, qpsi: np.ndarray, sol_extension: str
+) -> np.ndarray:
+    """Map normalized poloidal flux onto rho_tor_norm through one equilibrium's q profile.
+
+    rho_tor_norm = sqrt(Phi_N), with Phi_N from _phi_n_table.
+    Inside the LCFS Phi_N is interpolated on the qpsi grid,
+    outside it Phi_N continues linearly in psi_N.
+    psi_N below 0, which interpolation can give next to the axis, maps to 0.
+
+    Args:
+        psi_n: Normalized poloidal flux, any shape, NaN where unknown.
+        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
+        sol_extension: One of SOL_EXTENSIONS.
+
+    Returns:
+        rho_tor_norm shaped like psi_n, NaN where psi_n is.
+    """
+    psi_n_grid, phi_n_grid, sol_slope = _phi_n_table(qpsi, sol_extension)
+    psi_n_clipped = np.maximum(psi_n, 0.0)
+    phi_n_inside = np.interp(psi_n_clipped, psi_n_grid, phi_n_grid)
+    phi_n_outside = 1.0 + sol_slope * (psi_n_clipped - 1.0)
+    with np.errstate(invalid="ignore"):
+        phi_n = np.where(psi_n_clipped <= 1.0, phi_n_inside, phi_n_outside)
+    return np.sqrt(phi_n)
+
+
+def psi_n_from_rho_tor_norm(
+    rho_tor_norm: np.ndarray, qpsi: np.ndarray, sol_extension: str
+) -> np.ndarray:
+    """Map rho_tor_norm back onto normalized poloidal flux, the inverse of rho_tor_norm_from_psi_n.
+
+    Phi_N = rho_tor_norm^2 is inverted by interpolation on the qpsi grid inside the LCFS
+    and through the linear continuation outside it.
+    Phi_N rises monotonically with psi_N while q keeps one sign, so the inverse is single valued.
+
+    Args:
+        rho_tor_norm: Any shape, NaN where unknown.
+        qpsi: (n_psi,) safety factor on the uniform psi_N grid from 0 to 1.
+        sol_extension: One of SOL_EXTENSIONS.
+
+    Returns:
+        psi_N shaped like rho_tor_norm, NaN where rho_tor_norm is.
+    """
+    psi_n_grid, phi_n_grid, sol_slope = _phi_n_table(qpsi, sol_extension)
+    phi_n = np.square(rho_tor_norm)
+    psi_n_inside = np.interp(phi_n, phi_n_grid, psi_n_grid)
+    psi_n_outside = 1.0 + (phi_n - 1.0) / sol_slope
+    with np.errstate(invalid="ignore"):
+        psi_n = np.where(phi_n <= 1.0, psi_n_inside, psi_n_outside)
+    return psi_n
+
+
+def map_ts_channels_to_rho_tor_norm(
+    ds_shot: xr.Dataset, sol_extension: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map TS channel (R, Z) positions onto rho_tor_norm per slice.
+
+    Each channel's psi_N is a bilinear interpolation of the equilibrium's psirz at the channel position,
+    which rho_tor_norm_from_psi_n maps through that equilibrium's qpsi.
 
     Only times with at least one finite TS value are mapped.
-    A slice whose equilibrium is missing or degenerate keeps a NaN rho row,
-    the fit-staging min-points gate then skips it.
+    The equilibrium is not necessarily reconstructed at each of those times
+    (EFIT21 on C-Mod is native 1 kHz, but ANALYSIS runs on a ~20 ms clock),
+    so each TS slice maps through the reconstruction nearest in time,
+    accepted within EQ_MATCH_MAX_PERIODS of that reconstruction's sampling period.
+    A slice with no reconstruction in reach, or one without a usable flux map or qpsi,
+    keeps a NaN row, and the fit-staging min-points gate then skips it.
 
     Args:
         ds_shot: One shot's unprocessed dataset with standardized names
-            (ts_channel_r/z, ts_channel_t_e/n_e, psirz, simagx, sibdry, zmagx,
-            r_grid, z_grid).
+            (ts_channel_r/z, ts_channel_t_e/n_e, psirz, simagx, sibdry, qpsi, r_grid, z_grid).
+        sol_extension: How Phi_N continues outside the LCFS, one of SOL_EXTENSIONS.
 
     Returns:
-        (ts_times, rho): the (n_t,) times of the TS slices [s] and the
-        (n_t, n_ch) channel rho positions, NaN where the mapping failed.
+        (ts_times, rho_tor_norm): the (n_t,) times of the TS slices [s] and the
+        (n_t, n_ch) channel rho_tor_norm positions, NaN where the mapping failed.
     """
     if "shot" in ds_shot.dims:
         ds_shot = ds_shot.squeeze("shot", drop=True)
@@ -265,27 +523,50 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
     psirz = ds_shot["psirz"].transpose("time", "r_grid", "z_grid").values
     simagx = ds_shot["simagx"].transpose("time").values
     sibdry = ds_shot["sibdry"].transpose("time").values
-    zmagx = ds_shot["zmagx"].transpose("time").values
+    qpsi = ds_shot["qpsi"].transpose("time", "psi_idx").values
     ts_r = ds_shot["ts_channel_r"].transpose("time", "ts_channel").values
     ts_z = ds_shot["ts_channel_z"].transpose("time", "ts_channel").values
     r_grid = ds_shot["r_grid"].values
     z_grid = ds_shot["z_grid"].values
 
-    rho = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
+    # Each TS slice maps through the reconstruction nearest in time.
+    # A lone reconstruction has no period of its own, so the grid step stands in,
+    # as in workflow._hold_onto_grid.
+    all_times = ds_shot["time"].values
+    eq_rows = np.flatnonzero(np.isfinite(simagx))
+    eq_times = all_times[eq_rows]
+    if eq_times.size > 1:
+        eq_period = float(np.median(np.diff(eq_times)))
+    elif all_times.size > 1:
+        eq_period = float(np.median(np.diff(all_times)))
+    else:
+        eq_period = 0.0
+    eq_tol = EQ_MATCH_MAX_PERIODS * eq_period
+
+    rho_tor_norm = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
     n_no_equilibrium = 0
     for i, ts_idx in enumerate(ts_idxs):
-        # get psi_n at for this timeslice
-        psi_range = sibdry[ts_idx] - simagx[ts_idx]
-        psi_slice = psirz[ts_idx]
+        if eq_rows.size == 0:
+            n_no_equilibrium += 1
+            continue
+        nearest = int(np.argmin(np.abs(eq_times - ts_times[i])))
+        if abs(eq_times[nearest] - ts_times[i]) > eq_tol:
+            n_no_equilibrium += 1
+            continue
+        eq_idx = int(eq_rows[nearest])
+
+        psi_range = sibdry[eq_idx] - simagx[eq_idx]
+        psi_slice = psirz[eq_idx]
+        qpsi_slice = qpsi[eq_idx]
         if (
             not np.isfinite(psi_range)  # psi range NaN or inf
             or np.abs(psi_range) < 1e-10  # psi range too small to be physical
-            or not np.isfinite(zmagx[ts_idx])  # Z magnetic axis NaN or inf
             or not np.all(np.isfinite(psi_slice))  # psi slice has NaN or inf
+            or not np.all(np.isfinite(qpsi_slice))  # no q profile to integrate
         ):
             n_no_equilibrium += 1
             continue
-        psi_n_grid = (psi_slice - simagx[ts_idx]) / psi_range
+        psi_n_grid = (psi_slice - simagx[eq_idx]) / psi_range
 
         # Channel psi_n at the measured (R, Z)
         # NaN positions or positions off the grid stay NaN.
@@ -294,42 +575,15 @@ def map_ts_channels_to_rho(ds_shot: xr.Dataset) -> tuple[np.ndarray, np.ndarray]
         )
         with np.errstate(invalid="ignore"):
             psi_n_ch = interp(np.column_stack([ts_r[ts_idx], ts_z[ts_idx]]))
-
-        # psi_n along the midplane (z = magnetic axis height)
-        psi_n_mid = np.array(
-            [
-                np.interp(zmagx[ts_idx], z_grid, psi_n_grid[j, :])
-                for j in range(len(r_grid))
-            ]
+        rho_tor_norm[i, :] = rho_tor_norm_from_psi_n(
+            psi_n_ch, qpsi_slice, sol_extension
         )
-        i_axis = int(np.argmin(psi_n_mid))
-        r_axis = _refine_axis_radius(r_grid, psi_n_mid, i_axis)
-        r_lcfs_outboard = _lcfs_crossing_radius(r_grid[i_axis:], psi_n_mid[i_axis:])
-        if not np.isfinite(r_lcfs_outboard) or r_lcfs_outboard <= r_axis:
-            n_no_equilibrium += 1
-            continue
-
-        # Map each channel's psi_n to the outboard midplane radius, then normalize to rho.
-        # Anchor the table on the refined axis, where psi_n is 0 by definition, and keep
-        # only the grid nodes outboard of it (otherwise might get negative rho)
-        outboard = r_grid[i_axis:] > r_axis
-        psi_outboard = np.concatenate([[0.0], psi_n_mid[i_axis:][outboard]])
-        r_outboard = np.concatenate([[r_axis], r_grid[i_axis:][outboard]])
-        if r_outboard.size < 2:
-            n_no_equilibrium += 1
-            continue
-        keep = psi_outboard == np.maximum.accumulate(
-            psi_outboard
-        )  # Ensure monotonicity for interp
-        r_mid_ch = np.interp(psi_n_ch, psi_outboard[keep], r_outboard[keep])
-        with np.errstate(invalid="ignore"):
-            rho[i, :] = (r_mid_ch - r_axis) / (r_lcfs_outboard - r_axis)
 
     if n_no_equilibrium:
         logger.debug(
             f"No usable equilibrium at {n_no_equilibrium} of {ts_idxs.size} TS slices"
         )
-    return ts_times, rho
+    return ts_times, rho_tor_norm
 
 
 def channel_rows_at_times(data: xr.DataArray, ts_times: np.ndarray) -> np.ndarray:
@@ -337,7 +591,7 @@ def channel_rows_at_times(data: xr.DataArray, ts_times: np.ndarray) -> np.ndarra
 
     Args:
         data: Channel variable carrying a "time" coordinate.
-        ts_times: TS slice times [s], as returned by map_ts_channels_to_rho.
+        ts_times: TS slice times [s], as returned by map_ts_channels_to_rho_tor_norm.
 
     Returns:
         The (n_t, n_ch) rows at those times.

@@ -3,22 +3,26 @@
 One staged batch file serves every fitting method:
 it carries the cleaned Thomson channel data in fit units: Te [keV], ne [1e20 m^-3]
 (with the device-specific error floors already baked in at staging),
-the target rho grid, and the per-variable fit bound knobs.
+the target rho_tor_norm grid, and the per-variable fit bound knobs and anchors.
 Workers read a batch, fit it, and write a result file whose rows stay aligned with the input rows
 A slice that was skipped or culled is an all-NaN row, never a dropped one.
 
-This module must stay importable with only stdlib + numpy
-It ships to the cluster alongside the workers, where the venv holds nothing else
-(see bootstrap_remote.sh for how that gets set up)
+Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
 """
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
 
 FIT_VARIABLES = ("te", "ne")
+
+# How the staged rows were built. Workers do not care.
+# Carried in the batch file so a resumed run never mixes them (see workflow.stage_fit_batches).
+FIT_MODE_SAMPLE = "sample"  # one row per Thomson sample
+FIT_MODE_WINDOW_SAMPLE = "window_sample"  # one row per Thomson sample in a time window
+FIT_MODE_WINDOW_AVERAGE = "window_average"  # one row per time window, samples pooled
 
 # Per-slice fit statuses, stored as int8 arrays in the result files.
 STATUS_OK = 0  # clean fit
@@ -46,7 +50,6 @@ class FitBounds:
     """
 
     l1_min: float = 0.4
-    x0_min: float = 0.95
     var_max: float = 20.0
 
 
@@ -59,13 +62,47 @@ def default_fit_bounds() -> dict[str, FitBounds]:
     return {var: FitBounds() for var in FIT_VARIABLES}
 
 
+@dataclass(frozen=True)
+class FitAnchors:
+    """Virtual observations one variable is fit with, carried in the batch file.
+
+    Rows are in fit units (Te [keV], ne [1e20 m^-3]), set per device (see workflow.DeviceSettings).
+    Every method adds them to every slice.
+
+    Attributes:
+        value: (n, 3) rows of (rho_tor_norm, value, error).
+        grad: (n, 3) rows of (rho_tor_norm, d/drho_tor_norm, error), per unit rho_tor_norm.
+    """
+
+    value: np.ndarray
+    grad: np.ndarray
+
+    def scaled(self, scale: float) -> "FitAnchors":
+        """Divide the values and errors by scale, keeping the positions.
+
+        Args:
+            scale: The slice normalization the channel data was divided by.
+
+        Returns:
+            The anchors in the normalized units.
+        """
+        factor = np.array([1.0, 1.0 / scale, 1.0 / scale])
+        return FitAnchors(value=self.value * factor, grad=self.grad * factor)
+
+
 @dataclass
 class ShotFitInput:
     """Cleaned Thomson channel data for one shot, ready for GP fitting.
 
-    All channel arrays are (n_t, n_ch). x is the radial coordinate of each
-    channel (normalized minor radius rho), shared between te and ne since both
-    come from the same channels. Invalid points are NaN.
+    All channel arrays are (n_t, n_ch).
+    x is the radial coordinate of each channel (rho_tor_norm),
+    shared between te and ne since both come from the same channels.
+    Invalid points are NaN.
+
+    windows is the shot's (n_w, 2) time window bounds [s] and window_index
+    the (n_t,) window each row belongs to (see transport_validation_datasets.windows).
+    A shot staged without windows has an empty windows array and -1 in every window_index.
+    In a pooled row a channel appears once per Thomson sample, so n_ch is then samples x channels.
     """
 
     x: np.ndarray
@@ -74,6 +111,12 @@ class ShotFitInput:
     ne_y: np.ndarray
     ne_err: np.ndarray
     time: np.ndarray
+    windows: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
+    window_index: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.window_index is None:
+            self.window_index = np.full(np.asarray(self.time).shape, -1, dtype=np.int64)
 
     def has_fittable_points(self) -> bool:
         """Check that te and ne each have at least one finite (x, y, err) point.
@@ -96,10 +139,16 @@ class FitBatch:
 
     Attributes:
         shot_inputs: Per-shot channel data, keyed by shot number.
-        x_star: (n_x,) target rho grid the profiles are fit on.
+        x_star: (n_x,) target rho_tor_norm grid the profiles are fit on.
         min_points: Minimum valid channels per slice to attempt a fit.
         scale_per_slice: Normalize each slice by its max before fitting.
         bounds: Per-variable fit bound knobs, keyed by FIT_VARIABLES.
+        anchors: Per-variable virtual observations, keyed by FIT_VARIABLES.
+        pedestal_rho_tor_norm: Pedestal location for the methods whose model has one
+            (zk's length-scale transition, akho's mtanh centre).
+        sol_extension: How the staged positions continue outside the LCFS (machine.generic.SOL_EXTENSIONS).
+            Workers never read it, it only keeps a resumed run from mixing extensions.
+        fit_mode: One of the FIT_MODE_* values, how the rows were built.
     """
 
     shot_inputs: dict[int, ShotFitInput]
@@ -107,6 +156,10 @@ class FitBatch:
     min_points: int
     scale_per_slice: bool
     bounds: dict[str, FitBounds]
+    anchors: dict[str, FitAnchors]
+    pedestal_rho_tor_norm: float
+    sol_extension: str
+    fit_mode: str = FIT_MODE_SAMPLE
 
 
 @dataclass
@@ -115,8 +168,8 @@ class ShotFitOutput:
 
     The fit/std/grad/grad_std arrays are (n_t, n_x), row-aligned with the
     input slices. A slice that was not fit is an all-NaN row.
-    The gradients are the GP posterior derivative d/drho (mean and latent std)
-    in the profile's units per unit rho.
+    The gradients are the GP posterior derivative d/drho_tor_norm (mean and latent std)
+    in the profile's units per unit rho_tor_norm.
     The status arrays are (n_t,) int8 STATUS_* codes.
     The hyps arrays are optional method diagnostics ((n_t, n_hyp), NaN where a slice
     was not fit at optimized hyperparameters) workers that have none leave them as None.
@@ -142,7 +195,7 @@ class ShotFitOutput:
 
         Args:
             n_t: Number of time slices.
-            n_x: Number of rho grid points.
+            n_x: Number of rho_tor_norm grid points.
             time: (n_t,) slice times [s], echoed from the input.
 
         Returns:
@@ -175,12 +228,21 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         "x_star": np.asarray(batch.x_star, dtype=np.float64),
         "min_points": np.int64(batch.min_points),
         "scale_per_slice": np.bool_(batch.scale_per_slice),
+        "pedestal_rho_tor_norm": np.float64(batch.pedestal_rho_tor_norm),
+        "fit_mode": np.str_(batch.fit_mode),
+        "sol_extension": np.str_(batch.sol_extension),
     }
     for var in FIT_VARIABLES:
         for f in fields(FitBounds):
             arrays[f"bounds:{var}:{f.name}"] = np.float64(
                 getattr(batch.bounds[var], f.name)
             )
+        arrays[f"anchors:{var}:value"] = np.asarray(
+            batch.anchors[var].value, dtype=np.float64
+        )
+        arrays[f"anchors:{var}:grad"] = np.asarray(
+            batch.anchors[var].grad, dtype=np.float64
+        )
     for shot, si in batch.shot_inputs.items():
         arrays[f"{shot}:time"] = np.asarray(si.time, dtype=np.float32)
         arrays[f"{shot}:x"] = np.asarray(si.x, dtype=np.float32)
@@ -188,6 +250,8 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         arrays[f"{shot}:te_err"] = np.asarray(si.te_err, dtype=np.float32)
         arrays[f"{shot}:ne_y"] = np.asarray(si.ne_y, dtype=np.float32)
         arrays[f"{shot}:ne_err"] = np.asarray(si.ne_err, dtype=np.float32)
+        arrays[f"{shot}:windows"] = np.asarray(si.windows, dtype=np.float64)
+        arrays[f"{shot}:window_index"] = np.asarray(si.window_index, dtype=np.int64)
     _atomic_savez(path, arrays)
 
 
@@ -212,6 +276,7 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
             )
             for var in FIT_VARIABLES
         }
+        anchors = _unpack_anchors(data)
         shot_inputs = {
             shot: ShotFitInput(
                 x=data[f"{shot}:x"],
@@ -220,6 +285,8 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
                 ne_y=data[f"{shot}:ne_y"],
                 ne_err=data[f"{shot}:ne_err"],
                 time=data[f"{shot}:time"],
+                windows=data[f"{shot}:windows"],
+                window_index=data[f"{shot}:window_index"],
             )
             for shot in data["shots"].tolist()
         }
@@ -229,7 +296,41 @@ def unpack_fit_batch(path: Path | str) -> FitBatch:
             min_points=int(data["min_points"]),
             scale_per_slice=bool(data["scale_per_slice"]),
             bounds=bounds,
+            anchors=anchors,
+            pedestal_rho_tor_norm=float(data["pedestal_rho_tor_norm"]),
+            sol_extension=str(data["sol_extension"].item()),
+            fit_mode=str(data["fit_mode"].item()),
         )
+
+
+def _unpack_anchors(data) -> dict[str, FitAnchors]:
+    """Read the per-variable anchors out of an open batch npz.
+
+    Args:
+        data: The open npz file.
+
+    Returns:
+        FitAnchors keyed by variable name.
+    """
+    return {
+        var: FitAnchors(
+            value=data[f"anchors:{var}:value"], grad=data[f"anchors:{var}:grad"]
+        )
+        for var in FIT_VARIABLES
+    }
+
+
+def read_batch_anchors(path: Path | str) -> dict[str, FitAnchors]:
+    """Read only the anchors from a batch input npz (cheap).
+
+    Args:
+        path: Batch input npz path.
+
+    Returns:
+        FitAnchors keyed by variable name.
+    """
+    with np.load(path) as data:
+        return _unpack_anchors(data)
 
 
 def read_batch_shots(path: Path | str) -> list[int]:
@@ -245,6 +346,36 @@ def read_batch_shots(path: Path | str) -> list[int]:
         return data["shots"].tolist()
 
 
+def read_batch_windows(path: Path | str) -> dict[int, np.ndarray]:
+    """Read only the time windows each shot of a batch input npz was staged with.
+
+    Cheap: the channel arrays are never touched.
+
+    Args:
+        path: Batch input npz path.
+
+    Returns:
+        Per shot its (n_w, 2) window bounds [s], empty for a shot staged
+        without windows.
+    """
+    with np.load(path) as data:
+        return {shot: data[f"{shot}:windows"] for shot in data["shots"].tolist()}
+
+
+def read_batch_setting(path: Path | str, name: str) -> str:
+    """Read only one scalar setting from a batch input npz (cheap).
+
+    Args:
+        path: Batch input npz path.
+        name: The FitBatch field, "fit_mode", "sol_extension" or "pedestal_rho_tor_norm".
+
+    Returns:
+        The setting's value, as a string.
+    """
+    with np.load(path) as data:
+        return str(data[name].item())
+
+
 def pack_fit_results(
     path: Path | str, outputs: dict[int, ShotFitOutput], x_star: np.ndarray
 ):
@@ -253,7 +384,7 @@ def pack_fit_results(
     Args:
         path: Destination npz path.
         outputs: Per-shot fit outputs, keyed by shot number.
-        x_star: (n_x,) rho grid the profiles were fit on.
+        x_star: (n_x,) rho_tor_norm grid the profiles were fit on.
     """
     arrays = {
         "shots": np.array(sorted(outputs), dtype=np.int64),

@@ -14,7 +14,7 @@ import numpy as np
 from mkgp.core.kernels import SE_Kernel
 from mkgp.core.routines import GaussianProcess
 
-from transport_validation_datasets.gp_fitting.batch_io import FitBounds
+from transport_validation_datasets.gp_fitting.batch_io import FitAnchors, FitBounds
 from transport_validation_datasets.gp_fitting.zk.kernel import (
     ERR_HYP_BOUNDS,
     ERR_HYP_START,
@@ -32,26 +32,6 @@ from transport_validation_datasets.gp_fitting.zk.quality import (
     rise_is_data_supported,
 )
 
-# Edge boundary conditions, informed by Chilenski 2016. Columns: (rho, value, error).
-# Value BCs pull the profile to ~0 past the separatrix
-# Gradient BCs flatten it at the axis (rho=0) and past the edge.
-# The axis gradient uses a small positive error (mkgp needs a positive diagonal entry to stay invertible)
-VALUE_BC = np.array(
-    [[1.1, 0.0, 0.01], [1.2, 0.0, 0.01], [1.3, 0.0, 0.01], [1.4, 0.0, 0.01]]
-)
-GRAD_BC = np.array(
-    [
-        [0.0, 0.0, 0.01],
-        [1.1, 0.0, 0.1],
-        [1.2, 0.0, 0.1],
-        [1.3, 0.0, 0.1],
-        [1.4, 0.0, 0.1],
-    ]
-)
-# Half-width (in rho) of the x0 window used to pin the pedestal location when
-# tying Te to the ne fit. Narrow enough to hold x0, wide enough to stay a
-# valid (lower < upper) bound after clamping to the global x0 range.
-X0_PIN_HALFWIDTH = 1.0e-3
 # Extra optimizer attempts (beyond the first) when a fit pins a hyperparameter
 # at its bound - a different random restart usually escapes the same basin.
 MAX_HYP_RETRIES = 2
@@ -69,7 +49,7 @@ class ProfileFit:
         std: (n_x,) predictive std (includes observation noise).
         grad: (n_x,) posterior derivative d/drho.
         grad_std: (n_x,) latent derivative std.
-        hyps: Fitted [var, l1, l2, lw, x0].
+        hyps: Fitted [var, l1, l2, lw].
     """
 
     fit: np.ndarray
@@ -85,15 +65,16 @@ def run_gp(
     err_y,
     x_eval,
     fit_bounds: FitBounds,
+    anchors: FitAnchors,
+    pedestal_rho: float,
     hyperparams=None,
     optimize=True,
-    pin_x0=None,
     extra_grad_bc=None,
     nrestarts=NRESTARTS,
     hyp_retries=MAX_HYP_RETRIES,
     seed_salt=0,
 ) -> GaussianProcess | None:
-    """Set up the GP with edge BCs and fit it.
+    """Set up the GP with the anchors and fit it.
 
     With optimize=True and hyperparams=None the hyperparameters are tuned
     (nrestarts random restarts, mkgp's native LML maximization). Otherwise the
@@ -114,14 +95,12 @@ def run_gp(
         data_y: Channel values (normalized when scale_per_slice).
         err_y: Channel errors.
         x_eval: Points to predict at.
-        fit_bounds: The variable's staged bound knobs (l1 floor, x0 lower
-            bound).
-        hyperparams: Fixed [var, l1, l2, lw, x0] to predict at, or None.
+        fit_bounds: The variable's staged bound knobs (amplitude ceiling, l1 floor).
+        anchors: The variable's anchors, normalized like data_y (FitAnchors.scaled).
+        pedestal_rho: The kernel's length-scale transition center.
+        hyperparams: Fixed [var, l1, l2, lw] to predict at, or None.
         optimize: Tune the hyperparameters (only when hyperparams is None).
-        pin_x0: Narrow the x0 (pedestal location) bounds to a tight window
-            around this value, so bound enforcement holds the pedestal there
-            (used to tie the Te pedestal location to the ne fit).
-        extra_grad_bc: (n, 3) rows appended to the standard GRAD_BC set (the
+        extra_grad_bc: (n, 3) rows appended to the grad anchors (the
             monotonic-edge virtual observations, see MONO_CHECK_RHO).
         nrestarts: Optimizer random restarts per attempt.
         hyp_retries: Extra attempts when a fit pins a hyperparameter.
@@ -133,14 +112,14 @@ def run_gp(
         The fitted GaussianProcess, or None if every attempt failed.
     """
     kbounds = bounds_for(fit_bounds)
-    if pin_x0 is not None:
-        lo, hi = kbounds[0, 4], kbounds[1, 4]
-        kbounds[0, 4] = max(lo, pin_x0 - X0_PIN_HALFWIDTH)
-        kbounds[1, 4] = min(hi, pin_x0 + X0_PIN_HALFWIDTH)
-    xdata = np.concatenate([data_X, VALUE_BC[:, 0]])
-    ydata = np.concatenate([data_y, VALUE_BC[:, 1]])
-    yerr = np.concatenate([err_y, VALUE_BC[:, 2]])
-    grad_bc = GRAD_BC if extra_grad_bc is None else np.vstack([GRAD_BC, extra_grad_bc])
+    xdata = np.concatenate([data_X, anchors.value[:, 0]])
+    ydata = np.concatenate([data_y, anchors.value[:, 1]])
+    yerr = np.concatenate([err_y, anchors.value[:, 2]])
+    grad_bc = (
+        anchors.grad
+        if extra_grad_bc is None
+        else np.vstack([anchors.grad, extra_grad_bc])
+    )
 
     do_optimize = optimize and hyperparams is None
     n_attempts = (1 + hyp_retries) if do_optimize else 1
@@ -148,7 +127,8 @@ def run_gp(
     best_gp, best_lml = None, -np.inf
     for attempt in range(n_attempts):
         gp = GaussianProcess()
-        gp.set_kernel(kernel=build_kernel(hyperparams), kbounds=kbounds, regpar=1.0)
+        kernel = build_kernel(pedestal_rho, hyperparams)
+        gp.set_kernel(kernel=kernel, kbounds=kbounds, regpar=1.0)
         # Heteroscedastic noise model: GP-fit the error bars with an SE kernel
         # (mkgp HSGP path). The main fit then uses the smoothed errors and the
         # predictive std picks up a rho-varying noise term (see ERR_HYP_START).
@@ -197,7 +177,7 @@ def run_gp(
         if not do_optimize:
             return gp
 
-        hyps = np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
+        hyps = np.asarray(gp.get_gp_kernel().hyperparameters, dtype=float)
         lml = gp.get_gp_lml()
         if lml is not None and lml > best_lml:
             best_gp, best_lml = gp, lml
@@ -213,15 +193,15 @@ def fit_profile(
     err_y: np.ndarray,
     x_star: np.ndarray,
     fit_bounds: FitBounds,
-    pin_x0: float | None = None,
+    anchors: FitAnchors,
+    pedestal_rho: float,
     seed_salt: int = 0,
 ) -> ProfileFit | None:
     """Fit one cleaned profile slice and predict on x_star.
 
     Expects data that already went through cleaning.clean_channels
     (NaN-free, outliers removed, normalized when scale_per_slice).
-    the hyperparameters are always optimized. The fitted hyperparameters
-    are returned so callers can read the pedestal location (x0).
+    The hyperparameters are always optimized.
 
     After the fit, positive posterior gradients on the edge check grid are
     suppressed by virtual zero-slope observations and a refit at fixed
@@ -235,7 +215,8 @@ def fit_profile(
         err_y: Channel errors.
         x_star: Target rho grid.
         fit_bounds: The variable's staged bound knobs.
-        pin_x0: Hold the pedestal location at this value (see run_gp).
+        anchors: The variable's anchors, normalized like data_y.
+        pedestal_rho: The kernel's length-scale transition center.
         seed_salt: Restart seed offset for a reseeded retry (see run_gp).
 
     Returns:
@@ -248,11 +229,18 @@ def fit_profile(
     n_out = x_out.size
     x_eval = np.concatenate([x_out, MONO_CHECK_RHO])
     gp = run_gp(
-        data_X, data_y, err_y, x_eval, fit_bounds, pin_x0=pin_x0, seed_salt=seed_salt
+        data_X,
+        data_y,
+        err_y,
+        x_eval,
+        fit_bounds,
+        anchors,
+        pedestal_rho,
+        seed_salt=seed_salt,
     )
     if gp is None:
         return None
-    hyps_out = np.asarray(gp.get_gp_kernel_details()[1], dtype=float)
+    hyps_out = np.asarray(gp.get_gp_kernel().hyperparameters, dtype=float)
 
     # Monotonic-edge repair (see the MONO_CHECK_RHO block comment in
     # quality.py): pin the slope to zero wherever the fit rises on the check
@@ -281,9 +269,10 @@ def fit_profile(
             err_y,
             x_eval,
             fit_bounds,
+            anchors,
+            pedestal_rho,
             hyperparams=hyps_out,
             optimize=False,
-            pin_x0=pin_x0,
             extra_grad_bc=mono_bc,
             seed_salt=seed_salt,
         )
@@ -293,7 +282,7 @@ def fit_profile(
 
     # Te/ne are physical (positive) quantities but the GP posterior is
     # Gaussian with unbounded support, so the mean can dip slightly negative
-    # past the separatrix where the value BC pulls it to zero.
+    # past the separatrix where the value anchors pull it to zero.
     # Clip the mean at 0 (downstream should read the band as truncated at 0 likewise)
     fit = np.maximum(np.asarray(gp.get_gp_mean(), dtype=float).ravel()[:n_out], 0.0)
     # Predictive std (includes observation noise), not the latent-function std.

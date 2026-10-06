@@ -1,23 +1,14 @@
-"""Vendored analytic mtanh/cubic pre-fit stage of the akho method.
+"""Analytic mtanh and cubic pre-fit of the akho method.
 
-Vendored (a second time) from `cmod_to_imas/profile_fit_vendored.py`, which
-itself was vendored from the small `tokamak_profile_fitting` slice
-`fit_cmod.py` actually needed (`fit.py`, `profiles/fit_functions.py`,
-`utils.py`) -- that package is not pip-installable and only reachable via a
-`sys.path` hack into a sibling repo, so vendoring avoids that fragile
-dependency entirely (see `profile_fit_vendored.py`'s own docstring for the
-original provenance). `apply_2pt_shift` was dropped: it implements the
-two-point-model Te-separatrix shift, which needs an external per-shot
-calibration target that `FitBatch`/`ShotFitInput` do not carry (see
-worker_akho.py's module docstring) -- unused here, so not vendored.
-
-Pure numpy/scipy: this module sits on the worker's `python -m` import path
-into a minimal cluster venv (stdlib + numpy + mkgp only, see batch_io.py's
-module docstring) and must stay importable there.
+Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
 """
 
 import numpy as np
 from scipy.optimize import curve_fit
+
+# Te mtanh fits wider than this are broad core-shaping sigmoids pinned near
+# the width bound, not pedestals, so the cubic takes those slices.
+_TE_MTANH_MAX_WIDTH = 0.10
 
 
 def chi_squared(ydata, yfit, yerr):
@@ -29,41 +20,18 @@ def chi_squared(ydata, yfit, yerr):
     return np.sum((ydata - yfit) ** 2 / yerr**2)
 
 
-def reduced_chi_squared_inside_separatrix(
-    psi, ydata, yfit, yerr, num_params, only_edge=False
-):
-    """Chi-squared evaluated only inside the separatrix (psi < 1).
-
-    If only_edge=True, restrict further to 0.6 < psi < 1.0.
+def reduced_chi_squared_inside_separatrix(rho, ydata, yfit, yerr, num_params):
+    """Chi-squared evaluated only inside the separatrix (rho < 1).
 
     Returns:
-        The reduced chi-squared over the masked points, or np.inf if there
-        are not enough points to constrain the fit.
+        The reduced chi-squared over the masked points,
+        or np.inf if there are not enough points to constrain the fit.
     """
-    if only_edge:
-        mask = (psi > 0.6) & (psi < 1.0)
-    else:
-        mask = psi < 1.0
+    mask = rho < 1.0
     n = np.sum(mask)
     if n <= num_params:
         return np.inf
     return chi_squared(ydata[mask], yfit[mask], yerr[mask]) / (n - num_params)
-
-
-def Osborne_Tanh_linear(x, c0, c1, c2, c3, c4):
-    """Osborne tanh with a linear inboard slope and flat outboard (SOL) term.
-
-    c0: pedestal centre, c1: full width, c2: top, c3: bottom, c4: inboard linear.
-
-    Returns:
-        The function evaluated at `x`.
-    """
-    z = 2.0 * (c0 - x) / c1
-    P1 = 1.0 + c4 * z
-    P2 = 1.0
-    E1 = np.exp(z)
-    E2 = np.exp(-z)
-    return 0.5 * (c2 + c3 + (c2 - c3) * (P1 * E1 - P2 * E2) / (E1 + E2))
 
 
 def Osborne_Tanh_cubic(x, c0, c1, c2, c3, c4, c5, c6):
@@ -83,44 +51,37 @@ def Osborne_Tanh_cubic(x, c0, c1, c2, c3, c4, c5, c6):
     return 0.5 * (c2 + c3 + (c2 - c3) * (P1 * E1 - P2 * E2) / (E1 + E2))
 
 
-def Osborne_Tanh_cubic_linear_SOL(x, c0, c1, c2, c3, c4, c5, c6, c7):
-    """Osborne tanh with cubic inboard terms and a linear outboard (SOL) term.
+def Osborne_Tanh_cubic_zero_axis_slope(x, c0, c1, c2, c3, c5, c6):
+    """Osborne tanh (cubic inboard, flat SOL) with zero slope at the axis.
 
-    c7: outboard linear term.
+    Osborne_Tanh_cubic with the linear inboard term c4 solved for rather than fit,
+    so that df/dx = 0 exactly at the axis, as CubicZeroAxisSlope also holds.
+    With z0 = 2*c0/c1 and u = exp(-2*z0) the condition is linear in c4:
 
-    Returns:
-        The function evaluated at `x`.
-    """
-    z = 2.0 * (c0 - x) / c1
-    P1 = 1.0 + c4 * z + c5 * z**2 + c6 * z**3
-    P2 = 1.0 + c7 * z
-    E1 = np.exp(z)
-    E2 = np.exp(-z)
-    return 0.5 * (c2 + c3 + (c2 - c3) * (P1 * E1 - P2 * E2) / (E1 + E2))
+        P1'(z0)*(1+u) + (2*P1(z0) + 2)*u = 0
 
+    For realistic pedestals u is ~1e-6 or smaller,
+    so this is effectively P1'(z0) = 0.
 
-def Osborne_Tanh_cubic_quadratic_SOL(x, c0, c1, c2, c3, c4, c5, c6, c7, c8):
-    """Osborne tanh with cubic inboard terms and a quadratic outboard (SOL) term.
-
-    c7: outboard linear, c8: outboard quadratic.
+    c0: pedestal centre, c1: full width, c2: top, c3: bottom,
+    c5: quadratic, c6: cubic inboard terms.
 
     Returns:
         The function evaluated at `x`.
     """
-    z = 2.0 * (c0 - x) / c1
-    P1 = 1.0 + c4 * z + c5 * z**2 + c6 * z**3
-    P2 = 1.0 + c7 * z + c8 * z**2
-    E1 = np.exp(z)
-    E2 = np.exp(-z)
-    return 0.5 * (c2 + c3 + (c2 - c3) * (P1 * E1 - P2 * E2) / (E1 + E2))
+    z0 = 2.0 * c0 / c1
+    u = np.exp(-2.0 * z0)
+    c4 = -(
+        (2.0 * c5 * z0 + 3.0 * c6 * z0**2) * (1.0 + u)
+        + (4.0 + 2.0 * c5 * z0**2 + 2.0 * c6 * z0**3) * u
+    ) / (1.0 + u + 2.0 * z0 * u)
+    return Osborne_Tanh_cubic(x, c0, c1, c2, c3, c4, c5, c6)
 
 
 def CubicZeroAxisSlope(x, c0, c2, c3):
-    """Cubic polynomial with its linear term dropped.
+    """Cubic polynomial with no linear term, so its slope at the axis is exactly zero.
 
-    f'(0) == 0 identically for any c2/c3, enforcing zero profile gradient
-    at the magnetic axis (x=0) exactly, without a bounded/constrained
-    optimizer.
+    c0: axis value, c2: quadratic, c3: cubic term.
 
     Returns:
         The polynomial evaluated at `x`.
@@ -128,83 +89,46 @@ def CubicZeroAxisSlope(x, c0, c2, c3):
     return c0 + c2 * x**2 + c3 * x**3
 
 
-def Osborne_linear_initial_guesses(psi_edge, values_edge, n_params=7):
-    """Rough initial guesses for an Osborne tanh fit based on edge-only data.
+def Osborne_linear_initial_guesses(rho_edge, values_edge, n_params):
+    """Rough initial guesses for an Osborne tanh fit at a fixed centre, from edge-only data.
 
     Returns:
-        A list of length n_params with trailing zeros for polynomial terms.
+        [width, top, bottom], then zeros for the remaining polynomial terms up to n_params.
     """
     if len(values_edge) < 4:
-        return [1.0, 0.04, float(np.nanmax(values_edge)), 0.0] + [0.0] * (n_params - 4)
+        return [0.04, float(np.nanmax(values_edge)), 0.0] + [0.0] * (n_params - 3)
 
     avg = np.nanmean(values_edge)
     bottom = avg * 0.3
     top = avg * 1.1
 
-    max_r = psi_edge[-1]
-    min_r = psi_edge[-1]
-    for i in range(len(psi_edge) - 1, -1, -1):
+    max_r = rho_edge[-1]
+    min_r = rho_edge[-1]
+    for i in range(len(rho_edge) - 1, -1, -1):
         if values_edge[i] > bottom:
-            max_r = psi_edge[i]
+            max_r = rho_edge[i]
             break
-    for i in range(len(psi_edge) - 1, -1, -1):
+    for i in range(len(rho_edge) - 1, -1, -1):
         if values_edge[i] > top:
-            min_r = psi_edge[i]
+            min_r = rho_edge[i]
             break
 
     width = max_r - min_r
     if width <= 0:
-        width = abs(psi_edge[-3] - psi_edge[-5]) if len(psi_edge) > 5 else 0.05
-    centre = (max_r + min_r) / 2.0
+        width = abs(rho_edge[-3] - rho_edge[-5]) if len(rho_edge) > 5 else 0.05
 
-    return [centre, width, top, bottom] + [0.0] * (n_params - 4)
-
-
-# Map (core_order, sol_order) to the fit function and number of parameters.
-_FIT_FUNCTION_MAP = {
-    (3, 0): (Osborne_Tanh_cubic, 7),
-    (3, 1): (Osborne_Tanh_cubic_linear_SOL, 8),
-    (3, 2): (Osborne_Tanh_cubic_quadratic_SOL, 9),
-}
-
-
-def get_fit_function(core_order, sol_order):
-    """Return (fit_function, n_params) for the given polynomial orders.
-
-    core_order: polynomial order for the inboard region (only 3 currently
-    supported); sol_order: polynomial order for the outboard SOL (0, 1, or 2).
-
-    Returns:
-        A (fit_function, n_params) tuple.
-
-    Raises:
-        ValueError: If no fit function exists for the requested orders.
-    """
-    key = (core_order, sol_order)
-    if key not in _FIT_FUNCTION_MAP:
-        raise ValueError(
-            f"No fit function for core_order={core_order}, sol_order={sol_order}. "
-            f"Supported: {list(_FIT_FUNCTION_MAP.keys())}"
-        )
-    return _FIT_FUNCTION_MAP[key]
+    return [width, top, bottom] + [0.0] * (n_params - 3)
 
 
 def evaluate_with_gradient(fit_func, popt, x, h=1.0e-4):
-    """Evaluate a vendored fit function and its central-difference derivative.
+    """Evaluate an analytic fit function and its central-difference derivative.
 
-    Used to reconstruct the analytic mean fit's own contribution to the total
-    profile gradient/value: the mkgp GP stage (gp.py) only fits the
-    *residual* against this mean, so its own posterior mean/derivative do not
-    include the mean's own value/slope -- worker_akho.py's `_fit_variable`
-    stacks this on top of the GP-residual result. No closed-form derivative
-    is used (rather than deriving one per fit function) since the two
-    functions `_fit_one_profile` can pick between (Osborne_Tanh_cubic,
-    CubicZeroAxisSlope) both need one and a single finite-difference helper
-    covers both.
+    worker_akho.py adds both back onto the GP residual fit, which never saw the analytic mean.
+    One finite-difference helper covers both candidate functions.
 
     Args:
-        fit_func: One of this module's Osborne_Tanh_*/CubicZeroAxisSlope functions.
-        popt: Its fitted parameters (from _fit_one_profile).
+        fit_func: The winning candidate from fit_analytic_profile.
+        popt: Its fitted parameters.
         x: Points to evaluate at.
         h: Central-difference step.
 
@@ -217,196 +141,169 @@ def evaluate_with_gradient(fit_func, popt, x, h=1.0e-4):
     return mean, dmean_dx
 
 
-def _fit_one_profile(
-    psi,
-    values,
-    errors,
-    psi_grid,
-    fit_func,
-    n_params,
-    enforce_mtanh,
-    use_edge_chi_squared,
-    profile_type,
-    last_params=None,
-    debug_plot=False,
-    edge_thresh=0.8,
+def fit_analytic_profile(
+    rho, values, errors, is_channel, profile_type, edge_thresh, pedestal_rho
 ):
-    """Fit one profile (Te or ne) with mtanh and optionally cubic.
+    """Fit the zero-axis-slope mtanh and cubic to one profile, keep the one that fits better.
+
+    The mtanh is centred on pedestal_rho, so its free parameters are
+    the width, top, bottom, and inboard quadratic and cubic terms.
+    The candidates compete on reduced chi-squared inside the separatrix.
+    An mtanh needs three measured channels inside its pedestal width,
+    and a Te mtanh wider than _TE_MTANH_MAX_WIDTH is rejected.
+
+    Args:
+        rho: (n,) point positions, measured channels and value anchors.
+        values: (n,) values, normalized by the slice maximum when the batch scales per slice.
+        errors: (n,) errors, in the same units as values.
+        is_channel: (n,) True for measured channels, False for anchors.
+        profile_type: 'te' or 'ne', selects the bounds and initial guesses.
+        edge_thresh: rho above which points seed the edge-based initial guess.
+        pedestal_rho: The mtanh centre.
 
     Returns:
-        A (profile_on_grid, chi_squared, fit_type_str, updated_last_params)
-        tuple. Any element may be None if all fits fail.
+        (fit_func, popt) of the winning candidate, or None if both fail.
     """
     is_ne = profile_type == "ne"
-    scale = 1e20 if is_ne else 1.0
-    vals_s = values / scale
-    errs_s = errors / scale
-    max_val = max(vals_s)
+    max_val = max(values)
 
-    # Bounds: [c0, c1, c2, c3] + polynomial terms
-    # c0=centre, c1=width, c2=top, c3=bottom — matching original code exactly
+    def mtanh_at_pedestal(x, c1, c2, c3, c5, c6):
+        return Osborne_Tanh_cubic_zero_axis_slope(x, pedestal_rho, c1, c2, c3, c5, c6)
+
+    # c1, c2, c3, c5, c6
+    n_params = 5
+
+    # Bounds on [width, top, bottom] + inboard polynomial terms
     if is_ne:
-        lb = [0.85, 0.01, 0.0, -0.001] + [-np.inf] * (n_params - 4)
-        ub = [1.1, 0.25, max_val, np.inf] + [np.inf] * (n_params - 4)
+        lb = [0.01, 0.0, -0.001] + [-np.inf] * (n_params - 3)
+        ub = [0.25, max_val, np.inf] + [np.inf] * (n_params - 3)
     else:
-        lb = [0.85, 0.01, 10.0 / scale, -0.001] + [-np.inf] * (n_params - 4)
-        ub = [1.1, 0.2, max_val, max_val] + [np.inf] * (n_params - 4)
+        lb = [0.01, 0.0, -0.001] + [-np.inf] * (n_params - 3)
+        ub = [0.15, max_val, max_val] + [np.inf] * (n_params - 3)
 
-    # Hardcoded initial guesses — from original repo
+    # Hard-coded initial guesses, [c1, c2, c3, c5, c6]
     if is_ne:
         hardcoded = [
             # 650 kA C-Mod
             [
-                1.00604712,
                 3.7400836e-02,
                 2.10662412,
                 1.68897974e-02,
-                -6.32778417e-02,
                 2.29233952e-03,
                 -2.0627212e-05,
             ],
             # 1 MA C-Mod
             [
-                1.02123755e00,
                 5.02744526e-02,
                 2.54219267e00,
                 -9.99999694e-04,
-                2.58724602e-02,
                 -2.32961078e-03,
                 4.20279037e-05,
             ],
             # D3D
-            [0.99, 0.04, 1.0, 0.05, 0.0, 0.0, 0.0],
-            [0.99, 0.04, 0.3, 0.05, 0.0, 0.0, 0.0],
+            [0.04, 1.0, 0.05, 0.0, 0.0],
+            [0.04, 0.3, 0.05, 0.0, 0.0],
         ]
     else:
         hardcoded = [
-            # from fit_te_mtanh in original functions_profile_fitting.py
             [
-                9.92614859e-01,
                 4.01791101e-02,
-                2.55550908e02 / scale,
-                1.28542623e01 / scale,
-                2.17777084e-01,
+                2.55550908e02,
+                1.28542623e01,
                 -3.45196862e-03,
                 1.42947373e-04,
             ],
         ]
-
-    guesses = []
-    for g in hardcoded:
-        guesses.append(np.array((list(g) + [0.0] * n_params)[:n_params]))
-    # Osborne_linear auto-guess uses edge data including the SOL zero anchor,
-    # matching the original which passes raw_te_psi_edge/raw_ne_psi_edge after
-    # add_SOL_zeros_in_psi_coords (functions_fit_1D.py lines 333-334, 473)
+    guesses = [np.array(g) for g in hardcoded]
+    # The edge-based guess sees the value anchors too
     try:
-        edge_sel = psi > edge_thresh
-        auto = Osborne_linear_initial_guesses(psi[edge_sel], vals_s[edge_sel], n_params)
+        edge_sel = rho > edge_thresh
+        auto = Osborne_linear_initial_guesses(rho[edge_sel], values[edge_sel], n_params)
         guesses.insert(0, np.array(auto))
     except Exception:
         pass
-    if last_params is not None:
-        guesses.insert(0, np.array(last_params))
 
-    # Clamp all guesses to the parameter bounds.  Hardcoded C-Mod/D3D values
-    # have c2 (pedestal top) much higher than D3D data, putting them outside
-    # the ub[2]=max_val bound and causing curve_fit to raise immediately.
+    # Clamp the guesses to the bounds, the hard-coded pedestal tops can sit far above the data
     lb_arr = np.array(lb)
     ub_arr = np.array(ub)
     guesses = [np.clip(g, lb_arr, ub_arr) for g in guesses]
 
-    # Prepend data-adaptive guesses with c2 tuned to the actual data maximum
-    # so the optimizer starts from a physically reasonable point.
-    c2_est = max_val * 0.85
-    c3_est = max_val * 0.02
-    for _c0, _c1 in [(0.99, 0.04), (0.98, 0.04), (0.99, 0.05), (1.00, 0.03)]:
+    # Data-adaptive guesses with the pedestal top near the data maximum go first
+    for width_guess in (0.04, 0.05, 0.03):
         g = np.zeros(n_params)
-        g[0] = _c0
-        g[1] = _c1
-        g[2] = c2_est
-        if n_params > 3:
-            g[3] = c3_est
+        g[0] = width_guess
+        g[1] = 0.85 * max_val
+        g[2] = 0.02 * max_val
         guesses.insert(0, g)
 
-    # ---- mtanh fit ----
-    params_mtanh = profile_mtanh = chi_mtanh = None
+    params_mtanh = chi_mtanh = None
     for guess in guesses:
         try:
             params_mtanh, _ = curve_fit(
-                fit_func,
-                psi,
-                vals_s,
+                mtanh_at_pedestal,
+                rho,
+                values,
                 p0=guess,
-                sigma=errs_s,
+                sigma=errors,
                 absolute_sigma=True,
                 maxfev=2000,
                 bounds=(lb, ub),
             )
-            fitted_at_data = fit_func(psi, *params_mtanh)
+            mtanh_at_data = mtanh_at_pedestal(rho, *params_mtanh)
             chi_mtanh = reduced_chi_squared_inside_separatrix(
-                psi,
-                vals_s,
-                fitted_at_data,
-                errs_s,
-                n_params,
-                only_edge=use_edge_chi_squared,
+                rho, values, mtanh_at_data, errors, n_params
             )
-            profile_mtanh = fit_func(psi_grid, *params_mtanh) * scale
             break
         except Exception:
             continue
 
-    # if enforce_mtanh is True and the fit has succeeed, we can return immediately here
-    if enforce_mtanh:
-        if profile_mtanh is not None:
-            return profile_mtanh, chi_mtanh, "mtanh", params_mtanh
-        return None, None, None, last_params
-
-    # ---- cubic fallback ----
-    params_cubic = profile_cubic = chi_cubic = None
+    params_cubic = chi_cubic = None
     try:
         params_cubic, _ = curve_fit(
             CubicZeroAxisSlope,
-            psi,
-            vals_s,
-            sigma=errs_s,
+            rho,
+            values,
+            sigma=errors,
             absolute_sigma=True,
             maxfev=2000,
         )
+        cubic_at_data = CubicZeroAxisSlope(rho, *params_cubic)
         chi_cubic = reduced_chi_squared_inside_separatrix(
-            psi,
-            vals_s,
-            CubicZeroAxisSlope(psi, *params_cubic),
-            errs_s,
-            3,
-            only_edge=use_edge_chi_squared,
+            rho, values, cubic_at_data, errors, 3
         )
-        profile_cubic = CubicZeroAxisSlope(psi_grid, *params_cubic) * scale
     except Exception:
         pass
 
-    # discard fits with nonsensical chi-squared
+    # Discard fits with a nonsensical chi-squared
     def _bad_chi(chi):
         return chi is None or chi <= 0 or chi > 20
 
     if _bad_chi(chi_mtanh):
-        params_mtanh = profile_mtanh = chi_mtanh = None
+        params_mtanh = chi_mtanh = None
     if _bad_chi(chi_cubic):
-        params_cubic = profile_cubic = chi_cubic = None
+        params_cubic = chi_cubic = None
 
-    # discard mtanh if fewer than 3 points in the pedestal region
     if params_mtanh is not None:
-        lo, hi = params_mtanh[0] - params_mtanh[1], params_mtanh[0] + params_mtanh[1]
-        if np.sum((psi > lo) & (psi < hi)) < 3:
-            params_mtanh = profile_mtanh = chi_mtanh = None
+        lo = pedestal_rho - params_mtanh[0]
+        hi = pedestal_rho + params_mtanh[0]
+        in_pedestal = is_channel & (rho > lo) & (rho < hi)
+        if np.count_nonzero(in_pedestal) < 3:
+            params_mtanh = chi_mtanh = None
 
-    # choose best
-    if profile_mtanh is not None and profile_cubic is not None:
-        if chi_cubic < chi_mtanh:
-            return profile_cubic, chi_cubic, "cubic", params_cubic
-        return profile_mtanh, chi_mtanh, "mtanh", params_mtanh
-    if profile_mtanh is not None:
-        return profile_mtanh, chi_mtanh, "mtanh", params_mtanh
-    if profile_cubic is not None:
-        return profile_cubic, chi_cubic, "cubic", params_cubic
-    return None, None, None, last_params
+    if (
+        profile_type == "te"
+        and params_mtanh is not None
+        and params_mtanh[0] > _TE_MTANH_MAX_WIDTH
+    ):
+        params_mtanh = chi_mtanh = None
+
+    # Lowest reduced chi-squared wins, the mtanh on a tie
+    candidates = [
+        (chi_mtanh, mtanh_at_pedestal, params_mtanh),
+        (chi_cubic, CubicZeroAxisSlope, params_cubic),
+    ]
+    viable = [c for c in candidates if c[0] is not None]
+    if not viable:
+        return None
+    _, best_func, best_params = min(viable, key=lambda c: c[0])
+    return best_func, best_params

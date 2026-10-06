@@ -15,9 +15,7 @@ import xarray as xr
 from transport_validation_datasets.machine.mast.mast_dataset import (
     LEVEL2_PATH,
     TS_CHANNEL_Z,
-    TS_EQUILIBRIUM_TIME_TOL,
     MASTDataWorkflow,
-    _equilibrium_at_ts_times,
     _ohmic_power,
     _store_path_exists,
     _thomson_dataset,
@@ -176,62 +174,6 @@ class TestThomsonDataset:
         assert np.allclose(ds["ts_channel_r"].values, radius)
 
 
-def equilibrium_on_grid(grid: np.ndarray, reconstructed: list[int]) -> xr.Dataset:
-    # One shot's unprocessed dataset, with the equilibrium only at the grid
-    # times a reconstruction landed on
-    n_t = grid.size
-    fields = {}
-    for name in ("simagx", "sibdry", "zmagx", "rmagx"):
-        values = np.full(n_t, np.nan)
-        values[reconstructed] = np.arange(1.0, len(reconstructed) + 1.0)
-        fields[name] = ("time", values)
-    psirz = np.full((n_t, 2, 2), np.nan)
-    psirz[reconstructed] = np.arange(1.0, len(reconstructed) + 1.0)[:, None, None]
-    fields["psirz"] = (("time", "r_grid", "z_grid"), psirz)
-    return xr.Dataset(fields, coords={"time": grid})
-
-
-class TestEquilibriumAtTsTimes:
-    def test_grid_times_inside_window_take_nearest_reconstruction(self):
-        # EFIT runs on a 5 ms grid while the laser fires every ~4.2 ms,
-        # so a TS slice almost never lands on a reconstruction has to use the nearest
-        grid = np.round(np.arange(20) * 1e-3, 3)
-        ds = equilibrium_on_grid(grid, [0, 5, 10, 15])
-
-        out = _equilibrium_at_ts_times(ds)["simagx"].values
-
-        assert out[3] == 2.0  # 3 ms goes forward to the 5 ms reconstruction
-        assert out[7] == 2.0  # 7 ms goes backward to 5 ms
-        assert out[5] == 2.0
-
-    def test_grid_times_outside_the_window_stay_nan(self):
-        grid = np.round(np.arange(40) * 1e-3, 3)
-        ds = equilibrium_on_grid(grid, [0, 20])
-        first_gap = 1 + int(1e3 * TS_EQUILIBRIUM_TIME_TOL)
-
-        out = _equilibrium_at_ts_times(ds)["simagx"].values
-
-        assert np.isnan(out[first_gap])
-        assert np.isnan(out[10])
-
-    def test_stored_dataset_unchanged(self):
-        grid = np.round(np.arange(20) * 1e-3, 3)
-        ds = equilibrium_on_grid(grid, [0, 5, 10, 15])
-        before = ds["simagx"].values.copy()
-
-        _equilibrium_at_ts_times(ds)
-
-        assert np.array_equal(ds["simagx"].values, before, equal_nan=True)
-
-    def test_shot_with_no_reconstruction_unchanged(self):
-        grid = np.round(np.arange(20) * 1e-3, 3)
-        ds = equilibrium_on_grid(grid, [])
-
-        out = _equilibrium_at_ts_times(ds)
-
-        assert np.isnan(out["simagx"].values).all()
-
-
 @pytest.mark.slow  # reads the public S3 stores, ~60-90 s per shot
 class TestMakeUnprocessedDataFiles:
     def test_one_shot(self, tmp_path):
@@ -264,7 +206,7 @@ class TestMakeUnprocessedDataFiles:
 
 @pytest.mark.slow
 class TestPrepareFitInput:
-    def test_channels_are_mapped_onto_rho_in_the_fit_units(self, tmp_path):
+    def test_channels_mapped_on_rho_tor_norm_in_fit_units(self, tmp_path):
         skip_without_store()
         workflow = mast_workflow(tmp_path, shotlist=[TEST_SHOT])
         workflow.make_unprocessed_data_files()
@@ -276,10 +218,9 @@ class TestPrepareFitInput:
         assert fit_input.has_fittable_points()
         assert fit_input.x.shape == fit_input.te_y.shape == fit_input.ne_y.shape
         assert fit_input.time.size == fit_input.te_y.shape[0]
-        # Only the outboard side inside the separatrix neighbourhood is fit
-        finite_rho = fit_input.x[np.isfinite(fit_input.x)]
-        assert finite_rho.size > 0
-        assert finite_rho.min() >= 0.0
+        finite_rho_tor_norm = fit_input.x[np.isfinite(fit_input.x)]
+        assert finite_rho_tor_norm.size > 0
+        assert finite_rho_tor_norm.min() >= 0.0
         # Te [keV] and ne [1e20 m^-3], not the SI values in the stored file
         assert np.nanmax(fit_input.te_y) < 100.0
         assert np.nanmax(fit_input.ne_y) < 100.0

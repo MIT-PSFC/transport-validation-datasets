@@ -1,16 +1,15 @@
 """GP profile fitting with mkgp (Gibbs kernel, tanh-warped length scale).
 
-Each (shot, time slice) is fit independently, ne first, and when
-the ne fit resolves a clear pedestal location its x0 pins the Te fit's, so
-both profiles place the high-gradient region at the same rho
-(density is the cleaner pedestal indicator in C-Mod H-mode).
+Each (shot, time slice) is fit independently, Te and ne each on their own,
+with the kernel's length-scale transition at the configured pedestal location.
 Each variable's fit runs the cleaning pipeline (cleaning.py),
 the GP fit with edge boundary conditions and monotonic-edge repair (gp.py),
-and the nonphysical-fit checks with up to two repairs (quality.py, see _fit_variable).
+and the nonphysical-fit checks with up to three repairs (quality.py, see _fit_variable).
 
 Runs standalone on the cluster like so:
 `python -m transport_validation_datasets.gp_fitting.worker_zk input.npz output.npz --num-workers N`
-The import chain must stay within stdlib + numpy + mkgp (see batch_io module docstring)
+
+Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
 """
 
 import os
@@ -31,6 +30,7 @@ from transport_validation_datasets.gp_fitting.batch_io import (  # noqa: E402
     STATUS_OK,
     STATUS_REPAIRED,
     STATUS_SKIPPED,
+    FitAnchors,
     FitBatch,
     FitBounds,
     ShotFitOutput,
@@ -48,9 +48,6 @@ from transport_validation_datasets.gp_fitting.zk.cleaning import (  # noqa: E402
 from transport_validation_datasets.gp_fitting.zk.gp import (  # noqa: E402
     fit_profile,
 )
-from transport_validation_datasets.gp_fitting.zk.kernel import (  # noqa: E402
-    is_pedestal_resolved,
-)
 from transport_validation_datasets.gp_fitting.zk.quality import (  # noqa: E402
     REPAIR_HALFWIDTH,
     fit_ignores_data,
@@ -58,7 +55,7 @@ from transport_validation_datasets.gp_fitting.zk.quality import (  # noqa: E402
 )
 
 # Columns of the hyps diagnostic arrays in this method's outputs.
-HYP_NAMES = ("var", "l1", "l2", "lw", "x0")
+HYP_NAMES = ("var", "l1", "l2", "lw")
 
 # Core length-scale floor of the smooth-rescue attempt (see _fit_variable).
 # High enough to force the optimizer out of a short-l1 basin, below the 0.9
@@ -80,7 +77,9 @@ def _no_fit(status: int) -> VariableFit:
     )
 
 
-def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0, seed_salt=0):
+def _attempt_fit(
+    x, y, err, x_star, scale_per_slice, bounds, anchors, pedestal_rho, seed_salt=0
+):
     """Clean, fit, and rescale one variable of one slice, once.
 
     Args:
@@ -90,7 +89,8 @@ def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0, seed_salt=0
         x_star: Target rho grid.
         scale_per_slice: Normalize by the cleaned slice max before fitting.
         bounds: The variable's staged bound knobs.
-        pin_x0: Hold the pedestal location at this value, or None.
+        anchors: The variable's anchors, in the data's own units.
+        pedestal_rho: The kernel's length-scale transition center.
         seed_salt: Restart seed offset for a reseeded retry (see run_gp).
 
     Returns:
@@ -98,11 +98,13 @@ def _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, pin_x0, seed_salt=0
         cleaning left nothing usable or the GP fit failed. Gradients are not
         clamped: negative slopes are physical.
     """
-    cleaned = clean_channels(x, y, err, bounds, scale_per_slice)
+    cleaned = clean_channels(x, y, err, bounds, anchors, pedestal_rho, scale_per_slice)
     if cleaned is None:
         return None
-    cx, cy, cerr, scale = cleaned
-    pf = fit_profile(cx, cy, cerr, x_star, bounds, pin_x0=pin_x0, seed_salt=seed_salt)
+    cx, cy, cerr, scale, scaled_anchors = cleaned
+    pf = fit_profile(
+        cx, cy, cerr, x_star, bounds, scaled_anchors, pedestal_rho, seed_salt=seed_salt
+    )
     if pf is None:
         return None
     return (
@@ -142,29 +144,22 @@ def _fit_variable(
     min_points: int,
     scale_per_slice: bool,
     bounds: FitBounds,
-    pin_x0: float | None,
+    anchors: FitAnchors,
+    pedestal_rho: float,
 ) -> VariableFit:
     """Fit one variable of one time slice, with up to three repairs.
 
-    1: Attempt to fit the variable
-    2: If nonphysical and the pedestal was pinned, retry unpinned
-    (repair a: pinning can force the optimizer into a pathological basin on sparse-core data,
-    huge variance, invented interior hump, or an amplitude collapse under the bias guard,
-    that the free fit does not have)
-    3: If still nonphysical or failed, retry from a fresh restart seed
-    (repair b: a borderline slice sits between two near-equal LML basins and
-    the input-hashed seed picks one, so float-level input noise can flip an
-    identical-looking slice between healthy and nonphysical; a different,
-    still deterministic draw can land the healthy basin)
-    4: If still nonphysical, retry with the core length scale floored at
-    SMOOTH_RESCUE_L1_MIN
-    (repair c: the LML can genuinely prefer a short-l1 basin that explains
-    mid-profile wiggles by sacrificing the innermost channel cluster, MAST
-    28956 t=0.179; raising the floor forces the smooth basin, which the
-    checks then judge like any other fit)
-    5: if still nonphysical with a peak over droppable channels, retry with fewer channels
-    (repair d: a stray point or a miscalibrated block)
-    6: A peak sitting where there is no data to drop is pure extrapolation ringing,
+    1: Fit the variable.
+    2: If nonphysical or failed, retry from a fresh restart seed
+    (repair a: a borderline slice sits between two near-equal LML basins and the input-hashed seed picks one,
+    so a different, still deterministic draw can land the healthy basin).
+    3: If still nonphysical, retry with the core length scale floored at SMOOTH_RESCUE_L1_MIN
+    (repair b: the LML can prefer a short-l1 basin that explains mid-profile wiggles
+    by sacrificing the innermost channel cluster,
+    and the floor forces the smooth basin, which the checks then judge like any other fit).
+    4: If still nonphysical with a peak over droppable channels, refit without them
+    (repair c: a stray point or a miscalibrated block).
+    5: A peak where there is no data to drop is extrapolation ringing,
     and a biased fit with no peak has no channel subset that repairs it. Both get culled.
 
     Args:
@@ -175,7 +170,8 @@ def _fit_variable(
         min_points: Minimum valid channels to attempt a fit.
         scale_per_slice: Normalize by the cleaned slice max before fitting.
         bounds: The variable's staged bound knobs.
-        pin_x0: Hold the pedestal location at this value, or None.
+        anchors: The variable's anchors, in the data's own units.
+        pedestal_rho: The kernel's length-scale transition center.
 
     Returns:
         The variable's fit with its STATUS_* code; arrays are None for
@@ -189,21 +185,25 @@ def _fit_variable(
     if int(valid.sum()) < min_points:
         return _no_fit(STATUS_SKIPPED)
 
-    # The attempt ladder: as staged, then unpinned (repair a, only when
-    # pinned), then a fresh restart draw (repair b), then the smooth basin
-    # (repair c). The first clean fit returns; the last flagged fit feeds the
-    # channel-drop repair below.
-    attempts = [(pin_x0, 0, bounds)]
-    if pin_x0 is not None:
-        attempts.append((None, 0, bounds))
-    attempts.append((None, 1, bounds))
+    # The attempt ladder: as staged, then a fresh restart draw (repair a),
+    # then the smooth basin (repair b).
+    # The first clean fit returns, and the last flagged fit feeds the channel-drop repair below.
+    attempts = [(0, bounds), (1, bounds)]
     if bounds.l1_min < SMOOTH_RESCUE_L1_MIN:
-        attempts.append((None, 1, replace(bounds, l1_min=SMOOTH_RESCUE_L1_MIN)))
+        attempts.append((1, replace(bounds, l1_min=SMOOTH_RESCUE_L1_MIN)))
 
     last_flagged = None
-    for n_attempt, (pin, seed_salt, attempt_bounds) in enumerate(attempts):
+    for n_attempt, (seed_salt, attempt_bounds) in enumerate(attempts):
         result = _attempt_fit(
-            x, y, err, x_star, scale_per_slice, attempt_bounds, pin, seed_salt=seed_salt
+            x,
+            y,
+            err,
+            x_star,
+            scale_per_slice,
+            attempt_bounds,
+            anchors,
+            pedestal_rho,
+            seed_salt=seed_salt,
         )
         if result is None:
             continue
@@ -217,7 +217,7 @@ def _fit_variable(
         return _no_fit(STATUS_FAILED)
     peak, biased = last_flagged
 
-    # Repair d: drop the channels under the nonphysical peak and refit once.
+    # Repair c: drop the channels under the nonphysical peak and refit once.
     if peak is None:
         return _no_fit(STATUS_CULLED)
     drop = valid & (np.abs(x - peak) <= REPAIR_HALFWIDTH)
@@ -227,7 +227,9 @@ def _fit_variable(
     still_valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
     if int(still_valid.sum()) < min_points:
         return _no_fit(STATUS_CULLED)
-    result = _attempt_fit(x, y, err, x_star, scale_per_slice, bounds, None)
+    result = _attempt_fit(
+        x, y, err, x_star, scale_per_slice, bounds, anchors, pedestal_rho
+    )
     if result is None:
         return _no_fit(STATUS_CULLED)
     peak, biased = _fit_problems(result[0], x_star, x, y, err)
@@ -237,11 +239,7 @@ def _fit_variable(
 
 
 def _fit_slice(task: SliceTask) -> SliceResult:
-    """Fit Te and ne for one (shot, time slice).
-
-    ne is fit first; when its pedestal location is clearly resolved it pins Te's,
-    so both profiles place the high-gradient region at the same rho.
-    If the ne pedestal is not clearly resolved, Te is fit freely.
+    """Fit Te and ne for one (shot, time slice), independently.
 
     Args:
         task: The slice's channel data and fit settings.
@@ -249,22 +247,6 @@ def _fit_slice(task: SliceTask) -> SliceResult:
     Returns:
         Both variables' fits for the slice.
     """
-    ne = _fit_variable(
-        task.x,
-        task.ne_y,
-        task.ne_err,
-        task.x_star,
-        task.min_points,
-        task.scale_per_slice,
-        task.ne_bounds,
-        pin_x0=None,
-    )
-    ne_x0 = None if ne.hyps is None else float(ne.hyps[4])
-    pin_x0 = (
-        ne_x0
-        if ne_x0 is not None and is_pedestal_resolved(ne_x0, task.ne_bounds.x0_min)
-        else None
-    )
     te = _fit_variable(
         task.x,
         task.te_y,
@@ -273,7 +255,19 @@ def _fit_slice(task: SliceTask) -> SliceResult:
         task.min_points,
         task.scale_per_slice,
         task.te_bounds,
-        pin_x0=pin_x0,
+        task.te_anchors,
+        task.pedestal_rho_tor_norm,
+    )
+    ne = _fit_variable(
+        task.x,
+        task.ne_y,
+        task.ne_err,
+        task.x_star,
+        task.min_points,
+        task.scale_per_slice,
+        task.ne_bounds,
+        task.ne_anchors,
+        task.pedestal_rho_tor_norm,
     )
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)
 

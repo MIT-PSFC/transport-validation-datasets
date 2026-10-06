@@ -12,9 +12,8 @@ map_slices implements the per-(shot, time slice) fan-out for workers whose
 method fits slices independently. A worker with a different structure can
 ignore it and implement fit_batch directly.
 
-Diagnostics use print (not loguru) on purpose: workers run on the cluster
-where sbatch --output captures stdout, and the minimal cluster venv has no
-loguru (see batch_io module docstring).
+Ships to the cluster with the worker, must adhere to import rules in gp_fitting/__init__.py.
+(diagnostics use print instead of loguru)
 """
 
 import argparse
@@ -29,6 +28,7 @@ import numpy as np
 from transport_validation_datasets.gp_fitting.batch_io import (
     STATUS_CULLED,
     STATUS_REPAIRED,
+    FitAnchors,
     FitBatch,
     FitBounds,
     ShotFitOutput,
@@ -58,6 +58,9 @@ class SliceTask:
     scale_per_slice: bool
     te_bounds: FitBounds
     ne_bounds: FitBounds
+    te_anchors: FitAnchors
+    ne_anchors: FitAnchors
+    pedestal_rho_tor_norm: float
 
 
 @dataclass
@@ -133,6 +136,9 @@ def map_slices(
                 scale_per_slice=batch.scale_per_slice,
                 te_bounds=batch.bounds["te"],
                 ne_bounds=batch.bounds["ne"],
+                te_anchors=batch.anchors["te"],
+                ne_anchors=batch.anchors["ne"],
+                pedestal_rho_tor_norm=batch.pedestal_rho_tor_norm,
             )
             for i_time in range(n_t)
         )

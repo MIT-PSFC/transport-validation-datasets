@@ -9,7 +9,10 @@ import xarray as xr
 
 from transport_validation_datasets import PACKAGE_ROOT
 from transport_validation_datasets.gp_fitting.dispatcher import ClusterFitConfig
-from transport_validation_datasets.machine.cmod.cmod_dataset import CModDataWorkflow
+from transport_validation_datasets.machine.cmod.cmod_dataset import (
+    CModDataWorkflow,
+    CModSettings,
+)
 
 pytestmark = pytest.mark.skipif(
     not Path("/usr/local/mfe/ml_data_dump").exists(),
@@ -17,6 +20,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 TEST_DIR = PACKAGE_ROOT / "tests" / "test_outputs" / "test_cmod_workflow"
+
+# Fit methods the local stages run under.
+# The linear interpolation method (conftest.linear_method) fits a shot in well under a second,
+# so it runs by default and checks the plumbing on real C-Mod data
+# the actual GP fits take ~80 s per Thomson sample serially and are marked slow.
+# The dispatched tests stay on zk since the cluster gets gp_fitting/ only, not the tests package.
+METHODS = [
+    pytest.param("akho", marks=pytest.mark.slow),
+    pytest.param("zk", marks=pytest.mark.slow),
+    "linear",
+]
 
 
 def cmod_workflow(
@@ -68,7 +82,7 @@ class TestMakeUnprocessedDataFiles:
         shotlist_missing = [
             1160503006,  # Missing TS data
             1160503011,  # Missing EFIT data
-            1160503015,  # No EFIT21 tree at all
+            1160503015,  # No EFIT21 tree, the default reads no other
         ]
         shotlist_present = [
             1160503007,  # Should be present
@@ -89,6 +103,23 @@ class TestMakeUnprocessedDataFiles:
             assert not file_path.exists(), (
                 f"Unprocessed data file for shot {shot} should not exist"
             )
+
+    def test_efit_tree_fallback(self):
+        # A missing first tree falls through to ANALYSIS, which reconstructs every ~20 ms.
+        # Its EFIT 0D signals are interpolated onto the grid, so the shot still passes the filter,
+        # while the reconstruction itself stays on its own grid times.
+        test_dir = self.test_dir / "test_efit_tree_fallback"
+        shot = 1160712015
+        settings = CModSettings(efit_trees=["NOTATREE", "ANALYSIS"])
+        workflow = cmod_workflow(test_dir, shotlist=[shot], settings=settings)
+
+        workflow.make_unprocessed_data_files()
+
+        with xr.open_dataset(workflow.unprocessed_data_dir / f"{shot}.nc") as ds:
+            assert ds.attrs["efit_tree"] == "ANALYSIS"
+            n_energy = int(ds["energy_mhd"].notnull().sum())
+            n_reconstructions = int(ds["simagx"].notnull().sum())
+        assert n_energy > 10 * n_reconstructions
 
 
 def _trim_to_three_ts_slices(nc_path: Path):
@@ -138,8 +169,7 @@ def ssh_host_reachable(alias: str) -> bool:
 class TestGPFit:
     test_dir = TEST_DIR / "test_gp_fit"
 
-    @pytest.mark.slow  # serial GP fit, ~80s per TS slice
-    @pytest.mark.parametrize("method", ["zk", "akho"])
+    @pytest.mark.parametrize("method", METHODS)
     def test_serial(self, method: str):
         # Basic check that GP fitting can be performed on unprocessed data files
         test_dir = self.test_dir / "test_serial" / method
@@ -162,12 +192,14 @@ class TestGPFit:
             assert shot_path.exists(), (
                 f"GP fit results file for shot {shot} does not exist"
             )
+            with xr.open_dataset(shot_path) as ds_fit:
+                assert ds_fit.attrs["fit_method"] == method
 
     @pytest.mark.skipif(
         not ssh_host_reachable("orcd-login"),
         reason="no authenticated ssh session to orcd-login",
     )
-    @pytest.mark.parametrize("method", ["zk"])
+    @pytest.mark.parametrize("method", ["akho", "zk"])
     def test_dispatched(self, method: str):
         # check that GP fitting can be done via the dispatcher on a cluster (requires ssh config set up)
         test_dir = self.test_dir / "test_dispatched" / method
@@ -222,7 +254,7 @@ class TestGPFit:
         not ssh_host_reachable("orcd-login"),
         reason="no authenticated ssh session to orcd-login",
     )
-    @pytest.mark.parametrize("method", ["zk"])
+    @pytest.mark.parametrize("method", ["akho", "zk"])
     def test_dispatched_20(self, method: str):
         # check that GP fitting can be done via the dispatcher on a cluster for many full shots
         test_dir = self.test_dir / "test_dispatched_20" / method
@@ -272,12 +304,13 @@ class TestGPFit:
 class TestFinalAssembly:
     test_dir = TEST_DIR / "test_final_assembly"
 
-    def test_basic(self):
+    @pytest.mark.parametrize("method", METHODS)
+    def test_basic(self, method: str):
         # Basic check that the final assembly can be performed on GP fit results
-        test_dir = self.test_dir / "test_basic"
+        test_dir = self.test_dir / "test_basic" / method
         max_num_shots = 6
         workflow = cmod_workflow(
-            test_dir, clean=False, max_num_shots=max_num_shots, fit_method="zk"
+            test_dir, clean=False, max_num_shots=max_num_shots, fit_method=method
         )
         if workflow.stores_dir.exists():
             shutil.rmtree(workflow.stores_dir)

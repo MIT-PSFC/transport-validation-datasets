@@ -1,0 +1,32 @@
+# Shared settings for building from the PSFC machines with the fits dispatched
+# to the ORCD cluster. Nothing user-specific belongs here: the cluster paths
+# (remote_workdir, venv_path) go in configs/<user>.user.toml, which git
+# ignores, and both files are passed together, later overriding earlier:
+#
+#   --config configs/orcd.toml,configs/$USER.user.toml
+#
+# Keys are dataclass field names: gp_fitting.dispatcher.ClusterFitConfig for
+# [cluster], each device workflow's settings_cls for [cmod] and [mast]. See
+# transport_validation_datasets/config.py. A key left out keeps its default,
+# an unknown key is an error.
+
+[cluster]
+ssh_host = "orcd-login"
+# Ordered preference list of name@time_limit or name@time_limit@constraint,
+# comma separated in one string or a list of strings.
+partitions = "sched_mit_psfc_r8@11:00:00"
+max_concurrent_jobs = 20
+shots_per_batch = 1
+cpus_per_job = 32
+memory_per_node = "64G"
+max_retries = 2
+pending_timeout_s = 1800.0
+# Per user, set in configs/<user>.user.toml:
+# remote_workdir = scratch directory on the cluster (bootstrap_remote.sh's <scratch-dir>)
+# venv_path = the venv bootstrap_remote.sh built there
+
+[cmod]
+# EFIT trees the equilibrium, geometry signals, and timebase are read from, in order of preference
+# A shot takes the first one that works for all required signals.
+# Use ["EFIT21", "ANALYSIS"] to also pull the shots EFIT21 fails on from the ~20 ms ANALYSIS tree.
+efit_trees = ["EFIT21"]

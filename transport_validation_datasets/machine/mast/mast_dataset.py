@@ -2,17 +2,18 @@
 
 Most of it comes out of the level 2 store: https://s3.echo.stfc.ac.uk/mast/level2/shots/{shot}.zarr
 the 0D summary and equilibrium signals and the full GEQDSK reconstruction, whose flux map also places
-the Thomson channels in rho.
-Two things come from the level 1 store instead: the GEQDSK safety factor, which only level 1
-publishes as a flux function (see _equilibrium_qpsi), and the Thomson profiles, which level 2
-only carries interpolated onto a uniform (R, t) grid and without uncertainties
-(see _thomson_dataset). No MDSplus is involved,
-so this workflow runs anywhere with internet access.
+the Thomson channels in rho_tor_norm.
+Two things come from the level 1 store instead:
+the GEQDSK safety factor, which only level 1 publishes as a flux function (see _equilibrium_qpsi),
+and the Thomson profiles, which level 2 only carries interpolated onto a uniform (R, t) grid and without uncertainties (see _thomson_dataset).
 
+No MDSplus is involved, so this workflow runs anywhere with internet access.
 Reads are slow, so staging runs in a thread pool of prepare_workers threads.
-One shot costs ~60-90 s of round trips, which puts the
-packaged 1101-shot list at a few hours on the default 8 threads.
+One shot costs ~60-90 s of round trips,
+which puts the packaged 1101-shot list at a few hours on the default 8 threads.
 """
+
+from dataclasses import dataclass
 
 import numpy as np
 import xarray as xr
@@ -25,11 +26,11 @@ from transport_validation_datasets.machine.generic import (
     efit_cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
-    map_ts_channels_to_rho,
+    map_ts_channels_to_rho_tor_norm,
     snap_to_grid,
     ts_channel_fit_rows,
 )
-from transport_validation_datasets.workflow import DataWorkflow
+from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 
 # Public MAST open data, no credentials needed
 S3_ENDPOINT = "https://s3.echo.stfc.ac.uk"
@@ -66,19 +67,9 @@ SHOT_WINDOW_MIN_IP = 100e3
 # Samples of the causal boxcar smoothing dIp/dt in the ohmic power calculation
 OHMIC_SMOOTHING_SAMPLES = 10
 
-# Channels this far outside the separatrix sit in the far SOL, where mapping
-# through a magnetics-only reconstruction is not trustworthy.
-MAX_FIT_RHO = 1.05
-
-# Equilibrium fields the TS channel mapping reads, see _equilibrium_at_ts_times.
-TS_MAPPING_EQUILIBRIUM_FIELDS = ("psirz", "simagx", "sibdry", "zmagx", "rmagx")
-
-# How far a TS slice may reach for the reconstruction it is mapped through [s].
-# EFIT runs on a 5 ms grid and the Thomson laser fires every ~4.2 ms, so the two
-# almost never land on the same grid time: the offset is up to half an EFIT step
-# plus the half millisecond the 1 kHz snap can add. MAST equilibria move slowly
-# enough over 3 ms that selecting the nearest reconstruction is good enough.
-TS_EQUILIBRIUM_TIME_TOL = 3e-3
+# Channels this far outside the separatrix sit in the far SOL,
+# where mapping through a magnetics-only reconstruction is not trustworthy.
+MAX_FIT_RHO_TOR_NORM = 1.1
 
 # level 2 equilibrium signal -> standardized name.
 # All 0D, interpolated onto the 1 kHz timebase.
@@ -333,8 +324,16 @@ SIGNAL_ATTRS = {
 }
 
 
+@dataclass(frozen=True)
+class MASTSettings(DeviceSettings):
+    """MAST settings, the [mast] table of the config file."""
+
+
 class MASTDataWorkflow(DataWorkflow):
     """MAST specific data workflow for creating and processing datasets."""
+
+    settings_cls = MASTSettings
+    signal_attrs = SIGNAL_ATTRS
 
     min_pulse_length = 0.2
     min_usable_time = 0.1
@@ -381,9 +380,9 @@ class MASTDataWorkflow(DataWorkflow):
         30318,
     ]
 
-    # GP fit staging knobs. rho_max extends past the separatrix so the grid
-    # covers the fit's edge value boundary conditions.
-    fit_rho = np.linspace(0.0, 1.1, 64)
+    # GP fit staging knobs.
+    # A 1/60 step puts 1.0 and 1.1 on the grid.
+    fit_rho_tor_norm = np.linspace(0.0, 1.6, 97)
     fit_min_points = 10
     fit_scale_per_slice = True
     # Both variables share the same bounds on MAST:
@@ -391,16 +390,14 @@ class MASTDataWorkflow(DataWorkflow):
     #   data inside rho ~0.4, and an l1 of 0.2 lets the fit collapse onto the
     #   zero prior there (core dives below the innermost channels, amplitude
     #   rails, fit_ignores_data culls the slice).
-    # - x0 down to 0.85: edge-peaked ne (ears) has its structure at rho 0.85-0.95,
-    #   out of reach of the short edge scale with the default 0.95 bound.
     # - var ceiling 5: on slices with an empty core the marginal likelihood
     #   rails the amplitude at the default ceiling of 20, which invents core
     #   values several times the slice max with a band to match.
     #   5 allows a prior amplitude of ~2x the slice max and
     #   leaves every data-covered region untouched.
     fit_bounds = {
-        "te": FitBounds(l1_min=0.4, x0_min=0.85, var_max=5.0),
-        "ne": FitBounds(l1_min=0.4, x0_min=0.85, var_max=5.0),
+        "te": FitBounds(l1_min=0.4, var_max=5.0),
+        "ne": FitBounds(l1_min=0.4, var_max=5.0),
     }
 
     # The public S3 store tolerates concurrent reads, and every read is a
@@ -437,9 +434,8 @@ class MASTDataWorkflow(DataWorkflow):
         interpolated. The equilibrium is written as a full GEQDSK, so only the
         ~1 grid time in 5 that carries an EFIT slice has one (the rest are NaN,
         as are the trailing slots of the NaN-padded boundary contour).
-        Thomson slices land on their own ~4.2 ms laser cadence, which is why
-        the fit staging has to reach for a nearby reconstruction
-        (see _equilibrium_at_ts_times).
+        Thomson slices land on their own ~4.2 ms laser cadence,
+        so the fit staging maps each through the nearest reconstruction.
 
         Args:
             shot: Shot number to read.
@@ -516,13 +512,12 @@ class MASTDataWorkflow(DataWorkflow):
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
         """Build GP fit inputs for one shot from its unprocessed dataset.
 
-        1: Give every TS slice the nearest reconstruction to map through
-        2: Map the TS channels onto rho through that flux map
-        3: Convert to the fit units (Te [keV], ne [1e20 m^-3])
-        4: Drop the channels outside the fittable rho range
+        1: Map the TS channels onto rho_tor_norm through the nearest reconstruction
+        2: Convert to the fit units (Te [keV], ne [1e20 m^-3])
+        3: Drop the channels outside the fittable range
 
         BOTH sides of the chord are fit. The inboard side maps onto the same
-        rho through the reconstruction's interior flux, which a magnetics-only
+        rho_tor_norm through the reconstruction's interior flux, which a magnetics-only
         reconstruction does not pin precisely, and on a spherical tokamak Te
         is not strictly a flux function (poloidal asymmetries can be real).
 
@@ -538,8 +533,10 @@ class MASTDataWorkflow(DataWorkflow):
         Returns:
             The fit input, or None when the shot has nothing fittable.
         """
-        ds_shot = _equilibrium_at_ts_times(ds.squeeze("shot", drop=True))
-        ts_times, rho = map_ts_channels_to_rho(ds_shot)
+        ds_shot = ds.squeeze("shot", drop=True)
+        ts_times, rho_tor_norm = map_ts_channels_to_rho_tor_norm(
+            ds_shot, self.settings.sol_extension
+        )
         if ts_times.size == 0:
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None
@@ -547,47 +544,24 @@ class MASTDataWorkflow(DataWorkflow):
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
 
         with np.errstate(invalid="ignore"):
-            rho = np.where((rho >= 0.0) & (rho <= MAX_FIT_RHO), rho, np.nan)
+            rho_tor_norm = np.where(
+                rho_tor_norm <= MAX_FIT_RHO_TOR_NORM, rho_tor_norm, np.nan
+            )
 
         fit_input = ShotFitInput(
-            x=rho, te_y=te_y, te_err=te_err, ne_y=ne_y, ne_err=ne_err, time=ts_times
+            x=rho_tor_norm,
+            te_y=te_y,
+            te_err=te_err,
+            ne_y=ne_y,
+            ne_err=ne_err,
+            time=ts_times,
         )
         if not fit_input.has_fittable_points():
-            logger.warning(f"Shot {shot}: no finite (rho, te, ne) channel data to fit")
+            logger.warning(
+                f"Shot {shot}: no finite (rho_tor_norm, te, ne) channel data to fit"
+            )
             return None
         return fit_input
-
-
-def _equilibrium_at_ts_times(ds_shot: xr.Dataset) -> xr.Dataset:
-    """Put the nearest EFIT reconstruction on every grid time, for the mapping.
-
-    The unprocessed dataset carries each reconstruction only at the grid time it
-    was reconstructed on, which is the honest way to store it, but it leaves the
-    Thomson slices with nothing to map through: EFIT is on a 5 ms grid and the
-    laser fires every ~4.2 ms (see TS_EQUILIBRIUM_TIME_TOL). This copies the
-    fields the mapping reads onto every grid time within that window of a real
-    reconstruction, and only for the mapping, the stored dataset is untouched.
-
-    Args:
-        ds_shot: One shot's unprocessed dataset, with the shot dim squeezed out.
-
-    Returns:
-        The same dataset with the mapping's equilibrium fields nearest-filled,
-        still NaN at grid times with no reconstruction inside the window.
-    """
-    has_equilibrium = np.isfinite(np.asarray(ds_shot["simagx"].values, dtype=float))
-    if not has_equilibrium.any():
-        return ds_shot
-
-    grid_times = ds_shot["time"].values
-    nearest = (
-        ds_shot[list(TS_MAPPING_EQUILIBRIUM_FIELDS)]
-        .isel(time=has_equilibrium)
-        .reindex(time=grid_times, method="nearest", tolerance=TS_EQUILIBRIUM_TIME_TOL)
-    )
-    return ds_shot.assign(
-        {name: nearest[name] for name in TS_MAPPING_EQUILIBRIUM_FIELDS}
-    )
 
 
 def _s3():
@@ -901,14 +875,14 @@ def _equilibrium_dataset(
     psirz = equilibrium["psi"].transpose("time", "major_radius", "z").values
     current = np.asarray(equilibrium["ip"].values, dtype=float)
     r_grid = np.asarray(equilibrium["major_radius"].values, dtype=float)
-    # GEQDSK pairs bcentr with rcentr: a reader reconstructing the vacuum field
-    # as bcentr*rcentr/R has to land on fpol at the boundary. So scale the
-    # published vacuum field (given at the magnetic axis) by 1/R onto the same
-    # rcentr make_geqdsk_dataset writes into the file.
+    # MAST publishes no RCENTR, so the grid midpoint serves as the reference radius.
+    # A reader rebuilds the vacuum field as bcentr*rcentr/R, which has to land on fpol at the boundary.
+    # So the published vacuum field, given at the magnetic axis, is rescaled by 1/R onto rcentr.
+    rcentr = r_grid[len(r_grid) // 2]
     bcentr = (
         np.asarray(equilibrium["bvac_rmag"].values, dtype=float)
         * np.asarray(equilibrium["magnetic_axis_r"].values, dtype=float)
-        / r_grid[len(r_grid) // 2]
+        / rcentr
     )
     profiles = {
         name: _optional_rows(shot, equilibrium, source, (eq_time.size, n_psi))
@@ -940,6 +914,7 @@ def _equilibrium_dataset(
         qpsi=_equilibrium_qpsi(shot, eq_time, n_psi),
         psirz=psirz,
         cocos_input=efit_cocos_from_signs(current, bcentr),
+        rcentr=rcentr,
         rlim=rlim,
         zlim=zlim,
         **profiles,
