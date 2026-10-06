@@ -225,6 +225,18 @@ class CmodThomsonMethods:
         "te": r"\ts_te",
         "te_error": r"\ts_te_err",
     }
+    # The core Thomson readout was mid-upgrade during this shot range: both
+    # the legacy "yag" electronics/tree and the newer "yag_new" one
+    # digitized the same laser pulses (identical timebases, confirmed per
+    # shot), but with different channel counts/positions.
+    legacy_core_shot_range = (1030000000, 1040000000)  # Taken from C-Mod_Analysis routines
+    legacy_core_nodes = {
+        "z": r".yag.results.global.profile:z_sorted",
+        "ne": r".yag.results.global.profile:ne_rz_t",
+        "ne_error": r".yag.results.global.profile:ne_err_zt",
+        "te": r".yag.results.global.profile:te_rz_t",
+        "te_error": r".yag.results.global.profile:te_err_zt",
+    }
 
     # Per-variable attributes, IMAS data dictionary path under "ref"
     channel_attrs = {
@@ -321,7 +333,10 @@ class CmodThomsonMethods:
         """Get TS measurements for core and edge systems at their R and Z locations.
 
         Both systems measure along the same vertical laser chord, so R is the
-        beam radius for every channel. Data stays on the native TS timebase
+        beam radius for every channel. For shots in legacy_core_shot_range,
+        the legacy "yag" core channels are merged in alongside "yag_new"
+        (same ts_array label "core" for both -- see legacy_core_nodes).
+        Data stays on the native TS timebase
         (~20 Hz), not params.times.
 
         Args:
@@ -341,6 +356,31 @@ class CmodThomsonMethods:
         # Core te is stored in keV, convert to eV to match IMAS and edge system
         core["te"] = core["te"] * 1000.0
         core["te_error"] = core["te_error"] * 1000.0
+
+        shot_min, shot_max = CmodThomsonMethods.legacy_core_shot_range
+        if shot_min < params.shot_id < shot_max:
+            try:
+                legacy = CmodThomsonMethods._get_region_channels(
+                    params, CmodThomsonMethods.legacy_core_nodes
+                )
+                legacy["te"] = legacy["te"] * 1000.0
+                legacy["te_error"] = legacy["te_error"] * 1000.0
+                if not np.allclose(legacy["time"], core["time"], atol=1e-4):
+                    raise ValueError(
+                        "Legacy core TS timebase does not match yag_new core timebase"
+                    )
+                core["z"] = np.concatenate([core["z"], legacy["z"]])
+                for quant in ["ne", "ne_error", "te", "te_error"]:
+                    core[quant] = np.concatenate(
+                        [core[quant], legacy[quant]], axis=1
+                    )
+            except Exception as e:
+                params.logger.warning(
+                    "Legacy core Thomson scattering data not found/merged, "
+                    "continuing with yag_new core channels only."
+                )
+                params.logger.warning(repr(e))
+                params.logger.opt(exception=True).debug(e)
 
         edge = None
         try:
