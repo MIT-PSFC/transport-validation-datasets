@@ -229,7 +229,8 @@ class CmodThomsonMethods:
     # the legacy "yag" electronics/tree and the newer "yag_new" one
     # digitized the same laser pulses (identical timebases, confirmed per
     # shot), but with different channel counts/positions.
-    legacy_core_shot_range = (1030000000, 1040000000)  # Taken from C-Mod_Analysis routines
+    # Taken from C-Mod_Analysis routines
+    legacy_core_shot_range = (1030000000, 1040000000)
     legacy_core_nodes = {
         "z": r".yag.results.global.profile:z_sorted",
         "ne": r".yag.results.global.profile:ne_rz_t",
@@ -371,9 +372,7 @@ class CmodThomsonMethods:
                     )
                 core["z"] = np.concatenate([core["z"], legacy["z"]])
                 for quant in ["ne", "ne_error", "te", "te_error"]:
-                    core[quant] = np.concatenate(
-                        [core[quant], legacy[quant]], axis=1
-                    )
+                    core[quant] = np.concatenate([core[quant], legacy[quant]], axis=1)
             except Exception as e:
                 params.logger.warning(
                     "Legacy core Thomson scattering data not found/merged, "
