@@ -54,6 +54,9 @@ from transport_validation_datasets.gp_fitting.zk.quality import (  # noqa: E402
     nonphysical_peak,
 )
 
+# The method's own name for its fit, in the description of every fitted profile
+FIT_DESCRIPTION = "Nonstationary Gibbs Kernel"
+
 # Columns of the hyps diagnostic arrays in this method's outputs.
 HYP_NAMES = ("var", "l1", "l2", "lw")
 
@@ -272,42 +275,30 @@ def _fit_slice(task: SliceTask) -> SliceResult:
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)
 
 
-def fit_batch(
-    batch: FitBatch,
-    num_workers: int = 1,
-    *,
-    max_slices_per_shot: int | None = None,
-) -> dict[int, ShotFitOutput]:
+def fit_batch(batch: FitBatch, num_workers: int = 1) -> dict[int, ShotFitOutput]:
     """Fit every (shot, time slice) in the batch with the mkgp method.
 
     Hyperparameters are optimized for each individual slice, since plasma
     conditions (and thus profile shapes) change over the course of a shot.
-    Slices are fit serially (num_workers <= 1) or across worker processes;
-    mkgp fits are single-threaded, so parallelism comes only from the
-    slice-level pool (BLAS threads are pinned at module top).
+    Slices are fit serially (num_workers <= 1) or across worker processes.
+    mkgp fits are single-threaded,
+    so parallelism comes only from the slice-level pool (BLAS threads are pinned at module top).
 
     Args:
         batch: Staged batch inputs.
         num_workers: Slice-level worker processes.
-        max_slices_per_shot: If set, only fit the first N time slices of each
-            shot (debug aid).
 
     Returns:
         Fitted profiles keyed by shot number.
     """
-    return map_slices(
-        _fit_slice,
-        batch,
-        num_workers=num_workers,
-        max_slices_per_shot=max_slices_per_shot,
-    )
+    return map_slices(_fit_slice, batch, num_workers=num_workers)
 
 
 def main(argv: list[str] | None = None):
     """Run the mkgp worker CLI: input.npz output.npz --num-workers N.
 
     Args:
-        argv: Command-line arguments; None uses sys.argv.
+        argv: Command-line arguments, None uses sys.argv.
     """
     run_worker_cli(fit_batch, prog="worker_zk", argv=argv)
 

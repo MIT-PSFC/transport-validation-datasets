@@ -1,5 +1,4 @@
 import json
-import os
 import shutil
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -31,17 +30,20 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     FitBatch,
     ShotFitInput,
     ShotFitOutput,
+    atomic_write,
+    batch_settings,
     default_fit_bounds,
+    fit_batch_settings,
     pack_fit_batch,
-    read_batch_anchors,
-    read_batch_setting,
     read_batch_shots,
     read_batch_windows,
+    staged_batch_paths,
     unpack_fit_batch,
     unpack_fit_results,
 )
 from transport_validation_datasets.gp_fitting.dispatcher import (
     ClusterFitConfig,
+    ClusterFitDispatcher,
     plan_batches,
 )
 from transport_validation_datasets.machine.generic import (
@@ -74,8 +76,8 @@ from transport_validation_datasets.windows import (
 # Width of the centered boxcar applied before the transient thresholds are checked [s].
 TRANSIENT_SMOOTHING_WINDOW = 5e-3
 
-# Shots per staged batch when fitting locally: one, so a slow serial run can
-# resume shot by shot. Cluster runs use ClusterFitConfig.shots_per_batch.
+# Shots per staged batch when fitting locally: one, so a slow local run can resume shot by shot.
+# Cluster runs use ClusterFitConfig.shots_per_batch.
 LOCAL_SHOTS_PER_BATCH = 1
 
 # The radial coordinate every profile is fit on.
@@ -87,6 +89,14 @@ RHO_TOR_NORM_DEFINITION = (
 # The fit grid runs past this so every anchor is fit and plotted.
 # The fit files, the stores and the IMAS export keep only the grid up to here.
 STORED_RHO_TOR_NORM_MAX = 1.1
+
+# How _check_batch names the batch_io.fit_batch_settings keys in its messages, the rest go by their key
+FIT_SETTING_NAMES = {
+    "fit_mode": "fit mode",
+    "sol_extension": "SOL extension",
+    "pedestal_rho_tor_norm": "pedestal location",
+    "x_star": "fit grid",
+}
 
 # Per-slice fit statuses that count as a usable profile, see gp_fitting.batch_io.
 USABLE_FIT_STATUSES = (STATUS_OK, STATUS_REPAIRED)
@@ -402,7 +412,7 @@ class DataWorkflow(ABC):
                 fit result and fit plot subdirectories, and the cluster job's worker.
             cluster_config: If provided, GP profile fitting is dispatched to a SLURM
                 cluster (see gp_fitting/dispatcher.py).
-                If None, fitting runs single-threaded in this process.
+                If None, fitting runs serially in this process (registry.run_batch_file).
             prepare_workers: Threads used to stage source data. None takes the
                 device's default_prepare_workers.
             settings: The device's settings, an instance of its settings_cls
@@ -460,6 +470,8 @@ class DataWorkflow(ABC):
         # second one, which would write both datasets' logs into both files.
         self.logs_dir = self.data_assembly_dir / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        # The cluster fit jobs' SLURM logs, pulled back by the dispatcher
+        self.fit_job_logs_dir = self.logs_dir / "fit_jobs"
         launch_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.log_file = self.logs_dir / f"{ds_name}_{launch_time}.log"
         if DataWorkflow._log_sink_id is not None:
@@ -858,7 +870,7 @@ class DataWorkflow(ABC):
         """
         return sorted(int(p.stem) for p in self.unprocessed_data_dir.glob("*.nc"))
 
-    def run_gp_fitting(self, max_pages: int | None = None):
+    def run_gp_fitting(self, max_pages: int | None = None, skip_plots: bool = False):
         """Run GP profile fitting on the unprocessed data files.
 
         The stages, each skipping work that already exists on disk:
@@ -867,15 +879,18 @@ class DataWorkflow(ABC):
            restrict or pool the Thomson samples to the shotlist's
            time windows if it has any, and pack batch npz files into
            fit_staging_dir/batches. The staged batches are method-agnostic.
-        2. Fit each batch with self.fit_method's worker: single-threaded in
-           this process when cluster_config is None, otherwise dispatched to
-           the SLURM cluster.
+        2. Fit each batch with self.fit_method's worker:
+           serially in this process when cluster_config is None,
+           otherwise dispatched to the SLURM cluster.
         3. Write the batch results out as one netCDF per shot into
            fit_shots_dir.
-        4. Plot the fits per shot into fit_plots_dir.
+        4. Plot the fits per shot into fit_plots_dir, unless skip_plots.
+           The plots take about a minute per shot, far longer than the rest on a cluster.
+           A later run without skip_plots plots the shots that have no PDF yet.
 
         Args:
             max_pages: Maximum number of pages to plot per shot. None plots all.
+            skip_plots: Leave out step 4.
         """
         shots = self.unprocessed_shots()
         skipped = {s for s in shots if self.fit_already_failed(s)}
@@ -904,16 +919,10 @@ class DataWorkflow(ABC):
         if self.cluster_config is None:
             self._fit_batches_local(batches)
         else:
-            from transport_validation_datasets.gp_fitting.dispatcher import (
-                ClusterFitDispatcher,
-            )
-
-            dispatcher = ClusterFitDispatcher(
-                self.cluster_config, self.ds_name, self.fit_batches_dir, self.fit_method
-            )
-            dispatcher.run(batches)
+            self._dispatcher().run(batches)
         self.write_fit_results()
-        self.plot_fit_results(max_pages=max_pages)
+        if not skip_plots:
+            self.plot_fit_results(max_pages=max_pages)
 
     def clean_fit_state(self):
         """Delete every staged fit batch so the next run refits from scratch.
@@ -922,26 +931,34 @@ class DataWorkflow(ABC):
         untouched. This method's fit result files and fit plots are deleted
         too: both are rebuilt from the new fits, and the plots would otherwise
         survive the rebuild (plot_fit_results skips shots whose PDF exists).
+        The staging failure notes go too, so a staging change is tried on every shot again.
         With a cluster_config this also cancels the dataset's queued jobs and
         clears its remote batch files, which a from-scratch cluster fit needs:
         otherwise the next run adopts the cancelled jobs or pulls back the
         leftover results (see ClusterFitDispatcher.clean).
         """
         if self.cluster_config is not None:
-            from transport_validation_datasets.gp_fitting.dispatcher import (
-                ClusterFitDispatcher,
-            )
-
-            dispatcher = ClusterFitDispatcher(
-                self.cluster_config, self.ds_name, self.fit_batches_dir, self.fit_method
-            )
-            dispatcher.clean()
+            self._dispatcher().clean()
         elif self.fit_batches_dir.exists():
             shutil.rmtree(self.fit_batches_dir)
-        for out_dir in (self.fit_shots_dir, self.fit_plots_dir):
+        for out_dir in (self.fit_shots_dir, self.fit_plots_dir, self.failed_fits_dir):
             if out_dir.exists():
                 shutil.rmtree(out_dir)
         logger.info(f"Cleaned fit staging state in {self.fit_batches_dir}")
+
+    def _dispatcher(self) -> ClusterFitDispatcher:
+        """Build the cluster dispatcher of this dataset's fits.
+
+        Returns:
+            A ClusterFitDispatcher on cluster_config.
+        """
+        return ClusterFitDispatcher(
+            self.cluster_config,
+            self.ds_name,
+            self.fit_batches_dir,
+            self.fit_method,
+            self.fit_job_logs_dir,
+        )
 
     def stage_fit_batches(self, shots: list[int]) -> dict[str, list[int]]:
         """Stage fit inputs for the given shots into batch npz files.
@@ -1001,20 +1018,7 @@ class DataWorkflow(ABC):
                 shot_inputs[shot] = drop_rows_without_core(fit_input, shot)
             if not shot_inputs:
                 continue
-            pack_fit_batch(
-                in_path,
-                FitBatch(
-                    shot_inputs=shot_inputs,
-                    x_star=self.fit_rho_tor_norm,
-                    min_points=self.fit_min_points,
-                    scale_per_slice=self.fit_scale_per_slice,
-                    bounds=self.fit_bounds,
-                    anchors=self.fit_anchors,
-                    pedestal_rho_tor_norm=self.settings.pedestal_rho_tor_norm,
-                    sol_extension=self.settings.sol_extension,
-                    fit_mode=self.fit_mode,
-                ),
-            )
+            pack_fit_batch(in_path, self._fit_batch(shot_inputs))
             batches[batch_id] = sorted(shot_inputs)
             logger.info(f"Staged batch {batch_id} with {len(shot_inputs)} shots")
         return batches
@@ -1053,46 +1057,57 @@ class DataWorkflow(ABC):
                 "or build the dataset under another ds_name."
             )
 
+    def _fit_batch(self, shot_inputs: dict[int, ShotFitInput]) -> FitBatch:
+        """Build a batch of staged shots under this run's fit settings.
+
+        Args:
+            shot_inputs: Per-shot fit inputs, empty for the settings alone.
+
+        Returns:
+            The batch to pack or to compare settings against.
+        """
+        return FitBatch(
+            shot_inputs=shot_inputs,
+            x_star=self.fit_rho_tor_norm,
+            min_points=self.fit_min_points,
+            scale_per_slice=self.fit_scale_per_slice,
+            bounds=self.fit_bounds,
+            anchors=self.fit_anchors,
+            pedestal_rho_tor_norm=self.settings.pedestal_rho_tor_norm,
+            sol_extension=self.settings.sol_extension,
+            fit_mode=self.fit_mode,
+        )
+
     def _check_batch(self, in_path: Path, batch_id: str):
-        """Refuse a staged batch built with another fit mode, SOL extension, pedestal location, or anchors than this run's.
+        """Refuse a staged batch built with any fit setting other than this run's.
+
+        The settings are those of batch_io.fit_batch_settings.
 
         Args:
             in_path: The batch input npz.
             batch_id: The batch id, for the message.
         """
         where = f"Batch {batch_id}"
-        staged_mode = read_batch_setting(in_path, "fit_mode")
-        self._check_run_setting("fit mode", staged_mode, self.fit_mode, where)
-        staged_extension = read_batch_setting(in_path, "sol_extension")
-        run_extension = self.settings.sol_extension
-        self._check_run_setting("SOL extension", staged_extension, run_extension, where)
-        # As floats, so a TOML integer matches the float the batch stores
-        staged_pedestal_raw = read_batch_setting(in_path, "pedestal_rho_tor_norm")
-        staged_pedestal = str(float(staged_pedestal_raw))
-        run_pedestal = str(float(self.settings.pedestal_rho_tor_norm))
-        self._check_run_setting(
-            "pedestal location", staged_pedestal, run_pedestal, where
-        )
-        staged_anchors = read_batch_anchors(in_path)
-        staged_anchors_json = _anchors_json(staged_anchors)
-        run_anchors_json = _anchors_json(self.fit_anchors)
-        self._check_run_setting("anchors", staged_anchors_json, run_anchors_json, where)
+        staged = batch_settings(in_path)
+        run_batch = self._fit_batch({})
+        run = fit_batch_settings(run_batch)
+        for key, run_value in run.items():
+            name = FIT_SETTING_NAMES.get(key, key)
+            self._check_run_setting(name, staged[key], run_value, where)
 
     def _check_staged_batches(self):
         """Refuse a staging directory that does not match this run.
 
         Every batch input in fit_batches_dir is checked,
         because write_fit_results and the stack stage sweep them all:
-        its fit mode, SOL extension, pedestal location, and anchors must be this run's,
+        every fit setting must be this run's (_check_batch),
         and in a windowed run every shot must have the same windows it was staged with.
         An edited shotlist stops here, before any fit runs or any result is written.
-        A batch in another mode, with another SOL extension, pedestal location, other anchors or windows,
+        A batch built with another setting or other windows,
         or holding a shot the shotlist no longer lists raises ValueError
         (_check_batch, _check_windows_match).
         """
-        for in_path in sorted(self.fit_batches_dir.glob("batch_*.npz")):
-            if "_out_" in in_path.name:
-                continue
+        for in_path in staged_batch_paths(self.fit_batches_dir):
             batch_id = in_path.stem.removeprefix("batch_")
             self._check_batch(in_path, batch_id)
             if self.shot_windows is None:
@@ -1170,6 +1185,8 @@ class DataWorkflow(ABC):
     def _fit_batches_local(self, batches: dict[str, list[int]]):
         """Fit staged batches serially in this process, one at a time.
 
+        A worker error stops the run where it was raised, so a debugger lands on it.
+
         Args:
             batches: Mapping of batch id to shots, from stage_fit_batches.
         """
@@ -1181,9 +1198,8 @@ class DataWorkflow(ABC):
                 f"Fitting batch {batch_id} ({batches[batch_id]}) locally "
                 f"({i + 1}/{len(batches)})"
             )
-            registry.run_batch_file(
-                self.fit_method, self._batch_in_path(batch_id), out_path
-            )
+            in_path = self._batch_in_path(batch_id)
+            registry.run_batch_file(self.fit_method, in_path, out_path)
 
     def write_fit_results(self):
         """Write every batch's fit results out as one netCDF per shot.
@@ -1208,13 +1224,12 @@ class DataWorkflow(ABC):
                 align with its staged input.
         """
         self._check_staged_batches()
-        hyp_names = getattr(registry.load_worker(self.fit_method), "HYP_NAMES", None)
+        worker = registry.load_worker(self.fit_method)
+        hyp_names = getattr(worker, "HYP_NAMES", None)
         x_star = None
         n_written = 0
         n_shots = 0
-        for in_path in sorted(self.fit_batches_dir.glob("batch_*.npz")):
-            if "_out_" in in_path.name:
-                continue
+        for in_path in staged_batch_paths(self.fit_batches_dir):
             batch_id = in_path.stem.removeprefix("batch_")
             out_path = self._batch_out_path(batch_id)
             if not out_path.exists():
@@ -1257,13 +1272,15 @@ class DataWorkflow(ABC):
                         f"out of step. Rerun with --clean_fit_state."
                     )
                 ds = self._shot_fit_dataset(
-                    shot, so, batch_x_star, hyp_names, si.windows, si.window_index
+                    shot,
+                    so,
+                    batch_x_star,
+                    hyp_names,
+                    worker.FIT_DESCRIPTION,
+                    si.windows,
+                    si.window_index,
                 )
-                shot_path = self.fit_shots_dir / f"{shot}.nc"
-                shot_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = shot_path.with_suffix(".nc.tmp")
-                ds.to_netcdf(tmp_path)
-                os.replace(tmp_path, shot_path)
+                atomic_write(self.fit_shots_dir / f"{shot}.nc", ds.to_netcdf)
                 n_written += 1
 
         if n_shots == 0:
@@ -1281,6 +1298,7 @@ class DataWorkflow(ABC):
         so: ShotFitOutput,
         x_star: np.ndarray,
         hyp_names: list[str] | None,
+        fit_description: str,
         windows: np.ndarray,
         window_index: np.ndarray,
     ) -> xr.Dataset:
@@ -1299,6 +1317,8 @@ class DataWorkflow(ABC):
             so: The shot's ShotFitOutput.
             x_star: (n_x,) rho_tor_norm grid the profiles were fit on.
             hyp_names: Names of the method's hyperparameters, None if it has none.
+            fit_description: The method's own name for its fit (its worker's FIT_DESCRIPTION),
+                added to every profile's description.
             windows: (n_w, 2) time windows the shot was staged with [s].
             window_index: (n_t,) window of each row, -1 without windows.
 
@@ -1340,7 +1360,7 @@ class DataWorkflow(ABC):
                     ("shot", TIME_DIM, "rho_tor_norm"),
                     profile.astype(np.float32),
                     {
-                        "description": f"{extra}GP-fitted {desc} profile",
+                        "description": f"{extra}GP-fitted {desc} profile ({fit_description})",
                         "units": grad_unit,
                     },
                 )
@@ -1426,9 +1446,7 @@ class DataWorkflow(ABC):
         Args:
             max_pages: Maximum number of pages to plot per shot. None plots all.
         """
-        for in_path in sorted(self.fit_batches_dir.glob("batch_*.npz")):
-            if "_out_" in in_path.name:
-                continue
+        for in_path in staged_batch_paths(self.fit_batches_dir):
             batch_id = in_path.stem.removeprefix("batch_")
             out_path = self._batch_out_path(batch_id)
             if not out_path.exists():
@@ -1477,7 +1495,6 @@ class DataWorkflow(ABC):
         mb_per_chunk: int | None = 50,
         drop_unfit_slices: bool = True,
         forward_fill: bool = True,
-        extend_existing: bool = False,
     ) -> Path:
         """Stack the unprocessed data and the fit results into the internal dataset.
 
@@ -1486,6 +1503,7 @@ class DataWorkflow(ABC):
         result file. Shots are stacked along EPISODE_DIM and NaN padded along
         every other dimension, so shots of different lengths still line up.
         Only one shot is held in memory at a time.
+        An existing store is replaced.
 
         The store carries every signal needed for internal analysis.
 
@@ -1502,8 +1520,8 @@ class DataWorkflow(ABC):
         fresh_profile marking the window center.
 
         Args:
-            mb_per_chunk: Target size of a storage chunk, chunked along
-                EPISODE_DIM only. None leaves the chunking alone.
+            mb_per_chunk: Target size of each variable's storage chunks,
+                chunked along EPISODE_DIM only. None leaves the chunking alone.
             drop_unfit_slices: Ignore the slices whose te or ne fit did not come
                 back usable (USABLE_FIT_STATUSES), as though the shot had no
                 Thomson sample there. False places every slice on the grid,
@@ -1512,9 +1530,6 @@ class DataWorkflow(ABC):
                 over the grid times that follow it, for at most
                 MAX_HOLD_PERIODS of their own sampling period. False leaves the
                 grid times between samples NaN.
-            extend_existing: Append the shots that are not in the existing
-                store yet, instead of replacing it. The shots already in it are
-                left as they are, so this does not pick up refitted shots.
 
         Returns:
             Path of the Zarr store.
@@ -1531,28 +1546,16 @@ class DataWorkflow(ABC):
             )
         logger.info(f"Stacking {len(shots)} shots into the internal dataset")
 
-        zarr_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
-        if zarr_path.exists():
-            if not extend_existing:
-                logger.warning(
-                    f"Replacing the existing internal dataset at {zarr_path}"
-                )
-                shutil.rmtree(zarr_path)
-            else:
-                with xr.open_zarr(zarr_path, consolidated=True) as ds_store:
-                    in_store = {int(shot) for shot in ds_store[EPISODE_DIM].values}
-                shots = [shot for shot in shots if shot not in in_store]
-                logger.info(
-                    f"{len(in_store)} shots are already in {zarr_path}, "
-                    f"appending the {len(shots)} that are not"
-                )
-                if not shots:
-                    return zarr_path
-
         # Bound every non-episode dimension up front so that no shot ever has to
         # extend the store, which would rewrite the chunks of every shot in it.
+        # Before the old store goes, so a run its checks refuse leaves it in place.
         dim_sizes = self._internal_dataset_dim_sizes(shots)
         logger.info(f"Internal dataset dimension bounds: {dim_sizes}")
+
+        zarr_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
+        if zarr_path.exists():
+            logger.warning(f"Replacing the existing internal dataset at {zarr_path}")
+            shutil.rmtree(zarr_path)
 
         ds = build_tensorized_dataset(
             process_fn=lambda shot: self._internal_shot_dataset(
@@ -1562,9 +1565,8 @@ class DataWorkflow(ABC):
             zarr_path=zarr_path,
             time_dim=TIME_DIM,
             episode_dim=EPISODE_DIM,
-            extend_existing=extend_existing,
-            mb_per_chunk=mb_per_chunk,
             dim_sizes=dim_sizes,
+            mb_per_chunk=mb_per_chunk,
         )
         logger.info(
             f"Internal dataset at {zarr_path}: {dict(ds.sizes)}, "
@@ -1761,14 +1763,14 @@ class DataWorkflow(ABC):
         varying = {
             dim: sorted(values) for dim, values in seen.items() if len(values) > 1
         }
-        # A varying TIME_DIM is normal (shots run for different lengths), the
-        # rest are grids that are supposed to be fixed for the device: their
-        # coordinate values come from the first shot, so flag the mismatch.
+        # A varying TIME_DIM is normal, shots run for different lengths.
+        # The rest are fixed for the device, and add_to_zarr_store refuses a grid that differs from the store's.
         varying.pop(TIME_DIM, None)
         if varying:
             logger.warning(
-                f"Dimensions differ between shots: {varying}. The internal dataset takes "
-                f"their coordinate values from the first shot and NaN pads the rest."
+                f"Dimensions differ between shots: {varying}. "
+                "Shorter ordinal dimensions (channels, contour points) are NaN padded, "
+                "and a grid coordinate that differs from the store's stops the build."
             )
         return sizes
 
@@ -2379,23 +2381,6 @@ def _fit_anchors(settings: DeviceSettings) -> dict[str, FitAnchors]:
         grad = np.asarray(grad_rows, dtype=float).reshape(-1, 3)
         anchors[var] = FitAnchors(value=value, grad=grad)
     return anchors
-
-
-def _anchors_json(anchors: dict[str, FitAnchors]) -> str:
-    """Serialize fit anchors for comparison and messages.
-
-    Args:
-        anchors: FitAnchors keyed by variable name.
-
-    Returns:
-        The anchors as a JSON string.
-    """
-    return json.dumps(
-        {
-            var: {"value": a.value.tolist(), "grad": a.grad.tolist()}
-            for var, a in anchors.items()
-        }
-    )
 
 
 def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
