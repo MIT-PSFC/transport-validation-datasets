@@ -384,20 +384,17 @@ class MASTDataWorkflow(DataWorkflow):
     # A 1/60 step puts 1.0 and 1.1 on the grid.
     fit_rho_tor_norm = np.linspace(0.0, 1.6, 97)
     fit_min_points = 10
-    fit_scale_per_slice = True
     # Both variables share the same bounds on MAST:
-    # - l1 floor 0.4: the chord's tangency point leaves many slices with no
-    #   data inside rho ~0.4, and an l1 of 0.2 lets the fit collapse onto the
-    #   zero prior there (core dives below the innermost channels, amplitude
-    #   rails, fit_ignores_data culls the slice).
+    # - l1 floor 0.2: MAST cores carry structure a longer scale smooths away,
+    #   e.g. a hollow Te in the current ramp or a flat core with a knee at rho ~0.45
     # - var ceiling 5: on slices with an empty core the marginal likelihood
     #   rails the amplitude at the default ceiling of 20, which invents core
     #   values several times the slice max with a band to match.
     #   5 allows a prior amplitude of ~2x the slice max and
     #   leaves every data-covered region untouched.
     fit_bounds = {
-        "te": FitBounds(l1_min=0.4, var_max=5.0),
-        "ne": FitBounds(l1_min=0.4, var_max=5.0),
+        "te": FitBounds(l1_min=0.2, var_max=5.0),
+        "ne": FitBounds(l1_min=0.2, var_max=5.0),
     }
 
     # The public S3 store tolerates concurrent reads, and every read is a

@@ -50,7 +50,7 @@ class DatasetCLI:
         [cmod]
         efit_trees = ["EFIT21", "ANALYSIS"]
 
-    configs/orcd.toml is the shared file; the per-user cluster paths go in a
+    configs/orcd.toml is the shared file, the per-user cluster paths go in a
     second, gitignored file:
 
         --config configs/orcd.toml,configs/$USER.user.toml
@@ -100,6 +100,8 @@ class DatasetCLI:
         stage: str = "all",
         method: str = DEFAULT_METHOD,
         clean_fit_state: bool = False,
+        skip_fit_plots: bool = False,
+        max_fit_pages: int | None = None,
         mb_per_chunk: int = 50,
         config: Path | str | None = None,
     ):
@@ -122,31 +124,35 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
-            mb_per_chunk: Target size of a chunk of the internal Zarr store,
-                which is chunked along the shot dimension.
+            skip_fit_plots: Leave out the fit stage's per-shot PDFs, about a minute per shot.
+                A later fit stage without it plots the shots that have no PDF yet.
+            max_fit_pages: Most pages of a shot's fit PDF. None plots every slice.
+            mb_per_chunk: Target size of each variable's chunks in the internal
+                Zarr store, which is chunked along the shot dimension.
             config: TOML file(s), comma separated, with the [cluster] table
                 and the [cmod] settings table (see config.py, CModSettings).
                 None fits locally with the default settings.
         """
-        from transport_validation_datasets.config import load_run_config
         from transport_validation_datasets.machine.cmod.cmod_dataset import (
             CModDataWorkflow,
         )
 
-        cluster_config, settings = load_run_config(
-            config, "cmod", CModDataWorkflow.settings_cls, DEVICES
-        )
-        workflow = CModDataWorkflow(
+        _run_device(
+            CModDataWorkflow,
+            "cmod",
+            config=config,
+            stage=stage,
+            clean_fit_state=clean_fit_state,
+            skip_fit_plots=skip_fit_plots,
+            max_fit_pages=max_fit_pages,
+            mb_per_chunk=mb_per_chunk,
             ds_name=ds_name,
             data_assembly_dir=Path(data_assembly_dir),
             shotlist_file=shotlist_file,
             max_num_shots=max_num_shots,
             average_windows=average_windows,
             fit_method=method,
-            cluster_config=cluster_config,
-            settings=settings,
         )
-        _execute(workflow, stage, clean_fit_state, mb_per_chunk)
 
     def mast(
         self,
@@ -158,6 +164,8 @@ class DatasetCLI:
         stage: str = "all",
         method: str = DEFAULT_METHOD,
         clean_fit_state: bool = False,
+        skip_fit_plots: bool = False,
+        max_fit_pages: int | None = None,
         mb_per_chunk: int = 50,
         prepare_workers: int | None = None,
         config: Path | str | None = None,
@@ -181,62 +189,92 @@ class DatasetCLI:
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
                 Unprocessed data files are kept.
-            mb_per_chunk: Target size of a chunk of the internal Zarr store,
-                which is chunked along the shot dimension.
+            skip_fit_plots: Leave out the fit stage's per-shot PDFs, about a minute per shot.
+                A later fit stage without it plots the shots that have no PDF yet.
+            max_fit_pages: Most pages of a shot's fit PDF. None plots every slice.
+            mb_per_chunk: Target size of each variable's chunks in the internal
+                Zarr store, which is chunked along the shot dimension.
             prepare_workers: Threads used to read source data. None keeps the
                 MAST default, which the public S3 store tolerates.
             config: TOML file(s), comma separated, with the [cluster] table
-                and the [mast] settings table (see config.py; MAST has no
+                and the [mast] settings table (see config.py, MAST has no
                 settings yet, so the table is empty or absent). None fits locally.
         """
-        from transport_validation_datasets.config import load_run_config
         from transport_validation_datasets.machine.mast.mast_dataset import (
             MASTDataWorkflow,
         )
 
-        cluster_config, settings = load_run_config(
-            config, "mast", MASTDataWorkflow.settings_cls, DEVICES
-        )
-        workflow = MASTDataWorkflow(
+        _run_device(
+            MASTDataWorkflow,
+            "mast",
+            config=config,
+            stage=stage,
+            clean_fit_state=clean_fit_state,
+            skip_fit_plots=skip_fit_plots,
+            max_fit_pages=max_fit_pages,
+            mb_per_chunk=mb_per_chunk,
             ds_name=ds_name,
             data_assembly_dir=Path(data_assembly_dir),
             shotlist_file=shotlist_file,
             max_num_shots=max_num_shots,
             average_windows=average_windows,
             fit_method=method,
-            cluster_config=cluster_config,
             prepare_workers=prepare_workers,
-            settings=settings,
         )
-        _execute(workflow, stage, clean_fit_state, mb_per_chunk)
 
 
-def _execute(workflow, stage: str, clean_fit_state: bool, mb_per_chunk: int):
-    """Run the requested stages of an already built workflow.
+def _run_device(
+    workflow_cls,
+    device: str,
+    *,
+    config: Path | str | None,
+    stage: str,
+    clean_fit_state: bool,
+    skip_fit_plots: bool,
+    max_fit_pages: int | None,
+    mb_per_chunk: int,
+    **workflow_kwargs,
+):
+    """Build one device's workflow from its run configuration, then run the requested stages.
+
+    The stage is checked first, building the workflow can query the device's shotlist.
 
     Args:
-        workflow: The device's DataWorkflow.
+        workflow_cls: The device's DataWorkflow subclass.
+        device: The device's subcommand, which names its config table.
+        config: TOML file(s), comma separated, see config.py.
+            None takes the default settings and fits locally.
         stage: Which stage to run, one of STAGES.
         clean_fit_state: Wipe the staged fit batches before fitting.
-        mb_per_chunk: Target chunk size of the internal Zarr store.
+        skip_fit_plots: Leave out the fit stage's per-shot PDFs.
+        max_fit_pages: Most pages of a shot's fit PDF, None for every slice.
+        mb_per_chunk: Target size of each variable's chunks in the internal Zarr store.
+        **workflow_kwargs: The workflow's own arguments.
 
     Raises:
         ValueError: If the stage is not one of STAGES.
     """
+    from transport_validation_datasets.config import load_run_config
+
     if stage not in STAGES:
         raise ValueError(f"Unknown stage '{stage}'. Known stages: {list(STAGES)}")
+    cluster_config, settings = load_run_config(
+        config, device, workflow_cls.settings_cls, DEVICES
+    )
+    workflow = workflow_cls(
+        cluster_config=cluster_config, settings=settings, **workflow_kwargs
+    )
     if stage in ("unprocessed", "all"):
         workflow.make_unprocessed_data_files()
     if stage in ("fit", "all"):
         if clean_fit_state:
             workflow.clean_fit_state()
-        workflow.run_gp_fitting()
+        workflow.run_gp_fitting(max_pages=max_fit_pages, skip_plots=skip_fit_plots)
     if stage in ("stack", "all"):
         workflow.stack_internal_dataset(mb_per_chunk=mb_per_chunk)
     if stage in ("publish", "all"):
         workflow.publish_dataset()
-    # Deliberately not part of "all": needs the optional `imas` extra, and is
-    # its own opt-in step (see DataWorkflow.export_to_imas).
+    # Not part of "all": it needs the optional imas extra (see DataWorkflow.export_to_imas)
     if stage == "export":
         workflow.export_to_imas()
 

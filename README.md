@@ -3,7 +3,7 @@ Consolidated methods for generating datasets to validate transport codes and tra
 
 # Dataset structure
 
-Every device is reduced to one schema, listed under [The datasets](#the-datasets).
+Every device is reduced to one schema, listed under [Datasets](#datasets).
 Signal names are IMAS-like, units are SI, and each variable carries its IMAS
 data dictionary path under its `ref` attribute in the stored files, with the
 documentation page under `url`. The per-device sources of each signal live
@@ -29,11 +29,14 @@ applied), and `fit_settings` (the fit staging knobs).
 # Workflow
 
 1: Pull unprocessed data from source and filter down to regions of validity
+
 2: Perform GP profile fitting
+
 3: Stack shots into the internal dataset
+
 4: Publish dataset, stripping the internal-only signals
 
-# The datasets
+# Datasets
 
 Two Zarr stores per device, under `<data_assembly_dir>/<ds_name>/04_datasets/`:
 
@@ -47,18 +50,18 @@ Shots are stacked along `shot` and NaN padded along every other dimension, so
 shots of different lengths line up. Only one shot is ever held in memory while
 the internal store is built, and the published store is streamed from it.
 
-The timebase is the unprocessed data's uniform 1 kHz grid. `time_idx` is the
-grid ordinal, so shots of different lengths pad to a common size, and the
-`time` variable carries the times themselves.
+The timebase is the unprocessed data's uniform 1 kHz grid.
+`time_idx` is the grid dimension, so shots of different lengths pad to a common size,
+and the `time` variable carries the times themselves.
 
-Profiles arrive one per Thomson sample and equilibria on the reconstruction
-clock, both far slower than 1 kHz, so both are held forward over the grid times
-that follow them and `fresh_profile` / `fresh_equilibrium` mark the grid times
-that carry a sample of their own. A sample is held for at most
-`MAX_HOLD_PERIODS` of its own sampling period, so nothing is carried across the
-end of the shot or a stretch the filtering cut away. By default the slices
-whose Te and ne fits did not both come back usable are ignored, as though the
-shot had no Thomson sample there.
+Profiles are from Thomson scattering and equilibria from a reconstruction,
+both of which can be slower than 1 kHz,
+so so they are held forward over the grid times that follow them
+and `fresh_profile` / `fresh_equilibrium` mark the grid times that carry a sample of their own.
+A sample is held for at most `MAX_HOLD_PERIODS` of its own sampling period,
+so nothing is carried across the end of the shot or a stretch the filtering cut away.
+By default the slices whose Te and ne fits did not both come back usable are ignored,
+as though the shot had no Thomson sample there.
 
 | Group | Signals | Dimensions |
 | ------ | ------ | ------ |
@@ -71,15 +74,14 @@ shot had no Thomson sample there.
 The profiles are fit on rho_tor_norm from 0 to 1.6, so every fit anchor is on the fit grid and in the fit plots.
 The fit files, the stores and the IMAS export keep them out to rho_tor_norm 1.1.
 
-A signal the device does not have comes through as NaN, so the devices share
-one schema. Everything is float32, flags included, because the padding between
-shots of different lengths is NaN.
+A signal the device does not have comes through as NaN, so the devices share one schema.
+Everything is float32, flags included, because the padding between shots of different lengths is NaN.
 The power signals (power_ohm/radiated/nbi/ic/lh) are clipped at zero since source records often dip negative
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
 
 # Running
 
-One device per invocation, through the CLI:
+One device at a time, through the CLI:
 
 ```bash
 # Every stage, C-Mod (needs MDSplus access through disruption-py)
@@ -102,17 +104,20 @@ uv run python -m transport_validation_datasets.cli mast /path/to/data_assembly_d
     --stage publish
 ```
 
-`--help` lists every flag, and the stages resume: rerunning the same command
-picks up whatever is not on disk yet. Stack and publish are the exceptions,
-each always rebuilds its store.
+`--help` lists every flag, and the stages resume
+so rerunning the same command picks up whatever is not on disk yet.
+Stack and publish are the exceptions, each always rebuilds its store.
+The fit stage plots every shot's fits to a PDF, about a minute per shot.
+`--skip_fit_plots` leaves them out, and a later fit stage without it plots the shots that have no PDF yet.
+`--max_fit_pages` caps the pages of each PDF.
+A cluster fit pulls each job's SLURM log back into `<ds_name>/logs/fit_jobs/`.
 
 # Configuration
 
-`--config` takes one or more TOML files, comma separated, holding what does
-not change from run to run: the cluster the fits are dispatched to and the
-device-specific settings. The files are layered, a later one overrides an
-earlier one key by key. `configs/orcd.toml` is the shared file; the cluster
-paths are per user and go in `configs/<user>.user.toml`, which git ignores:
+`--config` takes one or more TOML files, comma separated.
+These configs are for the cluster the fits are dispatched to and the device-specific settings.
+The files are layered so later ones override earlier ones.
+For example, to run on the ORCD cluster with some per-user modifications, do something like this:
 
 ```bash
 --config configs/orcd.toml,configs/$USER.user.toml
@@ -130,16 +135,19 @@ efit_trees = ["EFIT21"]
 
 # configs/<user>.user.toml
 [cluster]
+ssh_host = "orcd-user"
+partitions = "mit_preemptable@8:00:00"
 remote_workdir = "/path/on/cluster"
 venv_path = "/path/on/cluster/.venv"
 ```
 
-Keys are dataclass field names: `ClusterFitConfig` in `gp_fitting/dispatcher.py`
-for `[cluster]`, the device workflow's `settings_cls` for `[cmod]` and `[mast]`
+Keys are dataclass field names:
+`ClusterFitConfig` in `gp_fitting/dispatcher.py` for `[cluster]`,
+the device workflow's `settings_cls` for `[cmod]` and `[mast]`
 (`CModSettings` in `machine/cmod/cmod_dataset.py`, `MASTSettings` in `machine/mast/mast_dataset.py`).
 A key left out keeps its default.
 A key the dataclass does not have, or a table that is neither `cluster` nor a device, is an error.
-Without a `[cluster]` table the fits run locally in the calling process, 
+Without a `[cluster]` table each batch is fit locally in a worker process on this machine's cores,
 and without `--config` everything keeps its default.
 Run-specific choices (`--ds_name`, `--shotlist_file`, `--stage`, `--method`, ...) stay command line flags.
 
@@ -156,8 +164,9 @@ te_grad_anchors = [[0.0, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1], [1.5, 0.0,
 # ne_value_anchors, ne_grad_anchors likewise
 ```
 
-The anchors are staged into the fit batches, so changing them needs
-`--clean_fit_state` or a new `--ds_name`.
+The anchors are staged into the fit batches,
+so changing them needs `--clean_fit_state` or a new `--ds_name`.
+The fit stage refuses batches staged under any other fit setting, the device's fit bounds and fit grid included.
 
 Both device tables also take `pedestal_rho_tor_norm`, the pedestal location every fit uses, 1.0 by default.
 zk places its kernel's length-scale transition there, and akho centers its mtanh there.
@@ -165,7 +174,7 @@ One value for both Te and ne. It is staged and checked like the anchors.
 
 ```toml
 [mast]
-pedestal_rho_tor_norm = 0.95
+pedestal_rho_tor_norm = 1.0
 ```
 
 Both device tables also take `sol_extension`, how the Thomson channels outside the LCFS are placed in rho_tor_norm.
@@ -182,12 +191,12 @@ sol_extension = "tangent"
 ```
 
 The `[cmod]` table also takes `efit_trees`, the EFIT trees a shot is read from, in order of preference.
-The default is only EFIT21, so a shot EFIT21 fails on is skipped.
-Adding ANALYSIS after it turns on pulling those shots from the ANALYSIS tree instead.
+The default is only EFIT21 (1 kHz magnetics-only), so a shot EFIT21 fails on is skipped.
+Adding ANALYSIS after it turns on pulling those shots from the ANALYSIS tree instead (50 Hz magnetics-only).
 Every retrieval reads the EFIT tree at least for its timebase, so a shot takes the first tree that serves all of them.
 A tree fails when it is missing or its reconstruction is missing a node,
 and the unprocessed file records the tree it used as its `efit_tree` attribute.
-A tree slower than the 1 kHz grid (ANALYSIS reconstructs every ~20 ms) has its EFIT 0D signals interpolated onto the grid,
+A tree slower than the 1 kHz grid has its EFIT 0D signals interpolated onto the grid,
 and `fresh_equilibrium` marks grid times where the reconstruction exists.
 Shots already recorded in `01_unprocessed/failed_shots/` are not retried,
 so their records need deleting for a rebuild to try another tree.
@@ -203,18 +212,20 @@ efit_trees = ["EFIT21", "ANALYSIS"]
 `--shotlist_file` takes one of two formats:
 
 - plain: one shot number per line
-- windowed: a CSV whose header holds `shot` (or `pulse_no`), `t_start` and
-  `t_end` [s], one row per window and a shot on as many rows as it has windows.
-  Other columns are ignored. Windows of one shot may overlap, but no two may
-  share a center (closer than 1 ms), because the center is where the averaged profile
-  is labeled.
+- windowed: 
+  a CSV whose header holds `shot` (or `pulse_no`), `t_start` and `t_end` [s],
+  one row per window and a shot on as many rows as it has windows.
+  Other columns are ignored.
+  Windows of one shot may overlap, but no two may share a center (closer than 1 ms),
+  because the center is where the averaged profile is labeled.
 
-Without a shotlist file the device's own list is used (C-Mod queries its SQL
-summary table, MAST reads the list shipped with the package).
+Without a shotlist file the device's own list is used
+(C-Mod queries its SQL summary table, MAST reads the list shipped with the package).
 
-The unprocessed stage is the same in every case: the whole shot is read,
-filtered, and written, so the unprocessed files can be reused when the windows
-change. Windows act on the fit and stack stages, in one of two modes:
+The unprocessed stage is the same in every case:
+the whole shot is read, filtered, and written,
+so the unprocessed files can be reused when the windows change.
+Windows act on the fit and stack stages, in one of two modes:
 
 | Mode | Flags | Fit stage | Store |
 | ---- | ----- | --------- | ----- |

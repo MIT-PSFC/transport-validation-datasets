@@ -15,17 +15,23 @@ _ENVELOPE_MARGIN = 1.2
 # Half-width of the envelope window, and of the channels the worker drops around a peak
 REPAIR_HALFWIDTH = 0.1
 
-# A fit whose innermost _FIT_BIAS_CORE_N channels sit on average more than _FIT_BIAS_CORE_SIGMA above it
-# is a core amplitude collapse,
+# A core amplitude collapse is a fit well below its innermost _FIT_BIAS_CORE_N channels,
 # where the likelihood prefers a small variance that hugs the prior below a sparse, noisy core.
-# Healthy fits stay below ~1.7 and collapses sit at 2.6 and above.
+# The residuals of those channels are averaged with weights 1/err^2,
+# so one huge-error channel cannot dilute the others.
+# A fit is flagged when that weighted mean residual is both
+# significant (more than _FIT_BIAS_CORE_SIGMA of its own error),
+# and large (more than _FIT_BIAS_CORE_FRACTION of the weighted mean data).
+# Significance alone flags precise fits that miss by a few percent,
+# and size alone flags fits that rightly ignore a few very noisy channels.
 # One-sided, since a fit above a low bad channel is doing its job,
 # and an overshoot is the envelope check's to judge.
 # Core-only, since the same test along the whole profile culls healthy fits.
 # No channel subset repairs a core the fit refuses to reach,
 # so a flagged fit gets the retries but never the channel drop.
 _FIT_BIAS_CORE_N = 4
-_FIT_BIAS_CORE_SIGMA = 2.5
+_FIT_BIAS_CORE_SIGMA = 3.0
+_FIT_BIAS_CORE_FRACTION = 0.15
 
 # Monotonic-edge constraint, applied by gp.fit_profile.
 # The GP can ring up into a bump past rho ~1.0,
@@ -39,7 +45,9 @@ _FIT_BIAS_CORE_SIGMA = 2.5
 # A rise the channels support is left alone (rise_is_data_supported),
 # since hollow ne genuinely rises through rho 0.6-0.9.
 # Tolerance and error are in scale_per_slice-normalized units.
-MONO_CHECK_RHO = np.concatenate([np.linspace(0.6, 0.85, 6), np.linspace(0.9, 1.09, 20)])
+# The grid runs to just inside the first value anchor.
+# A short edge length scale (l2 ~0.06) can ring up by several keV at rho ~1.2 (C-Mod 1160825021 t=0.75).
+MONO_CHECK_RHO = np.concatenate([np.linspace(0.6, 0.85, 6), np.linspace(0.9, 1.29, 40)])
 MONO_GRAD_TOL = 0.01
 MONO_GRAD_ERR = 0.05
 MONO_MAX_PASSES = 3
@@ -91,9 +99,12 @@ def rise_is_data_supported(data_x, data_y, err_y, rho) -> bool:
 def fit_ignores_data(data_x, data_y, err_y, x_star, y_fit) -> bool:
     """Check whether the fit sits below its innermost channels.
 
-    Compares the mean of z = (y - fit) / err over the innermost
-    _FIT_BIAS_CORE_N channels with _FIT_BIAS_CORE_SIGMA.
-    See the block comment above _FIT_BIAS_CORE_N for why the test is one-sided and core-only.
+    Over the innermost _FIT_BIAS_CORE_N channels, with residuals r = y - fit and weights w = 1/err^2,
+    the weighted mean residual has significance sum(w r) / sqrt(sum(w))
+    and relative size sum(w r) / sum(w y).
+    The fit is flagged when the significance exceeds _FIT_BIAS_CORE_SIGMA
+    and the relative size exceeds _FIT_BIAS_CORE_FRACTION.
+    See the block comment above _FIT_BIAS_CORE_N for why both, and why the test is one-sided and core-only.
 
     Args:
         data_x: Channel rho positions.
@@ -112,9 +123,15 @@ def fit_ignores_data(data_x, data_y, err_y, x_star, y_fit) -> bool:
     xs = np.asarray(data_x, dtype=float)[valid][order]
     ys = np.asarray(data_y, dtype=float)[valid][order]
     es = np.asarray(err_y, dtype=float)[valid][order]
-    z = (ys - np.interp(xs, np.asarray(x_star, dtype=float), y_fit)) / es
-    n_core = min(_FIT_BIAS_CORE_N, z.size)
-    return float(np.mean(z[:n_core])) > _FIT_BIAS_CORE_SIGMA
+    n_core = min(_FIT_BIAS_CORE_N, xs.size)
+    y_core = ys[:n_core]
+    fit_core = np.interp(xs[:n_core], np.asarray(x_star, dtype=float), y_fit)
+    residual_weighted_sum = float(np.sum((y_core - fit_core) / es[:n_core] ** 2))
+    weight_sum = float(np.sum(1.0 / es[:n_core] ** 2))
+    data_weighted_sum = float(np.sum(y_core / es[:n_core] ** 2))
+    significance = residual_weighted_sum / np.sqrt(weight_sum)
+    fraction = residual_weighted_sum / max(data_weighted_sum, 1e-12)
+    return significance > _FIT_BIAS_CORE_SIGMA and fraction > _FIT_BIAS_CORE_FRACTION
 
 
 def data_envelope(data_x, data_y, data_err, rho0) -> float:

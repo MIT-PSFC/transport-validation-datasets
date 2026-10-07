@@ -49,6 +49,9 @@ from transport_validation_datasets.gp_fitting.worker_base import (  # noqa: E402
     run_worker_cli,
 )
 
+# The method's own name for its fit, in the description of every fitted profile
+FIT_DESCRIPTION = "Polynomial/Tanh + GP corrections"
+
 # The value anchors join the analytic pre-fit with their errors inflated by this factor,
 # so they nudge its SOL level rather than deform its shape.
 # The GP stage sees them at full weight.
@@ -220,12 +223,7 @@ def _fit_slice(task: SliceTask) -> SliceResult:
     return SliceResult(shot=task.shot, i_time=task.i_time, te=te, ne=ne)
 
 
-def fit_batch(
-    batch: FitBatch,
-    num_workers: int = 1,
-    *,
-    max_slices_per_shot: int | None = None,
-) -> dict[int, ShotFitOutput]:
+def fit_batch(batch: FitBatch, num_workers: int = 1) -> dict[int, ShotFitOutput]:
     """Fit every (shot, time slice) in the batch with the akho method.
 
     Slices are fit serially (num_workers <= 1) or across worker processes.
@@ -235,17 +233,11 @@ def fit_batch(
     Args:
         batch: Staged batch inputs (see batch_io.FitBatch).
         num_workers: Slice-level worker processes.
-        max_slices_per_shot: If set, fit only the first N time slices of each shot, for debugging.
 
     Returns:
         Fitted profiles keyed by shot number.
     """
-    return map_slices(
-        _fit_slice,
-        batch,
-        num_workers=num_workers,
-        max_slices_per_shot=max_slices_per_shot,
-    )
+    return map_slices(_fit_slice, batch, num_workers=num_workers)
 
 
 def main(argv: list[str] | None = None):

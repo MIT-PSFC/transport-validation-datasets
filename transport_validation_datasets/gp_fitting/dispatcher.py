@@ -1,9 +1,9 @@
 """Dispatch GP profile fitting batches to a SLURM cluster.
 
-The dispatcher uploads staged batch input files (one npz per batch of shots,
-to avoid many-small-file transfers on clusters like Engaging) plus the
-gp_fitting worker package, submits one CPU job per batch, polls until
-completion, and pulls the result files back.
+The dispatcher uploads staged batch input files
+(one npz per batch of shots, to avoid many-small-file transfers on clusters like Engaging)
+plus the gp_fitting worker package, submits one CPU job per batch,
+polls until completion, and pulls the result files and the job logs back.
 Staging and result collection are the workflow's job (see DataWorkflow.run_gp_fitting),
 the dispatcher only ships, executes, and pulls.
 
@@ -33,7 +33,10 @@ from pathlib import Path
 from loguru import logger
 
 from transport_validation_datasets.gp_fitting import registry
-from transport_validation_datasets.gp_fitting.batch_io import read_batch_shots
+from transport_validation_datasets.gp_fitting.batch_io import (
+    read_batch_shots,
+    staged_batch_paths,
+)
 
 # rsync transfers go through the cluster login node, which sometimes drops
 # connections (exit 255), so transfers are retried before giving up
@@ -45,13 +48,17 @@ _RSYNC_SOURCE_MISSING_CODES = {23, 24}
 # polls to wait for a COMPLETED job's output to become pullable before
 # declaring the batch failed
 _MAX_OUTPUT_PULL_POLLS = 3
-# polls to tolerate a job in an unrecognized/unknown state (e.g. it vanished
-# from the queue) before treating the attempt as failed
+# polls to tolerate a job in an unrecognized/unknown state before treating the attempt as failed.
+# (e.g. it vanished from the queue)
+# Only polls that reached the cluster count, an ssh outage is not a job state.
 _MAX_UNKNOWN_POLLS = 5
 # how long clean() waits for cancelled jobs to actually leave the queue before
 # it deletes their batch files (see _wait_for_jobs_to_drain)
 CLEAN_DRAIN_TIMEOUT_S = 120.0
 CLEAN_DRAIN_POLL_S = 5.0
+# The OpenSSH client's own exit code when it could not run the remote command
+# (connection or authentication failure), distinct from any remote command's exit code
+_SSH_UNREACHABLE_CODE = 255
 
 # SLURM states that mean the job will never produce output
 _TERMINAL_FAILURE_STATES = {
@@ -64,6 +71,22 @@ _TERMINAL_FAILURE_STATES = {
     "BOOT_FAIL",
     "DEADLINE",
 }
+# SLURM states of a job that is still going to run or finish, nothing to do but wait
+_ACTIVE_STATES = {
+    "RUNNING",
+    "COMPLETING",
+    "CONFIGURING",
+    "REQUEUED",
+    "REQUEUE_HOLD",
+    "SUSPENDED",
+    "STAGE_OUT",
+    "RESIZING",
+    "SIGNALING",
+}
+
+
+class ClusterUnreachableError(RuntimeError):
+    """The ssh connection to the cluster failed, so nothing is known about the jobs."""
 
 
 @dataclass
@@ -72,8 +95,8 @@ class PartitionSpec:
 
     Attributes:
         name: Name of the SLURM partition.
-        time_limit: Wall time limit for jobs on this partition. Must not exceed the
-            partition's MaxTime; query it with
+        time_limit: Wall time limit for jobs on this partition.
+            Must not exceed the partition's MaxTime, query it with
             `scontrol show partition <name> | grep MaxTime`
             or `sinfo -p <name> -O partitionname,time`.
         constraint: Optional SLURM node constraint for this partition.
@@ -84,15 +107,13 @@ class PartitionSpec:
     constraint: str | None = None
 
 
-def parse_partition_specs(value) -> list["PartitionSpec"]:
+def parse_partition_specs(value: str) -> list["PartitionSpec"]:
     """Parse a partition spec string into PartitionSpecs.
 
     Args:
         value: Comma-separated entries of name@time_limit or
             name@time_limit@constraint, e.g.
             "sched_psfc_mit_r8@8:00:00,mit_preemptable@8:00:00@rocky8".
-            Also accepts a tuple/list of entry strings (Python Fire may
-            pre-split comma-separated arguments).
 
     Returns:
         One PartitionSpec per entry.
@@ -100,12 +121,8 @@ def parse_partition_specs(value) -> list["PartitionSpec"]:
     Raises:
         ValueError: If an entry does not match the format, or the spec is empty.
     """
-    if isinstance(value, str):
-        entries = value.split(",")
-    else:
-        entries = list(value)
     specs = []
-    for entry in entries:
+    for entry in value.split(","):
         fields = entry.strip().split("@")
         if len(fields) == 2:
             specs.append(PartitionSpec(name=fields[0], time_limit=fields[1]))
@@ -130,16 +147,16 @@ class ClusterFitConfig:
 
     Attributes:
         ssh_host: Host alias from ~/.ssh/config for the cluster login node,
-            with ControlMaster/ControlPath configured. An authenticated
-            session must already exist before dispatching (open one with a
-            plain `ssh <host>`); the login node's 2FA prompt cannot be
-            answered from here.
+            with ControlMaster/ControlPath configured.
+            An authenticated session must already exist before dispatching,
+            open one with a plain `ssh <host>`.
+            The login node's 2FA prompt cannot be answered from here.
         partitions: Ordered partition preference list, each with its own time limit
             and optional constraint (see parse_partition_specs for the string
-            format). mkgp is CPU-only, so these should be CPU partitions. A batch is
-            submitted to the first partition; it falls back to the next (wrapping
-            around) when its job is killed or sits PENDING longer than
-            pending_timeout_s.
+            format). mkgp is CPU-only, so these should be CPU partitions.
+            A batch is submitted to the first partition.
+            It falls back to the next (wrapping around)
+            when its job is killed or sits PENDING longer than pending_timeout_s.
         remote_workdir: Scratch directory on the cluster. Each dataset works
             in its own {remote_workdir}/{ds_name}/ subdirectory, holding that
             dataset's batch files, worker package, job scripts, and logs, so
@@ -150,8 +167,15 @@ class ClusterFitConfig:
         shots_per_batch: Shots packed into one npz / one job. At ~40 core-minutes per
             shot, 10 shots on 32 CPUs is ~15 minutes wall time. Small batches keep
             jobs running concurrently and bound the work lost to a killed job.
-        cpus_per_job: cpus-per-task for each fitting job; the worker runs this many
-            slice-fit processes.
+        cpus_per_job: cpus-per-task for each fitting job,
+            the worker runs this many slice-fit processes.
+        memory_per_node: sbatch --mem of each job, in SLURM's form ("64G", "4000M").
+            None leaves it to the partition's default.
+        poll_interval_s: Seconds between two polls of the job states.
+        job_name_prefix: First token of every job name,
+            gpfit-{ds_name}-{method}-{batch_id}-a{attempt} by default.
+            Jobs are adopted and cleaned by name, so two runs of one dataset
+            must share it, and two unrelated users of one account should not.
         max_retries: Resubmissions allowed per batch after a terminal job failure
             (TIMEOUT, PREEMPTED, OOM, ...). Each retry moves to the next partition in
             the list, wrapping around.
@@ -160,7 +184,7 @@ class ClusterFitConfig:
     """
 
     ssh_host: str
-    partitions: list[PartitionSpec] | str | tuple
+    partitions: list[PartitionSpec] | str
     remote_workdir: str
     venv_path: str
     max_concurrent_jobs: int = 8
@@ -173,9 +197,7 @@ class ClusterFitConfig:
     pending_timeout_s: float = 1800.0
 
     def __post_init__(self):
-        if not isinstance(self.partitions, list) or not all(
-            isinstance(p, PartitionSpec) for p in self.partitions
-        ):
+        if isinstance(self.partitions, str):
             self.partitions = parse_partition_specs(self.partitions)
 
 
@@ -220,9 +242,7 @@ def plan_batches(
     pending = set(pending_shots)
     batches: dict[str, list[int]] = {}
 
-    for batch_path in sorted(batches_dir.glob("batch_*.npz")):
-        if "_out_" in batch_path.name:
-            continue
+    for batch_path in staged_batch_paths(batches_dir):
         try:
             batch_shots = read_batch_shots(batch_path)
         except Exception as e:
@@ -270,21 +290,19 @@ def _ssh_config_user(dest: str) -> str:
 class _SSHBackend:
     """File transfer and job control on a remote cluster over ssh.
 
-    Everything goes through the OpenSSH client, never a Python SSH library:
-    paramiko and friends open a fresh transport per connection, which cannot
-    get through a login node that requires publickey AND keyboard-interactive
-    (2FA) - pubkey passes, the 2FA prompt goes unanswered, and the
-    connection dies. The OpenSSH client instead reuses the authenticated
-    ControlMaster socket from ~/.ssh/config, so one interactive `ssh <host>`
-    beforehand carries the whole dispatch without further 2FA rounds.
-    BatchMode=yes makes a dead master fail fast instead of hanging on the
-    2FA prompt. File transfers ride the same session through subprocess rsync.
-    No --mkpath: remote rsync may be too old for it (e.g. Engaging has 3.1.3),
-    so callers ensure_dir before pushing.
+    Everything goes through the OpenSSH client, never a Python SSH library.
+    paramiko and friends open a fresh transport per connection,
+    which a login node requiring publickey and 2FA turns away.
+    The OpenSSH client reuses the authenticated ControlMaster socket from ~/.ssh/config,
+    so one interactive `ssh <host>` beforehand carries the whole dispatch.
+    BatchMode=yes makes a dead master fail fast instead of hanging on the 2FA prompt.
+    File transfers ride the same session through subprocess rsync.
+    Remote rsync may be too old for --mkpath (Engaging has 3.1.3), so callers ensure_dir before pushing.
 
-    Job state resolution: squeue for active jobs, sacct for jobs that have
-    left the queue, scontrol as the last resort when slurmdbd is unreachable.
+    Job state resolution: squeue for active jobs, sacct for jobs that have left the queue,
+    scontrol as the last resort when slurmdbd is unreachable.
     Jobs found in none of the three are omitted, which the caller reads as UNKNOWN.
+    An ssh failure (exit 255) is ClusterUnreachableError instead.
     """
 
     def __init__(self, config: ClusterFitConfig, workdir: str):
@@ -329,7 +347,7 @@ class _SSHBackend:
 
         Args:
             script: Full sbatch script text.
-            job_name: Job name; also names the remote script file.
+            job_name: Job name, which also names the remote script file.
 
         Returns:
             The submitted SLURM job id.
@@ -346,15 +364,37 @@ class _SSHBackend:
             raise RuntimeError(f"sbatch failed for {job_name}: {result.stderr.strip()}")
         return int(result.stdout.strip().splitlines()[-1].split(";")[0])
 
-    def queued_jobs(self) -> list[tuple[str, int]]:
-        """List (name, job id) for every queued/running job of this user.
+    def _ssh_reaching_cluster(self, cmd: str):
+        """Run a command on the cluster, raising if ssh itself failed.
 
-        A list, not a name-keyed dict: two jobs can carry the same name (two
-        runs each submitting attempt 1 of the same batch), and clean() has to
-        cancel both.
+        A remote command's own non-zero exit (squeue on a job that left the
+        queue, sacct without slurmdbd) is left to the caller to read.
+
+        Args:
+            cmd: Shell command to run remotely.
 
         Returns:
-            (job name, job id) pairs.
+            The completed subprocess result.
+
+        Raises:
+            ClusterUnreachableError: If the ssh connection failed.
+        """
+        result = self._ssh(cmd)
+        if result.returncode == _SSH_UNREACHABLE_CODE:
+            raise ClusterUnreachableError(
+                f"ssh to {self._host} failed: {result.stderr.strip()}"
+            )
+        return result
+
+    def queued_jobs(self) -> dict[str, list[int]]:
+        """List the job ids of every queued/running job of this user, by job name.
+
+        Two jobs can carry the same name (two runs each submitting attempt 1
+        of the same batch), so every id of a name is kept: the adoption keeps
+        one and cancels the rest, and clean() cancels them all.
+
+        Returns:
+            Job name to its job ids.
 
         Raises:
             RuntimeError: If squeue fails.
@@ -363,11 +403,11 @@ class _SSHBackend:
         result = self._ssh(f"squeue {user_arg}-h -o {shlex.quote('%i|%j')}")
         if result.returncode != 0:
             raise RuntimeError(f"squeue failed: {result.stderr.strip()}")
-        jobs = []
+        jobs: dict[str, list[int]] = {}
         for line in result.stdout.splitlines():
             jid, _, name = line.strip().partition("|")
             if jid.isdigit() and name:
-                jobs.append((name, int(jid)))
+                jobs.setdefault(name, []).append(int(jid))
         return jobs
 
     def job_states(self, job_ids: list[int]) -> dict[int, str]:
@@ -377,16 +417,19 @@ class _SSHBackend:
             job_ids: Job ids to look up.
 
         Returns:
-            Job id to state mapping; ids resolvable by none of squeue, sacct,
-            or scontrol are omitted (callers read that as UNKNOWN).
+            Job id to state mapping.
+            Ids resolvable by none of squeue, sacct, or scontrol are omitted (callers read that as UNKNOWN).
+            An ssh connection failure is ClusterUnreachableError instead,
+            the states are then unknown for a reason that has nothing to do with the jobs.
         """
         if not job_ids:
             return {}
         id_arg = ",".join(str(i) for i in job_ids)
         states: dict[int, str] = {}
 
-        result = self._ssh(
-            f"squeue --jobs {id_arg} -h -o {shlex.quote('%i|%T')} 2>/dev/null || true"
+        # squeue exits non-zero when an id has left the queue, only its stdout matters
+        result = self._ssh_reaching_cluster(
+            f"squeue --jobs {id_arg} -h -o {shlex.quote('%i|%T')} 2>/dev/null"
         )
         for line in result.stdout.splitlines():
             jid, _, st = line.strip().partition("|")
@@ -395,12 +438,12 @@ class _SSHBackend:
 
         missing = [j for j in job_ids if j not in states]
         if missing:
-            # sacct reports per-step rows (12345.batch, 12345.extern) and
-            # decorates some states ("CANCELLED by 1234"); keep the job row
-            # and the bare state so it matches _TERMINAL_FAILURE_STATES.
+            # sacct reports per-step rows (12345.batch, 12345.extern)
+            # and decorates some states ("CANCELLED by 1234").
+            # Keep the job row and the bare state so it matches _TERMINAL_FAILURE_STATES.
             sacct_ids = ",".join(str(i) for i in missing)
-            result = self._ssh(
-                f"sacct -j {sacct_ids} -n -P -o JobID,State 2>/dev/null || true"
+            result = self._ssh_reaching_cluster(
+                f"sacct -j {sacct_ids} -n -P -o JobID,State 2>/dev/null"
             )
             for line in result.stdout.splitlines():
                 jid, _, st = line.strip().partition("|")
@@ -409,8 +452,8 @@ class _SSHBackend:
 
         missing = [j for j in job_ids if j not in states]
         for jid in missing:
-            result = self._ssh(
-                f"scontrol show job {jid} 2>/dev/null | tr ' ' '\\n' | grep '^JobState=' || true"
+            result = self._ssh_reaching_cluster(
+                f"scontrol show job {jid} 2>/dev/null | tr ' ' '\\n' | grep '^JobState='"
             )
             st = result.stdout.strip().partition("=")[2]
             if st:
@@ -536,7 +579,7 @@ class BatchState:
     output_path: Path
     job_base_name: str
     job_id: int | None = None
-    attempt: int = 0  # submissions so far; job names carry -a{attempt}
+    attempt: int = 0  # submissions so far, job names carry -a{attempt}
     failures: int = 0  # terminal failures so far, vs config.max_retries
     partition_idx: int = 0
     pending_since: float | None = None
@@ -568,7 +611,12 @@ class ClusterFitDispatcher:
     """Run staged GP fitting batches on a SLURM cluster."""
 
     def __init__(
-        self, config: ClusterFitConfig, ds_name: str, batches_dir: Path, method: str
+        self,
+        config: ClusterFitConfig,
+        ds_name: str,
+        batches_dir: Path,
+        method: str,
+        logs_dir: Path,
     ):
         """Set up the dispatcher for one dataset and fitting method.
 
@@ -576,9 +624,10 @@ class ClusterFitDispatcher:
             config: Cluster launch options.
             ds_name: Dataset name, used in job names and batch ids.
             batches_dir: Local directory holding the staged batch npz files.
-            method: Fitting method name; part of job names and output
-                filenames so two methods' runs never adopt each other's jobs
-                or outputs.
+            method: Fitting method name, part of job names and output filenames
+                so two methods' runs never adopt each other's jobs or outputs.
+            logs_dir: Local directory the job logs are pulled back into,
+                once per attempt when it ends.
         """
         self.config = config
         self.ds_name = ds_name
@@ -586,6 +635,7 @@ class ClusterFitDispatcher:
         self.worker_module = registry.worker_module(method)
         self.batches_dir = Path(batches_dir)
         self.batches_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir = Path(logs_dir)
         # Everything this dataset puts on the cluster (batch files, worker
         # package, job scripts, logs) lives in its own subdirectory, so
         # datasets sharing a remote_workdir never touch each other's files.
@@ -679,14 +729,9 @@ class ClusterFitDispatcher:
         live in the dataset's own remote_workdir subdirectory.
         """
         prefix = f"{self.config.job_name_prefix}-{self.ds_name}-"
-        for name, job_id in self.backend.queued_jobs():
-            if not name.startswith(prefix):
-                continue
+        for name, job_id in self._queued_jobs_named(prefix):
             logger.info(f"Clean: cancelling job {name} (id {job_id})")
-            try:
-                self.backend.cancel(job_id)
-            except Exception as e:
-                logger.warning(f"Clean: failed to cancel job {name} (id {job_id}): {e}")
+            self._cancel_job(job_id, f"Clean: job {name}")
 
         self._wait_for_jobs_to_drain(prefix)
 
@@ -714,17 +759,13 @@ class ClusterFitDispatcher:
             prefix: Job name prefix to wait out.
 
         Raises:
-            RuntimeError: If jobs are still queued after the drain timeout; a
-                stuck job (e.g. wedged in COMPLETING) needs a human, and
-                proceeding would quietly reuse stale fits.
+            RuntimeError: If jobs are still queued after the drain timeout.
+                A stuck job (e.g. wedged in COMPLETING) needs a human,
+                and proceeding would quietly reuse stale fits.
         """
         deadline = time.monotonic() + CLEAN_DRAIN_TIMEOUT_S
         while True:
-            remaining = [
-                (name, job_id)
-                for name, job_id in self.backend.queued_jobs()
-                if name.startswith(prefix)
-            ]
+            remaining = self._queued_jobs_named(prefix)
             if not remaining:
                 return
             if time.monotonic() >= deadline:
@@ -742,6 +783,34 @@ class ClusterFitDispatcher:
                 f"Clean: waiting for {len(remaining)} cancelled jobs to leave the queue"
             )
             time.sleep(CLEAN_DRAIN_POLL_S)
+
+    def _queued_jobs_named(self, prefix: str) -> list[tuple[str, int]]:
+        """List this user's queued jobs whose name starts with prefix.
+
+        Args:
+            prefix: Job name prefix.
+
+        Returns:
+            (job name, job id) pairs, one per job, a name repeated for duplicates.
+        """
+        return [
+            (name, job_id)
+            for name, job_ids in self.backend.queued_jobs().items()
+            if name.startswith(prefix)
+            for job_id in job_ids
+        ]
+
+    def _cancel_job(self, job_id: int, what: str):
+        """Cancel a job, logging instead of raising when scancel fails.
+
+        Args:
+            job_id: SLURM job id to cancel.
+            what: What the job is, for the warning.
+        """
+        try:
+            self.backend.cancel(job_id)
+        except Exception as e:
+            logger.warning(f"{what}: failed to cancel job {job_id}: {e}")
 
     def _push_worker_package(self):
         """Upload the gp_fitting worker package to the cluster.
@@ -803,7 +872,7 @@ class ClusterFitDispatcher:
         self.backend.ensure_dir(f"{self.remote_workdir}/logs")
 
         # Adopt jobs already in the queue from a previous run
-        queued = dict(self.backend.queued_jobs())
+        queued = self.backend.queued_jobs()
         for state in todo:
             self._adopt_queued_job(state, queued)
 
@@ -838,41 +907,42 @@ class ClusterFitDispatcher:
             state.job_id = self._submit_batch(state)
             budget -= 1
 
-    def _adopt_queued_job(self, state: BatchState, queued: dict[str, int]):
+    def _adopt_queued_job(self, state: BatchState, queued: dict[str, list[int]]):
         """Adopt a queued job from a previous run instead of resubmitting.
 
-        Job names carry an attempt suffix (-a{n}). The highest attempt wins
-        and lower-attempt stragglers are cancelled.
+        Job names carry an attempt suffix (-a{n}). The highest attempt wins,
+        its lowest job id when two runs submitted that attempt,
+        and the lower attempts and the duplicates are cancelled.
 
         Args:
             state: Batch to adopt a job for.
-            queued: Queued job names to job ids.
+            queued: Queued job names to their job ids.
         """
         candidates: list[tuple[int, int]] = []  # (attempt, job_id)
-        for name, job_id in queued.items():
+        for name, job_ids in queued.items():
             if name.startswith(f"{state.job_base_name}-a"):
                 suffix = name.removeprefix(f"{state.job_base_name}-a")
                 if suffix.isdigit():
-                    candidates.append((int(suffix), job_id))
+                    candidates.extend((int(suffix), job_id) for job_id in job_ids)
         if not candidates:
             return
         candidates.sort()
-        state.attempt, state.job_id = candidates[-1]
+        best_attempt = candidates[-1][0]
+        adopted = min(
+            job_id for attempt, job_id in candidates if attempt == best_attempt
+        )
+        state.attempt, state.job_id = best_attempt, adopted
         state.pending_since = time.monotonic()
         logger.info(
             f"Batch {state.batch_id}: found existing job {state.job_id} "
             f"(attempt {state.attempt}) in queue, not resubmitting"
         )
-        for _, stale_id in candidates[:-1]:
-            logger.info(
-                f"Batch {state.batch_id}: cancelling stale lower-attempt job {stale_id}"
-            )
-            try:
-                self.backend.cancel(stale_id)
-            except Exception as e:
-                logger.warning(
-                    f"Batch {state.batch_id}: failed to cancel stale job {stale_id}: {e}"
-                )
+        for attempt, stale_id in candidates:
+            if stale_id == adopted:
+                continue
+            kind = "duplicate" if attempt == best_attempt else "stale lower-attempt"
+            logger.info(f"Batch {state.batch_id}: cancelling {kind} job {stale_id}")
+            self._cancel_job(stale_id, f"Batch {state.batch_id}")
 
     def _render_script(self, state: BatchState, part: PartitionSpec) -> str:
         """Render the sbatch script of one batch attempt.
@@ -909,6 +979,10 @@ class ClusterFitDispatcher:
             "",
             f"source '{self.config.venv_path}/bin/activate'",
             f"export PYTHONPATH={workdir}/pkg",
+            # One BLAS thread per slice-fit process, the slice pool is the parallelism
+            "export OMP_NUM_THREADS=1",
+            "export OPENBLAS_NUM_THREADS=1",
+            "export MKL_NUM_THREADS=1",
             "",
             f"srun python -m {self.worker_module} {workdir}/{state.input_path.name} "
             f"{workdir}/{state.output_path.name} --num-workers {self.config.cpus_per_job}",
@@ -950,26 +1024,36 @@ class ClusterFitDispatcher:
         ]
         if not active:
             return
-        states = self.backend.job_states([b.job_id for b in active])
+        try:
+            states = self.backend.job_states([b.job_id for b in active])
+        except ClusterUnreachableError as e:
+            # Nothing is known about any job, so no job's unknown-poll count moves
+            logger.warning(
+                f"Could not poll the job states, trying again next poll: {e}"
+            )
+            return
         for state in active:
             slurm_state = states.get(state.job_id, "UNKNOWN")
             if slurm_state == "PENDING":
                 self._check_pending_timeout(state)
                 continue
-            if slurm_state in ("RUNNING", "COMPLETING", "CONFIGURING"):
+            if slurm_state in _ACTIVE_STATES:
                 state.pending_since = None
                 continue
             # Terminal or unknown: the output file is the source of truth
             remote_out = f"{self.remote_workdir}/{state.output_path.name}"
             if self.backend.pull_file(remote_out, self.batches_dir):
                 state.done = True
+                local_log = self._pull_job_log(state)
                 logger.info(
-                    f"Batch {state.batch_id}: job {state.job_id} finished, results pulled back"
+                    f"Batch {state.batch_id}: job {state.job_id} finished, results pulled back, log in {local_log}"
                 )
             elif slurm_state in _TERMINAL_FAILURE_STATES:
+                local_log = self._pull_job_log(state)
                 self._handle_failure(
                     state,
-                    f"job {state.job_id} ended in state {slurm_state} without producing {remote_out}",
+                    f"job {state.job_id} ended in state {slurm_state} without producing {remote_out}, "
+                    f"log in {local_log}",
                 )
             elif slurm_state == "COMPLETED":
                 # The job claims success, so the output may exist but be
@@ -977,10 +1061,11 @@ class ClusterFitDispatcher:
                 # flight. Keep trying for a few polls before giving up.
                 state.output_pull_polls += 1
                 if state.output_pull_polls >= _MAX_OUTPUT_PULL_POLLS:
+                    local_log = self._pull_job_log(state)
                     self._handle_failure(
                         state,
                         f"job {state.job_id} COMPLETED but {remote_out} could "
-                        f"not be pulled after {state.output_pull_polls} polls",
+                        f"not be pulled after {state.output_pull_polls} polls, log in {local_log}",
                     )
                 else:
                     logger.warning(
@@ -990,18 +1075,41 @@ class ClusterFitDispatcher:
                     )
             else:
                 # UNKNOWN (e.g. the job vanished from the queue): tolerate a
-                # few polls, then treat the attempt as failed
+                # few polls, then treat the attempt as failed.
+                # Cancelled first, in case it is alive after all: two jobs
+                # writing the same output would race.
                 state.unknown_polls += 1
                 if state.unknown_polls >= _MAX_UNKNOWN_POLLS:
+                    self._cancel_job(state.job_id, f"Batch {state.batch_id}")
+                    local_log = self._pull_job_log(state)
                     self._handle_failure(
                         state,
                         f"job {state.job_id} in state {slurm_state} for "
-                        f"{state.unknown_polls} polls with no output",
+                        f"{state.unknown_polls} polls with no output, log in {local_log}",
                     )
                 else:
                     logger.warning(
                         f"Batch {state.batch_id}: job {state.job_id} state {slurm_state}, no output yet"
                     )
+
+    def _pull_job_log(self, state: BatchState) -> Path | None:
+        """Pull the SLURM log of a batch's current attempt into logs_dir.
+
+        Called once the attempt has ended, so the log is complete.
+        The name matches the --output pattern of _render_script.
+
+        Args:
+            state: Batch whose attempt ended.
+
+        Returns:
+            The local log path, or None when the cluster has no log for it.
+        """
+        log_name = f"{state.job_name}_{state.job_id}.log"
+        remote_log = f"{self.remote_workdir}/logs/{log_name}"
+        if not self.backend.pull_file(remote_log, self.logs_dir):
+            logger.warning(f"Batch {state.batch_id}: no job log at {remote_log}")
+            return None
+        return self.logs_dir / log_name
 
     def _check_pending_timeout(self, state: BatchState):
         """Cancel a job stuck PENDING too long and hop to the next partition.
@@ -1032,12 +1140,7 @@ class ClusterFitDispatcher:
             f"Batch {state.batch_id}: job {state.job_id} PENDING for {elapsed:.0f}s "
             f"on {old_part}, cancelling and falling back to {new_part}"
         )
-        try:
-            self.backend.cancel(state.job_id)
-        except Exception as e:
-            logger.warning(
-                f"Batch {state.batch_id}: failed to cancel job {state.job_id}: {e}"
-            )
+        self._cancel_job(state.job_id, f"Batch {state.batch_id}")
         state.reset_for_resubmit()
         if state.pending_hops >= len(self.config.partitions):
             logger.warning(
@@ -1060,15 +1163,12 @@ class ClusterFitDispatcher:
                 f"{reason} (partition {part.name}, attempt {state.attempt}, "
                 f"{state.failures - 1}/{self.config.max_retries} retries used)"
             )
-            logger.error(
-                f"Batch {state.batch_id}: {state.fail_reason}; giving up, see logs "
-                f"in {self.remote_workdir}/logs"
-            )
+            logger.error(f"Batch {state.batch_id}: {state.fail_reason}, giving up")
             return
         state.partition_idx = (state.partition_idx + 1) % len(self.config.partitions)
         next_part = self.config.partitions[state.partition_idx].name
         logger.warning(
-            f"Batch {state.batch_id}: {reason}; retry {state.failures}/{self.config.max_retries} "
+            f"Batch {state.batch_id}: {reason}, retry {state.failures}/{self.config.max_retries} "
             f"on partition {next_part}"
         )
         state.reset_for_resubmit()
@@ -1089,12 +1189,12 @@ class ClusterFitDispatcher:
         lines = [
             f"GP fit dispatch: {len(states)} batches ({n_shots} shots), "
             f"{len(states) - len(failed)} done, {len(failed)} FAILED "
-            f"({n_failed_shots} shots; failed batches retry on the next run)"
+            f"({n_failed_shots} shots, failed batches retry on the next run)"
         ]
         for state in failed:
             reason = state.fail_reason or "output missing, unreadable, or incomplete"
             lines.append(
-                f"  batch {state.batch_id} (attempts {state.attempt}): {reason}; "
+                f"  batch {state.batch_id} (attempts {state.attempt}): {reason}, "
                 f"shots: {', '.join(str(s) for s in state.shots)}"
             )
         return "\n".join(lines)
