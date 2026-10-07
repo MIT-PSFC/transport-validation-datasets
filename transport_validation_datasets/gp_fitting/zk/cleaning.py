@@ -81,8 +81,8 @@ def _rough_hyperparameters(
 ) -> np.ndarray | None:
     """Run one reduced optimize pass on (possibly still contaminated) data.
 
-    Used only to get a locally-representative reference for the LOO outlier
-    removal; never returned to callers as a real fit result.
+    Used only to get a locally-representative reference for the LOO outlier removal,
+    never returned to callers as a real fit result.
 
     Args:
         x: Channel rho positions.
@@ -123,10 +123,9 @@ def _loo_standardized_residuals(
     from all the others (never from itself) in a single matrix solve, with no
     per-point or reference GP fit.
 
-    The value anchors are appended as fixed training points so
-    edge channels are judged against the same "pull to zero past the
-    separatrix" constraint the real fit sees; residuals are returned for the
-    real data points only.
+    The value anchors are appended as fixed training points so edge channels are
+    judged against the same "pull to zero past the separatrix" constraint the real fit sees.
+    Residuals are returned for the real data points only.
 
     Args:
         x: Channel rho positions.
@@ -134,8 +133,8 @@ def _loo_standardized_residuals(
         err: Channel errors.
         value_anchors: (n_a, 3) value anchor rows (normalized).
         pedestal_rho: The kernel's length-scale transition center.
-        hyperparams: Kernel hyperparameters (length scales etc.); None uses
-            the generic start values.
+        hyperparams: Kernel hyperparameters (length scales etc.),
+            None uses the generic start values.
 
     Returns:
         (n,) standardized residuals, or None if the covariance solve fails or
@@ -163,17 +162,18 @@ def _loo_standardized_residuals(
 def _locally_corroborated(x, y, err, i, sigma_corr) -> bool:
     """Check whether point i agrees with at least one immediate rho-neighbor.
 
-    This is what separates a genuinely high, steep core - a run of points that
-    each agree with the next - from an isolated bad channel. The global LOO
-    reference (_loo_standardized_residuals) predicts every point from a single
-    smooth kernel, so a legitimately steep core reads as a cluster of large
-    residuals and gets culled along with the real spikes. A point whose
-    neighbor sits at the same value is corroborated by real data at that rho,
-    so it is protected from the LOO drop; an isolated spike (high or low),
-    disagreeing with both neighbors, is not. Uses immediate sorted neighbors
-    like the staging spike screen (cleaning._isolated_spikes), but here one agreeing neighbor is enough
-    (that check needs both neighbors to agree with each other, which a steep
-    core fails).
+    This is what separates a genuinely high and steep core
+    (a run of points that each agree with the next) from an isolated bad channel.
+    The global LOO reference predicts every point from a single smooth kernel,
+    so a legitimately steep core reads as a cluster of large
+    residuals and gets culled along with the real spikes.
+    A point whose neighbor sits at the same value is corroborated
+    by real data at that rho, so it is protected from the LOO drop.
+    An isolated spike (high or low), disagreeing with both neighbors, is not.
+
+    Uses immediate sorted neighbors like the staging spike screen (cleaning._isolated_spikes),
+    but here one agreeing neighbor is enough
+    (that check needs both neighbors to agree with each other, which a steep core fails)
 
     Args:
         x: Channel rho positions.
@@ -221,8 +221,8 @@ def _remove_loo_outliers(
     over-sigma point is dropped only if it also disagrees with both immediate
     rho-neighbors, so consistently-high core points protect each other while
     an isolated spike is still removed. When the worst point is corroborated
-    the next-worst uncorroborated one is taken instead; if every remaining
-    over-sigma point is corroborated, stop.
+    the next-worst uncorroborated one is taken instead.
+    If every remaining over-sigma point is corroborated, it stops.
 
     Args:
         x: Channel rho positions.
@@ -230,7 +230,7 @@ def _remove_loo_outliers(
         err: Channel errors.
         value_anchors: (n_a, 3) value anchor rows (normalized).
         pedestal_rho: The kernel's length-scale transition center.
-        sigma: LOO residual threshold; 3.0 (rather than a stricter 2.0)
+        sigma: LOO residual threshold. 3.0 (rather than a stricter 2.0)
             tolerates reference/data mismatch on genuinely steep slices.
         sigma_corr: Combined-sigma window for neighbor corroboration.
         max_drop_frac: Stop after dropping this fraction of the points (and
@@ -238,9 +238,9 @@ def _remove_loo_outliers(
             bad or a real pedestal the fixed length scale cannot follow, and
             gutting it further only produces worse fits.
         ref_hyperparams: LOO kernel hyperparameters (the slice's own
-            rough-optimized shape); falls back to the generic start values if
-            None. Held fixed across iterations - refitting each pass would be
-            the old cost back.
+            rough-optimized shape), the generic start values if None.
+            Held fixed across iterations, refitting each pass would cost
+            an optimizer run per dropped point.
 
     Returns:
         (x, y, err) with the outliers removed.
