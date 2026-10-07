@@ -65,7 +65,7 @@ class SliceTask:
 
 @dataclass
 class VariableFit:
-    """Fit of one variable of one slice; arrays are None when it was not fit.
+    """Fit of one variable of one slice, the arrays are None when it was not fit.
 
     Attributes:
         fit: (n_x,) fitted profile.
@@ -98,7 +98,6 @@ def map_slices(
     fit_slice: Callable[[SliceTask], SliceResult],
     batch: FitBatch,
     num_workers: int = 1,
-    max_slices_per_shot: int | None = None,
 ) -> dict[int, ShotFitOutput]:
     """Run a per-slice fit function over every (shot, time slice) in the batch.
 
@@ -108,10 +107,7 @@ def map_slices(
     Args:
         fit_slice: Fits one SliceTask and returns its SliceResult.
         batch: The staged batch to fit.
-        num_workers: Slice-level worker processes; <= 1 fits serially in this
-            process.
-        max_slices_per_shot: If set, only fit the first N time slices of each
-            shot (debug aid); the remaining rows stay STATUS_SKIPPED.
+        num_workers: Slice-level worker processes, <= 1 fits serially in this process.
 
     Returns:
         Per-shot outputs, keyed by shot number, row-aligned with the inputs.
@@ -120,8 +116,6 @@ def map_slices(
     tasks = []
     for shot, si in batch.shot_inputs.items():
         n_t = si.te_y.shape[0]
-        if max_slices_per_shot is not None:
-            n_t = min(n_t, max_slices_per_shot)
         tasks.extend(
             SliceTask(
                 shot=shot,
@@ -196,9 +190,9 @@ def map_slices(
 def _print_repair_tallies(outputs: dict[int, ShotFitOutput]):
     """Print per-shot repaired/culled slice counts from the status arrays.
 
-    Repaired slices were refit after a pin release or a channel drop; culled
-    slices stayed nonphysical and were dropped. Logged so systematic problems
-    (a bad edge channel wrecking a whole shot) are visible in the job log.
+    Repaired slices were refit after a pin release or a channel drop.
+    Culled slices stayed nonphysical and were dropped.
+    Logged so systematic problems (a bad edge channel wrecking a whole shot) are visible in the job log.
 
     Args:
         outputs: Per-shot fit outputs.
@@ -231,7 +225,7 @@ def run_worker_cli(
     Args:
         fit_batch_fn: The worker's fit_batch(batch, num_workers=N) function.
         prog: Program name shown in the argparse help.
-        argv: Command-line arguments; None uses sys.argv.
+        argv: Command-line arguments, None uses sys.argv.
     """
     parser = argparse.ArgumentParser(prog=prog, description="GP profile fit worker")
     parser.add_argument("input", help="Path to batch input npz")
