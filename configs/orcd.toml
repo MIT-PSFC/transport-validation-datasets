@@ -5,10 +5,10 @@
 #
 #   --config configs/orcd.toml,configs/$USER.user.toml
 #
-# Keys are dataclass field names: gp_fitting.dispatcher.ClusterFitConfig for
-# [cluster], each device workflow's settings_cls for [cmod] and [mast]. See
-# transport_validation_datasets/config.py. A key left out keeps its default,
-# an unknown key is an error.
+# Keys are dataclass field names (see transport_validation_datasets/config.py):
+# gp_fitting.dispatcher.ClusterFitConfig for [cluster],
+# each device workflow's settings_cls for [cmod] and [mast].
+# A key left out keeps its default, an unknown key is an error.
 
 [cluster]
 ssh_host = "orcd-login"

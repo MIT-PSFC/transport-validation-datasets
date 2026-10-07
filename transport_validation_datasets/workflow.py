@@ -858,7 +858,7 @@ class DataWorkflow(ABC):
         """
         return sorted(int(p.stem) for p in self.unprocessed_data_dir.glob("*.nc"))
 
-    def run_gp_fitting(self, max_pages: int | None = None):
+    def run_gp_fitting(self, max_pages: int | None = None, skip_plots: bool = False):
         """Run GP profile fitting on the unprocessed data files.
 
         The stages, each skipping work that already exists on disk:
@@ -872,10 +872,13 @@ class DataWorkflow(ABC):
            the SLURM cluster.
         3. Write the batch results out as one netCDF per shot into
            fit_shots_dir.
-        4. Plot the fits per shot into fit_plots_dir.
+        4. Plot the fits per shot into fit_plots_dir, unless skip_plots.
+           The plots take about a minute per shot, far longer than the rest on a cluster.
+           A later run without skip_plots plots the shots that have no PDF yet.
 
         Args:
             max_pages: Maximum number of pages to plot per shot. None plots all.
+            skip_plots: Leave out step 4.
         """
         shots = self.unprocessed_shots()
         skipped = {s for s in shots if self.fit_already_failed(s)}
@@ -913,7 +916,8 @@ class DataWorkflow(ABC):
             )
             dispatcher.run(batches)
         self.write_fit_results()
-        self.plot_fit_results(max_pages=max_pages)
+        if not skip_plots:
+            self.plot_fit_results(max_pages=max_pages)
 
     def clean_fit_state(self):
         """Delete every staged fit batch so the next run refits from scratch.
@@ -1477,7 +1481,6 @@ class DataWorkflow(ABC):
         mb_per_chunk: int | None = 50,
         drop_unfit_slices: bool = True,
         forward_fill: bool = True,
-        extend_existing: bool = False,
     ) -> Path:
         """Stack the unprocessed data and the fit results into the internal dataset.
 
@@ -1486,6 +1489,7 @@ class DataWorkflow(ABC):
         result file. Shots are stacked along EPISODE_DIM and NaN padded along
         every other dimension, so shots of different lengths still line up.
         Only one shot is held in memory at a time.
+        An existing store is replaced.
 
         The store carries every signal needed for internal analysis.
 
@@ -1502,8 +1506,8 @@ class DataWorkflow(ABC):
         fresh_profile marking the window center.
 
         Args:
-            mb_per_chunk: Target size of a storage chunk, chunked along
-                EPISODE_DIM only. None leaves the chunking alone.
+            mb_per_chunk: Target size of each variable's storage chunks,
+                chunked along EPISODE_DIM only. None leaves the chunking alone.
             drop_unfit_slices: Ignore the slices whose te or ne fit did not come
                 back usable (USABLE_FIT_STATUSES), as though the shot had no
                 Thomson sample there. False places every slice on the grid,
@@ -1512,9 +1516,6 @@ class DataWorkflow(ABC):
                 over the grid times that follow it, for at most
                 MAX_HOLD_PERIODS of their own sampling period. False leaves the
                 grid times between samples NaN.
-            extend_existing: Append the shots that are not in the existing
-                store yet, instead of replacing it. The shots already in it are
-                left as they are, so this does not pick up refitted shots.
 
         Returns:
             Path of the Zarr store.
@@ -1531,28 +1532,16 @@ class DataWorkflow(ABC):
             )
         logger.info(f"Stacking {len(shots)} shots into the internal dataset")
 
-        zarr_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
-        if zarr_path.exists():
-            if not extend_existing:
-                logger.warning(
-                    f"Replacing the existing internal dataset at {zarr_path}"
-                )
-                shutil.rmtree(zarr_path)
-            else:
-                with xr.open_zarr(zarr_path, consolidated=True) as ds_store:
-                    in_store = {int(shot) for shot in ds_store[EPISODE_DIM].values}
-                shots = [shot for shot in shots if shot not in in_store]
-                logger.info(
-                    f"{len(in_store)} shots are already in {zarr_path}, "
-                    f"appending the {len(shots)} that are not"
-                )
-                if not shots:
-                    return zarr_path
-
         # Bound every non-episode dimension up front so that no shot ever has to
         # extend the store, which would rewrite the chunks of every shot in it.
+        # Before the old store goes, so a run its checks refuse leaves it in place.
         dim_sizes = self._internal_dataset_dim_sizes(shots)
         logger.info(f"Internal dataset dimension bounds: {dim_sizes}")
+
+        zarr_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
+        if zarr_path.exists():
+            logger.warning(f"Replacing the existing internal dataset at {zarr_path}")
+            shutil.rmtree(zarr_path)
 
         ds = build_tensorized_dataset(
             process_fn=lambda shot: self._internal_shot_dataset(
@@ -1562,9 +1551,8 @@ class DataWorkflow(ABC):
             zarr_path=zarr_path,
             time_dim=TIME_DIM,
             episode_dim=EPISODE_DIM,
-            extend_existing=extend_existing,
-            mb_per_chunk=mb_per_chunk,
             dim_sizes=dim_sizes,
+            mb_per_chunk=mb_per_chunk,
         )
         logger.info(
             f"Internal dataset at {zarr_path}: {dict(ds.sizes)}, "
@@ -1761,14 +1749,14 @@ class DataWorkflow(ABC):
         varying = {
             dim: sorted(values) for dim, values in seen.items() if len(values) > 1
         }
-        # A varying TIME_DIM is normal (shots run for different lengths), the
-        # rest are grids that are supposed to be fixed for the device: their
-        # coordinate values come from the first shot, so flag the mismatch.
+        # A varying TIME_DIM is normal, shots run for different lengths.
+        # The rest are fixed for the device, and add_to_zarr_store refuses a grid that differs from the store's.
         varying.pop(TIME_DIM, None)
         if varying:
             logger.warning(
-                f"Dimensions differ between shots: {varying}. The internal dataset takes "
-                f"their coordinate values from the first shot and NaN pads the rest."
+                f"Dimensions differ between shots: {varying}. "
+                "Shorter ordinal dimensions (channels, contour points) are NaN padded, "
+                "and a grid coordinate that differs from the store's stops the build."
             )
         return sizes
 
