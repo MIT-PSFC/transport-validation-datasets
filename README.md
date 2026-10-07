@@ -110,6 +110,7 @@ Stack and publish are the exceptions, each always rebuilds its store.
 The fit stage plots every shot's fits to a PDF, about a minute per shot.
 `--skip_fit_plots` leaves them out, and a later fit stage without it plots the shots that have no PDF yet.
 `--max_fit_pages` caps the pages of each PDF.
+A cluster fit pulls each job's SLURM log back into `<ds_name>/logs/fit_jobs/`.
 
 # Configuration
 
@@ -146,7 +147,7 @@ the device workflow's `settings_cls` for `[cmod]` and `[mast]`
 (`CModSettings` in `machine/cmod/cmod_dataset.py`, `MASTSettings` in `machine/mast/mast_dataset.py`).
 A key left out keeps its default.
 A key the dataclass does not have, or a table that is neither `cluster` nor a device, is an error.
-Without a `[cluster]` table the fits run locally in the calling process, 
+Without a `[cluster]` table each batch is fit locally in a worker process on this machine's cores,
 and without `--config` everything keeps its default.
 Run-specific choices (`--ds_name`, `--shotlist_file`, `--stage`, `--method`, ...) stay command line flags.
 
@@ -163,8 +164,9 @@ te_grad_anchors = [[0.0, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1], [1.5, 0.0,
 # ne_value_anchors, ne_grad_anchors likewise
 ```
 
-The anchors are staged into the fit batches, so changing them needs
-`--clean_fit_state` or a new `--ds_name`.
+The anchors are staged into the fit batches,
+so changing them needs `--clean_fit_state` or a new `--ds_name`.
+The fit stage refuses batches staged under any other fit setting, the device's fit bounds and fit grid included.
 
 Both device tables also take `pedestal_rho_tor_norm`, the pedestal location every fit uses, 1.0 by default.
 zk places its kernel's length-scale transition there, and akho centers its mtanh there.
