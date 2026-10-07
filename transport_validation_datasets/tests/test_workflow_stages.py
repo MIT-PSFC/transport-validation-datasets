@@ -24,7 +24,6 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     STATUS_OK,
     STATUS_SKIPPED,
     ShotFitInput,
-    read_batch_setting,
     unpack_fit_batch,
 )
 from transport_validation_datasets.machine.generic import (
@@ -333,13 +332,12 @@ class TestStageFitBatches:
         batches = workflow.stage_fit_batches([1])
 
         (batch_id,) = batches
-        si = unpack_fit_batch(workflow._batch_in_path(batch_id)).shot_inputs[1]
+        batch = unpack_fit_batch(workflow._batch_in_path(batch_id))
+        si = batch.shot_inputs[1]
         assert np.allclose(si.time, [0.11, 0.13, 0.15, 0.17, 0.19])
         assert (si.window_index == 0).all()
         assert np.array_equal(si.windows, [[0.1, 0.2]])
-        assert read_batch_setting(workflow._batch_in_path(batch_id), "fit_mode") == (
-            FIT_MODE_WINDOW_SAMPLE
-        )
+        assert batch.fit_mode == FIT_MODE_WINDOW_SAMPLE
 
     def test_shot_without_window_not_staged(self, tmp_path):
         # Both shots have unprocessed files, the windowed shotlist only lists one
@@ -504,9 +502,8 @@ class TestStackInternalDataset:
             times, np.concatenate([np.arange(100, 201), np.arange(240, 290)]) * 1e-3
         )
         has_profile = np.isfinite(store["t_e"].values[i, : times.size]).any(axis=-1)
-        # First window: no sample before 0.11, the 0.19 sample is held to the
-        # window's end. Second window: nothing crosses in from before 0.24,
-        # the 0.25 and 0.27 samples fill the rest
+        # First window: no sample before 0.11, the 0.19 sample is held to the window's end.
+        # Second window: nothing crosses in from before 0.24, the 0.25 and 0.27 samples fill the rest
         expected = ((times > 0.1095) & (times < 0.2005)) | (times > 0.2495)
         assert has_profile.tolist() == expected.tolist()
         assert int(store["fresh_profile"].values[i, : times.size].sum()) == 7
