@@ -102,7 +102,7 @@ def map_slices(
     """Run a per-slice fit function over every (shot, time slice) in the batch.
 
     Slices run serially (num_workers <= 1) or across a multiprocessing Pool.
-    fit_slice must be a top-level module function so it pickles into the Pool.
+    fit_slice must pickle into the Pool, a top-level module function or a partial of one.
 
     Args:
         fit_slice: Fits one SliceTask and returns its SliceResult.

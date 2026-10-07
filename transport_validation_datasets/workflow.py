@@ -378,7 +378,7 @@ class DataWorkflow(ABC):
     # GP fit staging knobs
     fit_rho_tor_norm = np.linspace(0.0, 1.6, 81)
     fit_min_points = 10
-    fit_scale_per_slice = False
+    fit_scale_per_slice = True
     fit_bounds = default_fit_bounds()
 
     def __init__(
