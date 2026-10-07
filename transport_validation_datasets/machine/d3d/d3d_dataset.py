@@ -215,6 +215,12 @@ class D3DDataWorkflow(DataWorkflow):
     # The EFIT P_oh stays below 0.6 MW through the ramp-up and above 2 MW only at disruptive terminations.
     # P_rad reaches 16.0 MW in the iteration_3 store, so 17 MW only catches collapses.
     transient_filter = {"power_ohm": 2e6, "power_radiated": 17e6}
+    # A sudden impurity influx collapses the stored energy as P_rad rises (206716 at 3.34 s, 1.21 to 0.30 MJ with P_rad 3.6 to 11.7 MW),
+    # mostly under both transient thresholds above.
+    # Wmhd below 60 percent of its 50 ms maximum is a collapse, and P_rad above 6 MW during one is cut.
+    # A heating cutoff drops Wmhd too, but lowers P_rad, so the decay after it is kept (204184 at 5.0 s).
+    collapse_filter = {"energy_mhd": 0.6}
+    collapse_transient_filter = {"power_radiated": 6e6}
     # ip reads near 0 well past the end of the plasma, so the end is the last ip above its threshold.
     # A disruption's thermal quench can land ~60 ms before that end (199122),
     # and the EFIT P_oh smooths the quench out of reach of its transient filter.

@@ -163,7 +163,11 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
    (ip compared as |ip|), and every `max_filter` signal at or below it, on the raw samples.
    The max filters take `greenwald_fraction` = n_e_line_average / n_GW with n_GW = Ip / (pi a^2),
    derived for the filter and not stored.
-4. Grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold.
+4. Grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold,
+   or where a `collapse_transient_filter` signal, smoothed the same way, is above its lower threshold during a collapse.
+   A collapse is where a `collapse_filter` signal, smoothed the same way, is below its fraction of its maximum over the last 50 ms (`COLLAPSE_WINDOW`).
+   On DIII-D this catches sudden impurity influxes, where the stored energy collapses as the radiated power rises,
+   while the decay after a heating cutoff, which lowers the radiated power, is kept.
    The centered window only selects grid times, no stored value is smoothed by it.
    The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`).
 5. The leading grid times of each segment are cut up to its first sample
@@ -189,6 +193,8 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
 | max greenwald_fraction | 2.0 | 2.0 | 2.0 | 2.0 |
 | transient power_ohm | 5 MW | 5 MW | 2 MW | 2 MW |
 | transient power_radiated | 5.5 MW | 3 MW | 5 MW | 17 MW |
+| collapse energy_mhd, fraction of its 50 ms maximum | - | - | - | 0.6 |
+| collapse transient power_radiated | - | - | - | 6 MW |
 | failure_margin (shared) | 50 ms | 50 ms | 50 ms | 50 ms |
 | end_margin | 50 ms | 50 ms | 50 ms | 100 ms |
 | min_pulse_length | 0.5 s | 0.2 s | 0.5 s | 0.5 s |
@@ -275,6 +281,8 @@ indicating a large change in the Thomson density calibration.
   IDA gives no point covariance, so its gradient error is a stand-in, 10 percent of |gradient| with a floor of
   0.1 keV and 0.05e20 m^-3 per unit rho_tor_norm (`worker_ida.GRADIENT_ERROR_FRACTION`, `GRADIENT_ERROR_FLOOR`),
   the proportion the GP fits of the other devices show at mid radius.
+- **DIII-D stored-energy drops below the collapse thresholds.** A drop whose radiated power stays under 6 MW is kept,
+  like most of the repeated 30-50 percent drops of the 2035xx pellet run (203534).
 
 # Running
 

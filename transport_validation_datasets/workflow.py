@@ -19,6 +19,7 @@ from transport_validation_datasets.cleaning import (
 )
 from transport_validation_datasets.dataset_utils import build_tensorized_dataset
 from transport_validation_datasets.filters import (
+    COLLAPSE_WINDOW,
     ENERGY_SANITY_LEEWAY,
     FAILURE_MARGIN,
     TRANSIENT_SMOOTHING_WINDOW,
@@ -345,6 +346,13 @@ class DataWorkflow(ABC):
             List of shot numbers to exclude.
         """
 
+    # Collapses, both empty for none (filters.slice_filter_mask).
+    # A collapse is where a collapse_filter signal, smoothed like transient_filter,
+    # is below its fraction of its maximum over the last COLLAPSE_WINDOW.
+    # During one, a collapse_transient_filter signal above its threshold is cut out as a transient.
+    collapse_filter: dict[str, float] = {}
+    collapse_transient_filter: dict[str, float] = {}
+
     # Floor on a shot's mean power_radiated over its kept times, as a fraction of its mean heating power, 0 for none.
     # A dead bolometer reading ~0 W passes the valid filter but breaks every power balance.
     min_radiated_fraction = 0.0
@@ -580,14 +588,17 @@ class DataWorkflow(ABC):
         A filter rejection's failure note is stamped with these (filter_rejection_note).
 
         Returns:
-            The min, max and transient filters, the transient smoothing window, the failure and end margins,
-            the minimum pulse length, and the thresholds of the whole-shot checks.
+            The min, max, transient and collapse filters, the transient smoothing and collapse windows,
+            the failure and end margins, the minimum pulse length, and the thresholds of the whole-shot checks.
         """
         return {
             "min_filter": self.min_filter,
             "max_filter": self.max_filter,
             "transient_filter": self.transient_filter,
+            "collapse_filter": self.collapse_filter,
+            "collapse_transient_filter": self.collapse_transient_filter,
             "transient_smoothing_window": TRANSIENT_SMOOTHING_WINDOW,
+            "collapse_window": COLLAPSE_WINDOW,
             "failure_margin": FAILURE_MARGIN,
             "end_margin": self.end_margin,
             "min_pulse_length": self.min_pulse_length,
@@ -857,7 +868,8 @@ class DataWorkflow(ABC):
         the end of the shot (end_of_shot_index),
         a 0D signal of DATASET_0D_SIGNALS that is not finite,
         a min_filter signal below its threshold or a max_filter signal above it,
-        and a transient_filter signal above its threshold after smoothing.
+        a transient_filter signal above its threshold after smoothing,
+        and a collapse_transient_filter signal above its threshold during a collapse (slice_filter_mask).
         What survives is one contiguous segment.
         Each segment is started where a kept usable reconstruction (usable_reconstructions) reaches,
         and only the longest segment is kept.
@@ -887,6 +899,8 @@ class DataWorkflow(ABC):
             self.min_filter,
             self.max_filter,
             self.transient_filter,
+            self.collapse_filter,
+            self.collapse_transient_filter,
             self.end_margin,
         )
         if slice_filter is None:

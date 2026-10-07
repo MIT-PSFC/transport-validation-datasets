@@ -25,6 +25,9 @@ from transport_validation_datasets.store_schema import (
 # It only selects grid times, no stored value is smoothed by it.
 TRANSIENT_SMOOTHING_WINDOW = 5e-3
 
+# How far back a collapse_filter signal's maximum reaches [s], so a collapse is a fall inside it.
+COLLAPSE_WINDOW = 50e-3
+
 # Margin cut before every grid time that fails a check [s], see slice_filter_mask.
 # power_ohm and power_radiated are smoothed non-causally (smoothed_power),
 # so they carry the event that ends a segment one smoothing window ahead of it.
@@ -57,6 +60,8 @@ def slice_filter_mask(
     min_filter: dict[str, float],
     max_filter: dict[str, float],
     transient_filter: dict[str, float],
+    collapse_filter: dict[str, float],
+    collapse_transient_filter: dict[str, float],
     end_margin: float,
 ) -> tuple[np.ndarray, np.ndarray, int] | None:
     """The grid times of one shot that pass the per-time checks of the filter spec.
@@ -65,7 +70,11 @@ def slice_filter_mask(
     the end of the shot (end_of_shot_index on |ip| and its min_filter threshold),
     a DATASET_0D_SIGNALS signal that is not finite,
     a min_filter signal below its threshold or a max_filter signal above it, judged on filter_inputs,
-    and a transient_filter signal above its threshold after a centered TRANSIENT_SMOOTHING_WINDOW boxcar.
+    a transient_filter signal above its threshold after a centered TRANSIENT_SMOOTHING_WINDOW boxcar,
+    and a collapse_transient_filter signal, smoothed the same way, above its lower threshold during a collapse.
+    A collapse is where a collapse_filter signal, smoothed the same way,
+    is below its fraction of its maximum over the last COLLAPSE_WINDOW.
+    The transient and collapse failures are the transients.
     Each grid time that fails a check before the end-of-shot cut also cuts the FAILURE_MARGIN before it,
     so a segment that ends on a failure ends that much earlier, and one that ends at the end-of-shot cut does not.
     Keeping the longest segment of what passes is left to the caller.
@@ -76,6 +85,8 @@ def slice_filter_mask(
         min_filter: {signal: threshold}, ip among them.
         max_filter: {signal: threshold}.
         transient_filter: {signal: threshold} on the smoothed signal.
+        collapse_filter: {signal: fraction} of the smoothed signal's maximum over the last COLLAPSE_WINDOW.
+        collapse_transient_filter: {signal: threshold} on the smoothed signal, only during a collapse.
         end_margin: Margin cut before the end of the plasma [s].
 
     Returns:
@@ -114,12 +125,41 @@ def slice_filter_mask(
                 ds[signal].values, TRANSIENT_SMOOTHING_WINDOW, dt
             )
             mask_transient = mask_transient | (smoothed > threshold)
+        collapse_steps = round(COLLAPSE_WINDOW / dt)
+        mask_collapse = np.zeros(times.size, dtype=bool)
+        for signal, fraction in collapse_filter.items():
+            smoothed = centered_boxcar_mean(
+                ds[signal].values, TRANSIENT_SMOOTHING_WINDOW, dt
+            )
+            recent_max = _trailing_max(smoothed, collapse_steps)
+            mask_collapse = mask_collapse | (smoothed < fraction * recent_max)
+        for signal, threshold in collapse_transient_filter.items():
+            smoothed = centered_boxcar_mean(
+                ds[signal].values, TRANSIENT_SMOOTHING_WINDOW, dt
+            )
+            mask_above = smoothed > threshold
+            mask_transient = mask_transient | (mask_collapse & mask_above)
     mask_pass = mask_pass & ~mask_transient
     mask_failed = ~mask_pass & mask_before_end
     margin_steps = round(FAILURE_MARGIN / dt)
     mask_in_margin = _before_failures(mask_failed, margin_steps)
     mask_valid = mask_before_end & mask_pass & ~mask_in_margin
     return mask_valid, mask_transient, end_cut_index
+
+
+def _trailing_max(values: np.ndarray, n_samples: int) -> np.ndarray:
+    """The maximum over each sample and the n_samples - 1 before it, NaN skipped.
+
+    Args:
+        values: (n_t,) the signal.
+        n_samples: Width of the window in samples.
+
+    Returns:
+        (n_t,) the trailing maximum, NaN only where the whole window is.
+    """
+    signal = xr.DataArray(values)
+    last_dim = signal.dims[-1]
+    return signal.rolling({last_dim: n_samples}, min_periods=1).max().values
 
 
 def _before_failures(mask_failed: np.ndarray, margin_steps: int) -> np.ndarray:

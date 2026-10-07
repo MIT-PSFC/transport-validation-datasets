@@ -422,6 +422,28 @@ class TestSliceFilters:
         assert times.max() == pytest.approx(0.29)
         assert np.allclose(np.diff(times), 1e-3)
 
+    def test_collapse_cut_only_when_radiation_rises(self, tmp_path):
+        # energy_mhd falls to 40 percent at 0.2 s,
+        # first under 60 percent of its recent maximum at 0.201 s after the 5 ms boxcar
+        workflow = make_workflow(tmp_path)
+        workflow.collapse_filter = {"energy_mhd": 0.6}
+        workflow.collapse_transient_filter = {"power_radiated": 6e6}
+        energy_mhd = np.where(self.grid < 0.2, 1e5, 4e4)
+        mask_burst = np.abs(self.grid - 0.2) < 0.03
+        power_radiated_burst = np.where(mask_burst, 8e6, 1e6)
+        # A heating cutoff, P_rad stays low through the fall
+        power_radiated_quiet = np.full(self.grid.size, 1e6)
+
+        times_burst = self.kept_times(
+            workflow, energy_mhd=energy_mhd, power_radiated=power_radiated_burst
+        )
+        times_quiet = self.kept_times(
+            workflow, energy_mhd=energy_mhd, power_radiated=power_radiated_quiet
+        )
+
+        assert times_burst.max() == pytest.approx(0.201 - 1e-3 - FAILURE_MARGIN)
+        assert times_quiet.max() == pytest.approx(0.29)
+
     def test_shot_ends_at_the_last_ip_above_its_threshold(self, tmp_path):
         # ip stays finite but below the threshold after 0.2 s, so the end margin counts back from 0.199 s
         workflow = make_workflow(tmp_path)
