@@ -11,14 +11,11 @@ import io
 from dataclasses import dataclass
 
 import numpy as np
-from mkgp.core.kernels import SE_Kernel
 from mkgp.core.routines import GaussianProcess
 
 from transport_validation_datasets.gp_fitting.batch_io import FitAnchors, FitBounds
 from transport_validation_datasets.gp_fitting.zk.kernel import (
-    ERR_HYP_BOUNDS,
-    ERR_HYP_START,
-    ERR_NRESTARTS,
+    HYP_START_SHORT_CORE,
     bounds_for,
     build_kernel,
     deterministic_seed,
@@ -32,12 +29,27 @@ from transport_validation_datasets.gp_fitting.zk.quality import (
     rise_is_data_supported,
 )
 
-# Extra optimizer attempts (beyond the first) when a fit pins a hyperparameter
-# at its bound - a different random restart usually escapes the same basin.
+# Extra optimizer attempts (beyond the first) when a fit pins a hyperparameter at its bound.
+# A different random restart usually escapes the same basin.
 MAX_HYP_RETRIES = 2
 # Optimizer random restarts for a real fit.
 # The cleaning module's rough reference fit runs fewer (only an outlier-judging reference).
 NRESTARTS = 8
+# Adam moves every hyperparameter ~eta decades a step,
+# where mkgp's default gradient ascent steps with a gain of 1e-5.
+OPTIMIZER_METHOD = "adam"
+OPTIMIZER_SPARS = [1.0e-2, 0.9, 0.999]  # eta, beta1, beta2
+# The ascent stops once a step changes the LML by less than this (mkgp epsilon).
+OPTIMIZER_LML_TOLERANCE = 1.0e-2
+# Weight of mkgp's kernel-complexity penalty in the LML (mkgp regpar).
+LML_COMPLEXITY_PENALTY = 1.0
+# Ascents from good starts converge in 30-60 adam steps,
+# and restarts from poor ones crawl to mkgp's cap of 500 without a better LML.
+# A cap of 100 found the same hyperparameters on 4 MAST slices in a third of the time.
+OPTIMIZER_MAXITER = 100
+# mkgp blends points closer than some value (0.005 by default) in x into one.
+# A threshold far below any channel spacing turns the blending off.
+MKGP_BLEND_DX = 1.0e-9
 
 
 @dataclass
@@ -46,8 +58,8 @@ class ProfileFit:
 
     Attributes:
         fit: (n_x,) posterior mean, clipped at 0.
-        std: (n_x,) predictive std (includes observation noise).
-        grad: (n_x,) posterior derivative d/drho.
+        std: (n_x,) predictive std, the latent std and the interpolated channel errors in quadrature.
+        grad: (n_x,) posterior derivative d/drho, 0 where fit is clipped.
         grad_std: (n_x,) latent derivative std.
         hyps: Fitted [var, l1, l2, lw].
     """
@@ -76,18 +88,19 @@ def run_gp(
 ) -> GaussianProcess | None:
     """Set up the GP with the anchors and fit it.
 
-    With optimize=True and hyperparams=None the hyperparameters are tuned
-    (nrestarts random restarts, mkgp's native LML maximization). Otherwise the
-    GP predicts at the given (or default start) hyperparameters with no
-    optimization.
+    With optimize=True and hyperparams=None the hyperparameters
+    are tuned by mkgp's LML maximization (OPTIMIZER_METHOD),
+    from HYP_START with nrestarts random restarts and once more
+    from HYP_START_SHORT_CORE, keeping the higher LML.
+    Otherwise the GP predicts at the given (or default start) hyperparameters with no optimization.
 
     The restarts are seeded from the fit's own input data (deterministic_seed),
     so the result only depends on (data_X, data_y, err_y),
     never on multiprocessing scheduling or slice processing order.
-    When optimizing, a fit that pins a hyperparameter at its bound
-    (pinned_hyperparams) is retried from a fresh, differently-seeded restart
-    set up to hyp_retries times. The attempt with the best log marginal
-    likelihood is kept even if every attempt stays pinned
+    When optimizing, a best fit that pins a hyperparameter at its bound
+    (pinned_hyperparams) is retried from HYP_START with a fresh,
+    differently-seeded restart set up to hyp_retries times.
+    The fit with the best log marginal likelihood is kept even if every attempt stays pinned
     (an unresolvable slice should still return its least-bad fit).
 
     Args:
@@ -95,7 +108,7 @@ def run_gp(
         data_y: Channel values (normalized when scale_per_slice).
         err_y: Channel errors.
         x_eval: Points to predict at.
-        fit_bounds: The variable's staged bound knobs (amplitude ceiling, l1 floor).
+        fit_bounds: The variable's staged bound knobs (amplitude and l1 ranges).
         anchors: The variable's anchors, normalized like data_y (FitAnchors.scaled).
         pedestal_rho: The kernel's length-scale transition center.
         hyperparams: Fixed [var, l1, l2, lw] to predict at, or None.
@@ -121,70 +134,95 @@ def run_gp(
         else np.vstack([anchors.grad, extra_grad_bc])
     )
 
-    do_optimize = optimize and hyperparams is None
-    n_attempts = (1 + hyp_retries) if do_optimize else 1
+    data = (xdata, ydata, yerr, grad_bc, x_eval)
 
+    if not (optimize and hyperparams is None):
+        return _fit_from_start(
+            data, kbounds, pedestal_rho, hyperparams, 0, optimize=False
+        )
+
+    # The short-core start has no random restarts, so it runs once, outside the reseeded attempts.
+    # A NaN LML never becomes the best, a NaN fit is no fit.
     best_gp, best_lml = None, -np.inf
-    for attempt in range(n_attempts):
-        gp = GaussianProcess()
-        kernel = build_kernel(pedestal_rho, hyperparams)
-        gp.set_kernel(kernel=kernel, kbounds=kbounds, regpar=1.0)
-        # Heteroscedastic noise model: GP-fit the error bars with an SE kernel
-        # (mkgp HSGP path). The main fit then uses the smoothed errors and the
-        # predictive std picks up a rho-varying noise term (see ERR_HYP_START).
-        err_kernel = SE_Kernel(*ERR_HYP_START)
-        err_kernel.enforce_bounds(True)
-        gp.set_error_kernel(
-            kernel=err_kernel,
-            kbounds=ERR_HYP_BOUNDS,
-            regpar=1.0,
-            nrestarts=ERR_NRESTARTS,
-        )
-        gp.set_error_search_parameters(epsilon=1.0e-2)
-        gp.set_raw_data(
-            xdata=xdata,
-            ydata=ydata,
-            yerr=yerr,
-            dxdata=grad_bc[:, 0],
-            dydata=grad_bc[:, 1],
-            dyerr=grad_bc[:, 2],
-        )
-        gp.set_search_parameters(epsilon=1.0e-2)
-        # Seed even on the predict-only path: the error-kernel fit inside
-        # GPRFit runs its own random restarts, so an unseeded RNG would make
-        # the result depend on process history (serial vs parallel workers).
+    gp_short = _fit_from_start(data, kbounds, pedestal_rho, HYP_START_SHORT_CORE, 0)
+    lml_short = None if gp_short is None else gp_short.get_gp_lml()
+    if lml_short is not None and np.isfinite(lml_short):
+        best_gp, best_lml = gp_short, lml_short
+    for attempt in range(1 + hyp_retries):
+        # Seed the random restarts from the fit's own inputs,
+        # so the result never depends on process history (serial vs parallel workers).
         np.random.seed(
             deterministic_seed(data_X, data_y, err_y, salt=attempt + 17 * seed_salt)
         )
-        if do_optimize:
-            fit_restarts = nrestarts
-        else:
-            # predict-only at fixed hyperparameters
-            # The public maxiter clamps to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
-            gp._imax = 0
-            fit_restarts = 0
-        try:
-            # mkgp prints optimizer status to stdout; keep worker logs clean.
-            with contextlib.redirect_stdout(io.StringIO()):
-                gp.GPRFit(
-                    np.asarray(x_eval, dtype=float),
-                    hsgp_flag=True,
-                    nrestarts=fit_restarts,
-                )
-        except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        gp = _fit_from_start(data, kbounds, pedestal_rho, None, nrestarts)
+        if gp is None:
             continue
-
-        if not do_optimize:
-            return gp
-
-        hyps = np.asarray(gp.get_gp_kernel().hyperparameters, dtype=float)
         lml = gp.get_gp_lml()
-        if lml is not None and lml > best_lml:
+        if lml is not None and np.isfinite(lml) and lml > best_lml:
             best_gp, best_lml = gp, lml
-        if not pinned_hyperparams(hyps, kbounds):
-            return gp  # converged inside the physical range, no need to retry
+        if best_gp is None:
+            continue
+        hyps_best = np.asarray(best_gp.get_gp_kernel().hyperparameters, dtype=float)
+        if not pinned_hyperparams(hyps_best, kbounds):
+            return best_gp  # converged inside the physical range, no need to retry
 
     return best_gp
+
+
+def _fit_from_start(
+    data: tuple,
+    kbounds: np.ndarray,
+    pedestal_rho: float,
+    start: np.ndarray | None,
+    nrestarts: int,
+    optimize: bool = True,
+) -> GaussianProcess | None:
+    """Build the GP at one start and run mkgp's fit from it.
+
+    Args:
+        data: (xdata, ydata, yerr, grad_bc, x_eval), the data with the anchors appended and the points to predict at.
+        kbounds: (2, 4) hyperparameter bounds.
+        pedestal_rho: The kernel's length-scale transition center.
+        start: [var, l1, l2, lw] to start from, None for HYP_START.
+        nrestarts: mkgp random restarts on top of the start.
+        optimize: Tune the hyperparameters, else predict at the start.
+
+    Returns:
+        The fitted GaussianProcess, or None if mkgp raised.
+    """
+    xdata, ydata, yerr, grad_bc, x_eval = data
+    gp = GaussianProcess()
+    kernel = build_kernel(pedestal_rho, start)
+    gp.set_kernel(kernel=kernel, kbounds=kbounds, regpar=LML_COMPLEXITY_PENALTY)
+    gp.set_raw_data(
+        xdata=xdata,
+        ydata=ydata,
+        yerr=yerr,
+        dxdata=grad_bc[:, 0],
+        dydata=grad_bc[:, 1],
+        dyerr=grad_bc[:, 2],
+    )
+    gp.set_conditioner(condnum=MKGP_BLEND_DX)
+    gp.set_search_parameters(
+        epsilon=OPTIMIZER_LML_TOLERANCE,
+        method=OPTIMIZER_METHOD,
+        spars=OPTIMIZER_SPARS,
+        maxiter=OPTIMIZER_MAXITER,
+    )
+    if not optimize:
+        # The public maxiter clamps to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
+        gp._imax = 0
+    x_eval_array = np.asarray(x_eval, dtype=float)
+    try:
+        # mkgp prints optimizer status to stdout, kept out of the worker logs.
+        # No heteroscedastic error model (hsgp_flag), every channel is fit with its own error.
+        # mkgp's error kernel smooths the errors in rho, 0.5x to 4x off where they vary channel to channel,
+        # as across a C-Mod pedestal (chi2 > 4 in 12 percent of probe slices with it, 1 percent without).
+        with contextlib.redirect_stdout(io.StringIO()):
+            gp.GPRFit(x_eval_array, hsgp_flag=False, nrestarts=nrestarts)
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+        return None
+    return gp
 
 
 def fit_profile(
@@ -274,7 +312,6 @@ def fit_profile(
             hyperparams=hyps_out,
             optimize=False,
             extra_grad_bc=mono_bc,
-            seed_salt=seed_salt,
         )
         if gp_mono is None:
             break
@@ -284,18 +321,24 @@ def fit_profile(
     # Gaussian with unbounded support, so the mean can dip slightly negative
     # past the separatrix where the value anchors pull it to zero.
     # Clip the mean at 0 (downstream should read the band as truncated at 0 likewise)
-    fit = np.maximum(np.asarray(gp.get_gp_mean(), dtype=float).ravel()[:n_out], 0.0)
-    # Predictive std (includes observation noise), not the latent-function std.
-    # With few, high-error core channels the latent band collapses to a
-    # misleadingly tight interval - it conditions on the fitted amplitude
-    # being exactly right and ignores the measurement scatter.
-    # noise_flag=True widens the band where the data is noisy.
-    # the noise term is rho-varying because run_gp fits an error kernel (HSGP),
-    # so the band tracks the local error bars instead of a constant RMS.
-    # The derivative std stays latent (the gradient is never directly
-    # observed, so folding in point noise there is not meaningful).
-    std = np.asarray(gp.get_gp_std(noise_flag=True), dtype=float).ravel()[:n_out]
-    grad = np.asarray(gp.get_gp_drv_mean(), dtype=float).ravel()[:n_out]
+    mean = np.asarray(gp.get_gp_mean(), dtype=float).ravel()[:n_out]
+    fit = np.maximum(mean, 0.0)
+    # Predictive std, the latent std and the channel errors in quadrature.
+    # Under few, high-error core channels the latent band alone is misleadingly tight.
+    # The errors are interpolated in rho and held flat past the first and last channel,
+    # so the band tracks the local error bars.
+    # mkgp's own noise term is one RMS over every error, 3-10x the edge errors on C-Mod Te.
+    # The derivative std stays latent, since the gradient is never directly observed.
+    order = np.argsort(data_X)
+    noise = np.interp(x_out, data_X[order], err_y[order])
+    latent_std_eval = gp.get_gp_std(noise_flag=False)
+    latent_std = np.asarray(latent_std_eval, dtype=float).ravel()[:n_out]
+    std = np.sqrt(latent_std**2 + noise**2)
+    # The gradient of the clipped profile, 0 wherever the clip holds the mean at 0.
+    # The unclipped mean climbs back up from its dip to the anchors,
+    # and that rise would otherwise show as a positive gradient under a flat zero profile.
+    grad_mean = np.asarray(gp.get_gp_drv_mean(), dtype=float).ravel()[:n_out]
+    grad = np.where(mean > 0.0, grad_mean, 0.0)
     grad_std = np.asarray(gp.get_gp_drv_std(noise_flag=False), dtype=float).ravel()[
         :n_out
     ]
