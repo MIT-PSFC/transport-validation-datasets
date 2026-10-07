@@ -979,10 +979,10 @@ class ClusterFitDispatcher:
             "",
             f"source '{self.config.venv_path}/bin/activate'",
             f"export PYTHONPATH={workdir}/pkg",
-            *(
-                f"export {name}={value}"
-                for name, value in registry.WORKER_THREAD_ENV.items()
-            ),
+            # One BLAS thread per slice-fit process, the slice pool is the parallelism
+            "export OMP_NUM_THREADS=1",
+            "export OPENBLAS_NUM_THREADS=1",
+            "export MKL_NUM_THREADS=1",
             "",
             f"srun python -m {self.worker_module} {workdir}/{state.input_path.name} "
             f"{workdir}/{state.output_path.name} --num-workers {self.config.cpus_per_job}",

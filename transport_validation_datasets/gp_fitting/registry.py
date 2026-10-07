@@ -53,28 +53,25 @@ def load_worker(method: str) -> ModuleType:
     return importlib.import_module(worker_module(method))
 
 
-def run_batch_file(
-    method: str,
-    input_path: Path | str,
-    output_path: Path | str,
-    num_workers: int = 1,
-):
-    """Fit one staged batch file locally, writing its result file.
+def run_batch_file(method: str, input_path: Path | str, output_path: Path | str):
+    """Fit one staged batch file in this process, one slice at a time, writing its result file.
 
-    This is the serial local path; it reads the same staged npz a cluster job
-    would, so the zk worker's data-derived seeding gives bit-identical
-    results in both modes. Never fit from in-memory data instead. Side effect:
-    the zk worker reseeds this process's global numpy RNG per fit.
+    Serial and in-process, so a breakpoint in a worker stops there.
+    It reads the same staged npz a cluster job would,
+    so the fits match a cluster run's as far as the numpy and scipy builds agree
+    (bootstrap_remote.sh pins the cluster's versions).
+
+    One difference is numpy keeps the BLAS thread count this process started with,
+    where a cluster job pins one.
 
     Args:
         method: Fitting method name.
         input_path: Batch input npz.
         output_path: Batch result npz to write.
-        num_workers: Slice-level worker processes; local runs use 1.
     """
     from transport_validation_datasets.gp_fitting import batch_io
 
     worker = load_worker(method)
     batch = batch_io.unpack_fit_batch(input_path)
-    outputs = worker.fit_batch(batch, num_workers=num_workers)
+    outputs = worker.fit_batch(batch, num_workers=1)
     batch_io.pack_fit_results(output_path, outputs, batch.x_star)
