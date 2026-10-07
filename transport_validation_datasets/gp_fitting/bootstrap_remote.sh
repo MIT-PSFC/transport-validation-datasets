@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# One-time setup of the GP fitting environment on a SLURM cluster.
+# Setup of the GP fitting environment on a SLURM cluster.
+# Rerun it after a pin below changes, it moves an existing venv to the new pins.
 #
 # The fitting jobs need only python + numpy + scipy + mkgp,
 # so instead of replicating the full repo environment remotely,
@@ -26,9 +27,9 @@ WORKDIR="$2"
 PYVER="${3:-3.12}"
 
 # Exact pins, kept in sync with uv.lock.
-# The zk worker relies on non-public mkgp surfaces (see zk/kernel.py),
+# The zk worker pokes a non-public mkgp attribute (_imax in zk/gp.py),
 # and a cluster fit only matches a local one when numpy and scipy are the same builds.
-MKGP_SPEC="mkgp==3.1.4"
+MKGP_SPEC="mkgp==3.1.5"
 NUMPY_SPEC="numpy==1.26.4"
 SCIPY_SPEC="scipy==1.17.1"
 
@@ -48,9 +49,11 @@ if ! command -v uv >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 cd '$WORKDIR'
-uv venv --python '$PYVER' .venv
+if [ ! -x .venv/bin/python ]; then
+    uv venv --python '$PYVER' .venv
+fi
 uv pip install --python .venv/bin/python '$NUMPY_SPEC' '$SCIPY_SPEC' '$MKGP_SPEC'
-.venv/bin/python -c "import mkgp; print('mkgp OK:', mkgp.__file__)"
+.venv/bin/python -c "import mkgp; print('mkgp OK:', mkgp.__version__, mkgp.__file__)"
 EOF
 
 echo
