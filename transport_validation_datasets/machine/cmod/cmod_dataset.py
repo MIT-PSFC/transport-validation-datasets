@@ -97,11 +97,14 @@ class CModDataWorkflow(DataWorkflow):
     # compared against the channel count AFTER the per-shot quality screens (_drop_broken_channels).
     # Many C-Mod shots carry exactly 10 channels, so tolerate one bad channel.
     fit_min_points = 9
-    fit_scale_per_slice = True
     # Hyperparameter bounds for the GP fit, per variable.
+    # Amplitude floor 1, the data scale since each slice is normalized to a max of 1.
+    # Below it the fits fall into a low-amplitude mean regression under peaked cores, with the axis under 0.7 of the core data.
+    # ne core scale ceiling 1: a quarter of the ne fits go past 0.7 given the room, and the ne double dips halve.
+    # Te keeps the 0.7 ceiling, a 0.5 or 0.6 one changes nothing.
     fit_bounds = {
-        "te": FitBounds(l1_min=0.35),
-        "ne": FitBounds(l1_min=0.55),
+        "te": FitBounds(l1_min=0.35, var_min=1.0),
+        "ne": FitBounds(l1_min=0.55, l1_max=1.0, var_min=1.0),
     }
 
     def get_shotlist_from_source(self) -> list[int]:
