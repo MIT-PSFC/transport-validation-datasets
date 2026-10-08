@@ -13,6 +13,10 @@ and `machine/cmod/dispy_methods.py`. The GEQDSK block's attributes are shared
 variable onto that convention.
 Each unprocessed file records the COCOS index of its GEQDSK signals in a root
 attribute `cocos`. The final dataset carries it as the per-shot variable `cocos`.
+It is identified per shot from the signs of the reconstruction's own Ip, B0, psi and q (`cocos_from_signs`),
+COCOS 7 or 1 on C-Mod with the field direction and 3 on MAST.
+The psi signals are per radian on both devices,
+while the IMAS nodes their `ref` points at hold the total flux in Wb, in COCOS 17.
 
 Every file records where it came from in its root attributes.
 The unprocessed files carry the source package that pulled
@@ -60,6 +64,15 @@ so so they are held forward over the grid times that follow them
 and `fresh_profile` / `fresh_equilibrium` mark the grid times that carry a sample of their own.
 A sample is held for at most `MAX_HOLD_PERIODS` of its own sampling period,
 so nothing is carried across the end of the shot or a stretch the filtering cut away.
+
+A reconstruction is usable (`usable_reconstructions`) when its axis and boundary psi are finite and meaningfully different,
+every value of its psirz and qpsi is finite, and its q profile gives a reasonable Phi_N map (`phi_n_map`).
+The fit stage maps the Thomson channels through the nearest usable reconstruction,
+before or after the slice, within `EQ_MATCH_MAX_PERIODS` (1.5) periods of the reconstruction clock.
+The stack stage holds only the usable ones onto the grid,
+so an unusable one is held over by the one before and is not marked fresh.
+The reach and the hold both run on the reconstruction clock (`reconstruction_clock_period`), which counts the unusable ones too.
+A channel below psi_N 1 more than 5 mm outside its reconstruction's boundary contour sits under an X-point, so it is left unmapped.
 By default the slices whose Te and ne fits did not both come back usable are ignored,
 as though the shot had no Thomson sample there.
 
@@ -178,8 +191,10 @@ pedestal_rho_tor_norm = 1.0
 ```
 
 Both device tables also take `sol_extension`, how the Thomson channels outside the LCFS are placed in rho_tor_norm.
-Inside the LCFS the normalized toroidal flux Phi_N is the integral of q over psi_N.
-q is undefined outside it, so Phi_N continues linearly in psi_N,
+Inside the LCFS the normalized toroidal flux Phi_N is the integral of |q| over psi_N (`phi_n_map`).
+Where q diverges at the LCFS of a diverted plasma,
+the integral runs past the last finite surface through q = a - b ln(1 - psi_N), fit to the surfaces inside it.
+q is undefined outside the LCFS, so Phi_N continues linearly in psi_N,
 with the slope from psi_N 0.95 to 1 (`"secant"`, the default) or the slope at the LCFS (`"tangent"`).
 The staged positions depend on it, so it is checked like the anchors,
 and it is recorded as the `sol_extension` attribute of the fit files and the stores.
@@ -197,7 +212,7 @@ Every retrieval reads the EFIT tree at least for its timebase, so a shot takes t
 A tree fails when it is missing or its reconstruction is missing a node,
 and the unprocessed file records the tree it used as its `efit_tree` attribute.
 A tree slower than the 1 kHz grid has its EFIT 0D signals interpolated onto the grid,
-and `fresh_equilibrium` marks grid times where the reconstruction exists.
+and `fresh_equilibrium` marks grid times where a usable reconstruction exists.
 Shots already recorded in `01_unprocessed/failed_shots/` are not retried,
 so their records need deleting for a rebuild to try another tree.
 
