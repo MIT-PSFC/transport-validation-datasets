@@ -47,9 +47,11 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
     plan_batches,
 )
 from transport_validation_datasets.machine.generic import (
+    DATASET_EQUILIBRIUM_SIGNALS,
     SOL_EXTENSIONS,
-    efit_cocos_from_signs,
+    reconstruction_clock_period,
     standardize_signal_attrs,
+    usable_reconstructions,
 )
 from transport_validation_datasets.machine.plots import (
     plot_ts_fits,
@@ -130,34 +132,6 @@ DATASET_0D_SIGNALS = (
     "power_nbi",
     "power_ic",
     "power_lh",
-)
-
-# GEQDSK block, everything needed to rebuild the equilibrium of a slice.
-# See machine.generic.make_geqdsk_dataset. The five that are constant in time
-# (rcentr, rleft, rdim, zmid, zdim) and the limiter contour are carried per
-# slice like the rest: they compress to nothing and keep the layout uniform.
-DATASET_EQUILIBRIUM_SIGNALS = (
-    "rmagx",
-    "zmagx",
-    "simagx",
-    "sibdry",
-    "bcentr",
-    "current",
-    "rcentr",
-    "rleft",
-    "rdim",
-    "zmid",
-    "zdim",
-    "fpol",
-    "pres",
-    "ffprime",
-    "pprime",
-    "qpsi",
-    "psirz",
-    "rbdry",
-    "zbdry",
-    "rlim",
-    "zlim",
 )
 
 # The raw Thomson channel measurements and chord geometry.
@@ -1971,14 +1945,8 @@ class DataWorkflow(ABC):
         standardize_signal_attrs(ds_stacked)
 
         # The sign convention of the GEQDSK block, per shot since a dataset
-        # may mix field directions: the unprocessed file's attribute, or
-        # inferred from the signs the way the devices set it, for files
-        # from before the attribute was kept
+        # may mix field directions, from the unprocessed file's attribute (see cocos_from_signs)
         cocos = ds_unprocessed.attrs.get("cocos")
-        if cocos is None and "current" in ds_unprocessed and "bcentr" in ds_unprocessed:
-            cocos = efit_cocos_from_signs(
-                ds_unprocessed["current"].values, ds_unprocessed["bcentr"].values
-            )
         ds_stacked["cocos"] = xr.DataArray(
             np.array([np.nan if cocos is None else cocos], dtype=np.float32),
             dims=(EPISODE_DIM,),
@@ -2105,7 +2073,7 @@ class DataWorkflow(ABC):
             grid: The shot's 1 kHz timebase [s].
             fresh_profile: Grid times carrying a Thomson slice of their own,
                 or the window centers of a window-averaged shot.
-            fresh_equilibrium: Grid times carrying a reconstruction of their own.
+            fresh_equilibrium: Grid times carrying a usable reconstruction.
             fit_mode: How the profiles were fit, one of the FIT_MODE_* values.
                 Only changes what fresh_profile is described as.
 
@@ -2136,7 +2104,7 @@ class DataWorkflow(ABC):
                 "fresh_equilibrium": (
                     (EPISODE_DIM, TIME_DIM),
                     fresh_equilibrium[None].astype(np.float32),
-                    {"description": held.format("equilibrium reconstruction")},
+                    {"description": held.format("usable equilibrium reconstruction")},
                 ),
             }
         )
@@ -2414,9 +2382,12 @@ def _hold_equilibrium(
     """Place a shot's equilibria on its 1 kHz grid.
 
     The equilibrium is reconstructed on its own clock, which is slower than
-    the grid on some devices (MAST reconstructs every 5 ms, C-Mod every
-    millisecond). The grid times a reconstruction landed on are the ones
-    with a finite simagx, the rest hold the last one.
+    the grid on some devices (MAST reconstructs every 5 ms, C-Mod every millisecond).
+    The grid times a reconstruction landed on are the ones with a finite simagx,
+    the rest hold the last one, for at most MAX_HOLD_PERIODS of the clock (reconstruction_clock_period).
+    An unusable reconstruction (usable_reconstructions) is treated as missing,
+    so the previous one holds over it and it is not fresh.
+    A shot with no usable reconstruction gets an all-NaN block.
 
     Args:
         ds_unprocessed: The shot's unprocessed dataset, on the grid, with
@@ -2426,7 +2397,7 @@ def _hold_equilibrium(
 
     Returns:
         (equilibrium, fresh): the GEQDSK variables on the grid, and the
-        mask of grid times carrying a reconstruction of their own.
+        mask of grid times carrying a usable reconstruction of their own.
     """
     names = [name for name in DATASET_EQUILIBRIUM_SIGNALS if name in ds_unprocessed]
     if "simagx" not in ds_unprocessed:
@@ -2434,15 +2405,16 @@ def _hold_equilibrium(
             grid.size, dtype=bool
         )
 
-    reconstructed = np.flatnonzero(
-        ds_unprocessed["simagx"]
-        .squeeze(EPISODE_DIM, drop=True)
-        .transpose(TIME_COORD)
-        .notnull()
-        .values
-    )
+    clock_period = reconstruction_clock_period(ds_unprocessed, grid)
+    usable = usable_reconstructions(ds_unprocessed)
+    reconstructed = np.flatnonzero(usable)
+    if reconstructed.size == 0:
+        logger.warning("No usable reconstruction, the equilibrium block is NaN")
+        nothing_held = xr.DataArray(np.zeros(grid.size, dtype=bool), dims=TIME_COORD)
+        ds_held = ds_unprocessed[names].where(nothing_held)
+        return {name: ds_held[name] for name in names}, np.zeros(grid.size, dtype=bool)
     reconstruction_index, fresh = _hold_onto_grid(
-        grid, grid[reconstructed], forward_fill
+        grid, grid[reconstructed], forward_fill, period=clock_period
     )
     # reconstruction_index counts reconstructions, the dataset is indexed by
     # grid time, so index the grid times the reconstructions landed on

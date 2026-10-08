@@ -23,7 +23,7 @@ from loguru import logger
 from transport_validation_datasets import PACKAGE_ROOT
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
-    efit_cocos_from_signs,
+    cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
@@ -864,7 +864,7 @@ def _equilibrium_dataset(
     Returns:
         Dataset on dim "idx" with "time"/"shot" coords, in the freeqdsk
         canonical names (see machine.generic.make_geqdsk_dataset), carrying the
-        COCOS number as an attribute.
+        COCOS number its signs give (cocos_from_signs) as an attribute.
     """
     eq_time = np.asarray(equilibrium["time"].values, dtype=float)
     n_psi = equilibrium.sizes["psi_norm"]
@@ -896,6 +896,10 @@ def _equilibrium_dataset(
     else:
         rlim = np.asarray(limiter["limiter_r"].values, dtype=float)
         zlim = np.asarray(limiter["limiter_z"].values, dtype=float)
+    simagx = np.asarray(equilibrium["psi_axis"].values, dtype=float)
+    sibdry = np.asarray(equilibrium["psi_boundary"].values, dtype=float)
+    qpsi = _equilibrium_qpsi(shot, eq_time, n_psi)
+    cocos_input = cocos_from_signs(current, bcentr, simagx, sibdry, qpsi)
 
     return make_geqdsk_dataset(
         shot_id=shot,
@@ -904,13 +908,13 @@ def _equilibrium_dataset(
         z_grid=equilibrium["z"].values,
         rmagx=np.asarray(equilibrium["magnetic_axis_r"].values, dtype=float),
         zmagx=np.asarray(equilibrium["magnetic_axis_z"].values, dtype=float),
-        simagx=np.asarray(equilibrium["psi_axis"].values, dtype=float),
-        sibdry=np.asarray(equilibrium["psi_boundary"].values, dtype=float),
+        simagx=simagx,
+        sibdry=sibdry,
         bcentr=bcentr,
         current=current,
-        qpsi=_equilibrium_qpsi(shot, eq_time, n_psi),
+        qpsi=qpsi,
         psirz=psirz,
-        cocos_input=efit_cocos_from_signs(current, bcentr),
+        cocos_input=cocos_input,
         rcentr=rcentr,
         rlim=rlim,
         zlim=zlim,

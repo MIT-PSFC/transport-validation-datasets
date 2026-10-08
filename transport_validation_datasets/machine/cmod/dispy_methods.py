@@ -10,7 +10,7 @@ from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import TimeSetting, TimeSettingParams
 
 from transport_validation_datasets.machine.generic import (
-    efit_cocos_from_signs,
+    cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     orient_signal,
@@ -112,6 +112,24 @@ class CmodGeometryMethods:
         return {"rout": rout}
 
 
+def _nan_contour_padding(
+    r_contour: np.ndarray, z_contour: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Turn the (0, 0) points EFIT pads a contour with into NaN.
+
+    Args:
+        r_contour: (..., n_points) contour major radii [m].
+        z_contour: (..., n_points) contour heights [m].
+
+    Returns:
+        The two arrays as float with the padding NaN.
+    """
+    r_contour = np.asarray(r_contour, dtype=float)
+    z_contour = np.asarray(z_contour, dtype=float)
+    padding = (r_contour == 0.0) & (z_contour == 0.0)
+    return np.where(padding, np.nan, r_contour), np.where(padding, np.nan, z_contour)
+
+
 class CmodEfitMethods:
     """C-Mod GEQDSK and EFIT-quality retrievals for stock disruption-py."""
 
@@ -139,7 +157,7 @@ class CmodEfitMethods:
     @staticmethod
     @physics_method(columns=[*geqdsk_cols.keys()], tokamak=Tokamak.CMOD)
     def get_geqdsk_parameters(params: PhysicsMethodParams):
-        """Retrieve the full GEQDSK reconstruction for C-Mod (COCOS-normalised).
+        """Retrieve the full GEQDSK reconstruction for C-Mod, with its COCOS identified.
 
         Args:
             params: disruption-py physics method parameters for the shot.
@@ -185,9 +203,20 @@ class CmodEfitMethods:
             params.logger.opt(exception=True).debug(e)
 
         geqdsk_data = orient_signal(geqdsk_data, efit_time)
+        # EFIT pads the contours with zeros to a fixed length, the stores pad with NaN
+        geqdsk_data["rbdry"], geqdsk_data["zbdry"] = _nan_contour_padding(
+            geqdsk_data["rbdry"], geqdsk_data["zbdry"]
+        )
+        if rlim is not None:
+            rlim, zlim = _nan_contour_padding(rlim, zlim)
 
-        cocos_input = efit_cocos_from_signs(
-            geqdsk_data["current"], geqdsk_data["bcentr"], params.logger
+        cocos_input = cocos_from_signs(
+            geqdsk_data["current"],
+            geqdsk_data["bcentr"],
+            geqdsk_data["simagx"],
+            geqdsk_data["sibdry"],
+            geqdsk_data["qpsi"],
+            params.logger,
         )
 
         # geqdsk_cols keys are the make_geqdsk_dataset argument names

@@ -314,6 +314,9 @@ class TestFinalAssembly:
         )
         if workflow.stores_dir.exists():
             shutil.rmtree(workflow.stores_dir)
+        # The kept unprocessed files spare the C-Mod read.
+        # The fits are redone, since the run refuses batches staged under other fit settings.
+        workflow.clean_fit_state()
 
         workflow.make_unprocessed_data_files()
         for shot in workflow.unprocessed_shots():
