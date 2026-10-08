@@ -1,56 +1,25 @@
 """Builds and writes a shot's `equilibrium`/`core_profiles`/`summary`/`wall` IDS.
 
-Each shot's IMAS IDS set is built from its fit results and unprocessed data,
-N time slices per shot, straight from the two per-shot files
-(fit_shots_dir/<shot>.nc, 01_unprocessed/<shot>.nc) -- no intermediate
-consolidated scenario file. Design notes:
+Each shot's IDS set is built straight from its two per-shot files,
+the fit results (fit_shots_dir/<shot>.nc) and the unprocessed data (01_unprocessed/<shot>.nc).
 
-  - `equilibrium` gets one `time_slice` per real EFIT reconstruction time in
-    the shot's unprocessed data (its own, full native time base -- not
-    thinned to or deduped against the Thomson slice times).
-  - `summary` is written at its own full native (1 kHz) 0D-signal
-    resolution, for the same reason, and carries every
-    `workflow.DATASET_0D_SIGNALS` entry the shot has (see
-    `_SUMMARY_SIGNAL_PATHS` for where each one lands).
-  - `core_profiles` gets one `profiles_1d` per usable Thomson slice time,
-    electrons (with the GP fit's 1-sigma uncertainties in the DD's
-    `*_error_upper` fields; `*_error_lower` is left unset, which the IMAS
-    convention reads as a symmetric error) + a single hydrogenic
-    main ion (Zeff=1, n_D=n_e). Zeff/impurity
-    composition are deliberately NOT computed here, and this package holds no
-    code for them at all -- that physics lives in a standalone
-    post-processing script kept entirely outside this repo (to avoid a TORAX
-    dependency clash -- see this project's plan notes), which computes them
-    afterward from already-written IMAS output and writes a new
-    `core_profiles.nc`. This module and `DataWorkflow.export_to_imas()` never
-    call it -- that decoupling is deliberate.
-  - No edge-physics modeling (see this project's plan notes) --
-    `_find_x_point` below is the one small piece in that direction: it
-    classifies `equilibrium.time_slice.boundary.type` (diverted vs.
-    limited), a core equilibrium-IDS field, and nothing beyond that.
-  - No derived flux-surface geometry: the `equilibrium` IDS
-    carries only what the EQDSK fields themselves supply (1D psi-grid
-    profiles, the 2D psi map, boundary/limiter contours, global scalars)
-    plus `phi`/`rho_tor` (a pure 1D integral of the EQDSK's own q profile,
-    also needed internally to place `core_profiles` on psi) and the
-    diverted/limited boundary classification (`_find_x_point`, scipy-only).
-    Everything derivable only by tracing flux surfaces (area/volume,
-    `r_inboard`/`r_outboard`, `j_phi`, elongation/triangularity, the
-    `gm1`...`gm9` flux-surface averages) is deliberately NOT written here:
-    that degree of processing belongs in an isolated post-processing step
-    run on the saved IMAS output, not in the conversion itself.
+  - `equilibrium` gets one `time_slice` per usable reconstruction, on the reconstruction's own clock.
+    It carries what the GEQDSK fields supply,
+    plus `phi`/`rho_tor` from the integral of the file's own q profile
+    and the diverted or limited classification (`_find_x_point`).
+    Nothing that needs flux surfaces traced (area, volume, `j_phi`, shaping, the `gm*` averages) is written.
+  - `summary` is written on the unprocessed file's 1 kHz grid,
+    with every `workflow.DATASET_0D_SIGNALS` entry the shot has (`_SUMMARY_SIGNAL_PATHS`).
+  - `core_profiles` gets one `profiles_1d` per usable Thomson slice:
+    electrons, with the GP fit's 1 sigma uncertainties in the `*_error_upper` fields,
+    and a single hydrogenic main ion (Zeff = 1, n_D = n_e).
+    Zeff and impurity composition are left to a post-processing script outside this repo,
+    which reads the written IDS.
+  - `wall` gets the limiter contour, when the shot has one.
 
-Each IDS is built as a real `imas` library object
-(`imas.IDSFactory(...).<ids>()`, field assignment, `.validate()`) and written
-straight to `<output_dir>/<ids>.nc` via `imas.DBEntry(...).put()`
-(`write_ids`) -- deliberately NOT through `fusio`'s dotted-key `xr.Dataset`
-round trip (`imas.util.to_xarray` -> `imas_io().write()`). That route ends
-in the very same `DBEntry.put()` call, but its array-of-structures shape
-inference silently keeps the nested per-slice arrays
-(`profiles_1d[i].ion[...]`, `time_slice[i].profiles_2d[...]`) only for the
-first time slice, emptying them on every later one (confirmed against fusio
-0.4.4 on synthetic 4-slice IDS). Writing the built IDS directly avoids that
-and needs no `fusio` dependency.
+Each IDS is built as an `imas` object (`imas.IDSFactory(...).<ids>()`, field assignment, `.validate()`)
+and written to `<output_dir>/<ids>.nc` through `imas.DBEntry(...).put()` (`write_ids`).
+fusio's xarray round trip is not used, it keeps the nested per-slice arrays only for the first slice (fusio 0.4.4).
 """
 
 from dataclasses import dataclass
@@ -60,66 +29,29 @@ import eqdsk
 import imas
 import numpy as np
 import xarray as xr
-from freeqdsk import geqdsk as freeqdsk_geqdsk
+from imas.dd_zip import latest_dd_version
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import minimize
 
+from transport_validation_datasets import TIME_COORD, TIME_DIM
 from transport_validation_datasets.imas_export.geqdsk_writer import write_geqdsk
 from transport_validation_datasets.machine.generic import (
+    DATASET_EQUILIBRIUM_SIGNALS,
     cumulative_q_integral,
     psi_n_from_rho_tor_norm,
+    sigma_bp,
+    usable_reconstructions,
+)
+from transport_validation_datasets.workflow import (
+    DATASET_0D_SIGNALS,
+    USABLE_FIT_STATUSES,
 )
 
+# The newest data dictionary the installed imas-python ships, so upgrading the package upgrades the written DD
+DD_VERSION = str(latest_dd_version())
 
-def _latest_dd_version() -> str:
-    """Get the newest data dictionary version the installed imas package ships.
-
-    The export's default DD version tracks the installed imas-python rather
-    than a hardcoded number, so upgrading the package upgrades the written
-    DD (the target COCOS follows along through _target_cocos). Falls back
-    to the DD 4.0 baseline if the lookup API is ever unavailable.
-
-    Returns:
-        The version string, e.g. "4.1.1".
-    """
-    try:
-        from imas.dd_zip import latest_dd_version
-
-        return str(latest_dd_version())
-    except Exception:
-        return "4.0.0"
-
-
-DD_VERSION = _latest_dd_version()
-
-
-def _target_cocos(dd_version: str) -> int:
-    """Get the IMAS convention of a data dictionary version.
-
-    The data dictionary switched its own convention from COCOS 11 to
-    COCOS 17 at DD 4.0, so the equilibrium IDS targets whichever matches
-    the version being written.
-
-    Args:
-        dd_version: IMAS data dictionary version string, e.g. "4.0.0".
-
-    Returns:
-        17 for DD 4.0 and later, 11 before.
-    """
-    return 11 if int(str(dd_version).split(".", 1)[0]) < 4 else 17
-
-
-def _sigma_bp(cocos: int) -> int:
-    """Get the sigma_Bp of a COCOS index, for the phi integral.
-
-    Args:
-        cocos: COCOS index.
-
-    Returns:
-        -1 for the conventions whose psi decreases along Ip (3, 4, 7, 8,
-        and their e_Bp=1 partners 13, 14, 17, 18), +1 for the rest.
-    """
-    return -1 if cocos % 10 in (3, 4, 7, 8) else 1
+# The data dictionary's own COCOS since DD 4.0, the convention the equilibrium IDS is written in
+TARGET_COCOS = 17
 
 
 # core_profiles' one ion species (see build_core_profiles):
@@ -140,10 +72,7 @@ class ShotExportSlice:
     """One Thomson slice's worth of data assembled for the IMAS export.
 
     Lives only for the duration of building one shot's IMAS output.
-    `core_profiles` gets electrons + a single hydrogenic main ion from this
-    directly (Zeff=1, n_D=n_e) -- Zeff/impurity composition are deliberately
-    not computed here or anywhere in this package; see the module docstring
-    above for where that physics actually lives.
+    `core_profiles` gets electrons and a single hydrogenic main ion from it (Zeff = 1, n_D = n_e).
 
     Attributes:
         time: Thomson slice time [s].
@@ -178,17 +107,6 @@ class ShotExportSlice:
 # ---------------------------------------------------------------------------
 
 
-def _spline_scalar(spline, r, z):
-    """`RectBivariateSpline(..., grid=False)` at one scalar `(r, z)` point.
-
-    Returns:
-        The spline value as a plain float, regardless of whether the
-        installed scipy returns a 0-d array, a shape-(1,) array, or a bare
-        float for scalar inputs.
-    """
-    return float(np.ravel(spline(r, z, grid=False))[0])
-
-
 def _find_x_point(eqi, bp_spline):
     """Locates the magnetic null (X-point) nearest the LCFS, if any.
 
@@ -201,8 +119,8 @@ def _find_x_point(eqi, bp_spline):
     Args:
         eqi: `eqdsk.EQDSKInterface` supplying the LCFS contour
             (`xbdry`/`zbdry`).
-        bp_spline: `RectBivariateSpline` of B_pol(R, Z) (any overall scale;
-            only ratios of its values are used).
+        bp_spline: `RectBivariateSpline` of B_pol(R, Z),
+            any overall scale since only ratios of its values are used.
 
     Returns:
         (r_x, z_x, diverted).
@@ -211,7 +129,7 @@ def _find_x_point(eqi, bp_spline):
     imin = int(np.argmin(bp_boundary))
     r0, z0 = eqi.xbdry[imin], eqi.zbdry[imin]
     result = minimize(
-        lambda p: _spline_scalar(bp_spline, p[0], p[1]) ** 2,
+        lambda p: bp_spline(p[0], p[1], grid=False) ** 2,
         x0=[r0, z0],
         method="Nelder-Mead",
         options={"xatol": 1e-6, "fatol": 1e-12},
@@ -219,21 +137,21 @@ def _find_x_point(eqi, bp_spline):
     r_x, z_x = float(result.x[0]), float(result.x[1])
     # A true X-point sits at (or just off) the LCFS's own B_pol minimum.
     # With no null nearby (a limited plasma) the unconstrained refinement
-    # walks down the smooth B_pol landscape all the way to the magnetic
-    # axis -- a genuine null, but not an X-point -- so a refinement that
-    # left the starting point's neighborhood is discarded in favor of the
-    # boundary minimum itself.
+    # walks down the smooth B_pol landscape all the way to the magnetic axis,
+    # a genuine null but not an X-point.
+    # So a refinement that left the starting point's neighborhood
+    # is discarded in favor of the boundary minimum itself.
     minor_radius = 0.5 * float(np.max(eqi.xbdry) - np.min(eqi.xbdry))
     if np.hypot(r_x - r0, z_x - z0) > 0.2 * minor_radius:
         r_x, z_x = float(r0), float(z0)
-    bp_min = _spline_scalar(bp_spline, r_x, z_x)
+    bp_min = float(bp_spline(r_x, z_x, grid=False))
     bp_typical = float(np.median(bp_boundary))
     diverted = bool(bp_min / bp_typical < _X_POINT_BPOL_RATIO_THRESHOLD)
     return r_x, z_x, diverted
 
 
 def _diverted(eqi):
-    """Whether `eqi` is diverted (True) or limited (False); see `_find_x_point`.
+    """Whether `eqi` is diverted (True) or limited (False), see `_find_x_point`.
 
     B_pol is built directly from the EQDSK's own 2D psi map as
     `|grad psi| / R` via a bicubic spline's analytic derivatives. The
@@ -276,27 +194,19 @@ class _EquilibriumTimeDerived:
     psi_boundary: float
 
 
-def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
+def _populate_equilibrium_time_slice(ts, eqi, sigma_bp_target: float):
     """Fills one `equilibrium.time_slice[i]` from one equilibrium reconstruction.
 
-    `eqi` is an `eqdsk.EQDSKInterface` already converted to target-COCOS.
+    `eqi` is an `eqdsk.EQDSKInterface` already converted to TARGET_COCOS.
     Writes only what the EQDSK fields themselves supply:
-    the 1D psi-grid profiles, the 2D psi map, the boundary contour, and the
-    global scalars, plus `phi`/`rho_tor` (a pure 1D integral of the EQDSK's
-    own q profile -- in the e_Bp=1 conventions
-    `dphi/dpsi = sigma_Bp * sigma_rho_theta_phi * q`, and both IMAS targets
-    (11 and 17) have `sigma_rho_theta_phi = +1`, so
-    `phi = sigma_bp * integral(q dpsi)` on the file's own uniform psi grid)
-    and the
-    diverted/limited classification (`_diverted`). Derived flux-surface
-    geometry (area/volume, `r_inboard`/`r_outboard`, `j_phi`, shaping, the
-    `gm*` averages) is deliberately not computed here -- see the module
-    docstring.
+    the 1D psi-grid profiles, the 2D psi map, the boundary contour, and the global scalars,
+    plus `phi`/`rho_tor`, the integral of the file's own q profile on its own uniform psi grid,
+    and the diverted or limited classification (`_diverted`).
 
     Args:
         ts: The `equilibrium.time_slice[i]` node to fill.
-        eqi: `eqdsk.EQDSKInterface`, target-COCOS.
-        sigma_bp: sigma_Bp of the target COCOS (see _sigma_bp), setting the
+        eqi: `eqdsk.EQDSKInterface`, in TARGET_COCOS.
+        sigma_bp_target: sigma_Bp of TARGET_COCOS (generic.sigma_bp), setting the
             sign of the phi integral.
 
     Returns:
@@ -319,15 +229,14 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
 
     bcentr = float(eqi.bcentre)
     # dphi/dpsi = sigma_Bp * sigma_rho_theta_phi * q in the e_Bp=1 (11-18) conventions,
-    # and both IMAS targets (11, 17) have sigma_rho_theta_phi = +1,
-    # so phi = sigma_bp * integral(q dpsi).
-    # That lands phi on the sign of B0, its physical direction, for either field polarity under either target.
-    q_integral = cumulative_q_integral(qpsi)
-    phi = sigma_bp * (psi_boundary - psi_axis) * q_integral
-    # rho_tor needs a reference field to carry units of meters; phi and
-    # bcentr share a sign, so the ratio is positive. A zero vacuum field is
-    # nonphysical, but fall back to the dimensionless sqrt(psi_norm) rather
-    # than divide by zero.
+    # and COCOS 17 has sigma_rho_theta_phi = +1, so phi = sigma_Bp * integral(q dpsi).
+    # That lands phi on the sign of B0, its physical direction, for either field polarity.
+    q_integral = cumulative_q_integral(psi_norm, qpsi)
+    phi = sigma_bp_target * (psi_boundary - psi_axis) * q_integral
+    # rho_tor needs a reference field to carry units of meters.
+    # phi and bcentr share a sign, so the ratio is positive.
+    # A zero vacuum field is nonphysical,
+    # and takes the dimensionless sqrt(psi_norm) rather than divide by zero.
     rho_tor = np.sqrt(phi / (np.pi * bcentr)) if abs(bcentr) > 0 else np.sqrt(psi_norm)
     rho_tor_a = rho_tor[-1] if rho_tor[-1] > 0.0 else 1.0
     ts.profiles_1d.phi = phi
@@ -345,10 +254,7 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     zbdry = np.asarray(eqi.zbdry, dtype=float)
     ts.boundary.outline.r = rbdry
     ts.boundary.outline.z = zbdry
-    # C-Mod EFIT boundary contours are zero-padded to a fixed size; (0, 0)
-    # pairs are unphysical (R >= 0.4 m) and must not enter the R extent.
-    real = ~((rbdry == 0.0) & (zbdry == 0.0))
-    ts.boundary.minor_radius = float((rbdry[real].max() - rbdry[real].min()) / 2.0)
+    ts.boundary.minor_radius = float((rbdry.max() - rbdry.min()) / 2.0)
     ts.boundary.type = 1 if _diverted(eqi) else 0
 
     ts.profiles_2d.resize(1)
@@ -366,54 +272,24 @@ def _populate_equilibrium_time_slice(ts, eqi, sigma_bp: int):
     )
 
 
-def _source_cocos(geqdsk_path) -> int:
-    """Determine the COCOS convention of one raw C-Mod EFIT geqdsk file.
-
-    C-Mod's EFIT writes psi increasing from axis to boundary whatever the
-    signs of Ip and Bt (verified across the staged 2003-2016 campaigns:
-    574 shots, 770k reconstructions, sibdry > simagx and q > 0 in every
-    one), so no single COCOS number covers the machine: the file's sigma_Bp
-    follows sign(Ip). In the file's right-handed (R, phi, Z) frame that
-    makes normal-field shots (Ip < 0) COCOS 7 and reversed-field shots
-    (Ip > 0) COCOS 1, with sigma_rho_theta_phi = +1 throughout (q > 0 with
-    Ip and B0 always of like sign). A mismatched fixed number does not
-    corrupt silently -- eqdsk's sign identification raises -- but this
-    keeps both field polarities converting.
-
-    Args:
-        geqdsk_path: The `.geqdsk` file to classify.
-
-    Returns:
-        7 when the file's plasma current is negative, 1 otherwise.
-    """
-    with open(geqdsk_path) as fh:
-        cpasma = float(freeqdsk_geqdsk.read(fh)["cpasma"])
-    return 7 if cpasma < 0 else 1
-
-
-def build_equilibrium(factory, times, geqdsk_paths, target_cocos: int | None = None):
-    """`equilibrium` IDS: one `time_slice` per real EFIT reconstruction time.
+def build_equilibrium(factory, times, geqdsk_paths, source_cocos: int):
+    """`equilibrium` IDS: one `time_slice` per usable reconstruction, in TARGET_COCOS.
 
     Args:
         factory: `imas.IDSFactory` to build the IDS from.
-        times: (n_eq,) real EFIT reconstruction times [s].
+        times: (n_eq,) times of the usable reconstructions [s].
         geqdsk_paths: (n_eq,) `.geqdsk` file paths, one per time in `times`
             (see `geqdsk_writer.write_geqdsk`).
-        target_cocos: COCOS convention the IDS is written in. None takes
-            the convention matching DD_VERSION (see _target_cocos); pass
-            the one matching the factory's DD version when it differs.
+        source_cocos: COCOS convention of the files,
+            the unprocessed file's cocos attribute (see machine.generic.cocos_from_signs).
 
     Returns:
-        (eq, eqi_first, derived_by_time): the validated `equilibrium` IDS;
-        `eqi_first` is the first time's `eqdsk.EQDSKInterface` (reused by
-        `build_wall` for the time-invariant limiter contour);
-        `derived_by_time` maps each time to its `_EquilibriumTimeDerived`,
-        for `core_profiles.profiles_1d.grid.psi` placement (see
-        `build_imas_from_shot`).
+        (eq, eqi_first, derived_by_time): the validated `equilibrium` IDS,
+        the first time's `eqdsk.EQDSKInterface`, which `build_wall` takes the limiter contour from,
+        and each time's `_EquilibriumTimeDerived`,
+        which places `core_profiles.profiles_1d.grid.psi` (see `build_imas_from_shot`).
     """
-    if target_cocos is None:
-        target_cocos = _target_cocos(DD_VERSION)
-    sigma_bp = _sigma_bp(target_cocos)
+    sigma_bp_target = sigma_bp(TARGET_COCOS)
     eq = factory.equilibrium()
     eq.ids_properties.homogeneous_time = 1
     eq.time = np.asarray(times, dtype=float)
@@ -426,11 +302,11 @@ def build_equilibrium(factory, times, geqdsk_paths, target_cocos: int | None = N
     for i, (t, geqdsk_path) in enumerate(zip(times, geqdsk_paths)):
         eqi = eqdsk.EQDSKInterface.from_file(
             str(geqdsk_path),
-            from_cocos=_source_cocos(geqdsk_path),
-            to_cocos=target_cocos,
+            from_cocos=source_cocos,
+            to_cocos=TARGET_COCOS,
         )
         ts = eq.time_slice[i]
-        derived = _populate_equilibrium_time_slice(ts, eqi, sigma_bp)
+        derived = _populate_equilibrium_time_slice(ts, eqi, sigma_bp_target)
         derived_by_time[t] = derived
         bcentr_per_time[i] = derived.bcentr
         if eqi_first is None:
@@ -445,13 +321,6 @@ def build_equilibrium(factory, times, geqdsk_paths, target_cocos: int | None = N
 
 
 # ---------------------------------------------------------------------------
-# ion composition (decoupled Zeff/impurity post-processing, consumed here --
-# see this project's plan notes, "Post-processing: Zeff and impurity
-# composition")
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # core_profiles IDS
 # ---------------------------------------------------------------------------
 
@@ -459,10 +328,7 @@ def build_equilibrium(factory, times, geqdsk_paths, target_cocos: int | None = N
 def build_core_profiles(factory, slices: list[ShotExportSlice]):
     """`core_profiles` IDS: one `profiles_1d` per usable Thomson slice.
 
-    Electrons + a single hydrogenic main ion (D, Zeff=1, n_D=n_e) -- Zeff and
-    impurity composition are deliberately not computed here or anywhere in
-    this package; see the module docstring above for where that physics
-    actually lives.
+    Electrons and a single hydrogenic main ion (D, Zeff = 1, n_D = n_e).
 
     Args:
         factory: `imas.IDSFactory` to build the IDS from.
@@ -485,9 +351,8 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
         p1d.electrons.density = s.n_e
         p1d.electrons.density_thermal = s.n_e
         p1d.electrons.temperature = s.t_e
-        # The GP fit's 1-sigma predictive uncertainty is symmetric: per the
-        # IMAS convention, filling only `*_error_upper` and leaving
-        # `*_error_lower` unset declares exactly that.
+        # The GP fit's 1 sigma predictive uncertainty is symmetric.
+        # Per the IMAS convention, filling only `*_error_upper` and leaving `*_error_lower` unset declares exactly that.
         if s.t_e_error is not None:
             p1d.electrons.temperature_error_upper = s.t_e_error
         if s.n_e_error is not None:
@@ -506,8 +371,8 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
         ion.density = s.n_e
         ion.density_thermal = s.n_e
         ion.temperature = s.t_e
-        # n_D = n_e exactly (single species, Zeff=1), so its uncertainty is
-        # n_e's; T_i = T_e likewise.
+        # n_D = n_e exactly (single species, Zeff = 1), so its uncertainty is n_e's,
+        # and T_i = T_e likewise.
         if s.n_e_error is not None:
             ion.density_error_upper = s.n_e_error
             ion.density_thermal_error_upper = s.n_e_error
@@ -525,16 +390,14 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
 
 
 # ---------------------------------------------------------------------------
-# summary IDS: full native 0D-signal resolution (see this module's own
-# docstring)
+# summary IDS, on the unprocessed file's 1 kHz grid
 # ---------------------------------------------------------------------------
 
 
-# `workflow.DATASET_0D_SIGNALS` name -> (summary sub-structure, field) it is
-# written to; each target is a `summary_dynamic` node whose `.value` holds the
-# time series. Every DATASET_0D_SIGNALS entry has a home here, and the paths
-# match the `ref` attrs the machine modules record on the unprocessed signals
-# (confirmed against the installed DD 4.0.0 by introspection).
+# `workflow.DATASET_0D_SIGNALS` name -> (summary sub-structure, field) it is written to.
+# Each target is a `summary_dynamic` node whose `.value` holds the time series.
+# Every DATASET_0D_SIGNALS entry has a home here,
+# and the paths match the `ref` attrs the machine modules record on the unprocessed signals (checked against DD 4.1.1).
 _SUMMARY_SIGNAL_PATHS = {
     "ip": ("global_quantities", "ip"),
     "b0": ("global_quantities", "b0"),
@@ -555,17 +418,17 @@ _SUMMARY_SIGNAL_PATHS = {
 
 
 def build_summary(factory, time, signals):
-    """`summary` IDS at its own full native (unprocessed-file) 0D-signal resolution.
+    """`summary` IDS on the unprocessed file's own 1 kHz grid.
 
     Args:
         factory: `imas.IDSFactory` to build the IDS from.
-        time: (n,) time base [s] -- the unprocessed file's own 0D-signal
-            sampling, independent of `equilibrium.time`/`core_profiles.time`.
-        signals: `workflow.DATASET_0D_SIGNALS` name -> (n,) signal on `time`.
-            Any subset; a signal that is absent, or NaN everywhere (how a
-            device without it stages it), is left unset in the IDS. A name
-            with no entry in `_SUMMARY_SIGNAL_PATHS` is an error, so a new
-            DATASET_0D_SIGNALS entry cannot be dropped silently.
+        time: (n,) the unprocessed file's grid [s],
+            independent of `equilibrium.time` and `core_profiles.time`.
+        signals: `workflow.DATASET_0D_SIGNALS` name -> (n,) signal on `time`, any subset.
+            A signal that is absent, or NaN everywhere (how a device without it stages it),
+            is left unset in the IDS.
+            A name with no entry in `_SUMMARY_SIGNAL_PATHS` is an error,
+            so a new DATASET_0D_SIGNALS entry cannot be dropped silently.
 
     Returns:
         The validated `summary` IDS.
@@ -599,11 +462,9 @@ def build_summary(factory, time, signals):
 def build_wall(factory, time, eqi):
     """`wall` IDS, single time slice: limiter contour only.
 
-    Sourced from `eqi.xlim`/`.zlim` -- the real limiter contour the
-    `.geqdsk` file carries natively (COCOS-invariant geometry). `eqi` is
-    any one of the shot's already-loaded `eqdsk.EQDSKInterface` objects
-    (see `build_equilibrium`'s `eqi_first`): the limiter is time-invariant,
-    so this needs only one.
+    Sourced from `eqi.xlim`/`.zlim`, the limiter contour the `.geqdsk` file carries (COCOS-invariant geometry).
+    The limiter is time-invariant,
+    so any one of the shot's loaded `eqdsk.EQDSKInterface` objects serves (`build_equilibrium`'s `eqi_first`).
 
     Args:
         factory: `imas.IDSFactory` to build the IDS from.
@@ -627,14 +488,11 @@ def build_wall(factory, time, eqi):
 
 
 def write_ids(ids, output_dir, dd_version=DD_VERSION, overwrite=False):
-    """Writes one IDS to `<output_dir>/<ids name>.nc`.
-
-    Goes via `imas.DBEntry`/`.put()` -- the same call every other IMAS
-    netCDF writer (fusio's included) bottoms out in.
+    """Writes one IDS to `<output_dir>/<ids name>.nc` through `imas.DBEntry`/`.put()`.
 
     Args:
-        ids: A populated, validated IDS object (e.g. from
-            `build_equilibrium`); its own `metadata.name` picks the file name.
+        ids: A populated, validated IDS object (e.g. from `build_equilibrium`),
+            whose own `metadata.name` picks the file name.
         output_dir: Directory the `.nc` file goes in (created if missing).
         dd_version: IMAS data dictionary version to write with.
         overwrite: Rewrite the file if it already exists.
@@ -663,56 +521,40 @@ def build_imas_from_shot(
     """Builds one shot's `equilibrium`/`core_profiles`/`summary`/`wall` IDS.
 
     The IDS set is built from the shot's fit results and unprocessed data.
-    `core_profiles` gets electrons + a single hydrogenic main ion (see
-    `build_core_profiles`) -- no Zeff/impurity composition; see the module
-    docstring above for the standalone script that adds those afterward.
 
     Args:
         shot: Shot number.
-        fit_ds: `_shot_fit_dataset()`'s output for this shot
-            (`fit_shots_dir/<shot>.nc`) -- `t_e`/`n_e`/`t_e_fit_status`/
-            `n_e_fit_status` on `(shot, TIME_DIM, rho_tor_norm)`, real slice times in
-            `TIME_COORD`, and the `sol_extension` attribute the channels were staged with.
-        unprocessed_ds: This shot's unprocessed data
-            (`01_unprocessed/<shot>.nc`) -- needs `ip` and
-            `workflow.DATASET_EQUILIBRIUM_SIGNALS`, all on the shot's common
-            time grid (the equilibrium signals NaN outside a real EFIT
-            reconstruction time). Every other `workflow.DATASET_0D_SIGNALS`
-            entry present is written to `summary` (see `build_summary`).
+        fit_ds: `_shot_fit_dataset()`'s output for this shot (`fit_shots_dir/<shot>.nc`),
+            `t_e`/`n_e`/`t_e_fit_status`/`n_e_fit_status` on `(shot, TIME_DIM, rho_tor_norm)`,
+            real slice times in `TIME_COORD`, and the `sol_extension` attribute the channels were staged with.
+        unprocessed_ds: This shot's unprocessed data (`01_unprocessed/<shot>.nc`).
+            Needs `ip`, the `cocos` attribute, and the GEQDSK block (`DATASET_EQUILIBRIUM_SIGNALS`)
+            on the shot's grid, NaN outside a reconstruction time.
+            Every other `workflow.DATASET_0D_SIGNALS` entry present is written to `summary` (see `build_summary`).
         geqdsk_dir: Directory to write this shot's per-equilibrium-time
             `.geqdsk` files into (see `geqdsk_writer.write_geqdsk`).
         dd_version: IMAS data dictionary version.
 
     Returns:
-        The four populated, validated IDS objects, in the order
-        `equilibrium`, `core_profiles`, `summary`, `wall`; write each with
-        `write_ids`.
+        The populated, validated IDS objects to write with `write_ids`:
+        `equilibrium`, `core_profiles`, `summary`, and `wall` when the shot has a limiter contour.
 
     Raises:
         KeyError: If the shot's unprocessed data has no `ip` signal.
     """
-    from transport_validation_datasets.workflow import (
-        DATASET_0D_SIGNALS,
-        DATASET_EQUILIBRIUM_SIGNALS,
-        TIME_COORD,
-        TIME_DIM,
-        USABLE_FIT_STATUSES,
-    )
-
     factory = imas.IDSFactory(version=dd_version)
     geqdsk_dir = Path(geqdsk_dir)
 
     if "shot" in unprocessed_ds.dims:
         unprocessed_ds = unprocessed_ds.squeeze("shot", drop=True)
 
-    # DATASET_EQUILIBRIUM_SIGNALS lives on the shot's common time grid (same as
-    # the 0D signals), NaN outside a real EFIT reconstruction time -- not a
-    # compact per-EFIT-time array. Filter down to the real reconstruction
-    # times first (any one scalar field, e.g. simagx, is finite exactly
-    # where every field in the block is, since they're all written together
-    # for the same reconstruction).
-    eq_valid = np.flatnonzero(np.isfinite(unprocessed_ds["simagx"].to_numpy()))
-    eq_ds = unprocessed_ds[list(DATASET_EQUILIBRIUM_SIGNALS)].isel(time=eq_valid)
+    # The GEQDSK block lives on the shot's grid, like the 0D signals,
+    # NaN outside a reconstruction time. Filter down to the usable reconstructions first.
+    # A device without a limiter contour stages no rlim and zlim.
+    eq_usable = usable_reconstructions(unprocessed_ds)
+    eq_valid = np.flatnonzero(eq_usable)
+    eq_names = [name for name in DATASET_EQUILIBRIUM_SIGNALS if name in unprocessed_ds]
+    eq_ds = unprocessed_ds[eq_names].isel(time=eq_valid)
     eq_times = eq_ds["time"].to_numpy().astype(float)
     geqdsk_paths = [
         write_geqdsk(
@@ -723,8 +565,9 @@ def build_imas_from_shot(
         )
         for i in range(eq_times.size)
     ]
+    source_cocos = int(unprocessed_ds.attrs["cocos"])
     eq, eqi_first, derived_by_time = build_equilibrium(
-        factory, eq_times, geqdsk_paths, target_cocos=_target_cocos(dd_version)
+        factory, eq_times, geqdsk_paths, source_cocos
     )
 
     usable = (
@@ -745,8 +588,8 @@ def build_imas_from_shot(
     )
 
     unprocessed_time = unprocessed_ds["time"].to_numpy().astype(float)
-    # Whichever DATASET_0D_SIGNALS the shot has; only `ip` is required (for
-    # core_profiles.global_quantities.ip).
+    # Whichever DATASET_0D_SIGNALS the shot has.
+    # Only `ip` is required, for core_profiles.global_quantities.ip.
     signal_0d = {
         name: unprocessed_ds[name].to_numpy().astype(float)
         for name in DATASET_0D_SIGNALS
@@ -783,5 +626,8 @@ def build_imas_from_shot(
 
     cp = build_core_profiles(factory, slices)
     sm = build_summary(factory, unprocessed_time, signal_0d)
-    wall = build_wall(factory, eq_times[0], eqi_first)
-    return eq, cp, sm, wall
+    ids_list = [eq, cp, sm]
+    if "rlim" in eq_ds:
+        wall = build_wall(factory, eq_times[0], eqi_first)
+        ids_list.append(wall)
+    return ids_list
