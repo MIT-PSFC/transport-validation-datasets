@@ -19,6 +19,10 @@ from transport_validation_datasets.machine.mast.mast_dataset import (
     _store_path_exists,
     _thomson_dataset,
 )
+from transport_validation_datasets.machine.mast.shotlist import (
+    _chord_rho_tor_norm_min,
+    _near_axis_fraction,
+)
 
 # Carries Thomson, an equilibrium, and a limiter contour, and is the shot the
 # hollow-ne calibration notes in gp_fitting/zk/quality.py refer to
@@ -118,6 +122,60 @@ class TestThomsonDataset:
 
 
 @pytest.mark.slow  # reads the public S3 stores, ~60-90 s per shot
+def circular_efm(times, axis_z, psi_axis, psi_boundary, axis_r=0.9, minor_radius=0.5):
+    # Stand-in for the level 1 efm group: circular flux surfaces, psi quadratic in the distance to the axis,
+    # and a flat q, so rho_tor_norm is the distance over minor_radius.
+    # The profile grid is the flux grid itself.
+    r_grid = np.linspace(0.2, 1.6, 141)
+    z_grid = np.linspace(-1.0, 1.0, 201)
+    r_mesh, z_mesh = np.meshgrid(r_grid, z_grid, indexing="ij")
+    psirz = []
+    for z_axis, psi_0, psi_1 in zip(axis_z, psi_axis, psi_boundary):
+        distance_squared = (r_mesh - axis_r) ** 2 + (z_mesh - z_axis) ** 2
+        psirz.append(psi_0 + (psi_1 - psi_0) * distance_squared / minor_radius**2)
+    return xr.Dataset(
+        {
+            "psi_axis": ("time", np.asarray(psi_axis, dtype=float)),
+            "psi_boundary": ("time", np.asarray(psi_boundary, dtype=float)),
+            "psirz": (("time", "profile_r", "profile_z"), np.stack(psirz)),
+            "gridr": ("n_r", r_grid),
+            "gridz": ("n_z", z_grid),
+            "qpsi_c": (("time", "psi_norm"), np.full((len(times), 65), 2.0)),
+        },
+        coords={"time": times, "profile_r": r_grid, "profile_z": z_grid},
+    )
+
+
+class TestShotlist:
+    def test_chord_rho_tor_norm_min_is_the_surface_tangent_to_the_chord(self):
+        # On the axis, 0.1 m below the chord, no boundary flux, and no flux map at all
+        efm = circular_efm(
+            times=np.array([0.1, 0.2, 0.3, 0.4]),
+            axis_z=[0.0, -0.1, 0.0, 0.0],
+            psi_axis=[-1.0, -1.0, -1.0, np.nan],
+            psi_boundary=[0.0, 0.0, np.nan, 0.0],
+        )
+        ds_thomson = xr.Dataset(
+            {"ts_channel_r": ("ts_channel", np.linspace(0.3, 1.4, 30))}
+        )
+
+        eq_time, rho_min = _chord_rho_tor_norm_min(efm, ds_thomson)
+
+        np.testing.assert_allclose(eq_time, [0.1, 0.2, 0.3])
+        np.testing.assert_allclose(rho_min, [0.0, 0.1 / 0.5, np.nan], atol=1e-9)
+
+    def test_near_axis_fraction_maps_through_the_nearest_usable_reconstruction(self):
+        # The 10 ms reconstruction is unusable and the reach is 1.5 periods (15 ms).
+        # 8 ms maps through 0 ms, 12 ms through the far 20 ms one, 40 ms through none.
+        eq_time = np.array([0.0, 0.01, 0.02])
+        rho_min = np.array([0.05, np.nan, 0.3])
+        window_times = np.array([0.0, 0.008, 0.012, 0.04])
+
+        near_axis_fraction = _near_axis_fraction(window_times, eq_time, rho_min)
+
+        assert near_axis_fraction == 0.5
+
+
 class TestMakeUnprocessedDataFiles:
     def test_one_shot(self, tmp_path):
         skip_without_store()

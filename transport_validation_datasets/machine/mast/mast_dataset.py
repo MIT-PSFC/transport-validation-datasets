@@ -11,6 +11,7 @@ only supplies the summary signals: ip, power_nbi, n_e_line_average and power_rad
 No MDSplus is involved, so this workflow runs anywhere with internet access.
 Reads are slow, so staging runs in a thread pool of prepare_workers threads.
 One shot costs ~30-40 s of round trips.
+The packaged shotlist is built by machine/mast/shotlist.py.
 """
 
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from transport_validation_datasets.machine.generic import (
     ts_channel_fit_rows,
 )
 from transport_validation_datasets.store_schema import apply_signal_attrs
+from transport_validation_datasets.windows import read_shotlist
 from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 
 # Public MAST open data, no credentials needed
@@ -46,8 +48,8 @@ LEVEL2_PATH = "mast/level2/shots"
 # The raw diagnostic output, see the module docstring for the groups read
 LEVEL1_PATH = "mast/level1/shots"
 
-# Shotlist for M8 and M9 campaigns
-DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "machine" / "mast" / "mast_shotlist_M8_M9"
+# Shotlist for the M7-M9 campaigns, built by shotlist.py
+DEFAULT_SHOTLIST_FILE = PACKAGE_ROOT / "machine" / "mast" / "mast_shotlist_M7_M9"
 
 # The core Thomson system (AYC) views along a horizontal chord at the midplane,
 # so every channel is at the same height and only its major radius varies.
@@ -340,17 +342,9 @@ class MASTDataWorkflow(DataWorkflow):
 
         Returns:
             Shot numbers to process.
-
-        Raises:
-            FileNotFoundError: If the packaged shotlist file is missing.
         """
-        if not DEFAULT_SHOTLIST_FILE.exists():
-            raise FileNotFoundError(
-                f"No MAST shotlist file at {DEFAULT_SHOTLIST_FILE}. Create a text "
-                "file with one shot number per line, or pass shotlist_file."
-            )
-        with open(DEFAULT_SHOTLIST_FILE) as f:
-            return [int(line.strip()) for line in f if line.strip().isdigit()]
+        shotlist, _ = read_shotlist(DEFAULT_SHOTLIST_FILE)
+        return shotlist
 
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         """Read one shot from the MAST stores into standardized signals.
@@ -416,7 +410,8 @@ class MASTDataWorkflow(DataWorkflow):
         NOTE: The Thomson chord runs along z = TS_CHANNEL_Z while the MAST
         equilibria may put the magnetic axis 0.15-0.25 m lower, so the chord
         passes above the axis and never crosses the innermost flux surfaces.
-        This may lead to extrapolation in the core.
+        This leads to extrapolation and poor fits in the core.
+        The packaged shotlist keeps only shots whose chord passes near the axis.
 
         Args:
             shot: Shot number being staged.
