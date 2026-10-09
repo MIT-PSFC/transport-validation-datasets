@@ -377,7 +377,7 @@ efit_trees = ["EFIT21", "ANALYSIS"]
 
 `--shotlist_file` takes one of two formats:
 
-- plain: one shot number per line
+- plain: one shot number per line, blank lines and lines starting with `#` skipped
 - windowed: 
   a CSV whose header holds `shot` (or `pulse_no`), `t_start` and `t_end` [s],
   one row per window and a shot on as many rows as it has windows.
@@ -387,6 +387,15 @@ efit_trees = ["EFIT21", "ANALYSIS"]
 
 Without a shotlist file the device's own list is used
 (C-Mod queries its SQL summary table, MAST reads the list shipped with the package).
+
+The MAST list holds the M7-M9 shots whose stores carry every signal the workflow reads,
+whose plasma current passes the ip gates for at least `min_pulse_length`,
+and whose Thomson chord passes within rho_tor_norm 0.1 of the magnetic axis for over 80% of that window.
+The CSV records why each shot was rejected, and a rerun with it retries only the shots that could not be read:
+
+```bash
+uv run python -m transport_validation_datasets.machine.mast.shotlist build scratch/mast_shotlist/mast_scan.csv
+```
 
 The unprocessed stage is the same in every case:
 the whole shot is read, filtered, and written,
@@ -424,6 +433,6 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 | Device | Source | Shotlist | Notes |
 | ------ | ------ | -------- | ----- |
 | C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. A shot needs both the core and the edge Thomson system, the edge samples placed on the core's laser pulses one by one. |
-| MAST | Level 1 Zarr store at https://s3.echo.stfc.ac.uk/mast/level1/shots (efm for the equilibrium, ayc for the Thomson profiles, amc for the toroidal field coil current), plus the summary group of the level 2 store at https://s3.echo.stfc.ac.uk/mast/level2/shots | 1101 shots from the M8 and M9 campaigns, shipped with the package | Public, anonymous, read in a thread pool (`--prepare_workers`) |
+| MAST | Level 1 Zarr store at https://s3.echo.stfc.ac.uk/mast/level1/shots (efm for the equilibrium, ayc for the Thomson profiles, amc for the toroidal field coil current), plus the summary group of the level 2 store at https://s3.echo.stfc.ac.uk/mast/level2/shots | 1678 shots from the M7-M9 campaigns, shipped with the package and built by `machine/mast/shotlist.py` | Public, anonymous, read in a thread pool (`--prepare_workers`) |
 | DIII-D | | | |
 | TCV | | | |
