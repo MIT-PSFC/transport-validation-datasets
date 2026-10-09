@@ -496,9 +496,7 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     p_oh is disruption-py's own (get_ohmic_parameters), at the time resolution of the fast loop voltage and Ip.
     Its EFIT li inductance correction is exact at the EFIT21 slice times
     and NaN outside the EFIT time range.
-    The methods are selected by name,
-    since selected by column the disruption-py built-ins serving the same columns would run too,
-    and they interpolate.
+    Avoiding disruption-py internals because they interpolate.
 
     Args:
         shot: Shot number to retrieve data for.

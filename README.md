@@ -59,11 +59,19 @@ The timebase is the unprocessed data's uniform 1 kHz grid.
 and the `time` variable carries the times themselves.
 
 Profiles are from Thomson scattering and equilibria from a reconstruction,
-both of which can be slower than 1 kHz,
-so so they are held forward over the grid times that follow them
+both of which can be slower than 1 kHz or missing for certain timesteps,
+so they are held forward over the grid times that follow them
 and `fresh_profile` / `fresh_equilibrium` mark the grid times that carry a sample of their own.
-A sample is held for at most `MAX_HOLD_PERIODS` of its own sampling period,
-so nothing is carried across the end of the shot or a stretch the filtering cut away.
+A profile is held for at most `PROFILE_MAX_HOLD` (100 ms) on every device, whatever its Thomson cadence,
+so dropped slices are bridged and `fresh_profile` tells a fresh profile from a held one.
+The GEQDSK block of a reconstruction
+is held for at most `MAX_HOLD_PERIODS` (1.5) periods of the reconstruction clock, or `EQUILIBRIUM_HOLD_FLOOR` (10 ms) when that is longer,
+so a few missing reconstructions do not cut the shot,
+and nothing is carried across the end of the shot or a stretch the filtering cut away.
+The 0D signals taken from the reconstruction (`EQUILIBRIUM_0D_SIGNALS`: energy_mhd, beta_tor_norm and the shape)
+hold the last usable reconstruction until the next one, with no limit (`hold_from_usable_reconstructions`),
+so they change exactly where `fresh_equilibrium` is 1.
+b0 is not one of them, it is the vacuum field of the measured toroidal field coil current.
 
 A reconstruction is usable (`usable_reconstructions`) when its axis and boundary psi are finite and meaningfully different,
 every value of its psirz and qpsi is finite, and its q profile gives a reasonable Phi_N map (`phi_n_map`).
@@ -91,6 +99,20 @@ A signal the device does not have comes through as NaN, so the devices share one
 Everything is float32, flags included, because the padding between shots of different lengths is NaN.
 The power signals (power_ohm/radiated/nbi/ic/lh) are clipped at zero since source records often dip negative
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
+
+Every stored value is causal, no grid time draws on a later sample, with these exceptions:
+power_radiated is smoothed by a centered 50 ms boxcar applied twice (`smoothed_power`),
+the kernel of DIII-D's bolometer postprocessing.
+power_ohm is disruption-py's on C-Mod and built from interpolated level 2 signals on MAST.
+The EFIT and Thomson slices are snapped to the nearest grid time (`snap_to_grid`), up to 0.5 ms early,
+and a Thomson slice can map through a reconstruction up to `EQ_MATCH_MAX_PERIODS` later than it (see above).
+The end of every shot is cut `end_margin` (50 ms, one smoothing window) before the last finite ip,
+so the smoothed power_radiated does not carry the current quench.
+
+Every other 0D signal is placed on the 1 kHz grid without interpolation (`signal_on_grid`).
+One sampled faster than the grid is averaged over each grid step, grid time t taking the mean of (t - 1 ms, t].
+One sampled slower is held forward from its last finite sample for at most `MAX_HOLD_PERIODS` of its own sampling period.
+The 0D signals taken from the reconstruction are held as above instead.
 
 # Running
 
@@ -211,7 +233,8 @@ Adding ANALYSIS after it turns on pulling those shots from the ANALYSIS tree ins
 Every retrieval reads the EFIT tree at least for its timebase, so a shot takes the first tree that serves all of them.
 A tree fails when it is missing or its reconstruction is missing a node,
 and the unprocessed file records the tree it used as its `efit_tree` attribute.
-A tree slower than the 1 kHz grid has its EFIT 0D signals interpolated onto the grid,
+A tree slower than the 1 kHz grid (ANALYSIS reconstructs every ~20 ms) has its EFIT 0D signals held like EFIT21's,
+from the last usable reconstruction until the next,
 and `fresh_equilibrium` marks grid times where a usable reconstruction exists.
 Shots already recorded in `01_unprocessed/failed_shots/` are not retried,
 so their records need deleting for a rebuild to try another tree.
@@ -272,7 +295,7 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 
 | Device | Source | Shotlist | Notes |
 | ------ | ------ | -------- | ----- |
-| C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. |
+| C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. A shot needs both the core and the edge Thomson system, the edge samples placed on the core's laser pulses one by one. |
 | MAST | Level 2 Zarr store at https://s3.echo.stfc.ac.uk/mast/level2/shots, plus two level 1 groups: EFM for the GEQDSK safety factor and AYC for the Thomson profiles | 1101 shots from the M8 and M9 campaigns, shipped with the package | Public, anonymous, read in a thread pool (`--prepare_workers`) |
 | DIII-D | | | |
 | TCV | | | |

@@ -23,11 +23,15 @@ from loguru import logger
 from transport_validation_datasets import PACKAGE_ROOT
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
+    POWER_SMOOTHING_WINDOW,
     cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
+    signal_on_grid,
+    smoothed_power,
     snap_to_grid,
+    ts_channel_dataset,
     ts_channel_fit_rows,
 )
 from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
@@ -72,7 +76,8 @@ OHMIC_SMOOTHING_SAMPLES = 10
 MAX_FIT_RHO_TOR_NORM = 1.1
 
 # level 2 equilibrium signal -> standardized name.
-# All 0D, interpolated onto the 1 kHz timebase.
+# All 0D, snapped onto the 1 kHz timebase with the GEQDSK block (_equilibrium_0d_dataset),
+# then held from the last usable reconstruction (hold_from_usable_reconstructions).
 EQUILIBRIUM_SIGNALS = {
     "wmhd": "energy_mhd",
     "beta_tor_normal": "beta_tor_norm",
@@ -83,7 +88,7 @@ EQUILIBRIUM_SIGNALS = {
     "geometric_axis_r": "geometric_axis_r",
 }
 
-# level 2 summary signal -> standardized name, same treatment
+# level 2 summary signal -> standardized name, placed on the 1 kHz timebase (signal_on_grid)
 SUMMARY_SIGNALS = {
     "line_average_n_e": "n_e_line_average",
     "power_radiated": "power_radiated",
@@ -152,7 +157,9 @@ SIGNAL_ATTRS = {
         "ref": "/summary/global_quantities/power_ohm/value",
     },
     "power_radiated": {
-        "description": "Bulk radiated power",
+        "description": (
+            "Bulk radiated power, smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0"
+        ),
         "units": "W",
         "ref": "/summary/global_quantities/power_radiated_inside_lcfs/value",
     },
@@ -359,9 +366,9 @@ class MASTDataWorkflow(DataWorkflow):
         "power_radiated": 3.0e6,
         "power_ohm": 5.0e6,
     }
-    # MAST's ip record runs through the current quench, so a small ip cutoff
-    # still lets disruption transients in. Has to be longer than C-Mod's 20 ms.
-    end_margin = 0.04
+    # MAST's ip record runs through the current quench, so a small ip cutoff still lets disruption transients in.
+    # One smoothing window, so the smoothed power_radiated does not carry the quench (POWER_SMOOTHING_WINDOW).
+    end_margin = POWER_SMOOTHING_WINDOW
     # Shots the validity filtering rejects outright (checked 2026-08-20 by
     # running them through the pipeline), skipped here to save the processing.
     # 29430 is the worst of them: its bolometer is broken, the raw radiated
@@ -425,9 +432,9 @@ class MASTDataWorkflow(DataWorkflow):
         """Read one shot from the MAST stores into standardized signals.
 
         The three sources are put on the shot's 1 kHz timebase differently:
-        the 0D signals are interpolated (they are smooth), while the
-        equilibrium reconstruction and the Thomson slices are snapped to the
-        nearest grid time without interpolation, since neither is meaningful
+        the summary 0D signals are placed causally (signal_on_grid, see _zero_d_dataset), while the
+        equilibrium reconstruction, the 0D signals taken from it (_equilibrium_0d_dataset), and the Thomson slices
+        are snapped to the nearest grid time without interpolation, since none is meaningful
         interpolated. The equilibrium is written as a full GEQDSK, so only the
         ~1 grid time in 5 that carries an EFIT slice has one (the rest are NaN,
         as are the trailing slots of the NaN-padded boundary contour).
@@ -491,13 +498,17 @@ class MASTDataWorkflow(DataWorkflow):
 
         limiter = data_tree["wall"].ds if "wall" in data_tree else None
         ds_0d = _zero_d_dataset(shot, summary, equilibrium, timebase)
+        ds_equilibrium_0d_efit = _equilibrium_0d_dataset(shot, equilibrium)
+        ds_equilibrium_0d = snap_to_grid(ds_equilibrium_0d_efit, timebase)
         ds_equilibrium = snap_to_grid(
             _equilibrium_dataset(shot, equilibrium, limiter), timebase
         )
         ds_thomson = snap_to_grid(ds_thomson, timebase)
 
         ds = xr.merge(
-            [ds_0d, ds_equilibrium, ds_thomson], compat="no_conflicts", join="outer"
+            [ds_0d, ds_equilibrium_0d, ds_equilibrium, ds_thomson],
+            compat="no_conflicts",
+            join="outer",
         )
         ds = ds.set_index(idx=["shot", "time"]).unstack("idx")
         ds.attrs = dict(ds_equilibrium.attrs)
@@ -708,8 +719,14 @@ def _zero_d_dataset(
     equilibrium: xr.Dataset,
     timebase: np.ndarray,
 ) -> xr.Dataset:
-    """Interpolate the 0D signals onto the timebase under standardized names.
+    """Place the summary 0D signals and power_ohm onto the timebase under standardized names.
 
+    Every signal but power_ohm (_ohmic_power) is placed causally (signal_on_grid),
+    never interpolated, so no grid time draws on a later sample,
+    and power_radiated is then smoothed non-causally (smoothed_power), the DIII-D prad_tot kernel.
+    The 0D signals taken from the reconstruction are in _equilibrium_0d_dataset.
+    b0 is the vacuum field, which EFIT computes from the measured TF current rather than reconstructs,
+    so it is placed here, from the reconstruction times it is published on.
     Plasma current and toroidal field are stored as magnitudes, the signed
     versions live in the equilibrium signals (see _equilibrium_dataset).
 
@@ -723,29 +740,24 @@ def _zero_d_dataset(
         Dataset of 0D signals on dim "idx", with "time" and "shot" coords.
     """
     summary_time = summary["time"].values
-    eq_time = equilibrium["time"].values
+    eq_time = np.asarray(equilibrium["time"].values, dtype=float)
 
     data = {
-        name: interp1(eq_time, equilibrium[source].values, timebase)
-        for source, name in EQUILIBRIUM_SIGNALS.items()
+        name: signal_on_grid(summary_time, summary[source].values, timebase)
+        for source, name in SUMMARY_SIGNALS.items()
     }
-    data.update(
-        {
-            name: interp1(summary_time, summary[source].values, timebase)
-            for source, name in SUMMARY_SIGNALS.items()
-        }
-    )
 
     ip = np.asarray(summary["ip"].values, dtype=float)
-    data["ip"] = np.abs(interp1(summary_time, ip, timebase))
-    # bvac_rmag is the vacuum field at the magnetic axis. Rescale it by 1/R to
-    # the geometric axis, so b0 is referenced the same way as on the other
-    # devices (C-Mod rout, D3D rsurf, TCV R_geom).
-    data["b0"] = np.abs(
-        interp1(eq_time, equilibrium["bvac_rmag"].values, timebase)
-        * interp1(eq_time, equilibrium["magnetic_axis_r"].values, timebase)
-        / data["geometric_axis_r"]
-    )
+    ip_on_timebase = signal_on_grid(summary_time, ip, timebase)
+    data["ip"] = np.abs(ip_on_timebase)
+    # bvac_rmag is the vacuum field at the magnetic axis.
+    # Rescaled by 1/R to the geometric axis on the reconstruction times, then placed,
+    # so b0 is referenced the same way as on the other devices (C-Mod rout, D3D rsurf, TCV R_geom).
+    bvac_rmag = np.asarray(equilibrium["bvac_rmag"].values, dtype=float)
+    r_axis = np.asarray(equilibrium["magnetic_axis_r"].values, dtype=float)
+    r_geometric = np.asarray(equilibrium["geometric_axis_r"].values, dtype=float)
+    b0_eq = np.abs(bvac_rmag * r_axis / r_geometric)
+    data["b0"] = signal_on_grid(eq_time, b0_eq, timebase)
     data["power_ohm"] = _ohmic_power(
         summary_time,
         ip,
@@ -755,7 +767,10 @@ def _zero_d_dataset(
         equilibrium["vloop_dynamic"].values,
         timebase,
     )
-    data["power_nbi"] = interp1(summary_time, summary["power_nbi"].values, timebase)
+    data["power_radiated"] = smoothed_power(data["power_radiated"])
+    data["power_nbi"] = signal_on_grid(
+        summary_time, summary["power_nbi"].values, timebase
+    )
     # MAST has no ICRF or lower hybrid, zero where ip is valid
     data["power_ic"] = data["ip"] * 0.0
     data["power_lh"] = data["ip"] * 0.0
@@ -765,6 +780,34 @@ def _zero_d_dataset(
         coords={
             "time": ("idx", timebase),
             "shot": ("idx", np.repeat(shot, timebase.size)),
+        },
+    )
+
+
+def _equilibrium_0d_dataset(shot: int, equilibrium: xr.Dataset) -> xr.Dataset:
+    """Collect the 0D signals taken from the reconstruction on its own times, ready for snap_to_grid.
+
+    They are snapped with the GEQDSK block,
+    and DataWorkflow.make_unprocessed_data_files holds them from the last usable reconstruction
+    (EQUILIBRIUM_0D_SIGNALS).
+
+    Args:
+        shot: Shot number being read.
+        equilibrium: The store's equilibrium group.
+
+    Returns:
+        Dataset of the EQUILIBRIUM_SIGNALS on dim "idx", with "time" and "shot" coords.
+    """
+    eq_time = np.asarray(equilibrium["time"].values, dtype=float)
+    data = {
+        name: np.asarray(equilibrium[source].values, dtype=float)
+        for source, name in EQUILIBRIUM_SIGNALS.items()
+    }
+    return xr.Dataset(
+        data_vars={name: ("idx", values) for name, values in data.items()},
+        coords={
+            "time": ("idx", eq_time),
+            "shot": ("idx", np.repeat(shot, eq_time.size)),
         },
     )
 
@@ -939,10 +982,9 @@ def _thomson_dataset(
     ne uncertainties and the per-slice radial basis (ayc re-derives it every
     pulse, and it moves by up to ~2 cm over a shot).
 
-    A channel is kept only where the value and its error are both finite and
-    positive, since the fit needs both. Slices left with no usable channel at
-    all are dropped: some shots publish every other slice empty, radial basis
-    included (shot 30097, for one).
+    Only readings with a finite, positive value and error are kept,
+    and slices left with no usable channel at all are dropped (ts_channel_dataset):
+    some shots publish every other slice empty, radial basis included (shot 30097, for one).
 
     Args:
         shot: Shot number being read.
@@ -954,42 +996,20 @@ def _thomson_dataset(
         Dataset on dims ("idx", "ts_channel") with "time"/"shot" coords.
     """
     ts_time = np.asarray(thomson["time"].values, dtype=float)
-    in_shot = (ts_time >= timebase[0]) & (ts_time <= timebase[-1])
-    ts_time = ts_time[in_shot]
-
-    channel_data = {}
-    for source, name in (("te", "ts_channel_t_e"), ("ne", "ts_channel_n_e")):
-        values = _time_first(thomson[source])[in_shot]
-        errors = _time_first(thomson[f"{source}_error"])[in_shot]
-        with np.errstate(invalid="ignore"):
-            usable = (values > 0) & (errors > 0)
-        channel_data[name] = np.where(usable, values, np.nan)
-        channel_data[f"{name}_error"] = np.where(usable, errors, np.nan)
-
-    r_channel = _time_first(thomson["radius"])[in_shot]
-    has_data = np.isfinite(channel_data["ts_channel_t_e"]) | np.isfinite(
-        channel_data["ts_channel_n_e"]
-    )
-    keep = has_data.any(axis=1)
-    n_empty = int((~keep).sum())
-    if n_empty:
-        logger.debug(f"Shot {shot}: dropping {n_empty} empty Thomson slices")
-
-    return xr.Dataset(
-        data_vars={
-            "ts_channel_r": (("idx", "ts_channel"), r_channel[keep]),
-            "ts_channel_z": (
-                ("idx", "ts_channel"),
-                np.full(r_channel[keep].shape, TS_CHANNEL_Z),
-            ),
-            **{
-                name: (("idx", "ts_channel"), values[keep])
-                for name, values in channel_data.items()
-            },
-        },
-        coords={
-            "time": ("idx", ts_time[keep]),
-            "shot": ("idx", np.repeat(shot, int(keep.sum()))),
-            "ts_channel": np.arange(r_channel.shape[1]),
-        },
+    r_rows = _time_first(thomson["radius"])
+    z_rows = np.full(r_rows.shape, TS_CHANNEL_Z)
+    te_rows = _time_first(thomson["te"])
+    te_error_rows = _time_first(thomson["te_error"])
+    ne_rows = _time_first(thomson["ne"])
+    ne_error_rows = _time_first(thomson["ne_error"])
+    return ts_channel_dataset(
+        shot,
+        ts_time,
+        r_rows,
+        z_rows,
+        te=te_rows,
+        te_error=te_error_rows,
+        ne=ne_rows,
+        ne_error=ne_error_rows,
+        timebase=timebase,
     )
