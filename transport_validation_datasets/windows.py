@@ -46,11 +46,14 @@ def read_shotlist(
     """Read a shotlist file, with or without time windows.
 
     Two formats.
-    Plain: one shot number per line, anything else ignored, or a CSV with a
-    shot column and no window columns, other columns ignored.
-    Windowed: a CSV whose header holds shot, t_start and t_end [s], other
-    columns ignored; a shot appears on one row per window.
+    Plain: one shot number per line, blank lines and lines starting with # skipped,
+    or a CSV with a shot column and no window columns, other columns ignored.
+    Windowed: a CSV whose header holds shot, t_start and t_end [s], other columns ignored.
+    A shot appears on one row per window.
     The shot column may also be called pulse_no.
+    The header is read as plain comma-separated names,
+    so a quoted header, a byte order mark or another separator leaves the file plain,
+    where its lines are not shot numbers and the error names the first one.
 
     Args:
         path: The shotlist file.
@@ -65,19 +68,20 @@ def read_shotlist(
     labelled.
 
     Raises:
-        ValueError: If a windowed file has no shot column, a shot column
-            holds something that is not an integer, a window is not a
-            finite range with t_start < t_end, or two windows of one shot
-            have the same center.
+        ValueError: If a line is not a shot number (plain) or a row's shot
+            column is not an integer (CSV), a windowed file has no shot
+            column, a window is not a finite range with t_start < t_end,
+            two windows of one shot have the same center, or the file
+            holds no shot at all.
     """
     path = Path(path)
     with open(path, newline="") as f:
         header = [column.strip() for column in f.readline().split(",")]
         f.seek(0)
+        shot_column = next((c for c in SHOT_COLUMNS if c in header), None)
         if not all(column in header for column in WINDOW_COLUMNS):
-            shot_column = next((c for c in SHOT_COLUMNS if c in header), None)
             if shot_column is None:
-                plain = [int(line.strip()) for line in f if line.strip().isdigit()]
+                plain = _read_plain_shot_lines(f, path)
             else:
                 plain = []
                 for line_number, row in enumerate(csv.DictReader(f), start=2):
@@ -85,9 +89,10 @@ def read_shotlist(
                         plain.append(int(row[shot_column]))
                     except (TypeError, ValueError) as e:
                         raise ValueError(f"{path} line {line_number}: {e}") from e
+            if not plain:
+                raise ValueError(f"{path}: no shot in the shotlist")
             return list(dict.fromkeys(plain)), None
 
-        shot_column = next((c for c in SHOT_COLUMNS if c in header), None)
         if shot_column is None:
             raise ValueError(
                 f"{path}: a windowed shotlist needs a {' or '.join(SHOT_COLUMNS)} "
@@ -109,6 +114,8 @@ def read_shotlist(
                 )
             shots.append(shot)
             windows.setdefault(shot, []).append((t_start, t_end))
+    if not shots:
+        raise ValueError(f"{path}: no shot in the shotlist")
 
     for shot, shot_windows in windows.items():
         shot_windows.sort()
@@ -121,6 +128,35 @@ def read_shotlist(
                     f"would label the same grid time"
                 )
     return list(dict.fromkeys(shots)), windows
+
+
+def _read_plain_shot_lines(lines, path: Path) -> list[int]:
+    """Read one shot number per line, skipping blank lines and # comments.
+
+    Args:
+        lines: The open file.
+        path: Its path, for the message.
+
+    Returns:
+        The shot numbers in file order, repeats included.
+
+    Raises:
+        ValueError: If a line that is neither blank nor a comment is not an integer.
+    """
+    shots = []
+    for line_number, line in enumerate(lines, start=1):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        try:
+            shots.append(int(text))
+        except ValueError as e:
+            raise ValueError(
+                f"{path} line {line_number}: {text!r} is not a shot number. "
+                "A shotlist is one shot number per line, or a CSV with a shot "
+                "(or pulse_no) column and optional t_start and t_end columns."
+            ) from e
+    return shots
 
 
 def window_bounds(windows) -> np.ndarray:
