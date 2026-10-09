@@ -32,6 +32,7 @@ from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFit
 from transport_validation_datasets.machine.generic import (
     POWER_SMOOTHING_WINDOW,
     absent_heating_powers,
+    channel_fit_rows,
     channel_rows_at_times,
     cocos_from_signs,
     make_geqdsk_dataset,
@@ -42,7 +43,6 @@ from transport_validation_datasets.machine.generic import (
     smoothed_power,
     snap_to_grid,
     ts_channel_dataset,
-    ts_channel_fit_rows,
 )
 from transport_validation_datasets.store_schema import apply_signal_attrs
 from transport_validation_datasets.windows import read_shotlist
@@ -445,7 +445,7 @@ class MASTDataWorkflow(DataWorkflow):
             logger.warning(f"Shot {shot}: no Thomson slices to fit")
             return None
 
-        te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
+        te_y, te_err, ne_y, ne_err = channel_fit_rows(ds_shot, ts_times)
         # The read keeps only positive values with positive errors, see _thomson_dataset
         te_y, ne_y = drop_huge_error_readings(te_y, te_err, ne_y, ne_err, shot)
 

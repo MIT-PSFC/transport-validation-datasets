@@ -6,12 +6,14 @@ from disruption_py.core.physics_method.decorator import physics_method
 from disruption_py.core.physics_method.params import PhysicsMethodParams
 from disruption_py.inout.mds import mdsExceptions
 from disruption_py.machine.tokamak import Tokamak
-from disruption_py.settings import TimeSetting, TimeSettingParams
+from disruption_py.settings import TimeSettingParams
 
+from transport_validation_datasets.dispy_utils import (
+    UniformTimebaseSetting,
+    efit_geqdsk_dataset,
+    injected_power,
+)
 from transport_validation_datasets.machine.generic import (
-    cocos_from_signs,
-    injected_power_on_grid,
-    make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     normalized_beta,
     orient_signal,
@@ -33,25 +35,25 @@ TS_PAIR_MAX_OFFSET = 1e-3
 TWOPI_DIODE_CALIBRATION = 4.5
 
 
-class UniformTimeSetting(TimeSetting):
+class UniformTimeSetting(UniformTimebaseSetting):
     """1 kHz uniform timebase up to the maximum time in the EFIT tree.
 
     The EFIT trees read here (EFIT21, ANALYSIS) keep their times in seconds.
     """
 
-    def _get_times(self, params: TimeSettingParams) -> np.ndarray:
-        """Build the shot's 1 kHz timebase from the EFIT tree's own time range.
+    def efit_end_time(self, params: TimeSettingParams) -> float:
+        """Read the last time of the EFIT tree.
 
         Args:
             params: Parameters needed to retrieve the timebase.
 
         Returns:
-            Times from 0 to the last EFIT time in 1 ms steps [s].
+            The end time [s].
         """
         (efit_time,) = params.mds_conn.get_dims(
             r"\efit_aeqdsk:ali", tree_name="_efit_tree"
         )
-        return make_uniform_1kHz_timebase(float(np.max(efit_time)))
+        return float(np.max(efit_time))
 
 
 def _aeqdsk_node(params: PhysicsMethodParams, expression: str) -> np.ndarray:
@@ -209,31 +211,6 @@ class CmodPlasmaMethods:
         return {"tci_nl_04": nl_04_on_grid}
 
 
-def _injected_power(
-    params: PhysicsMethodParams, node: str, tree_name: str
-) -> np.ndarray:
-    """An injected heating power record on the timebase (injected_power_on_grid), in the record's units.
-
-    0 when the shot has no record, that heating system did not run.
-
-    Args:
-        params: disruption-py physics method parameters for the shot.
-        node: MDSplus node of the power record.
-        tree_name: Tree holding it.
-
-    Returns:
-        (n_t,) the power on params.times.
-    """
-    try:
-        power, power_time = params.mds_conn.get_data_with_dims(
-            node, tree_name=tree_name
-        )
-    except mdsExceptions.MdsException:
-        params.logger.debug("no {node} record, taking 0", node=node)
-        return np.zeros(len(params.times))
-    return injected_power_on_grid(power_time, power, params.times)
-
-
 class CmodPowerMethods:
     """C-Mod power retrievals that replace the disruption-py built-ins.
 
@@ -268,7 +245,7 @@ class CmodPowerMethods:
     def get_heating_powers(params: PhysicsMethodParams):
         r"""ICRF net power (\rf_power_net, MW) and lower hybrid net power (LH \top.results:netpow, kW).
 
-        Each is 0 outside its record and on a shot without the system (_injected_power).
+        Each is 0 outside its record and on a shot without the system (dispy_utils.injected_power).
 
         Args:
             params: disruption-py physics method parameters for the shot.
@@ -276,29 +253,11 @@ class CmodPowerMethods:
         Returns:
             Dict with p_icrf and p_lh [W] on the requested timebase.
         """
-        p_icrf_mw = _injected_power(params, r"\rf_power_net", "rf")
-        p_lh_kw = _injected_power(params, r"\top.results:netpow", "lh")
+        p_icrf_mw = injected_power(params, r"\rf_power_net", "rf")
+        p_lh_kw = injected_power(params, r"\top.results:netpow", "lh")
         p_icrf = p_icrf_mw * 1e6
         p_lh = p_lh_kw * 1e3
         return {"p_icrf": p_icrf, "p_lh": p_lh}
-
-
-def _nan_contour_padding(
-    r_contour: np.ndarray, z_contour: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Turn the (0, 0) points EFIT pads a contour with into NaN.
-
-    Args:
-        r_contour: (..., n_points) contour major radii [m].
-        z_contour: (..., n_points) contour heights [m].
-
-    Returns:
-        The two arrays as float with the padding NaN.
-    """
-    r_contour = np.asarray(r_contour, dtype=float)
-    z_contour = np.asarray(z_contour, dtype=float)
-    padding = (r_contour == 0.0) & (z_contour == 0.0)
-    return np.where(padding, np.nan, r_contour), np.where(padding, np.nan, z_contour)
 
 
 class CmodEfitMethods:
@@ -377,33 +336,9 @@ class CmodEfitMethods:
             params.logger.opt(exception=True).debug(e)
 
         geqdsk_data = orient_signal(geqdsk_data, efit_time)
-        # EFIT pads the contours with zeros to a fixed length, the stores pad with NaN
-        geqdsk_data["rbdry"], geqdsk_data["zbdry"] = _nan_contour_padding(
-            geqdsk_data["rbdry"], geqdsk_data["zbdry"]
-        )
-        if rlim is not None:
-            rlim, zlim = _nan_contour_padding(rlim, zlim)
-
-        cocos_input = cocos_from_signs(
-            geqdsk_data["current"],
-            geqdsk_data["bcentr"],
-            geqdsk_data["simagx"],
-            geqdsk_data["sibdry"],
-            geqdsk_data["qpsi"],
-            params.logger,
-        )
-
         # geqdsk_cols keys are the make_geqdsk_dataset argument names
-        ds_geqdsk = make_geqdsk_dataset(
-            shot_id=params.shot_id,
-            times=efit_time,
-            r_grid=r_grid,
-            z_grid=z_grid,
-            cocos_input=cocos_input,
-            rcentr=rcentr,
-            rlim=rlim,
-            zlim=zlim,
-            **geqdsk_data,
+        ds_geqdsk = efit_geqdsk_dataset(
+            params, efit_time, r_grid, z_grid, rcentr, geqdsk_data, rlim, zlim
         )
 
         # Snap onto requested timebase without interpolation

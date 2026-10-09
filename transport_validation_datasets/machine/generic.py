@@ -452,6 +452,37 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     )
 
 
+def snap_signals_to_grid(
+    shot: int,
+    source_times: np.ndarray,
+    signals: dict[str, np.ndarray],
+    grid_times: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Snap 0D signals sharing one clock onto the grid (snap_to_grid), for those taken from a reconstruction.
+
+    Each lands on the grid time its reconstruction does, NaN between,
+    so DataWorkflow.add_equilibrium_signals can hold it from the last usable reconstruction.
+
+    Args:
+        shot: Shot number.
+        source_times: (n_source,) times of the samples [s].
+        signals: (n_source,) values per signal name.
+        grid_times: Uniform timebase to snap onto [s].
+
+    Returns:
+        (n_grid,) values per signal name.
+    """
+    ds_source = xr.Dataset(
+        data_vars={name: ("idx", values) for name, values in signals.items()},
+        coords={
+            "time": ("idx", source_times),
+            "shot": ("idx", np.repeat(shot, source_times.size)),
+        },
+    )
+    ds_on_grid = snap_to_grid(ds_source, grid_times)
+    return {name: ds_on_grid[name].values for name in signals}
+
+
 def ts_channel_dataset(
     shot: int,
     ts_time: np.ndarray,
@@ -590,7 +621,10 @@ def hold_onto_grid(
 
 
 def signal_on_grid(
-    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray
+    source_times: np.ndarray,
+    values: np.ndarray,
+    grid: np.ndarray,
+    hold_floor: float = 0.0,
 ) -> np.ndarray:
     """Place a 0D signal on the grid causally, so no grid value draws on a later sample.
 
@@ -605,6 +639,7 @@ def signal_on_grid(
         source_times: (n_source,) ascending sample times of the source [s].
         values: (n_source,) the signal at those times, NaN where missing.
         grid: The shot's 1 kHz timebase [s].
+        hold_floor: A slower source holds at least this long [s], for a record that often skips samples.
 
     Returns:
         (n_grid,) the signal on the grid, NaN where it has no value.
@@ -623,26 +658,27 @@ def signal_on_grid(
         return _window_mean_on_grid(
             times_finite, values_finite, grid_float64, grid_step
         )
-    return _held_on_grid(times_finite, values_finite, grid_float64)
+    return _held_on_grid(times_finite, values_finite, grid_float64, hold_floor)
 
 
 def _held_on_grid(
-    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray
+    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray, hold_floor: float
 ) -> np.ndarray:
     """Each grid time takes the last sample at or before it (hold_onto_grid).
 
-    A sample is held for at most MAX_HOLD_PERIODS of the median sample spacing,
+    A sample is held for at most MAX_HOLD_PERIODS of the median sample spacing, or hold_floor when that is longer,
     so a longer gap in the source stays NaN.
 
     Args:
         source_times: (n_source,) ascending finite sample times [s], at least two.
         values: (n_source,) the samples.
         grid: (n_grid,) the timebase [s].
+        hold_floor: The hold reaches at least this far [s].
 
     Returns:
         (n_grid,) the held signal, NaN where nothing is held.
     """
-    sample_index, _ = hold_onto_grid(grid, source_times)
+    sample_index, _ = hold_onto_grid(grid, source_times, hold_floor=hold_floor)
     mask_held = sample_index >= 0
     values_held = np.full(grid.size, np.nan)
     values_held[mask_held] = values[sample_index[mask_held]]
@@ -1522,13 +1558,12 @@ def map_ts_channels_to_rho_tor_norm(
     z_grid = ds_shot["z_grid"].values
 
     eq_index = nearest_usable_reconstructions(ds_shot, ts_times)
-    rho_tor_norm = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
+    psi_n_rows = np.full((ts_idxs.size, ts_r.shape[1]), np.nan)
     for i, ts_idx in enumerate(ts_idxs):
         eq_idx = int(eq_index[i])
         if eq_idx < 0:
             continue
         psi_range = sibdry[eq_idx] - simagx[eq_idx]
-        qpsi_slice = qpsi[eq_idx]
         psi_n_grid = (psirz[eq_idx] - simagx[eq_idx]) / psi_range
 
         # Channel psi_n at the measured (R, Z)
@@ -1543,16 +1578,43 @@ def map_ts_channels_to_rho_tor_norm(
             channel_positions, psi_n_ch, rbdry[eq_idx], zbdry[eq_idx]
         )
         psi_n_ch[private_flux] = np.nan
-        rho_tor_norm[i, :] = rho_tor_norm_from_psi_n(
-            psi_n_ch, qpsi_slice, sol_extension
-        )
+        psi_n_rows[i, :] = psi_n_ch
 
+    rho_tor_norm = rho_tor_norm_rows(psi_n_rows, eq_index, qpsi, sol_extension)
     n_no_equilibrium = int((eq_index < 0).sum())
     if n_no_equilibrium:
         logger.debug(
             f"No usable equilibrium at {n_no_equilibrium} of {ts_idxs.size} TS slices"
         )
     return ts_times, rho_tor_norm
+
+
+def rho_tor_norm_rows(
+    psi_n_rows: np.ndarray,
+    eq_index: np.ndarray,
+    qpsi: np.ndarray,
+    sol_extension: str,
+) -> np.ndarray:
+    """Map rows of psi_N onto rho_tor_norm, each through the q profile of its own reconstruction.
+
+    Args:
+        psi_n_rows: (n_rows, n_points) psi_N of each profile sample, NaN where unknown.
+        eq_index: (n_rows,) index of each row's reconstruction along qpsi's time axis,
+            -1 for none (nearest_usable_reconstructions).
+        qpsi: (n_t, n_psi) q profiles on the GEQDSK psi_N grid.
+        sol_extension: How Phi_N continues outside the LCFS, one of SOL_EXTENSIONS.
+
+    Returns:
+        (n_rows, n_points) rho_tor_norm, NaN where psi_N is and in the rows with no reconstruction.
+    """
+    rho_tor_norm = np.full(psi_n_rows.shape, np.nan)
+    for i_row, i_eq in enumerate(eq_index):
+        if i_eq < 0:
+            continue
+        rho_tor_norm[i_row] = rho_tor_norm_from_psi_n(
+            psi_n_rows[i_row], qpsi[i_eq], sol_extension
+        )
+    return rho_tor_norm
 
 
 def _distance_to_contour(points: np.ndarray, contour: np.ndarray) -> np.ndarray:
@@ -1681,38 +1743,41 @@ def nearest_in_reach(
     return nearest_index
 
 
-def channel_rows_at_times(data: xr.DataArray, ts_times: np.ndarray) -> np.ndarray:
-    """Take the rows of a (time, ts_channel) variable at the TS slice times.
+def channel_rows_at_times(data: xr.DataArray, times: np.ndarray) -> np.ndarray:
+    """Take the rows of a (time, channel) variable at the given grid times.
 
     Args:
-        data: Channel variable carrying a "time" coordinate.
-        ts_times: TS slice times [s], as returned by map_ts_channels_to_rho_tor_norm.
+        data: Variable on "time" and one channel dimension (ts_channel, ida_point), carrying a "time" coordinate.
+        times: Grid times [s], e.g. the TS slice times of map_ts_channels_to_rho_tor_norm.
 
     Returns:
         The (n_t, n_ch) rows at those times.
     """
-    values = data.transpose("time", "ts_channel").values
-    return values[np.isin(data["time"].values, ts_times)]
+    channel_dims = [dim for dim in data.dims if dim != "time"]
+    values = data.transpose("time", *channel_dims).values
+    return values[np.isin(data["time"].values, times)]
 
 
-def ts_channel_fit_rows(
-    ds_shot: xr.Dataset, ts_times: np.ndarray
+def channel_fit_rows(
+    ds_shot: xr.Dataset, times: np.ndarray, prefix: str = "ts_channel"
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Read the TS channel rows at the slice times, converted to the fit units.
+    """Read the profile readings at the given times, converted to the fit units.
 
     The unprocessed files are SI (Te [eV], ne [m^-3]),
     the fits and every device's cleaning threshold are calibrated in Te [keV] and ne [1e20 m^-3].
 
     Args:
         ds_shot: One shot's unprocessed dataset, shot dim squeezed out.
-        ts_times: TS slice times [s].
+        times: Grid times of the profile samples [s].
+        prefix: Name prefix of the reading variables, f"{prefix}_t_e" and so on.
+            The Thomson channels by default, DIII-D's IDA points are "ida".
 
     Returns:
         (te_y, te_err, ne_y, ne_err), each (n_t, n_ch) in the fit units.
     """
     rows = {
         name: np.asarray(
-            channel_rows_at_times(ds_shot[f"ts_channel_{name}"], ts_times), float
+            channel_rows_at_times(ds_shot[f"{prefix}_{name}"], times), float
         )
         for name in ("t_e", "t_e_error", "n_e", "n_e_error")
     }

@@ -237,6 +237,7 @@ class DataWorkflow(ABC):
     4. publish_dataset:
       derive the published copy of the internal store, with
       published_strip_signals stripped out.
+      A device whose data has no release permission (publishable False) stops at stage 3.
 
     Each stage resumes from what is already on disk, except the last two,
     which always rebuild their store. A device subclass supplies the source
@@ -361,6 +362,18 @@ class DataWorkflow(ABC):
     fit_scale_per_slice = True
     fit_bounds = default_fit_bounds()
 
+    # The fit methods (gp_fitting.registry) this device's profiles may be fit with, the first the default.
+    # Any other method is refused, so a device-specific one like ida never runs on another device.
+    fit_methods: tuple[str, ...] = ("zk", "akho")
+
+    # False holds the device at its internal store, for data there is no permission to release:
+    # publish_dataset and export_to_imas refuse it.
+    publishable = True
+
+    # True when the staged readings are already a fitted profile (DIII-D IDA),
+    # so the screens for raw Thomson readings (cleaning.clean_fit_rows) are skipped.
+    prefit_profiles = False
+
     def __init__(
         self,
         ds_name: str,
@@ -368,7 +381,7 @@ class DataWorkflow(ABC):
         shotlist_file: Path | None = None,
         max_num_shots: int | None = None,
         average_windows: bool = False,
-        fit_method: str = "zk",
+        fit_method: str | None = None,
         cluster_config: ClusterFitConfig | None = None,
         prepare_workers: int | None = None,
         settings: DeviceSettings | None = None,
@@ -388,8 +401,9 @@ class DataWorkflow(ABC):
             average_windows: Pool every Thomson point inside a time window
                 and fit each window as one profile, instead of fitting the
                 Thomson samples inside it one by one. Needs a shotlist with windows.
-            fit_method: GP fitting method name (see gp_fitting.registry). Names the
-                fit result and fit plot subdirectories, and the cluster job's worker.
+            fit_method: GP fitting method name (see gp_fitting.registry), one of the device's fit_methods.
+                Names the fit result and fit plot subdirectories, and the cluster job's worker.
+                None takes the first of fit_methods.
             cluster_config: If provided, GP profile fitting is dispatched to a SLURM
                 cluster (see gp_fitting/dispatcher.py).
                 If None, fitting runs serially in this process (registry.run_batch_file).
@@ -401,8 +415,16 @@ class DataWorkflow(ABC):
 
         Raises:
             TypeError: If settings is not an instance of the device's settings_cls.
-            ValueError: If average_windows is set without a windowed shotlist.
+            ValueError: If fit_method is not one of the device's fit_methods,
+                or average_windows is set without a windowed shotlist or on a prefit_profiles device.
         """
+        if fit_method is None:
+            fit_method = self.fit_methods[0]
+        if fit_method not in self.fit_methods:
+            raise ValueError(
+                f"{type(self).__name__} is fit with {list(self.fit_methods)}, "
+                f"not '{fit_method}'"
+            )
         self.ds_name = ds_name
         self.data_assembly_dir = data_assembly_dir / self.ds_name
 
@@ -480,8 +502,12 @@ class DataWorkflow(ABC):
 
         if average_windows and self.shot_windows is None:
             raise ValueError(
-                "average_windows needs a shotlist with time windows (a CSV with t_start and t_end columns),"
+                "average_windows needs a shotlist with time windows (a CSV with t_start and t_end columns), "
                 "there is nothing to average over without them"
+            )
+        if average_windows and self.prefit_profiles:
+            raise ValueError(
+                f"{type(self).__name__} stages fitted profiles, which cannot be pooled over a window"
             )
         if self.shot_windows is None:
             self.fit_mode = FIT_MODE_SAMPLE
@@ -1200,7 +1226,8 @@ class DataWorkflow(ABC):
         and run_gp_fitting refuses the whole staging directory when any of it
         disagrees with this run (_check_staged_batches),
         so an edited shotlist never quietly reuses fits made for other windows.
-        Every shot's per-sample rows go through cleaning.clean_fit_rows before any window pools them,
+        Every shot's per-sample rows go through cleaning.clean_fit_rows before any window pools them
+        (skipped for prefit_profiles, which are not raw readings),
         and its staged rows through cleaning.drop_rows_without_core after.
         A shot whose prepare_fit_input returns None or nothing fittable, or that cleaning leaves nothing fittable,
         is recorded as failed and skipped on later runs.
@@ -1236,7 +1263,8 @@ class DataWorkflow(ABC):
                     self.record_failed_fit(shot, "No fittable Thomson channel data.")
                     continue
                 # Per sample, before any window pools the samples, see cleaning.py
-                fit_input = clean_fit_rows(fit_input, shot)
+                if not self.prefit_profiles:
+                    fit_input = clean_fit_rows(fit_input, shot)
                 if not fit_input.has_fittable_points():
                     self.record_failed_fit(
                         shot, "No fittable Thomson channel data after cleaning."
@@ -1507,6 +1535,7 @@ class DataWorkflow(ABC):
                     batch_x_star,
                     hyp_names,
                     worker.FIT_DESCRIPTION,
+                    getattr(worker, "GRADIENT_ERROR_DESCRIPTION", None),
                     si.windows,
                     si.window_index,
                 )
@@ -1529,6 +1558,7 @@ class DataWorkflow(ABC):
         x_star: np.ndarray,
         hyp_names: list[str] | None,
         fit_description: str,
+        gradient_error_description: str | None,
         windows: np.ndarray,
         window_index: np.ndarray,
     ) -> xr.Dataset:
@@ -1549,6 +1579,9 @@ class DataWorkflow(ABC):
             hyp_names: Names of the method's hyperparameters, None if it has none.
             fit_description: The method's own name for its fit (its worker's FIT_DESCRIPTION),
                 added to every profile's description.
+            gradient_error_description: The worker's own description of its gradient error
+                (GRADIENT_ERROR_DESCRIPTION), a template on the profile name,
+                None for a GP fit's own uncertainty.
             windows: (n_w, 2) time windows the shot was staged with [s].
             window_index: (n_t,) window of each row, -1 without windows.
 
@@ -1586,11 +1619,14 @@ class DataWorkflow(ABC):
                 )
                 fit_rows = getattr(so, f"{var}_{suffix}")
                 profile = fit_rows[None, :, stored] * si_factor
+                description = f"{extra}GP-fitted {desc} profile ({fit_description})"
+                if suffix == "grad_std" and gradient_error_description is not None:
+                    description = gradient_error_description.format(desc=desc)
                 data_vars[f"{name}{out_suffix}"] = (
                     ("shot", TIME_DIM, "rho_tor_norm"),
                     profile.astype(np.float32),
                     {
-                        "description": f"{extra}GP-fitted {desc} profile ({fit_description})",
+                        "description": description,
                         "units": grad_unit,
                     },
                 )
@@ -1611,7 +1647,7 @@ class DataWorkflow(ABC):
         time_description = (
             "Time window centers"
             if self.fit_mode == FIT_MODE_WINDOW_AVERAGE
-            else "Thomson slice times"
+            else "Profile slice times (Thomson, IDA on DIII-D)"
         )
         coords = {
             "shot": [shot],
@@ -1858,8 +1894,10 @@ class DataWorkflow(ABC):
             stores_dir/<ds_name>_published.zarr.
 
         Raises:
-            ValueError: If there is no internal store to derive from.
+            ValueError: If the device is not publishable,
+                or there is no internal store to derive from.
         """
+        self._check_publishable("publishing")
         internal_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
         published_path = self.stores_dir / f"{self.ds_name}_published.zarr"
         if not internal_path.exists():
@@ -1899,6 +1937,21 @@ class DataWorkflow(ABC):
             f"{len(ds_published.data_vars)} variables, {len(stripped)} stripped"
         )
         return published_path
+
+    def _check_publishable(self, stage: str):
+        """Refuse a stage that releases data for a device whose data stays internal.
+
+        Args:
+            stage: The refused stage, for the message.
+
+        Raises:
+            ValueError: If the device is not publishable.
+        """
+        if not self.publishable:
+            raise ValueError(
+                f"{type(self).__name__} data has no release permission, "
+                f"its datasets stop at the internal store, so {stage} is refused"
+            )
 
     def _internal_dataset_shots(self) -> list[int]:
         """List the shots that can go into the internal dataset.
@@ -1940,10 +1993,12 @@ class DataWorkflow(ABC):
 
         `core_profiles` here carries electrons + a single hydrogenic main ion
         only (Zeff=1, n_D=n_e).
+        A device that is not publishable is refused (_check_publishable).
 
         Args:
             overwrite: Rewrite a shot's IMAS output even if it already exists.
         """
+        self._check_publishable("the IMAS export")
         from transport_validation_datasets.imas_export.scenario_export import (
             build_imas_from_shot,
             write_ids,
@@ -2372,7 +2427,7 @@ class DataWorkflow(ABC):
 
         Args:
             grid: The shot's 1 kHz timebase [s].
-            fresh_profile: Grid times carrying a Thomson slice of their own,
+            fresh_profile: Grid times carrying a profile slice of their own,
                 or the window centers of a window-averaged shot.
             fresh_equilibrium: Grid times carrying a usable reconstruction of their own (usable_reconstructions).
             fit_mode: How the profiles were fit, one of the FIT_MODE_* values.
@@ -2394,7 +2449,7 @@ class DataWorkflow(ABC):
             "1 at the center grid time of each averaging window, 0 across the rest "
             "of the window, which holds the same window-averaged profile"
             if fit_mode == FIT_MODE_WINDOW_AVERAGE
-            else held.format("Thomson slice")
+            else held.format("profile slice (a Thomson slice, an IDA slice on DIII-D)")
         )
         return xr.Dataset(
             {

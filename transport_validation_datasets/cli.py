@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 import fire
+from loguru import logger
 
 # Dataset creation plots every shot and normally runs headless
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -16,13 +17,11 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 STAGES = ("unprocessed", "fit", "stack", "publish", "export", "all")
 
 # The subcommands below, and the device tables a config file may hold.
-DEVICES = ("cmod", "mast")
-
-DEFAULT_METHOD = "zk"
+DEVICES = ("cmod", "mast", "tcv", "d3d")
 
 
 class DatasetCLI:
-    """Build the dataset of one device: cmod, or mast.
+    """Build the dataset of one device: cmod, mast, tcv, or d3d.
 
         python -m transport_validation_datasets.cli mast /path/to/data_assembly_dir
 
@@ -30,9 +29,13 @@ class DatasetCLI:
 
         unprocessed: pull the source data, filter it, one netCDF per shot
         fit:         GP fit the Thomson profiles of every unprocessed shot
+                     (DIII-D carries its IDA fits onto the fit grid instead)
         stack:       combine both into the internal Zarr store
         publish:     derive the published store from the internal one, with
                      the device's published_strip_signals stripped out
+
+    TCV and DIII-D data has no release permission, so those two stop at the internal store:
+    --stage all leaves publishing out, and --stage publish or export refuse them.
 
     Every stage resumes: work already on disk is skipped, so a killed run is
     restarted by running the same command again. Stack and publish are the
@@ -43,7 +46,7 @@ class DatasetCLI:
     Configuration. The cluster and the device settings live in TOML files
     passed through --config, comma separated and layered (a later file
     overrides an earlier one key by key, see config.py). The [cluster] table
-    dispatches the fit stage to a SLURM cluster, the [cmod] or [mast] table
+    dispatches the fit stage to a SLURM cluster, the [cmod], [mast], [tcv] or [d3d] table
     sets that device's workflow settings, e.g. turning on C-Mod's fallback
     to the ANALYSIS tree for shots EFIT21 fails on (the default reads EFIT21 only):
 
@@ -98,7 +101,7 @@ class DatasetCLI:
         max_num_shots: int | None = None,
         average_windows: bool = False,
         stage: str = "all",
-        method: str = DEFAULT_METHOD,
+        method: str | None = None,
         clean_fit_state: bool = False,
         skip_fit_plots: bool = False,
         max_fit_pages: int | None = None,
@@ -119,7 +122,7 @@ class DatasetCLI:
             average_windows: Pool the Thomson points of each time window into
                 one fit per window. Needs a shotlist with windows.
             stage: Which stage to run, one of STAGES.
-            method: GP fitting method (see gp_fitting.registry).
+            method: GP fitting method (see gp_fitting.registry), None takes zk.
             clean_fit_state: Before fitting, cancel this dataset's queued
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
@@ -162,7 +165,7 @@ class DatasetCLI:
         max_num_shots: int | None = None,
         average_windows: bool = False,
         stage: str = "all",
-        method: str = DEFAULT_METHOD,
+        method: str | None = None,
         clean_fit_state: bool = False,
         skip_fit_plots: bool = False,
         max_fit_pages: int | None = None,
@@ -184,7 +187,7 @@ class DatasetCLI:
             average_windows: Pool the Thomson points of each time window into
                 one fit per window. Needs a shotlist with windows.
             stage: Which stage to run, one of STAGES.
-            method: GP fitting method (see gp_fitting.registry).
+            method: GP fitting method (see gp_fitting.registry), None takes zk.
             clean_fit_state: Before fitting, cancel this dataset's queued
                 cluster jobs and delete every staged batch, so the fit starts
                 from scratch. Destructive: fits already computed are lost.
@@ -222,6 +225,133 @@ class DatasetCLI:
             prepare_workers=prepare_workers,
         )
 
+    def tcv(
+        self,
+        data_assembly_dir: Path | str,
+        ds_name: str = "tcv",
+        shotlist_file: Path | str | None = None,
+        max_num_shots: int | None = None,
+        average_windows: bool = False,
+        stage: str = "all",
+        method: str | None = None,
+        clean_fit_state: bool = False,
+        skip_fit_plots: bool = False,
+        max_fit_pages: int | None = None,
+        mb_per_chunk: int = 50,
+        config: Path | str | None = None,
+    ):
+        """Build the TCV dataset, sourced from the DEFUSE exports and the LIUQE MEQ databases.
+
+        Internal only: the dataset stops at the internal store, see DatasetCLI.
+
+        Args:
+            data_assembly_dir: Directory holding the intermediate files, plots,
+                logs, and datasets.
+            ds_name: Dataset name, used in paths and cluster job names.
+            shotlist_file: File with one shot number per line, or a CSV with
+                shot, t_start and t_end columns for time windows.
+                None takes every shot with both a DEFUSE export and a MEQ database.
+            max_num_shots: Stop once this many shots have unprocessed data
+                files. None processes the whole shotlist.
+            average_windows: Pool the Thomson points of each time window into
+                one fit per window. Needs a shotlist with windows.
+            stage: Which stage to run, one of STAGES.
+            method: GP fitting method (see gp_fitting.registry), None takes zk.
+            clean_fit_state: Before fitting, cancel this dataset's queued
+                cluster jobs and delete every staged batch, so the fit starts
+                from scratch. Destructive: fits already computed are lost.
+                Unprocessed data files are kept.
+            skip_fit_plots: Leave out the fit stage's per-shot PDFs, about a minute per shot.
+                A later fit stage without it plots the shots that have no PDF yet.
+            max_fit_pages: Most pages of a shot's fit PDF. None plots every slice.
+            mb_per_chunk: Target size of each variable's chunks in the internal
+                Zarr store, which is chunked along the shot dimension.
+            config: TOML file(s), comma separated, with the [cluster] table
+                and the [tcv] settings table (see config.py, TCVSettings).
+                None fits locally with the default settings.
+        """
+        from transport_validation_datasets.machine.tcv.tcv_dataset import (
+            TCVDataWorkflow,
+        )
+
+        _run_device(
+            TCVDataWorkflow,
+            "tcv",
+            config=config,
+            stage=stage,
+            clean_fit_state=clean_fit_state,
+            skip_fit_plots=skip_fit_plots,
+            max_fit_pages=max_fit_pages,
+            mb_per_chunk=mb_per_chunk,
+            ds_name=ds_name,
+            data_assembly_dir=Path(data_assembly_dir),
+            shotlist_file=shotlist_file,
+            max_num_shots=max_num_shots,
+            average_windows=average_windows,
+            fit_method=method,
+        )
+
+    def d3d(
+        self,
+        data_assembly_dir: Path | str,
+        ds_name: str = "d3d",
+        shotlist_file: Path | str | None = None,
+        max_num_shots: int | None = None,
+        stage: str = "all",
+        method: str | None = None,
+        clean_fit_state: bool = False,
+        skip_fit_plots: bool = False,
+        max_fit_pages: int | None = None,
+        mb_per_chunk: int = 50,
+        config: Path | str | None = None,
+    ):
+        """Build the DIII-D dataset, sourced from MDSplus through disruption-py and the IDA databases.
+
+        Internal only: the dataset stops at the internal store, see DatasetCLI.
+        The profiles are IDA's own GP fits, carried onto the fit grid by the ida method,
+        so the fit stage runs locally in seconds and window averaging is not offered.
+
+        Args:
+            data_assembly_dir: Directory holding the intermediate files, plots,
+                logs, and datasets.
+            ds_name: Dataset name, used in paths.
+            shotlist_file: File with one shot number per line, or a CSV with
+                shot, t_start and t_end columns for time windows.
+                None takes every shot an IDA database of the [d3d] settings serves.
+            max_num_shots: Stop once this many shots have unprocessed data
+                files. None processes the whole shotlist.
+            stage: Which stage to run, one of STAGES.
+            method: Fit method, None takes ida, the only one that serves DIII-D (DataWorkflow.fit_methods).
+            clean_fit_state: Before fitting, delete every staged batch, so the fit starts from scratch.
+                Unprocessed data files are kept.
+            skip_fit_plots: Leave out the fit stage's per-shot PDFs.
+                A later fit stage without it plots the shots that have no PDF yet.
+            max_fit_pages: Most pages of a shot's fit PDF. None plots every slice.
+            mb_per_chunk: Target size of each variable's chunks in the internal
+                Zarr store, which is chunked along the shot dimension.
+            config: TOML file(s), comma separated, with the [d3d] settings table
+                (see config.py, D3DSettings). None takes the default settings.
+        """
+        from transport_validation_datasets.machine.d3d.d3d_dataset import (
+            D3DDataWorkflow,
+        )
+
+        _run_device(
+            D3DDataWorkflow,
+            "d3d",
+            config=config,
+            stage=stage,
+            clean_fit_state=clean_fit_state,
+            skip_fit_plots=skip_fit_plots,
+            max_fit_pages=max_fit_pages,
+            mb_per_chunk=mb_per_chunk,
+            ds_name=ds_name,
+            data_assembly_dir=Path(data_assembly_dir),
+            shotlist_file=shotlist_file,
+            max_num_shots=max_num_shots,
+            fit_method=method,
+        )
+
 
 def _run_device(
     workflow_cls,
@@ -238,6 +368,8 @@ def _run_device(
     """Build one device's workflow from its run configuration, then run the requested stages.
 
     The stage is checked first, building the workflow can query the device's shotlist.
+    --stage all leaves publishing out for a device that is not publishable,
+    an explicit --stage publish lets the workflow refuse it.
 
     Args:
         workflow_cls: The device's DataWorkflow subclass.
@@ -272,7 +404,11 @@ def _run_device(
         workflow.run_gp_fitting(max_pages=max_fit_pages, skip_plots=skip_fit_plots)
     if stage in ("stack", "all"):
         workflow.stack_internal_dataset(mb_per_chunk=mb_per_chunk)
-    if stage in ("publish", "all"):
+    if stage == "all" and not workflow.publishable:
+        logger.info(
+            f"{type(workflow).__name__} data stays internal, leaving publishing out"
+        )
+    elif stage in ("publish", "all"):
         workflow.publish_dataset()
     # Not part of "all": it needs the optional imas extra (see DataWorkflow.export_to_imas)
     if stage == "export":

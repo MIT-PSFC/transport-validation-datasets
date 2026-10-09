@@ -192,10 +192,15 @@ def plot_unprocessed_data(
     ax_ne.set_ylabel("n_e [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_ne.set_ylim(_signal_ylim(ne_signals))
 
-    # Dots at 0 for the times a Thomson sample is measured.
-    # No ts_channel dim means the retrieval failed and the column is all NaN.
-    if "ts_channel_n_e" in ds and "ts_channel" in ds["ts_channel_n_e"].dims:
-        mask_profile = ds["ts_channel_n_e"].notnull().any(dim="ts_channel")
+    # Dots at 0 for the times a profile is measured, a Thomson sample or a DIII-D IDA slice.
+    # No channel dim means the retrieval failed and the column is all NaN.
+    for reading, channel_dim in (
+        ("ts_channel_n_e", "ts_channel"),
+        ("ida_n_e", "ida_point"),
+    ):
+        if reading not in ds or channel_dim not in ds[reading].dims:
+            continue
+        mask_profile = ds[reading].notnull().any(dim=channel_dim)
         ax_ne.plot(
             time,
             np.where(mask_profile, 0, np.nan),

@@ -15,7 +15,11 @@ from transport_validation_datasets.cleaning import (
     drop_in_both,
     relative_dips,
 )
-from transport_validation_datasets.dispy_utils import passive_log_settings, summary
+from transport_validation_datasets.dispy_utils import (
+    empty_result,
+    passive_log_settings,
+    summary,
+)
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.cmod.dispy_methods import (
     CmodAeqdskMethods,
@@ -28,10 +32,10 @@ from transport_validation_datasets.machine.cmod.dispy_methods import (
 from transport_validation_datasets.machine.generic import (
     POWER_SMOOTHING_WINDOW,
     absent_heating_powers,
+    channel_fit_rows,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
     snap_to_grid,
-    ts_channel_fit_rows,
     values_held_from_usable,
 )
 from transport_validation_datasets.store_schema import apply_signal_attrs
@@ -383,7 +387,7 @@ class CModDataWorkflow(DataWorkflow):
             return None
 
         ds_shot = ds.squeeze("shot", drop=True)
-        te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
+        te_y, te_err, ne_y, ne_err = channel_fit_rows(ds_shot, ts_times)
         # Before the raw validity below, so drop_in_both never takes the sound ne of a faulty Te channel
         te_faulty = _te_faulty_channels(ds_shot)
         te_y[:, te_faulty] = np.nan
@@ -489,7 +493,7 @@ class CModDataWorkflow(DataWorkflow):
                 ds, self.settings.sol_extension
             )
             ds_shot = ds.squeeze("shot", drop=True)
-            te_y, te_err, _, _ = ts_channel_fit_rows(ds_shot, ts_times)
+            te_y, te_err, _, _ = channel_fit_rows(ds_shot, ts_times)
             te_faulty = _te_faulty_channels(ds_shot)
         return (
             ts_times,
@@ -515,19 +519,6 @@ def _te_faulty_channels(ds_shot: xr.Dataset) -> np.ndarray:
     ts_array = ds_shot["ts_array"].values
     at_height = np.abs(channel_height - TE_FAULTY_CHANNEL_Z) < TS_CHANNEL_Z_TOL
     return np.flatnonzero((ts_array == "core") & at_height)
-
-
-def _is_empty_result(result: xr.Dataset) -> bool:
-    """Check whether get_shots_data returned no usable data for a shot.
-
-    When retrieval fails (e.g. a missing MDSplus tree), get_shots_data logs the
-    error and returns an empty dataset with no shot/time index variables. Reshaping
-    that with set_index would raise, so callers use this to skip the shot instead.
-
-    Returns:
-        True if the result has no usable shot/time data, False otherwise.
-    """
-    return "shot" not in result or "time" not in result or result["time"].size == 0
 
 
 def _read_with_efit_tree(
@@ -604,7 +595,7 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         log_settings=passive_log_settings(),
         num_processes=1,
     )
-    if _is_empty_result(result):
+    if empty_result(result):
         return None
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
@@ -653,7 +644,7 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         log_settings=passive_log_settings(),
         num_processes=1,
     )
-    if _is_empty_result(result):
+    if empty_result(result):
         return None
     efit_times = result["time"].values
     timebase = make_uniform_1kHz_timebase(float(efit_times.max()))
@@ -687,7 +678,7 @@ def _get_efit_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         log_settings=passive_log_settings(),
         num_processes=1,
     )
-    if _is_empty_result(result):
+    if empty_result(result):
         return None
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
@@ -718,7 +709,7 @@ def _get_thomson_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         log_settings=passive_log_settings(),
         num_processes=1,
     )
-    if _is_empty_result(result):
+    if empty_result(result):
         return None
     # Snap native ~20 Hz TS slices onto the uniform 1 kHz grid, no interpolation.
     # Grid times with no TS slice come back as NaN.
