@@ -7,10 +7,11 @@ Every device is reduced to one schema, listed under [Datasets](#datasets).
 Signal names are IMAS-like, units are SI, and each variable carries its IMAS
 data dictionary path under its `ref` attribute in the stored files, with the
 documentation page under `url`. The per-device sources of each signal live
-next to their attributes in `machine/mast/mast_dataset.py` (`SIGNAL_ATTRS`)
-and `machine/cmod/dispy_methods.py`. The GEQDSK block's attributes are shared
-(`machine/generic.py`, `GEQDSK_SIGNAL_ATTRS`). The stack stage brings every
-variable onto that convention.
+next to their attributes in the device modules
+(`SIGNAL_ATTRS` of `machine/cmod/cmod_dataset.py` and `machine/mast/mast_dataset.py`).
+The units and data dictionary paths every store shares are in `store_schema.py`,
+and the GEQDSK block's attributes in `machine/generic.py` (`GEQDSK_SIGNAL_ATTRS`).
+The stack stage brings every variable onto that convention.
 Each unprocessed file records the COCOS index of its GEQDSK signals in a root
 attribute `cocos`. The final dataset carries it as the per-shot variable `cocos`.
 It is identified per shot from the signs of the reconstruction's own Ip, B0, psi and q (`cocos_from_signs`),
@@ -27,8 +28,8 @@ the shot (`source_package`, `source_version`, `source_url`,
 shot they hold (a key the shots disagree on becomes a JSON list of its
 values), and add the build (`build_time`, `build_host`), this package's state
 at build time, and the run configuration as JSON: `device_settings` (the
-`[<device>]` table), `filters` (every threshold the unprocessed stage
-applied), and `fit_settings` (the fit staging knobs).
+`[<device>]` table), `filters` (every threshold the unprocessed and stack
+stages applied, see [Filtering](#filtering)), and `fit_settings` (the fit staging knobs).
 
 # Workflow
 
@@ -73,21 +74,11 @@ hold the last usable reconstruction until the next one, with no limit (`hold_fro
 so they change exactly where `fresh_equilibrium` is 1.
 b0 is not one of them, it is the vacuum field of the measured toroidal field coil current.
 
-A reconstruction is usable (`usable_reconstructions`) when its axis and boundary psi are finite and meaningfully different,
-every value of its psirz and qpsi is finite, and its q profile gives a reasonable Phi_N map (`phi_n_map`).
-The fit stage maps the Thomson channels through the nearest usable reconstruction,
-before or after the slice, within `EQ_MATCH_MAX_PERIODS` (1.5) periods of the reconstruction clock.
-The stack stage holds only the usable ones onto the grid,
-so an unusable one is held over by the one before and is not marked fresh.
-The reach and the hold both run on the reconstruction clock (`reconstruction_clock_period`), which counts the unusable ones too.
-A channel below psi_N 1 more than 5 mm outside its reconstruction's boundary contour sits under an X-point, so it is left unmapped.
-By default the slices whose Te and ne fits did not both come back usable are ignored,
-as though the shot had no Thomson sample there.
-
 | Group | Signals | Dimensions |
 | ------ | ------ | ------ |
-| 0D | ip, b0, energy_mhd, beta_tor_norm, n_e_line_average, minor_radius, geometric_axis_r, elongation, triangularity_upper/lower, power_ohm/radiated/nbi/ic/lh | (shot, time_idx) |
+| 0D | ip, b0, energy_mhd, beta_tor_norm, n_e_line_average, minor_radius, geometric_axis_r, elongation, triangularity_upper/lower, power_ohm/radiated/nbi/ic/lh/ec | (shot, time_idx) |
 | Time | time, fresh_profile, fresh_equilibrium | (shot, time_idx) |
+| Per shot | r0, cocos | (shot) |
 | Fitted profiles | t_e, n_e, their _error, _gradient, _gradient_error, _fit_status | (shot, time_idx, rho_tor_norm) |
 | Equilibrium | the full GEQDSK block: psirz, fpol, pres, ffprime, pprime, qpsi, rbdry, zbdry, rlim, zlim, rmagx, zmagx, simagx, sibdry, bcentr, current, rcentr, rleft, rdim, zmid, zdim | (shot, time_idx, grid) |
 | Raw Thomson channels (internal store only) | ts_channel_r, ts_channel_z, ts_channel_t_e, ts_channel_n_e, their _error | (shot, time_idx, ts_channel) |
@@ -95,24 +86,161 @@ as though the shot had no Thomson sample there.
 The profiles are fit on rho_tor_norm from 0 to 1.6, so every fit anchor is on the fit grid and in the fit plots.
 The fit files, the stores and the IMAS export keep them out to rho_tor_norm 1.1.
 
-A signal the device does not have comes through as NaN, so the devices share one schema.
+The heating powers are the launched powers (IMAS `power_launched_*`), not the absorbed ones.
+A heating system the device does not have is zero, so the devices share one schema.
 Everything is float32, flags included, because the padding between shots of different lengths is NaN.
-The power signals (power_ohm/radiated/nbi/ic/lh) are clipped at zero since source records often dip negative
+The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since source records often dip negative
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
 
 Every stored value is causal, no grid time draws on a later sample, with these exceptions:
-power_radiated is smoothed by a centered 50 ms boxcar applied twice (`smoothed_power`),
+power_ohm and power_radiated are smoothed by a centered 50 ms boxcar applied twice (`smoothed_power`),
 the kernel of DIII-D's bolometer postprocessing.
-power_ohm is disruption-py's on C-Mod and built from interpolated level 2 signals on MAST.
 The EFIT and Thomson slices are snapped to the nearest grid time (`snap_to_grid`), up to 0.5 ms early,
-and a Thomson slice can map through a reconstruction up to `EQ_MATCH_MAX_PERIODS` later than it (see above).
-The end of every shot is cut `end_margin` (50 ms, one smoothing window) before the last finite ip,
-so the smoothed power_radiated does not carry the current quench.
+and a Thomson slice can map through a reconstruction up to `EQ_MATCH_MAX_PERIODS` later than it (see [Filtering](#filtering)).
 
 Every other 0D signal is placed on the 1 kHz grid without interpolation (`signal_on_grid`).
 One sampled faster than the grid is averaged over each grid step, grid time t taking the mean of (t - 1 ms, t].
 One sampled slower is held forward from its last finite sample for at most `MAX_HOLD_PERIODS` of its own sampling period.
 The 0D signals taken from the reconstruction are held as above instead.
+Derivatives are backward differences.
+
+b0 is the vacuum toroidal field at the fixed major radius r0, as IMAS defines it:
+the magnetics btor at 0.66 m on C-Mod,
+and mu0 24 I_TF / (2 pi r0) from the toroidal field coil current `amc/tf_current` on MAST, at EFIT's bvac_r of 1.0 m,
+which is the field EFIT's bvac_val gives.
+ip and b0 keep their source sign, the cocos variable records the convention.
+beta_tor_norm is normalized as IMAS defines it, 100 beta_tor a |b0| / |Ip|[MA] with beta_tor = 2 mu0 <p> / b0^2 and b0 at r0.
+Both devices build it the same way (`generic.normalized_beta`),
+from the reconstruction's own stored energy and volume, <p> = 2 W / (3 V), with its own a, b0 and Ip:
+EFIT wplasm, vout, aout, bcentr and cpasma on C-Mod, efm plasma_energy, plasma_volume, minor_radius, bvac_val and plasma_current_c on MAST.
+Neither reconstruction's own betan is IMAS's:
+C-Mod's EFIT betan takes |btaxp|, the total field at the magnetic axis,
+and MAST's efm betan takes the vacuum field at the geometric axis.
+energy_mhd on MAST is efm plasma_energy, 3/2 the volume integral of the reconstructed pressure.
+power_ohm is Ip V_loop - dW_pol/dt, computed from the equilibrium reconstruction alone the same way on every device
+(`DataWorkflow.add_equilibrium_signals`, `generic.ohmic_power_on_grid`):
+V_loop = sigma_Bp 2 pi dpsi_boundary/dt is the loop voltage at the LCFS from the block's `sibdry`,
+W_pol = (pi / mu0) int |grad psi|^2 / R dR dZ is the poloidal field energy inside the boundary from `psirz`
+(`poloidal_field_energy`),
+and Ip is the block's `current`, so the sign convention is the reconstruction's own.
+Both derivatives are backward differences between consecutive usable reconstructions,
+and the result is held like every signal taken from the reconstruction, then smoothed.
+No measured loop voltage enters,
+the C-Mod wall flux loop `mflux:v0` reads 35-55 percent off the LCFS voltage at flattop on some shots.
+n_e_line_average is the IMAS line average, the interferometer line integral over the chord length inside the plasma:
+on C-Mod the TCI chord 4 `nl_04` over EFIT's `rco2v` for that chord (49 to 61 cm over a shot, held like the EFIT 0D signals),
+on MAST the level 2 summary `line_average_n_e`.
+
+# Filtering
+
+Each stage drops what it can judge from its own inputs.
+The stores record every threshold in their `filters` attribute,
+and the device classes hold them (`min_filter`, `max_filter`, `transient_filter` and the attributes below).
+
+A reconstruction is usable (`usable_reconstructions`) when its axis and boundary psi are finite and meaningfully different,
+every value of its psirz and qpsi is finite, and its q profile gives a reasonable Phi_N map (`phi_n_map`).
+All three stages that touch the equilibrium use only the usable ones:
+the unprocessed stage holds the reconstruction's 0D signals from them and starts each kept segment where one reaches (step 6 below),
+the fit stage maps the Thomson channels through the nearest one,
+before or after the slice, within `EQ_MATCH_MAX_PERIODS` (1.5) periods of the reconstruction clock,
+and the stack stage holds them onto the grid, so an unusable one is held over by the one before and is not marked fresh.
+The reach and the hold both run on the reconstruction clock (`reconstruction_clock_period`), which counts the unusable ones too.
+
+Unprocessed stage (`make_unprocessed_data_files`, `filter_and_plot`), per shot.
+Steps 3 to 5 and 9 are the filter spec every device store shares (`filters.py`).
+Every check from 3 to 5 cuts the grid times it fails out as a gap (`slice_filter_mask`).
+A failed grid time before the end-of-shot cut also cuts the 50 ms before it (`FAILURE_MARGIN`, one `POWER_SMOOTHING_WINDOW`),
+since the smoothed power_ohm and power_radiated carry the event that ends a segment one smoothing window ahead of it:
+
+1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
+2. The reconstruction's 0D signals are held and power_ohm is derived (`add_equilibrium_signals`).
+3. End of shot (`end_of_shot_index`): the plasma ends at the last grid time with |ip| at or above its `min_filter` threshold,
+   and everything after `end_margin` (50 ms, one smoothing window) before that is cut.
+   A shot whose |ip| never reaches the threshold is rejected.
+4. Every 0D signal must be finite, every `min_filter` signal at or above its threshold
+   (ip compared as |ip|), and every `max_filter` signal at or below it, on the raw samples.
+   The max filters take `greenwald_fraction` = n_e_line_average / n_GW with n_GW = Ip / (pi a^2),
+   derived for the filter and not stored.
+5. Grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold.
+   The centered window only selects grid times, no stored value is smoothed by it.
+   The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`).
+6. The leading grid times of each segment are cut up to its first sample
+   that a usable reconstruction of the same segment reaches within the GEQDSK block's hold,
+   since the store would have no equilibrium before it.
+   This is mostly the early parts of a shot, before its first usable reconstruction.
+7. Only the longest segment is kept, shaded green in the accepted-shot plots.
+   Only the kept segment's reconstructions reach the store,
+   so step 6 trims each segment as if it alone were kept, and the longest is chosen after every trim.
+8. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod 0.5 s, MAST 0.2 s).
+9. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
+   - a mean `power_radiated` below `min_radiated_fraction` of the mean input power, ohmic plus auxiliary (a dead bolometer),
+     or above `max_radiated_fraction` of it, since more cannot be radiated than is put in (`radiated_fraction_reason`)
+   - a negative median `power_ohm`, the reconstruction's current and boundary flux disagreeing in sign (`ohmic_power_sign_reason`)
+   - an `energy_mhd` rise from the first kept time to its peak greater than all the input power integrated to that time (`energy_sanity_reason`)
+
+The standardized source pull of every shot is kept unfiltered in `01_unprocessed/source/`.
+A rerun filters from it without touching the source.
+Each pull is stamped with the code that read it (`pull_*` attributes, `pull_provenance`),
+which the unprocessed file and the store carry, and the store lists the commits when its shots disagree.
+A rerun does not check them, so delete `01_unprocessed/source/` after a change to a device read.
+A rejection's note in `01_unprocessed/failed_shots/` records the filter settings that made it,
+so a rerun skips a shot the same settings rejected and filters it again when they change.
+Deleting the unprocessed files (`01_unprocessed/*.nc`) reruns a filter change on the shots that passed.
+A change to the filter code alone needs the notes deleted too.
+A shot that is accepted loses its note, so the notes count only the current rejections.
+
+Fit stage: the Thomson channels map through the nearest usable reconstruction in reach,
+the Thomson screens in `cleaning.py` run on every sample before fitting,
+and the fit method's own checks give each slice a fit status.
+A channel below psi_N 1 more than 5 mm outside its reconstruction's boundary contour sits in a private flux region,
+under an X-point, so it is left unmapped.
+
+Stack stage (`_internal_shot_dataset`), per shot:
+
+1. The shots excluded or rejected by the unprocessed stage checks above are left out again.
+2. A slice is dropped (`_usable_slice_mask`) when
+   - its Te or ne fit status is not usable (not OK or REPAIRED)
+   - Te at rho_tor_norm 1 is above `FLAT_TE_EDGE_RATIO` (0.4) of its peak,
+     a flat profile from inboard and outboard Thomson channels that disagree after mapping
+   - the 1 sigma band of Te or ne inside the LCFS is wider than the profile's peak,
+     one channel's huge error carried into the band
+
+   The previous slice holds over a dropped one like over any gap.
+3. The shot is dropped when its fitted density disagrees with the interferometer (`fit_rejection_reason`).
+   The shot median over its slices of mean(n_e over rho_tor_norm 0-1) / `n_e_line_average`
+   must sit inside the device's `density_ratio_bounds`.
+   A shot with no slice to compare is dropped too.
+   The ratio is a proxy for the chord integral, and the bounds absorb its offset on each device.
+4. The usable reconstructions are held onto the grid, as above.
+
+Fit slices outside the unprocessed file's time span were fit before a filter change cut them and are dropped,
+so a filter change restacks on the old fits.
+`export_to_imas` runs checks 1-3 too (`_usable_shot_fit`), so the IMAS export holds the same shots as the stores.
+
+MAST starts at shot 23809 (`first_shot`).
+Before it the Thomson density reads ~0.87x the interferometer, against 0.98-1.00 after,
+indicating a large change in the Thomson density calibration.
+
+# Known limitations
+
+- **Thomson against interferometer.** Inside the density bounds the two still differ shot to shot.
+  The kept shots sit at 0.76-1.16 on C-Mod and 0.75-1.10 on MAST.
+- **MAST transients inside the kept windows.** Reconnection events and Ip spikes that stay under the transient thresholds remain,
+  e.g. 28203 at 0.343 s, where core Te drops from 0.55 to 0.12 keV, Ip spikes from 0.53 to 0.68 MA and P_rad reaches 2.8 MW.
+  The transient filter needs P_rad above 3 MW after smoothing.
+- **MAST EFIT vertical glitches.** Single reconstructions jump zmagx and zbdry by 5-10 cm and come back at the next one,
+  e.g. 24623 at 0.29-0.33 s (39 reconstructions in 26 shots out of ~1000).
+- **Equilibrium gaps.** The 10 ms hold floor bridges a missing reconstruction in the GEQDSK block,
+  but not two in a row on MAST (a 15 ms step), which leaves the block NaN there.
+  The 0D signals taken from the reconstruction hold across any gap.
+  A Thomson slice inside a bridged gap maps through no reconstruction (it reaches only `EQ_MATCH_MAX_PERIODS`),
+  so the profile before it is held there.
+- **power_ohm is the reconstruction's.** Its loop voltage is the boundary flux derivative of the equilibrium, not a flux loop,
+  so it carries the reconstruction's flux noise (smoothed over 50 ms).
+- **MAST summary signals.** The level 2 summary group is FAIR-MAST's own 1 kHz resampling of ip, n_e_line_average, power_radiated and power_nbi,
+  whose causality this package does not verify.
+- **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
+  It is an artifact of the EFIT basis functions.
 
 # Running
 
@@ -296,6 +424,6 @@ uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_d
 | Device | Source | Shotlist | Notes |
 | ------ | ------ | -------- | ----- |
 | C-Mod | MDSplus through disruption-py | 2016 campaign from the C-Mod SQL summary table (Ip above 100 kA, pulse above 0.5 s), kept only on days with blessed Thomson data | Needs to run somewhere with MDSplus tree access. A shot needs both the core and the edge Thomson system, the edge samples placed on the core's laser pulses one by one. |
-| MAST | Level 2 Zarr store at https://s3.echo.stfc.ac.uk/mast/level2/shots, plus two level 1 groups: EFM for the GEQDSK safety factor and AYC for the Thomson profiles | 1101 shots from the M8 and M9 campaigns, shipped with the package | Public, anonymous, read in a thread pool (`--prepare_workers`) |
+| MAST | Level 1 Zarr store at https://s3.echo.stfc.ac.uk/mast/level1/shots (efm for the equilibrium, ayc for the Thomson profiles, amc for the toroidal field coil current), plus the summary group of the level 2 store at https://s3.echo.stfc.ac.uk/mast/level2/shots | 1101 shots from the M8 and M9 campaigns, shipped with the package | Public, anonymous, read in a thread pool (`--prepare_workers`) |
 | DIII-D | | | |
 | TCV | | | |

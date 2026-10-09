@@ -25,6 +25,7 @@ imas = pytest.importorskip("imas")
 from transport_validation_datasets import TIME_COORD, TIME_DIM  # noqa: E402
 from transport_validation_datasets.gp_fitting.batch_io import STATUS_OK  # noqa: E402
 from transport_validation_datasets.imas_export.scenario_export import (  # noqa: E402
+    _SUMMARY_SIGNAL_PATHS,
     TARGET_COCOS,
     build_imas_from_shot,
     write_ids,
@@ -34,6 +35,7 @@ from transport_validation_datasets.machine.generic import (  # noqa: E402
     rho_tor_norm_from_psi_n,
     sigma_bp,
 )
+from transport_validation_datasets.store_schema import DATASET_0D_SIGNALS  # noqa: E402
 
 R0, A_MINOR = 0.68, 0.22
 N_PSI = 33
@@ -112,10 +114,13 @@ def synthetic_unprocessed(
         name: on_eq_times(value, dims) for name, (value, dims) in profiles.items()
     }
     assert set(data_vars) == set(DATASET_EQUILIBRIUM_SIGNALS)
+    # Every other 0D signal of the schema at 1.0, so each summary path it is written to is exercised
+    for name in DATASET_0D_SIGNALS:
+        data_vars[name] = (("time",), np.ones(n_t))
     data_vars["ip"] = (("time",), np.full(n_t, ip0))
     data_vars["b0"] = (("time",), np.full(n_t, b0))
     return xr.Dataset(
-        data_vars=data_vars, coords={"time": time}, attrs={"cocos": cocos}
+        data_vars=data_vars, coords={"time": time}, attrs={"cocos": cocos, "r0": R0}
     )
 
 
@@ -218,6 +223,14 @@ def test_imas_export_chain_reads_back(tmp_path, ip_sign, b0_sign, psi_sign, coco
     sm = read_back("summary")
     assert np.allclose(np.asarray(sm.global_quantities.ip.value), ip_sign * 0.8e6)
     assert np.allclose(np.asarray(sm.global_quantities.b0.value), b0_sign * 5.4)
+    assert sm.global_quantities.r0.value == pytest.approx(R0)
+    for name, (group, field) in _SUMMARY_SIGNAL_PATHS.items():
+        if name in ("ip", "b0"):
+            continue
+        written = np.asarray(getattr(getattr(sm, group), field).value)
+        assert np.allclose(written, 1.0), (
+            f"{name} not written to summary {group}.{field}"
+        )
 
     wall = read_back("wall")
     outline = wall.description_2d[0].limiter.unit[0].outline

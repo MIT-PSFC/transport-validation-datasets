@@ -9,7 +9,7 @@ the fit results (fit_shots_dir/<shot>.nc) and the unprocessed data (01_unprocess
     and the diverted or limited classification (`_find_x_point`).
     Nothing that needs flux surfaces traced (area, volume, `j_phi`, shaping, the `gm*` averages) is written.
   - `summary` is written on the unprocessed file's 1 kHz grid,
-    with every `workflow.DATASET_0D_SIGNALS` entry the shot has (`_SUMMARY_SIGNAL_PATHS`).
+    with every `store_schema.DATASET_0D_SIGNALS` entry (`_SUMMARY_SIGNAL_PATHS`).
   - `core_profiles` gets one `profiles_1d` per usable Thomson slice:
     electrons, with the GP fit's 1 sigma uncertainties in the `*_error_upper` fields,
     and a single hydrogenic main ion (Zeff = 1, n_D = n_e).
@@ -33,7 +33,7 @@ from imas.dd_zip import latest_dd_version
 from scipy.interpolate import RectBivariateSpline
 from scipy.optimize import minimize
 
-from transport_validation_datasets import TIME_COORD, TIME_DIM
+from transport_validation_datasets import TIME_COORD
 from transport_validation_datasets.imas_export.geqdsk_writer import write_geqdsk
 from transport_validation_datasets.machine.generic import (
     DATASET_EQUILIBRIUM_SIGNALS,
@@ -42,9 +42,9 @@ from transport_validation_datasets.machine.generic import (
     sigma_bp,
     usable_reconstructions,
 )
-from transport_validation_datasets.workflow import (
+from transport_validation_datasets.store_schema import (
     DATASET_0D_SIGNALS,
-    USABLE_FIT_STATUSES,
+    STORE_SIGNAL_ATTRS,
 )
 
 # The newest data dictionary the installed imas-python ships, so upgrading the package upgrades the written DD
@@ -394,41 +394,55 @@ def build_core_profiles(factory, slices: list[ShotExportSlice]):
 # ---------------------------------------------------------------------------
 
 
-# `workflow.DATASET_0D_SIGNALS` name -> (summary sub-structure, field) it is written to.
-# Each target is a `summary_dynamic` node whose `.value` holds the time series.
-# Every DATASET_0D_SIGNALS entry has a home here,
-# and the paths match the `ref` attrs the machine modules record on the unprocessed signals (checked against DD 4.1.1).
-_SUMMARY_SIGNAL_PATHS = {
-    "ip": ("global_quantities", "ip"),
-    "b0": ("global_quantities", "b0"),
+# The summary fields of the 0D signals whose store ref is the equilibrium's own quantity, not a summary path
+_SUMMARY_REMAPS = {
     "energy_mhd": ("global_quantities", "energy_mhd"),
     "beta_tor_norm": ("global_quantities", "beta_tor_norm"),
-    "power_ohm": ("global_quantities", "power_ohm"),
-    "power_radiated": ("global_quantities", "power_radiated"),
-    "n_e_line_average": ("line_average", "n_e"),
     "minor_radius": ("boundary", "minor_radius"),
     "geometric_axis_r": ("boundary", "geometric_axis_r"),
     "elongation": ("boundary", "elongation"),
     "triangularity_upper": ("boundary", "triangularity_upper"),
     "triangularity_lower": ("boundary", "triangularity_lower"),
-    "power_nbi": ("heating_current_drive", "power_nbi"),
-    "power_ic": ("heating_current_drive", "power_ic"),
-    "power_lh": ("heating_current_drive", "power_lh"),
 }
 
 
-def build_summary(factory, time, signals):
-    """`summary` IDS on the unprocessed file's own 1 kHz grid.
+def _summary_signal_paths() -> dict[str, tuple[str, str]]:
+    """Map every DATASET_0D_SIGNALS name to the summary sub-structure and field it is written to.
+
+    A signal whose store ref (store_schema.STORE_SIGNAL_ATTRS) is /summary/<sub-structure>/<field>/value
+    is written there, the rest where _SUMMARY_REMAPS puts them.
+    Each target is a `summary_dynamic` node whose `.value` holds the time series.
+
+    Returns:
+        {name: (sub-structure, field)}.
+    """
+    paths = {}
+    for name in DATASET_0D_SIGNALS:
+        ref = STORE_SIGNAL_ATTRS[name]["ref"]
+        if ref.startswith("/summary/"):
+            _, _, group, field, _ = ref.split("/")
+            paths[name] = (group, field)
+        else:
+            paths[name] = _SUMMARY_REMAPS[name]
+    return paths
+
+
+_SUMMARY_SIGNAL_PATHS = _summary_signal_paths()
+
+
+def build_summary(factory, time, signals, r0):
+    """`summary` IDS on the unprocessed file's own 1 kHz grid, with the radius b0 is given at.
 
     Args:
         factory: `imas.IDSFactory` to build the IDS from.
         time: (n,) the unprocessed file's grid [s],
             independent of `equilibrium.time` and `core_profiles.time`.
-        signals: `workflow.DATASET_0D_SIGNALS` name -> (n,) signal on `time`, any subset.
+        signals: `store_schema.DATASET_0D_SIGNALS` name -> (n,) signal on `time`, any subset.
             A signal that is absent, or NaN everywhere (how a device without it stages it),
             is left unset in the IDS.
             A name with no entry in `_SUMMARY_SIGNAL_PATHS` is an error,
             so a new DATASET_0D_SIGNALS entry cannot be dropped silently.
+        r0: The reference major radius b0 is given at [m], a constant of the shot.
 
     Returns:
         The validated `summary` IDS.
@@ -443,6 +457,7 @@ def build_summary(factory, time, signals):
     sm = factory.summary()
     sm.ids_properties.homogeneous_time = 1
     sm.time = np.asarray(time, dtype=float)
+    sm.global_quantities.r0.value = float(r0)
     for name, (group, field) in _SUMMARY_SIGNAL_PATHS.items():
         if name not in signals:
             continue
@@ -524,13 +539,13 @@ def build_imas_from_shot(
 
     Args:
         shot: Shot number.
-        fit_ds: `_shot_fit_dataset()`'s output for this shot (`fit_shots_dir/<shot>.nc`),
-            `t_e`/`n_e`/`t_e_fit_status`/`n_e_fit_status` on `(shot, TIME_DIM, rho_tor_norm)`,
+        fit_ds: This shot's usable fitted slices (`DataWorkflow._usable_shot_fit` of `fit_shots_dir/<shot>.nc`),
+            `t_e`/`n_e` on `(shot, time_idx, rho_tor_norm)`,
             real slice times in `TIME_COORD`, and the `sol_extension` attribute the channels were staged with.
         unprocessed_ds: This shot's unprocessed data (`01_unprocessed/<shot>.nc`).
-            Needs `ip`, the `cocos` attribute, and the GEQDSK block (`DATASET_EQUILIBRIUM_SIGNALS`)
+            Needs `ip`, the `cocos` and `r0` attributes, and the GEQDSK block (`DATASET_EQUILIBRIUM_SIGNALS`)
             on the shot's grid, NaN outside a reconstruction time.
-            Every other `workflow.DATASET_0D_SIGNALS` entry present is written to `summary` (see `build_summary`).
+            Every other `store_schema.DATASET_0D_SIGNALS` entry present is written to `summary` (see `build_summary`).
         geqdsk_dir: Directory to write this shot's per-equilibrium-time
             `.geqdsk` files into (see `geqdsk_writer.write_geqdsk`).
         dd_version: IMAS data dictionary version.
@@ -570,11 +585,7 @@ def build_imas_from_shot(
         factory, eq_times, geqdsk_paths, source_cocos
     )
 
-    usable = (
-        fit_ds["t_e_fit_status"].isin(list(USABLE_FIT_STATUSES))
-        & fit_ds["n_e_fit_status"].isin(list(USABLE_FIT_STATUSES))
-    ).squeeze("shot", drop=True)
-    fit_ds = fit_ds.squeeze("shot", drop=True).isel({TIME_DIM: usable.values})
+    fit_ds = fit_ds.squeeze("shot", drop=True)
     ts_times = fit_ds[TIME_COORD].to_numpy().astype(float)
     rho_tor_norm = fit_ds["rho_tor_norm"].to_numpy().astype(float)
     sol_extension = fit_ds.attrs["sol_extension"]
@@ -625,7 +636,7 @@ def build_imas_from_shot(
         )
 
     cp = build_core_profiles(factory, slices)
-    sm = build_summary(factory, unprocessed_time, signal_0d)
+    sm = build_summary(factory, unprocessed_time, signal_0d, unprocessed_ds.attrs["r0"])
     ids_list = [eq, cp, sm]
     if "rlim" in eq_ds:
         wall = build_wall(factory, eq_times[0], eqi_first)
