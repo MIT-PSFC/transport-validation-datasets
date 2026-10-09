@@ -1,4 +1,4 @@
-"""The channel screens a device calls: relative dips, shot-long biased channels, and the error inflation where two chord branches disagree."""
+"""The channel screens a device calls: relative dips, shot-long biased or low channels, and the error inflation where two chord branches disagree."""
 
 import numpy as np
 
@@ -6,6 +6,7 @@ from transport_validation_datasets.cleaning import (
     branch_disagreement_errors,
     drop_broken_channels,
     low_side_channels,
+    persistently_low_channels,
     relative_dips,
 )
 
@@ -157,3 +158,44 @@ class TestBranchDisagreementErrors:
         err_out = branch_disagreement_errors(rho, y, err, inboard)
 
         assert np.allclose(err_out, err, rtol=1e-2)
+
+
+class TestPersistentlyLowChannels:
+    def _rows(self, n_slices=40):
+        # 41 channels evenly in rho over a parabolic profile, a little noise
+        rng = np.random.default_rng(0)
+        rho = np.linspace(0.0, 1.0, 41)
+        x_rows = np.tile(rho, (n_slices, 1))
+        y_rows = (1.0 - 0.8 * rho**2) * (
+            1.0 + 0.02 * rng.standard_normal((n_slices, rho.size))
+        )
+        return x_rows, y_rows
+
+    def test_channel_low_all_shot_is_flagged(self):
+        x_rows, y_rows = self._rows()
+        y_rows[:, 12] *= 0.3
+
+        low = persistently_low_channels(x_rows, y_rows)
+
+        assert np.flatnonzero(low).tolist() == [12]
+
+    def test_channel_low_in_a_minority_of_slices_is_kept(self):
+        x_rows, y_rows = self._rows()
+        y_rows[:10, 12] *= 0.3
+
+        low = persistently_low_channels(x_rows, y_rows)
+
+        assert not low.any()
+
+    def test_steep_edge_and_short_shot_are_not_judged(self):
+        # Past PERSISTENT_RHO_MAX the profile may fall faster than any neighbourhood median,
+        # and a channel seen in fewer than PERSISTENT_MIN_SLICES slices is never flagged
+        x_rows, y_rows = self._rows()
+        y_rows[:, -1] *= 0.1
+        low_edge = persistently_low_channels(x_rows, y_rows)
+        x_short, y_short = self._rows(n_slices=5)
+        y_short[:, 12] *= 0.3
+        low_short = persistently_low_channels(x_short, y_short)
+
+        assert not low_edge.any()
+        assert not low_short.any()
