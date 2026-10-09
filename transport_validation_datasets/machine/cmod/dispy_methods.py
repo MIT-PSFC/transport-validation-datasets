@@ -13,12 +13,16 @@ from transport_validation_datasets.machine.generic import (
     injected_power_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
+    normalized_beta,
     orient_signal,
     signal_on_grid,
     smoothed_power,
     snap_to_grid,
     ts_channel_dataset,
 )
+
+# Column of the aeqdsk rco2v in-plasma chord lengths [cm] that is TCI chord 4, the chord nl_04 integrates along
+TCI_NL_04_RCO2V_COLUMN = 3
 
 # Core and edge Thomson read the same laser pulses on clocks ~20 us apart,
 # so an edge sample further than this from every core time has no partner pulse [s]
@@ -50,8 +54,31 @@ class UniformTimeSetting(TimeSetting):
         return make_uniform_1kHz_timebase(float(np.max(efit_time)))
 
 
-class CmodGeometryMethods:
-    """Geometry signals from the C-Mod aeqdsk that stock disruption-py skips."""
+def _aeqdsk_node(params: PhysicsMethodParams, expression: str) -> np.ndarray:
+    """Read one aeqdsk node on the EFIT times, NaN when the tree lacks it.
+
+    Args:
+        params: disruption-py physics method parameters for the shot, on the EFIT times.
+        expression: MDSplus expression of the node, with any unit conversion.
+
+    Returns:
+        (n_eq,) the node's values.
+    """
+    try:
+        values = params.mds_conn.get_data(expression, tree_name="_efit_tree")
+    except mdsExceptions.MdsException as e:
+        params.logger.warning(repr(e))
+        params.logger.opt(exception=True).debug(e)
+        return np.full(len(params.times), np.nan)
+    return np.asarray(values, dtype=float)
+
+
+class CmodAeqdskMethods:
+    """0D C-Mod aeqdsk signals read as the tree stores them, which stock disruption-py skips or rebuilds.
+
+    Every method runs on the EFIT tree's own times (time_setting "efit", see cmod_dataset._get_efit0d_dataset),
+    and the workflow holds them from the last usable reconstruction.
+    """
 
     @staticmethod
     @physics_method(columns=["rout"], tokamak=Tokamak.CMOD)
@@ -65,24 +92,57 @@ class CmodGeometryMethods:
             params: disruption-py physics method parameters for the shot.
 
         Returns:
-            Dict with rout [m] on the requested timebase.
+            Dict with rout [m] on the EFIT times.
         """
-        efit_time_node = params.mds_conn.get_data(
-            r"\efit_aeqdsk:time", tree_name="_efit_tree"
-        )
-        efit_time = np.asarray(efit_time_node, dtype=float)
-        try:
-            rout = params.mds_conn.get_data(
-                r"\efit_aeqdsk:rout/100", tree_name="_efit_tree"
-            )
-        except mdsExceptions.MdsException as e:
-            params.logger.warning(repr(e))
-            params.logger.opt(exception=True).debug(e)
-            rout = np.full(len(efit_time), np.nan)
-
-        if not np.array_equal(params.times, efit_time):
-            rout = signal_on_grid(efit_time, rout, params.times)
+        rout = _aeqdsk_node(params, r"\efit_aeqdsk:rout/100")
         return {"rout": rout}
+
+    @staticmethod
+    @physics_method(columns=["beta_tor_norm"], tokamak=Tokamak.CMOD)
+    def get_normalized_beta(params: PhysicsMethodParams):
+        """Retrieve the normalized beta as IMAS defines it, with the vacuum field b0 at r0 (normalized_beta).
+
+        Built from EFIT's own stored energy and volume, wplasm = 3/2 <p> vout.
+        bcentr is the vacuum field at rcencm, the fixed 0.66 m the store's r0 is.
+        EFIT's betat normalizes with the vacuum field at rout instead,
+        and its betan node multiplies by |btaxp|, the total field at the magnetic axis.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with beta_tor_norm [percent m T / MA] on the EFIT times.
+        """
+        energy_mhd = _aeqdsk_node(params, r"\efit_aeqdsk:wplasm")  # [J]
+        volume = _aeqdsk_node(params, r"\efit_aeqdsk:vout/1e6")  # [m^3]
+        minor_radius = _aeqdsk_node(params, r"\efit_aeqdsk:aout/100")  # [m]
+        b_center = _aeqdsk_node(params, r"\efit_aeqdsk:bcentr")  # [T]
+        ip = _aeqdsk_node(params, r"\efit_aeqdsk:cpasma")  # [A]
+        beta_tor_norm = normalized_beta(energy_mhd, volume, minor_radius, b_center, ip)
+        return {"beta_tor_norm": beta_tor_norm}
+
+    @staticmethod
+    @physics_method(columns=["tci_chord_04"], tokamak=Tokamak.CMOD)
+    def get_tci_chord_length(params: PhysicsMethodParams):
+        """Retrieve the in-plasma length of TCI chord 4, EFIT's aeqdsk rco2v for that chord (49 to 61 cm over a shot).
+
+        NaN where EFIT gives none, a length that is not positive.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with tci_chord_04 [m] on the EFIT times.
+        """
+        chord_lengths_cm = _aeqdsk_node(params, r"\efit_aeqdsk:rco2v")
+        # The NaN fallback of a tree without rco2v is already one per reconstruction
+        if chord_lengths_cm.ndim == 1:
+            return {"tci_chord_04": chord_lengths_cm}
+        if chord_lengths_cm.shape[0] != len(params.times):
+            chord_lengths_cm = chord_lengths_cm.T
+        chord_length = chord_lengths_cm[:, TCI_NL_04_RCO2V_COLUMN] / 100
+        chord_length = np.where(chord_length > 0, chord_length, np.nan)
+        return {"tci_chord_04": chord_length}
 
 
 class CmodPlasmaMethods:
@@ -128,24 +188,25 @@ class CmodPlasmaMethods:
         return {"bt": btor_on_grid}
 
     @staticmethod
-    @physics_method(columns=["n_e"], tokamak=Tokamak.CMOD)
-    def get_line_average_density(params: PhysicsMethodParams):
-        """Line-averaged density, the TCI chord 4 line integral nl_04 over a 0.6 m chord, as disruption-py takes it.
+    @physics_method(columns=["tci_nl_04"], tokamak=Tokamak.CMOD)
+    def get_line_integral_density(params: PhysicsMethodParams):
+        """TCI chord 4 line-integrated density nl_04, averaged over each grid step.
 
-        nl_04 is averaged over each grid step.
+        CModDataWorkflow.add_equilibrium_signals divides it by the chord's in-plasma length
+        (CmodAeqdskMethods.get_tci_chord_length) into n_e_line_average.
 
         Args:
             params: disruption-py physics method parameters for the shot.
 
         Returns:
-            Dict with n_e [m^-3] on the requested timebase.
+            Dict with tci_nl_04 [m^-2] on the requested timebase.
         """
         nl_04, nl_04_time = params.mds_conn.get_data_with_dims(
             r".tci.results:nl_04", tree_name="electrons"
         )
         nl_04_samples = np.squeeze(nl_04)
         nl_04_on_grid = signal_on_grid(nl_04_time, nl_04_samples, params.times)
-        return {"n_e": nl_04_on_grid / 0.6}
+        return {"tci_nl_04": nl_04_on_grid}
 
 
 def _injected_power(

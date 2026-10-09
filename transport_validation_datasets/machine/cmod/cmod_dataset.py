@@ -8,12 +8,13 @@ from disruption_py.settings.output_setting import DatasetOutputSetting
 from disruption_py.workflow import get_shots_data
 from loguru import logger
 
+from transport_validation_datasets import TIME_COORD
 from transport_validation_datasets.cleaning import drop_in_both
 from transport_validation_datasets.dispy_utils import passive_log_settings, summary
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.cmod.dispy_methods import (
+    CmodAeqdskMethods,
     CmodEfitMethods,
-    CmodGeometryMethods,
     CmodPlasmaMethods,
     CmodPowerMethods,
     CmodThomsonMethods,
@@ -21,27 +22,28 @@ from transport_validation_datasets.machine.cmod.dispy_methods import (
 )
 from transport_validation_datasets.machine.generic import (
     POWER_SMOOTHING_WINDOW,
+    absent_heating_powers,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
     snap_to_grid,
     ts_channel_fit_rows,
+    values_held_from_usable,
 )
+from transport_validation_datasets.store_schema import apply_signal_attrs
 from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 
 # Attributes of the signals this module makes rather than reads with
 # attributes attached (DataWorkflow.signal_attrs). Everything else carries
 # disruption-py's, rewritten to the shared convention at the stack stage.
+# The units and IMAS paths of the store signals come from store_schema.STORE_SIGNAL_ATTRS.
 SIGNAL_ATTRS = {
     "ip": {
         "description": "Plasma current, magnetics ip (Rogowski coil), signed, mean of each 1 ms grid step",
     },
-    "b0": {
-        "description": "Vacuum toroidal field at 0.66 m, magnetics btor, signed, mean of each 1 ms grid step",
-    },
     "n_e_line_average": {
         "description": (
             "Line-averaged electron density, TCI chord 4 line integral nl_04 (mean of each 1 ms grid step) "
-            "over a 0.6 m chord"
+            "over its in-plasma length, the EFIT rco2v of that chord held from the last usable reconstruction"
         ),
     },
     "power_radiated": {
@@ -56,17 +58,34 @@ SIGNAL_ATTRS = {
     "power_lh": {
         "description": "Lower hybrid net heating power (LH netpow), mean of each 1 ms grid step, zero outside its record",
     },
+    "b0": {
+        "description": "Vacuum toroidal field at r0, magnetics btor, signed, mean of each 1 ms grid step",
+    },
+    "r0": {
+        "description": "Reference major radius btor is quoted at, the fixed 0.66 m where EFIT quotes bcentr (RZERO)",
+    },
+    "beta_tor_norm": {
+        "description": (
+            "Normalized toroidal beta as IMAS defines it, 100 beta_tor aout |bcentr| / |cpasma| with beta_tor = 2 mu0 <p> / bcentr^2, "
+            "<p> = 2 wplasm / (3 vout) and bcentr the vacuum field at rcencm = r0, "
+            "not the EFIT betan node, which takes |btaxp|"
+        ),
+    },
     "power_nbi": {
         "description": "Neutral beam heating power (none on C-Mod)",
-        "units": "W",
-        "ref": "/summary/heating_current_drive/power_nbi/value",
+    },
+    "power_ec": {
+        "description": "Electron cyclotron heating power (none on C-Mod)",
     },
     "geometric_axis_r": {
         "description": "Major radius of the geometric center of the boundary (EFIT rout)",
-        "units": "m",
-        "ref": "/equilibrium/time_slice(itime)/boundary/geometric_axis/r",
     },
 }
+
+# Major radius the magnetics btor is quoted at, the store's r0 [m].
+# The raw btor, with no pre-shot baseline subtracted, matches EFIT bcentr to 0.9991-0.9998 (median of 6 shots),
+# and EFIT quotes bcentr at rcentr, stored as RZERO = 0.66 m.
+R0 = 0.66
 
 
 @dataclass(frozen=True)
@@ -98,21 +117,34 @@ class CModDataWorkflow(DataWorkflow):
     signal_attrs = SIGNAL_ATTRS
 
     min_pulse_length = 0.5
-    min_usable_time = 0.2
-    min_segment_length = 0.1
-    valid_filter = {
-        "ip": {"min_abs": 100e3},  # Only care about magnitude of ip
-        "n_e_line_average": {"min": 1e18, "max": 4e20},
-        "energy_mhd": {"min": 3e3},
-        "beta_tor_norm": {"min": 0.08, "max": 2.0},
+    min_filter = {
+        "ip": 100e3,
+        # 2.7 kJ keeps the ramp-ups, 3 s of kept time over 990 shots more than 3 kJ would
+        "energy_mhd": 2.7e3,
+        # A broken interferometer record, the lowest kept value in a 40-shot sample is 2.4e19
+        "n_e_line_average": 1e19,
     }
+    max_filter = {
+        "greenwald_fraction": 2.0,
+    }
+    # Input power tops out near 6 MW, so 5.5 MW radiated is a collapse or a broken record.
+    # Over 990 shots it fires in 48 and costs 28 s of kept time, 2 percent.
     transient_filter = {
         "power_ohm": 5.0e6,
-        "power_radiated": 2.5e6,
+        "power_radiated": 5.5e6,
     }
-    # One smoothing window, so the smoothed power_radiated does not carry the current quench (POWER_SMOOTHING_WINDOW)
+    # One smoothing window, so the smoothed powers never carry the current quench (POWER_SMOOTHING_WINDOW)
     end_margin = POWER_SMOOTHING_WINDOW
     shot_blacklist = []
+    # Shots radiate a median 25 percent of their heating power.
+    # The lowest live bolometer record, 1160928005, sits at 1.9 percent.
+    # The two shots with no record at all are caught by the all-finite check of slice_filter_mask.
+    min_radiated_fraction = 0.01
+    # More radiated than put in. The highest in a 40-shot sample is 0.87.
+    max_radiated_fraction = 1.0
+    # Thomson n_e against the interferometer. Large disagreement indicates TS miscalibration.
+    # 1160527001 and 1160527002 are 0.69, the next lowest shot is 0.76, the highest at 1.16
+    density_ratio_bounds = (0.72, 1.3)
 
     # GP fit staging knobs
     # Minimum valid (rho_tor_norm, value) pairs required per timestep to run the GP fit,
@@ -137,7 +169,7 @@ class CModDataWorkflow(DataWorkflow):
         """
         data = summary(
             summary_table="summary",
-            ipmax=self.valid_filter["ip"]["min_abs"],
+            ipmax=self.min_filter["ip"],
             pulse_length=self.min_pulse_length,
             min_shot=1160500000,
             max_shot=1160932000,
@@ -145,7 +177,7 @@ class CModDataWorkflow(DataWorkflow):
         )
         shotlist = data[:, 0].astype(int).tolist()
 
-        # Days with blessed TS data, email from J. Hughes 2025-12-12
+        # Days with blessed TS data, email from J. Hughes 2025-12-19
         blessed_days = [
             1160503,
             1160527,
@@ -154,14 +186,15 @@ class CModDataWorkflow(DataWorkflow):
             1160630,
             1160708,
         ]
+        # First and last day, both blessed
         blessed_day_ranges = [
-            [1160607, 1160610],
-            [1160712, 1160719],
-            [1160803, 1160820],
-            [1160823, 1160903],
-            [1160908, 1160916],
-            [1160919, 1160924],
-            [1160927, 1160931],
+            [1160607, 1160609],
+            [1160712, 1160718],
+            [1160803, 1160819],
+            [1160823, 1160902],
+            [1160908, 1160915],
+            [1160919, 1160923],
+            [1160927, 1160930],
         ]
         for day_range in blessed_day_ranges:
             blessed_days.extend(range(day_range[0], day_range[1] + 1))
@@ -231,6 +264,7 @@ class CModDataWorkflow(DataWorkflow):
 
         All signals stay in SI units.
         ip and b0 keep the sign of their source, the GEQDSK signals carry the COCOS convention.
+        b0 is btor as read, the vacuum field at R0, which the r0 attribute carries.
 
         Args:
             ds: Merged dataset with disruption-py signal names.
@@ -244,14 +278,10 @@ class CModDataWorkflow(DataWorkflow):
             # summary/global_quantities
             "bt": "b0",
             "wmhd": "energy_mhd",
-            "beta_n": "beta_tor_norm",
-            "p_oh": "power_ohm",
             "p_rad": "power_radiated",
             # summary/heating_current_drive
             "p_icrf": "power_ic",
             "p_lh": "power_lh",
-            # summary/line_average
-            "n_e": "n_e_line_average",
             # equilibrium/time_slice/boundary
             "a_minor": "minor_radius",
             "kappa": "elongation",
@@ -269,15 +299,40 @@ class CModDataWorkflow(DataWorkflow):
             logger.warning("No Thomson scattering channels retrieved for this shot.")
             return None
 
-        # C-Mod has no NBI, zero where ip is valid
-        if "ip" in ds:
-            ds["power_nbi"] = ds["ip"] * 0.0
-            ds["power_nbi"].attrs = {}
-        for name, attrs in self.signal_attrs.items():
-            if name in ds:
-                ds[name].attrs.update(attrs)
+        # Per shot like cocos, the stack stage stores it as the r0 variable
+        ds.attrs["r0"] = R0
+
+        # C-Mod has no NBI or ECH
+        ds = ds.assign(absent_heating_powers(ds["ip"], ("power_nbi", "power_ec")))
+        apply_signal_attrs(ds, self.signal_attrs)
 
         return ds
+
+    def add_equilibrium_signals(
+        self, ds_standardized: xr.Dataset, reconstruction_usable: np.ndarray
+    ) -> xr.Dataset:
+        """Hold the reconstruction's signals (DataWorkflow.add_equilibrium_signals) and form n_e_line_average.
+
+        n_e_line_average is the TCI chord 4 line integral tci_nl_04 over the chord's in-plasma length tci_chord_04,
+        EFIT's rco2v, held from the last usable reconstruction like every signal taken from one (values_held_from_usable).
+
+        Args:
+            ds_standardized: One shot's standardized dataset on (shot, time), with its GEQDSK block. Modified in place.
+            reconstruction_usable: (n_t,) True at the usable reconstructions (usable_reconstructions).
+
+        Returns:
+            The dataset with n_e_line_average in place of tci_nl_04 and tci_chord_04.
+        """
+        ds = super().add_equilibrium_signals(ds_standardized, reconstruction_usable)
+        grid = np.asarray(ds[TIME_COORD].values, dtype=float)
+        chord_length = ds["tci_chord_04"].transpose(..., TIME_COORD)
+        chord_length_values = values_held_from_usable(
+            chord_length.values, reconstruction_usable, grid
+        )
+        chord_length_held = chord_length.copy(data=chord_length_values)
+        ds["n_e_line_average"] = ds["tci_nl_04"] / chord_length_held
+        apply_signal_attrs(ds, self.signal_attrs)
+        return ds.drop_vars(["tci_nl_04", "tci_chord_04"])
 
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
         """Build GP fit inputs for one shot from its unprocessed dataset.
@@ -492,10 +547,8 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     Only signals sampled faster than the grid belong here
     (magnetics, TCI, bolometry, RF and LH power),
     and each grid time takes the mean of the preceding millisecond (signal_on_grid).
-    The EFIT-derived 0D signals are in _get_efit0d_dataset instead.
-    p_oh is disruption-py's own (get_ohmic_parameters), at the time resolution of the fast loop voltage and Ip.
-    Its EFIT li inductance correction is exact at the EFIT21 slice times
-    and NaN outside the EFIT time range.
+    The EFIT-derived 0D signals are in _get_efit0d_dataset instead,
+    and power_ohm comes from the GEQDSK block (DataWorkflow.add_equilibrium_signals).
     Avoiding disruption-py internals because they interpolate.
 
     Args:
@@ -509,12 +562,10 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     fast_methods = [
         "get_plasma_current",  # ip
         "get_toroidal_field",  # bt, the vacuum field at 0.66 m
-        "get_line_average_density",  # n_e [m^-3]
+        "get_line_integral_density",  # tci_nl_04 [m^-2]
         "get_radiated_power",  # p_rad
         # p_icrf, p_lh (lower hybrid heating on C-Mod, NOT the L-H threshold power as on TCV)
         "get_heating_powers",
-        # p_oh, with the v_loop it is built from
-        "get_ohmic_parameters",
     ]
 
     retrieval_settings = RetrievalSettings(
@@ -534,8 +585,6 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     )
     if _is_empty_result(result):
         return None
-    # Only p_oh is wanted from the built-in
-    result = result.drop_vars("v_loop")
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
@@ -559,12 +608,13 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     """
     efit0d_signals = [
         "wmhd",  # Total stored energy (C-Mod has no consistent fast particle measurement, so this is all we've got)
-        "beta_n",  # Normalized beta
+        "beta_tor_norm",  # As IMAS defines it, from wplasm and vout
         "a_minor",  # Plasma minor radius
         "kappa",  # Plasma elongation
         "tritop",  # Top triangularity
         "tribot",  # Bottom triangularity
         "rout",  # Geometric major radius [m]
+        "tci_chord_04",  # In-plasma length of TCI chord 4 [m], under n_e_line_average
     ]
 
     retrieval_settings = RetrievalSettings(
@@ -572,7 +622,7 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         time_setting="efit",
         efit_nickname_setting=efit_tree,
         only_requested_columns=True,
-        custom_physics_methods=[CmodGeometryMethods.get_geometric_major_radius],
+        custom_physics_methods=[CmodAeqdskMethods],
     )
     result = get_shots_data(
         tokamak=Tokamak.CMOD,
