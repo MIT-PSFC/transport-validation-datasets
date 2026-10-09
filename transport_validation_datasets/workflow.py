@@ -48,7 +48,14 @@ from transport_validation_datasets.gp_fitting.dispatcher import (
 )
 from transport_validation_datasets.machine.generic import (
     DATASET_EQUILIBRIUM_SIGNALS,
+    EQUILIBRIUM_HOLD_FLOOR,
+    MAX_HOLD_PERIODS,
+    POWER_SMOOTHING_WINDOW,
+    PROFILE_MAX_HOLD,
     SOL_EXTENSIONS,
+    centered_boxcar_mean,
+    hold_from_usable_reconstructions,
+    hold_onto_grid,
     reconstruction_clock_period,
     standardize_signal_attrs,
     usable_reconstructions,
@@ -102,16 +109,6 @@ FIT_SETTING_NAMES = {
 
 # Per-slice fit statuses that count as a usable profile, see gp_fitting.batch_io.
 USABLE_FIT_STATUSES = (STATUS_OK, STATUS_REPAIRED)
-
-# A grid time carries a sample of its own when it sits this close to one [s].
-# Only absorbs float round-off, everything shares the staged 1 kHz timebase.
-SAMPLE_TIME_TOL = 1e-6
-
-# How long a slowly sampled signal (a fitted profile, an equilibrium) is held
-# forward onto the 1 kHz timebase, in periods of its own sampling. Above 1 to
-# tolerate jitter in the sampling, low enough that nothing is carried across a
-# real gap: the end of the shot, or a stretch the filtering cut away.
-MAX_HOLD_PERIODS = 1.5
 
 # Unprocessed signals carried into the internal dataset. The union over every
 # device: a signal the device does not have comes through as NaN, so all the
@@ -551,9 +548,11 @@ class DataWorkflow(ABC):
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         """Read one shot from the device's source into standardized signals.
 
-        Everything the datasets need, under the standardized names, on
-        the shot's uniform 1 kHz timebase. Filtering, plotting, and writing are
-        make_unprocessed_data_files' job.
+        Everything the datasets need, under the standardized names,
+        on the shot's uniform 1 kHz timebase.
+        The EQUILIBRIUM_0D_SIGNALS sit on the grid times their reconstructions land on,
+        NaN between, and make_unprocessed_data_files holds them (hold_from_usable_reconstructions).
+        Filtering, plotting, and writing are make_unprocessed_data_files' job too.
 
         Args:
             shot: Shot number to read.
@@ -572,11 +571,13 @@ class DataWorkflow(ABC):
         Saves one file per shot in unprocessed_data_dir, with standardized
         signal names on a common 1 kHz timebase, plus a plot per shot showing
         what was kept and why.
+        Before the filters, the EQUILIBRIUM_0D_SIGNALS are held from the last usable reconstruction
+        (hold_from_usable_reconstructions).
 
         Resumes: shots that already have a file, are blacklisted, or failed on
-        an earlier run are skipped without touching the source. Source reads
-        run prepare_workers at a time; filtering, plotting, and writing stay on
-        this thread, since they are matplotlib and netCDF work.
+        an earlier run are skipped without touching the source.
+        Source reads run prepare_workers at a time,
+        while filtering, plotting, and writing stay on this thread, since they are matplotlib and netCDF work.
         """
         self.unprocessed_data_dir.mkdir(parents=True, exist_ok=True)
         workers = max(1, self.prepare_workers or 1)
@@ -656,6 +657,7 @@ class DataWorkflow(ABC):
         for shot, ds_standardized in zip(shots, datasets, strict=True):
             if ds_standardized is None:
                 continue
+            ds_standardized = hold_from_usable_reconstructions(ds_standardized)
             ds_unprocessed = self.filter_and_plot(ds_standardized)
             if ds_unprocessed is None:
                 logger.warning(
@@ -715,23 +717,17 @@ class DataWorkflow(ABC):
                     np.abs(ds_input[signal]) <= bounds["max_abs"]
                 )
 
-        # 2: Apply transient_filter: cut everything from the first time a signal exceeds
-        # its threshold. The comparison uses each signal smoothed by a centered boxcar
-        # (TRANSIENT_SMOOTHING_WINDOW wide) so that sporadic noise spikes on their own do
-        # not trip the filter.
+        # 2: Apply transient_filter: cut everything from the first time a signal exceeds its threshold.
+        # The comparison uses each signal smoothed by a centered boxcar TRANSIENT_SMOOTHING_WINDOW wide,
+        # so that sporadic noise spikes on their own do not trip the filter.
         dt = float(np.median(np.diff(ds_input["time"].values)))
-        smoothing_samples = max(1, round(TRANSIENT_SMOOTHING_WINDOW / dt))
-        if smoothing_samples % 2 == 0:
-            # Boxcar must be odd so it stays centered on the present timestep
-            smoothing_samples += 1
-
         transient_margin_time = None
         for signal, threshold in self.transient_filter.items():
-            smoothed = (
-                ds_input[signal]
-                .rolling(time=smoothing_samples, center=True, min_periods=1)
-                .mean()
+            signal_time_last = ds_input[signal].transpose(..., "time")
+            smoothed_values = centered_boxcar_mean(
+                signal_time_last.values, TRANSIENT_SMOOTHING_WINDOW, dt
             )
+            smoothed = signal_time_last.copy(data=smoothed_values)
             exceeded = valid_mask & (smoothed > threshold)
             if exceeded.any():
                 first_time = float(
@@ -1468,7 +1464,6 @@ class DataWorkflow(ABC):
         self,
         mb_per_chunk: int | None = 50,
         drop_unfit_slices: bool = True,
-        forward_fill: bool = True,
     ) -> Path:
         """Stack the unprocessed data and the fit results into the internal dataset.
 
@@ -1485,9 +1480,11 @@ class DataWorkflow(ABC):
         the grid ordinal, so shots of different lengths can be padded to a
         common size, and the TIME_COORD variable carries the times themselves.
         The fitted profiles come one per Thomson sample and the equilibria on
-        the reconstruction clock, (might be slower than 1 kHz), so they are held
+        the reconstruction clock, which might be slower than 1 kHz, so they are held
         forward onto the grid with the fresh_profile and fresh_equilibrium
-        flags marking the grid times that carry a recent sample.
+        flags marking the grid times that carry a sample of their own.
+        A profile is held for at most PROFILE_MAX_HOLD,
+        the GEQDSK block for at most MAX_HOLD_PERIODS of its clock, at least EQUILIBRIUM_HOLD_FLOOR.
 
         With a windowed shotlist only the grid times inside the windows are
         kept, and a window-averaged profile fills its whole window with
@@ -1500,10 +1497,6 @@ class DataWorkflow(ABC):
                 back usable (USABLE_FIT_STATUSES), as though the shot had no
                 Thomson sample there. False places every slice on the grid,
                 all-NaN profiles included.
-            forward_fill: Hold each fitted profile and each equilibrium forward
-                over the grid times that follow it, for at most
-                MAX_HOLD_PERIODS of their own sampling period. False leaves the
-                grid times between samples NaN.
 
         Returns:
             Path of the Zarr store.
@@ -1533,7 +1526,7 @@ class DataWorkflow(ABC):
 
         ds = build_tensorized_dataset(
             process_fn=lambda shot: self._internal_shot_dataset(
-                shot, drop_unfit_slices, forward_fill
+                shot, drop_unfit_slices
             ),
             identifiers=shots,
             zarr_path=zarr_path,
@@ -1765,16 +1758,15 @@ class DataWorkflow(ABC):
         return mask
 
     def _internal_shot_dataset(
-        self, shot: int, drop_unfit_slices: bool, forward_fill: bool
+        self, shot: int, drop_unfit_slices: bool
     ) -> xr.Dataset | None:
         """Build one shot's contribution to the internal dataset.
 
-        Internal dataset is on a 1 kHz timebase from the unprocessed dataset.
-        The fitted profiles are sampled far more slowly than that (one per Thomson sample).
-        In addition, on some devices the equilibria are sampled more slowly
-        and on some devices the equilibrium is too, so both are held forward
-        onto the grid and the fresh flags mark which grid times carry a sample
-        of their own.
+        The internal dataset is on the unprocessed dataset's 1 kHz timebase.
+        The fitted profiles are sampled far more slowly (one per Thomson sample),
+        and on some devices the equilibria are too, so both are held forward
+        onto the grid and the fresh flags mark which grid times carry a sample of their own.
+        A profile is held for at most PROFILE_MAX_HOLD, the equilibria as _hold_equilibrium holds them.
 
         A shot fit with time windows is placed on its full grid first, then
         cut down to the grid times inside the windows, so an equilibrium from
@@ -1786,8 +1778,6 @@ class DataWorkflow(ABC):
             shot: Shot number.
             drop_unfit_slices: Ignore the slices whose te or ne fit did not come
                 back usable, as though the shot had no Thomson sample there.
-            forward_fill: Hold profiles and equilibria forward onto the grid
-                times between their samples.
 
         Returns:
             The shot's dataset, or None when it has no usable fitted slice.
@@ -1840,7 +1830,7 @@ class DataWorkflow(ABC):
 
         if fit_mode == FIT_MODE_WINDOW_AVERAGE:
             slice_index, fresh_profile = _place_windows_on_grid(
-                grid, windows, window_index, forward_fill, shot
+                grid, windows, window_index, shot
             )
             if not fresh_profile.any():
                 raise ValueError(
@@ -1849,16 +1839,8 @@ class DataWorkflow(ABC):
                     f"unprocessed file are out of step, refit the shot."
                 )
         else:
-            # The fits of a windowed run only cover the Thomson samples inside the
-            # windows, so the hold period comes from every sample in the file,
-            # not from the fitted slice times with the inter-window gaps in them
-            period = (
-                _sample_period(ds_unprocessed, grid)
-                if fit_mode == FIT_MODE_WINDOW_SAMPLE
-                else None
-            )
-            slice_index, fresh_profile = _hold_onto_grid(
-                grid, slice_times, forward_fill, period
+            slice_index, fresh_profile = hold_onto_grid(
+                grid, slice_times, max_hold_time=PROFILE_MAX_HOLD
             )
             if not fresh_profile.any():
                 raise ValueError(
@@ -1893,9 +1875,7 @@ class DataWorkflow(ABC):
         if missing:
             logger.debug(f"Shot {shot}: filling {missing} with NaN, not on this device")
 
-        equilibrium, fresh_equilibrium = _hold_equilibrium(
-            ds_unprocessed, grid, forward_fill
-        )
+        equilibrium, fresh_equilibrium = _hold_equilibrium(ds_unprocessed, grid)
         data_vars.update(equilibrium)
 
         # Every other unprocessed signal (the raw Thomson channels) comes
@@ -2053,6 +2033,9 @@ class DataWorkflow(ABC):
                     "scale_per_slice": self.fit_scale_per_slice,
                     "bounds": self.fit_bounds,
                     "max_hold_periods": MAX_HOLD_PERIODS,
+                    "profile_max_hold": PROFILE_MAX_HOLD,
+                    "equilibrium_hold_floor": EQUILIBRIUM_HOLD_FLOOR,
+                    "power_smoothing_window": POWER_SMOOTHING_WINDOW,
                 }
             ),
         }
@@ -2073,7 +2056,7 @@ class DataWorkflow(ABC):
             grid: The shot's 1 kHz timebase [s].
             fresh_profile: Grid times carrying a Thomson slice of their own,
                 or the window centers of a window-averaged shot.
-            fresh_equilibrium: Grid times carrying a usable reconstruction.
+            fresh_equilibrium: Grid times carrying a usable reconstruction of their own (usable_reconstructions).
             fit_mode: How the profiles were fit, one of the FIT_MODE_* values.
                 Only changes what fresh_profile is described as.
 
@@ -2082,6 +2065,12 @@ class DataWorkflow(ABC):
         """
         held = (
             "1 where this grid time carries its own {}, 0 where it holds an earlier one"
+        )
+        equilibrium_description = (
+            "1 where a usable reconstruction (usable_reconstructions) lands, "
+            "0 where the GEQDSK block holds an earlier one. "
+            "The 0D equilibrium signals change only where it is 1, "
+            "and hold the last usable reconstruction until the next one"
         )
         profile_description = (
             "1 at the center grid time of each averaging window, 0 across the rest "
@@ -2104,7 +2093,7 @@ class DataWorkflow(ABC):
                 "fresh_equilibrium": (
                     (EPISODE_DIM, TIME_DIM),
                     fresh_equilibrium[None].astype(np.float32),
-                    {"description": held.format("usable equilibrium reconstruction")},
+                    {"description": equilibrium_description},
                 ),
             }
         )
@@ -2165,67 +2154,12 @@ def _drop_short_segments(
     return keep, dropped_lengths
 
 
-def _hold_onto_grid(
-    grid: np.ndarray,
-    sample_times: np.ndarray,
-    forward_fill: bool,
-    period: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Map every grid time onto the sample it takes its values from.
-
-    A grid time that carries a sample of its own takes that one. The rest
-    take the most recent earlier sample, held for at most MAX_HOLD_PERIODS
-    sampling periods so that nothing is carried across a long gap: the end
-    of the shot, a diagnostic dropping out, or a stretch the filtering cut
-    away. With forward_fill False nothing is held and only the grid times
-    that carry a sample of their own come out.
-
-    Args:
-        grid: The shot's 1 kHz timebase [s].
-        sample_times: Times of the samples to place on it [s], ascending.
-        forward_fill: Hold each sample forward until the next one.
-        period: The sampling period to hold for [s]. None takes the median
-            spacing of sample_times, which is right when they are every
-            sample there is, and wrong when they are a windowed subset.
-
-    Returns:
-        (sample_index, fresh): sample_index[i] is the index of the sample
-        that grid time i draws from, -1 where it draws from none, and
-        fresh[i] marks the grid times that carry a sample of their own.
-    """
-    sample_index = np.full(grid.size, -1, dtype=int)
-    fresh = np.zeros(grid.size, dtype=bool)
-    if sample_times.size == 0:
-        return sample_index, fresh
-
-    # Index of the last sample at or before each grid time
-    previous_sample = (
-        np.searchsorted(sample_times, grid + SAMPLE_TIME_TOL, side="right") - 1
-    )
-    has_previous = previous_sample >= 0
-    age = grid - sample_times[np.clip(previous_sample, 0, None)]
-    fresh = has_previous & (np.abs(age) <= SAMPLE_TIME_TOL)
-    if not forward_fill:
-        sample_index[fresh] = previous_sample[fresh]
-        return sample_index, fresh
-
-    # One sample on its own has no period to hold for,
-    # so it only fills the grid step it sits on
-    if period is None:
-        period = np.median(
-            np.diff(sample_times) if sample_times.size > 1 else np.diff(grid)
-        )
-    still_held = has_previous & (age <= MAX_HOLD_PERIODS * float(period))
-    sample_index[still_held] = previous_sample[still_held]
-    return sample_index, fresh
-
-
 def _hold_fits_onto_grid(ds_fit: xr.Dataset, slice_index: np.ndarray) -> xr.Dataset:
     """Place a shot's fit results on its 1 kHz grid.
 
     Args:
         ds_fit: The shot's fit results, one row per Thomson slice.
-        slice_index: Slice each grid time draws from, from _hold_onto_grid.
+        slice_index: Slice each grid time draws from, from hold_onto_grid.
 
     Returns:
         The fit results on the grid, NaN at the grid times that draw on no
@@ -2248,41 +2182,10 @@ def _fit_windows(ds_fit: xr.Dataset) -> np.ndarray:
     return window_bounds(json.loads(ds_fit.attrs["windows"]))
 
 
-def _sample_period(ds_unprocessed: xr.Dataset, grid: np.ndarray) -> float | None:
-    """Median spacing of a shot's Thomson samples, from its unprocessed file.
-
-    Args:
-        ds_unprocessed: The shot's unprocessed dataset, on the grid, with
-            its time coordinate already dropped.
-        grid: The shot's 1 kHz timebase [s].
-
-    Returns:
-        The period [s], or None when the file holds fewer than two samples
-        (the caller then falls back to _hold_onto_grid's own estimate).
-    """
-    if "ts_channel_t_e" not in ds_unprocessed or "ts_channel_n_e" not in ds_unprocessed:
-        return None
-    has_sample = (
-        (
-            ds_unprocessed["ts_channel_t_e"].notnull()
-            | ds_unprocessed["ts_channel_n_e"].notnull()
-        )
-        .any(dim="ts_channel")
-        .squeeze(EPISODE_DIM, drop=True)
-        .transpose(TIME_COORD)
-        .values
-    )
-    sample_times = grid[has_sample]
-    if sample_times.size < 2:
-        return None
-    return float(np.median(np.diff(sample_times)))
-
-
 def _place_windows_on_grid(
     grid: np.ndarray,
     windows: np.ndarray,
     window_index: np.ndarray,
-    forward_fill: bool,
     shot: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map every grid time onto the window-averaged profile it takes its values from.
@@ -2291,7 +2194,6 @@ def _place_windows_on_grid(
     the window draws from it, and the one nearest the window center is
     flagged fresh. Where windows overlap, a grid time draws from the holding
     window whose center is nearest (the earlier one on a tie).
-    With forward_fill False only the center times draw.
     A window with no grid time left in the unprocessed file (the filtering cut it away)
     is logged and its profile left out.
 
@@ -2299,11 +2201,10 @@ def _place_windows_on_grid(
         grid: The shot's 1 kHz timebase [s].
         windows: (n_w, 2) window bounds [s], sorted by start.
         window_index: (n_rows,) window of each kept fit row.
-        forward_fill: Fill the whole window, not only its center.
         shot: Shot number, for the log lines.
 
     Returns:
-        (sample_index, fresh) as _hold_onto_grid returns them: the fit row
+        (sample_index, fresh) as hold_onto_grid returns them: the fit row
         each grid time draws from, -1 for none, and the window centers.
     """
     sample_index = np.full(grid.size, -1, dtype=int)
@@ -2327,7 +2228,7 @@ def _place_windows_on_grid(
         fresh[members[np.argmin(np.abs(grid[members] - centers[row]))]] = True
     distance = np.where(member, np.abs(grid[:, None] - centers[None, :]), np.inf)
     nearest = distance.argmin(axis=1)
-    draws = np.isfinite(distance.min(axis=1)) if forward_fill else fresh
+    draws = np.isfinite(distance.min(axis=1))
     sample_index[draws] = nearest[draws]
     return sample_index, fresh
 
@@ -2377,14 +2278,15 @@ def _tile_channel_groups(groups: list | None, n_columns: int) -> list | None:
 
 
 def _hold_equilibrium(
-    ds_unprocessed: xr.Dataset, grid: np.ndarray, forward_fill: bool
+    ds_unprocessed: xr.Dataset, grid: np.ndarray
 ) -> tuple[dict[str, xr.DataArray], np.ndarray]:
     """Place a shot's equilibria on its 1 kHz grid.
 
     The equilibrium is reconstructed on its own clock, which is slower than
     the grid on some devices (MAST reconstructs every 5 ms, C-Mod every millisecond).
-    The grid times a reconstruction landed on are the ones with a finite simagx,
-    the rest hold the last one, for at most MAX_HOLD_PERIODS of the clock (reconstruction_clock_period).
+    The grid times a reconstruction landed on are the ones with a finite simagx, the rest hold the last one,
+    for at most MAX_HOLD_PERIODS of the clock (reconstruction_clock_period), or EQUILIBRIUM_HOLD_FLOOR when that is longer,
+    so a few missing reconstructions are bridged.
     An unusable reconstruction (usable_reconstructions) is treated as missing,
     so the previous one holds over it and it is not fresh.
     A shot with no usable reconstruction gets an all-NaN block.
@@ -2393,7 +2295,6 @@ def _hold_equilibrium(
         ds_unprocessed: The shot's unprocessed dataset, on the grid, with
             its time coordinate already dropped.
         grid: The shot's 1 kHz timebase [s].
-        forward_fill: Hold each reconstruction forward until the next one.
 
     Returns:
         (equilibrium, fresh): the GEQDSK variables on the grid, and the
@@ -2413,8 +2314,11 @@ def _hold_equilibrium(
         nothing_held = xr.DataArray(np.zeros(grid.size, dtype=bool), dims=TIME_COORD)
         ds_held = ds_unprocessed[names].where(nothing_held)
         return {name: ds_held[name] for name in names}, np.zeros(grid.size, dtype=bool)
-    reconstruction_index, fresh = _hold_onto_grid(
-        grid, grid[reconstructed], forward_fill, period=clock_period
+    reconstruction_index, fresh = hold_onto_grid(
+        grid,
+        grid[reconstructed],
+        clock_period,
+        hold_floor=EQUILIBRIUM_HOLD_FLOOR,
     )
     # reconstruction_index counts reconstructions, the dataset is indexed by
     # grid time, so index the grid times the reconstructions landed on
