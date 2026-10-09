@@ -17,12 +17,12 @@ import xarray as xr
 
 import transport_validation_datasets.workflow as workflow_module
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_validation_datasets.filters import FAILURE_MARGIN
 from transport_validation_datasets.gp_fitting.batch_io import (
     FIT_MODE_SAMPLE,
     FIT_MODE_WINDOW_AVERAGE,
     FIT_MODE_WINDOW_SAMPLE,
     STATUS_OK,
-    STATUS_SKIPPED,
     ShotFitInput,
     unpack_fit_batch,
 )
@@ -43,6 +43,27 @@ RHO_TOR_NORM_CH = np.linspace(0.05, 1.1, 24)
 # Where make_source_dataset injects the bad readings
 MISFIRED_TE_CHANNEL = 3  # rho_tor_norm 0.19
 NOISY_NE_CHANNEL = 7  # rho_tor_norm 0.37
+
+# Every 0D signal of the schema, so the finite filter passes unless a test breaks one.
+# No heating power, so the shot checks only see what a test puts in.
+DEFAULT_ZERO_D = {
+    "ip": 1.0e6,
+    "b0": 2.0,
+    "energy_mhd": 1.0e5,
+    "beta_tor_norm": 1.0,
+    "n_e_line_average": NE_AXIS,
+    "minor_radius": 0.2,
+    "geometric_axis_r": 0.7,
+    "elongation": 1.6,
+    "triangularity_upper": 0.3,
+    "triangularity_lower": 0.3,
+    "power_ohm": 0.0,
+    "power_radiated": 0.0,
+    "power_nbi": 0.0,
+    "power_ic": 0.0,
+    "power_lh": 0.0,
+    "power_ec": 0.0,
+}
 
 # Dummy shot numbers used throughout the tests
 BLACKLISTED_SHOT = 9
@@ -76,6 +97,7 @@ def make_source_dataset(
     duration: float,
     broken_sample: int | None,
     bad_readings: bool,
+    extra_signals: dict[str, float | np.ndarray] | None = None,
 ) -> xr.Dataset:
     grid = make_uniform_1kHz_timebase(duration)
     n_t = grid.size
@@ -108,9 +130,16 @@ def make_source_dataset(
     def channel(values):
         return ((EPISODE_DIM, TIME_COORD, "ts_channel"), values[None])
 
+    zero_d = {**DEFAULT_ZERO_D, **(extra_signals or {})}
     return xr.Dataset(
         {
-            "ip": ((EPISODE_DIM, TIME_COORD), np.full((1, n_t), 1.0e6)),
+            **{
+                name: (
+                    (EPISODE_DIM, TIME_COORD),
+                    np.full((1, n_t), values, dtype=float),
+                )
+                for name, values in zero_d.items()
+            },
             # rho_tor_norm stands in for R, see DummyWorkflow.prepare_fit_input
             "ts_channel_r": channel(np.tile(RHO_TOR_NORM_CH, (n_t, 1))),
             "ts_channel_z": channel(np.zeros((n_t, n_ch))),
@@ -120,16 +149,17 @@ def make_source_dataset(
             "ts_channel_n_e_error": channel(ne_error),
         },
         coords={EPISODE_DIM: [shot], TIME_COORD: grid, "ts_channel": np.arange(n_ch)},
+        # The radius b0 is given at, as every device's source attaches it
+        attrs={"r0": 0.7},
     )
 
 
 class DummyWorkflow(DataWorkflow):
-    valid_filter = {"ip": {"min_abs": 1.0}}
+    min_filter = {"ip": 1.0}
+    max_filter = {}
     transient_filter = {}
     end_margin = 0.01
     min_pulse_length = 0.1
-    min_usable_time = 0.05
-    min_segment_length = 0.01
     shot_blacklist = [BLACKLISTED_SHOT]
     fit_rho_tor_norm = np.linspace(0.0, 1.4, 29)
     fit_min_points = 3
@@ -139,10 +169,18 @@ class DummyWorkflow(DataWorkflow):
         self.shape = parabola
         self.broken_samples: dict[int, int] = {}
         self.bad_readings = False
+        # 0D signals a shot's source carries beyond ip, a value or an array on the grid
+        self.extra_signals: dict[int, dict[str, float | np.ndarray]] = {}
         super().__init__(*args, **kwargs)
 
     def get_shotlist_from_source(self) -> list[int]:
         return [1, 2]
+
+    def add_equilibrium_signals(
+        self, ds_standardized: xr.Dataset, reconstruction_usable: np.ndarray | None
+    ) -> xr.Dataset:
+        # The synthetic source has no GEQDSK block, it carries its own 0D signals and power_ohm
+        return ds_standardized
 
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         self.source_reads.append(shot)
@@ -155,6 +193,7 @@ class DummyWorkflow(DataWorkflow):
             duration,
             broken_sample=self.broken_samples.get(shot),
             bad_readings=self.bad_readings,
+            extra_signals=self.extra_signals.get(shot),
         )
 
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
@@ -253,6 +292,34 @@ class TestMakeUnprocessedDataFiles:
 
         assert workflow.source_reads == reads
 
+    def test_rejected_shot_refiltered_only_when_its_filters_change(
+        self, tmp_path, monkeypatch
+    ):
+        # A rerun under the filters that rejected a shot skips it,
+        # and a filter change reruns it from the kept pull, never the source
+        workflow = make_workflow(tmp_path, shots=[1])
+        workflow.min_filter = {"ip": 2e6}
+        workflow.make_unprocessed_data_files()
+        assert workflow.unprocessed_shots() == []
+
+        filtered_shots = []
+        filter_and_plot = workflow.filter_and_plot
+
+        def recording_filter_and_plot(ds_input, reconstruction_usable):
+            filtered_shots.append(int(ds_input["shot"].values.flat[0]))
+            return filter_and_plot(ds_input, reconstruction_usable)
+
+        monkeypatch.setattr(workflow, "filter_and_plot", recording_filter_and_plot)
+        workflow.make_unprocessed_data_files()
+        assert filtered_shots == []
+
+        workflow.min_filter = {"ip": 1.0}
+        workflow.make_unprocessed_data_files()
+
+        assert filtered_shots == [1]
+        assert workflow.unprocessed_shots() == [1]
+        assert workflow.source_reads == [1]
+
     def test_blacklisted_never_read_unreadable_retried(self, tmp_path):
         workflow = make_workflow(tmp_path, shots=[1, BLACKLISTED_SHOT, UNREADABLE_SHOT])
 
@@ -281,6 +348,155 @@ class TestMakeUnprocessedDataFiles:
         workflow.make_unprocessed_data_files()
 
         assert workflow.unprocessed_shots() == [1]
+
+    def test_broken_record_rejected_and_recorded(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        workflow.extra_signals = {1: {"power_radiated": np.nan}}
+
+        workflow.make_unprocessed_data_files()
+
+        assert workflow.unprocessed_shots() == [2]
+        assert workflow.shot_already_failed(1)
+
+
+class TestTransientGaps:
+    grid = make_uniform_1kHz_timebase(DURATION).astype(float)
+
+    def kept_times(self, tmp_path, spike_time: float) -> np.ndarray:
+        # A 20 MW ohmic spike 5 ms wide, above the 5 MW threshold for 7 ms after smoothing
+        workflow = make_workflow(tmp_path)
+        workflow.transient_filter = {"power_ohm": 5e6}
+        power_ohm = np.where(np.abs(self.grid - spike_time) <= 2.5e-3, 2e7, 1e5)
+        ds = make_source_dataset(
+            1, parabola, DURATION, None, False, extra_signals={"power_ohm": power_ohm}
+        )
+        ds_filtered = workflow.filter_and_plot(ds, None)
+        return ds_filtered[TIME_COORD].values
+
+    def test_early_spike_cut_out_and_the_longer_stretch_after_kept(self, tmp_path):
+        times = self.kept_times(tmp_path, 0.06)
+
+        assert 0.06 < times.min() < 0.07
+        assert times.max() > 0.28
+
+    def test_late_spike_keeps_the_longer_stretch_before(self, tmp_path):
+        times = self.kept_times(tmp_path, 0.22)
+
+        # The transient starts at 0.217 s, and FAILURE_MARGIN cuts the 20 ms before it
+        assert times.min() < 1e-3
+        assert times.max() == pytest.approx(0.217 - 1e-3 - FAILURE_MARGIN)
+
+
+class TestSliceFilters:
+    grid = make_uniform_1kHz_timebase(DURATION).astype(float)
+
+    def kept_times(self, workflow, **signals) -> np.ndarray:
+        ds = make_source_dataset(
+            1, parabola, DURATION, None, False, extra_signals=signals
+        )
+        ds_filtered = workflow.filter_and_plot(ds, None)
+        return ds_filtered[TIME_COORD].values
+
+    def test_min_max_and_nan_failures_are_gaps_around_the_longest_segment(
+        self, tmp_path
+    ):
+        # A low energy_mhd stretch, a Greenwald fraction over 2, and a NaN power sample,
+        # leaving 0.161-0.29 s (the end margin cuts after 0.29 s) as the longest segment
+        workflow = make_workflow(tmp_path)
+        workflow.min_filter = {"ip": 1.0, "energy_mhd": 5e4}
+        workflow.max_filter = {"greenwald_fraction": 2.0}
+        energy_mhd = np.where((self.grid > 0.05) & (self.grid < 0.08), 1e4, 1e5)
+        # n_GW of 1 MA in a 0.2 m minor radius is ~8e20 m^-3
+        n_e_line_average = np.where(
+            (self.grid > 0.10) & (self.grid < 0.12), 2e21, NE_AXIS
+        )
+        power_radiated = np.where(np.isclose(self.grid, 0.16), np.nan, 0.0)
+
+        times = self.kept_times(
+            workflow,
+            energy_mhd=energy_mhd,
+            n_e_line_average=n_e_line_average,
+            power_radiated=power_radiated,
+        )
+
+        assert times.min() == pytest.approx(0.161)
+        assert times.max() == pytest.approx(0.29)
+        assert np.allclose(np.diff(times), 1e-3)
+
+    def test_shot_ends_at_the_last_ip_above_its_threshold(self, tmp_path):
+        # ip stays finite but below the threshold after 0.2 s, so the end margin counts back from 0.199 s
+        workflow = make_workflow(tmp_path)
+        workflow.min_filter = {"ip": 1e5}
+        ip = np.where(self.grid < 0.2, 1e6, 1e3)
+
+        times = self.kept_times(workflow, ip=ip)
+
+        assert times.max() == pytest.approx(0.189)
+
+
+class TestShotRejectionReason:
+    grid = make_uniform_1kHz_timebase(DURATION).astype(float)
+
+    def kept_dataset(self, **signals) -> xr.Dataset:
+        return make_source_dataset(
+            1, parabola, DURATION, None, False, extra_signals=signals
+        )
+
+    def test_radiated_fraction_floor_only_when_set(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        # 3 kW radiated against 1 MW of heating is 0.3 percent
+        ds = self.kept_dataset(power_radiated=3e3, power_nbi=1e6)
+        assert workflow.shot_rejection_reason(ds) is None
+
+        workflow.min_radiated_fraction = 0.025
+
+        assert "power_radiated" in workflow.shot_rejection_reason(ds)
+        healthy = self.kept_dataset(power_radiated=2e5, power_nbi=1e6)
+        assert workflow.shot_rejection_reason(healthy) is None
+        # No heating record, nothing to compare against
+        unheated = self.kept_dataset(power_radiated=3e3)
+        assert workflow.shot_rejection_reason(unheated) is None
+
+    def test_radiated_fraction_ceiling_only_when_set(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        # 1.5 MW radiated against 1 MW of heating radiates more than is put in
+        ds = self.kept_dataset(power_radiated=1.5e6, power_nbi=1e6)
+        assert workflow.shot_rejection_reason(ds) is None
+
+        workflow.max_radiated_fraction = 1.0
+
+        assert "ceiling" in workflow.shot_rejection_reason(ds)
+        healthy = self.kept_dataset(power_radiated=8e5, power_nbi=1e6)
+        assert workflow.shot_rejection_reason(healthy) is None
+
+    def test_energy_rise_beyond_heating_rejected(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        # 100 kJ stored over the 0.3 s shot, peaking at the end
+        energy_mhd = 1e5 * self.grid / self.grid[-1]
+        # 0.3 s at 0.1 MW is 30 kJ, and the NaN half of a power record puts nothing in
+        power_nbi_half_nan = np.where(self.grid < 0.15, np.nan, 0.0)
+        unheated = self.kept_dataset(
+            energy_mhd=energy_mhd, power_ohm=1e5, power_nbi=power_nbi_half_nan
+        )
+        # 0.3 s at 0.1 + 0.3 MW is 120 kJ, and a negative power takes nothing out
+        heated = self.kept_dataset(
+            energy_mhd=energy_mhd, power_ohm=1e5, power_nbi=3e5, power_lh=-1e6
+        )
+
+        assert "energy_mhd" in workflow.shot_rejection_reason(unheated)
+        assert workflow.shot_rejection_reason(heated) is None
+
+    def test_rise_from_first_kept_time_against_input_up_to_peak(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        # 0.3 MW puts in 30 kJ by the peak at 0.1 s and 90 kJ over the shot.
+        # Both shots start at 200 kJ, so judging the peak itself would reject both,
+        # and integrating past the peak would pass both.
+        rise_shape = np.minimum(self.grid, 0.2 - self.grid) / 0.1
+        small_rise = self.kept_dataset(energy_mhd=2e5 + 2e4 * rise_shape, power_ohm=3e5)
+        large_rise = self.kept_dataset(energy_mhd=2e5 + 4e4 * rise_shape, power_ohm=3e5)
+
+        assert workflow.shot_rejection_reason(small_rise) is None
+        assert "energy_mhd" in workflow.shot_rejection_reason(large_rise)
 
 
 class TestStageFitBatches:
@@ -536,7 +752,7 @@ class TestStackInternalDataset:
         )
         assert "center" in store["fresh_profile"].attrs["description"]
 
-    def test_unfit_slices_dropped_by_default_and_kept_on_request(self, tmp_path):
+    def test_unfit_slices_are_held_over(self, tmp_path):
         workflow = make_workflow(tmp_path, shots=[1])
         workflow.broken_samples = {1: 3}  # the sample at 0.07 s has 2 channels
         workflow.make_unprocessed_data_files()
@@ -551,12 +767,47 @@ class TestStackInternalDataset:
         assert np.isfinite(dropped["t_e"].values[i, at]).all()
         assert dropped["t_e_fit_status"].values[i, at] == STATUS_OK
 
-        kept = xr.open_zarr(
-            workflow.stack_internal_dataset(drop_unfit_slices=False), consolidated=True
-        )
-        assert int(kept["fresh_profile"].values[i, : times.size].sum()) == 15
-        assert kept["t_e_fit_status"].values[i, at] == STATUS_SKIPPED
-        assert np.isnan(kept["t_e"].values[i, at]).all()
+    def test_check_added_after_unprocessed_stage_drops_shot(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        workflow.extra_signals = {
+            1: {"power_radiated": 3e3, "power_nbi": 1e6},
+            2: {"power_radiated": 2e5, "power_nbi": 1e6},
+        }
+        workflow.make_unprocessed_data_files()
+        workflow.run_gp_fitting()
+
+        # The files on disk were written without a floor, the stack applies it now
+        workflow.min_radiated_fraction = 0.025
+        store = xr.open_zarr(workflow.stack_internal_dataset(), consolidated=True)
+
+        assert store[EPISODE_DIM].values.tolist() == [2]
+
+    def test_shots_excluded_after_files_written_left_out(self, tmp_path):
+        workflow = make_workflow(tmp_path, shots=[1, 2, 3])
+        workflow.make_unprocessed_data_files()
+        workflow.run_gp_fitting()
+
+        workflow.first_shot = 2
+        workflow.shot_blacklist = [3]
+        store = xr.open_zarr(workflow.stack_internal_dataset(), consolidated=True)
+
+        assert store[EPISODE_DIM].values.tolist() == [2]
+
+    def test_density_far_off_interferometer_drops_shot(self, tmp_path):
+        workflow = make_workflow(tmp_path)
+        # The fitted parabola averages ~0.77 of its axis value over rho_tor_norm 0-1,
+        # so shot 2's interferometer reads ~5x its Thomson
+        workflow.extra_signals = {
+            1: {"n_e_line_average": NE_AXIS * shot_scale(1)},
+            2: {"n_e_line_average": 4.0 * NE_AXIS * shot_scale(2)},
+        }
+        workflow.make_unprocessed_data_files()
+        workflow.run_gp_fitting()
+
+        workflow.density_ratio_bounds = (0.5, 1.3)
+        store = xr.open_zarr(workflow.stack_internal_dataset(), consolidated=True)
+
+        assert store[EPISODE_DIM].values.tolist() == [1]
 
     def test_publish_strips_raw_channels(self, tmp_path):
         workflow = make_workflow(tmp_path)

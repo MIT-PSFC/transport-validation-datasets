@@ -8,15 +8,19 @@ change here quietly changes what lands in every device's store.
 import numpy as np
 import xarray as xr
 
-from transport_validation_datasets import EPISODE_DIM, TIME_COORD
+from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
+from transport_validation_datasets.gp_fitting.batch_io import STATUS_CULLED, STATUS_OK
 from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
     MAX_HOLD_PERIODS,
     hold_onto_grid,
+    keep_longest_segment,
 )
 from transport_validation_datasets.workflow import (
-    _drop_short_segments,
     _hold_equilibrium,
+    _trim_and_keep_longest,
+    _trim_segment_starts,
+    _usable_slice_mask,
 )
 
 
@@ -25,92 +29,81 @@ def grid_ms(n: int) -> np.ndarray:
     return np.round(np.arange(n) * 1e-3, 3)
 
 
-class TestDropShortSegments:
-    def test_segment_shorter_than_the_minimum_cleared(self):
-        times = grid_ms(10)
-        keep = np.array(
-            [False, False, True, True, True, False, False, False, False, False]
-        )
+def runs(*lengths: int) -> np.ndarray:
+    # Alternating kept and cut runs of the given lengths in samples, starting with a kept run
+    return np.concatenate([np.full(n, i % 2 == 0) for i, n in enumerate(lengths)])
 
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
+
+class TestKeepLongestSegment:
+    def test_only_the_longest_run_left(self):
+        times = grid_ms(30)
+        keep = runs(5, 2, 10, 3, 10)
+
+        kept, dropped = keep_longest_segment(keep, times)
+
+        # Equally long runs keep the earliest
+        assert np.flatnonzero(kept).tolist() == list(range(7, 17))
+        # Measured first to last sample, so n samples span n - 1 ms
+        assert np.allclose(dropped, [0.004, 0.009])
+
+    def test_empty_mask_keeps_nothing(self):
+        kept, dropped = keep_longest_segment(np.zeros(10, dtype=bool), grid_ms(10))
 
         assert not kept.any()
+        assert dropped == []
+
+
+class TestTrimSegmentStarts:
+    def test_each_segment_starts_on_its_first_startable_sample(self):
+        # Three segments: one starting on a sample that can start it,
+        # one whose first such sample is 2 samples in, and one with none
+        keep = np.array([1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1], dtype=bool)
+        can_start = np.array([1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0], dtype=bool)
+
+        trimmed = _trim_segment_starts(keep, can_start)
+
+        assert np.flatnonzero(trimmed).tolist() == [0, 1, 2, 6, 7]
+
+
+class TestTrimAndKeepLongest:
+    def test_earlier_segment_never_starts_a_later_one(self):
+        # A 5 ms clock, so a reconstruction reaches 7.5 ms.
+        # The 0 ms reconstruction of the 0-2 ms segment reaches 4-7 ms, but only one segment is kept,
+        # so 4-9 ms have no equilibrium of their own and are trimmed.
+        times = grid_ms(30)
+        keep = np.zeros(30, dtype=bool)
+        keep[0:3] = True
+        keep[4:21] = True
+        reconstruction_usable = np.zeros(30, dtype=bool)
+        reconstruction_usable[[0, 10, 15, 20]] = True
+
+        kept, dropped, n_trimmed = _trim_and_keep_longest(
+            keep, times, reconstruction_usable, 0.005
+        )
+
+        assert np.flatnonzero(kept).tolist() == list(range(10, 21))
         assert len(dropped) == 1
+        assert n_trimmed == 6
 
-    def test_long_segment_survives(self):
-        times = grid_ms(10)
-        keep = np.array(
-            [False, False, True, True, True, True, True, True, False, False]
+    def test_longest_judged_after_every_trim(self):
+        # 0-45 ms starts on its own 0 ms reconstruction.
+        # 47-95 ms is reached at 47 only by the 45 ms reconstruction before it,
+        # so on its own it starts at 58 and spans 37 ms, shorter than 0-45 ms.
+        times = grid_ms(100)
+        keep = np.zeros(100, dtype=bool)
+        keep[0:46] = True
+        keep[47:96] = True
+        reconstruction_usable = np.zeros(100, dtype=bool)
+        reconstruction_usable[0:46:5] = True
+        reconstruction_usable[58:96:5] = True
+
+        kept, dropped, n_trimmed = _trim_and_keep_longest(
+            keep, times, reconstruction_usable, 0.005
         )
 
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
-
-        assert np.array_equal(kept, keep)
-        assert dropped == []
-
-    def test_segment_measured_first_to_last_sample(self):
-        # n samples on the 1 kHz grid span n - 1 ms,
-        # so a 5 sample run is exactly 4 ms long and a 4 ms minimum keeps it
-        times = grid_ms(10)
-        keep = np.array(
-            [False, True, True, True, True, True, False, False, False, False]
-        )
-
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.004)
-        assert np.array_equal(kept, keep)
-        assert dropped == []
-
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
-        assert not kept.any()
-        assert dropped == [0.004]
-
-    def test_short_and_long_segments_judged_independently(self):
-        times = grid_ms(12)
-        keep = np.array(
-            [True, True, False, False, False]
-            + [True, True, True, True, True, True, True]
-        )
-
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
-
-        assert np.array_equal(
-            kept,
-            np.array(
-                [False, False, False, False, False]
-                + [True, True, True, True, True, True, True]
-            ),
-        )
-        assert len(dropped) == 1
-
-    def test_run_touching_either_end_still_seen(self):
-        times = grid_ms(10)
-        keep = np.array(
-            [True, True, False, False, False, False, False, False, True, True]
-        )
-
-        kept, dropped = _drop_short_segments(keep, times, min_length=0.005)
-
-        assert not kept.any()
-        assert len(dropped) == 2
-
-    def test_empty_mask_drops_nothing(self):
-        times = grid_ms(10)
-
-        kept, dropped = _drop_short_segments(np.zeros(10, dtype=bool), times, 0.005)
-
-        assert not kept.any()
-        assert dropped == []
-
-    def test_input_mask_not_mutated(self):
-        times = grid_ms(10)
-        keep = np.array(
-            [False, False, True, True, True, False, False, False, False, False]
-        )
-        original = keep.copy()
-
-        _drop_short_segments(keep, times, min_length=0.005)
-
-        assert np.array_equal(keep, original)
+        assert np.flatnonzero(kept).tolist() == list(range(0, 46))
+        assert np.allclose(dropped, [0.037])
+        assert n_trimmed == 11
 
 
 class TestHoldOntoGrid:
@@ -291,3 +284,42 @@ class TestHoldEquilibrium:
         assert set(held) == {"rmagx"}
         assert not fresh.any()
         assert held["rmagx"].shape == (1, grid.size)
+
+
+class TestUsableSliceMask:
+    def test_flat_te_and_band_wider_than_profile_inside_lcfs_rejected(self):
+        rho_tor_norm = np.linspace(0.0, 1.1, 23)
+        i_mid = 10  # rho_tor_norm 0.5
+        i_sol = 21  # rho_tor_norm 1.05
+        n_t = 6
+        te = np.tile(1000.0 * (1.0 - (rho_tor_norm / 1.2) ** 2), (n_t, 1))
+        ne = np.tile(1.0e20 * (1.0 - (rho_tor_norm / 1.2) ** 2), (n_t, 1))
+        te_error = np.full((n_t, rho_tor_norm.size), 50.0)
+        ne_error = np.full((n_t, rho_tor_norm.size), 5.0e18)
+        status = np.full(n_t, STATUS_OK)
+        # 0 is a healthy slice
+        te[1] = 500.0  # flat, te at the LCFS equals its peak
+        te_error[2, i_mid] = 2000.0
+        ne_error[3, i_mid] = 2.0e20
+        # Past the LCFS a blown band says nothing about the profile inside
+        te_error[4, i_sol] = 2000.0
+        status[5] = STATUS_CULLED
+        profile_dims = (EPISODE_DIM, TIME_DIM, "rho_tor_norm")
+        ds_fit = xr.Dataset(
+            {
+                "t_e": (profile_dims, te[None]),
+                "t_e_error": (profile_dims, te_error[None]),
+                "n_e": (profile_dims, ne[None]),
+                "n_e_error": (profile_dims, ne_error[None]),
+                "t_e_fit_status": ((EPISODE_DIM, TIME_DIM), status[None]),
+                "n_e_fit_status": (
+                    (EPISODE_DIM, TIME_DIM),
+                    np.full((1, n_t), STATUS_OK),
+                ),
+            },
+            coords={EPISODE_DIM: [1], "rho_tor_norm": rho_tor_norm},
+        )
+
+        usable = _usable_slice_mask(ds_fit)
+
+        assert np.flatnonzero(usable).tolist() == [0, 4]
