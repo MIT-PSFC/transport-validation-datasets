@@ -2,7 +2,6 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import xarray as xr
-from disruption_py.core.utils.math import interp1
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
 from disruption_py.settings.output_setting import DatasetOutputSetting
@@ -15,10 +14,13 @@ from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFit
 from transport_validation_datasets.machine.cmod.dispy_methods import (
     CmodEfitMethods,
     CmodGeometryMethods,
+    CmodPlasmaMethods,
+    CmodPowerMethods,
     CmodThomsonMethods,
     UniformTimeSetting,
 )
 from transport_validation_datasets.machine.generic import (
+    POWER_SMOOTHING_WINDOW,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
     snap_to_grid,
@@ -30,6 +32,30 @@ from transport_validation_datasets.workflow import DataWorkflow, DeviceSettings
 # attributes attached (DataWorkflow.signal_attrs). Everything else carries
 # disruption-py's, rewritten to the shared convention at the stack stage.
 SIGNAL_ATTRS = {
+    "ip": {
+        "description": "Plasma current, magnetics ip (Rogowski coil), signed, mean of each 1 ms grid step",
+    },
+    "b0": {
+        "description": "Vacuum toroidal field at 0.66 m, magnetics btor, signed, mean of each 1 ms grid step",
+    },
+    "n_e_line_average": {
+        "description": (
+            "Line-averaged electron density, TCI chord 4 line integral nl_04 (mean of each 1 ms grid step) "
+            "over a 0.6 m chord"
+        ),
+    },
+    "power_radiated": {
+        "description": (
+            "Total radiated power, AXUV twopi_diode x 4.5 (cross-calibrated to the 2pi foil bolometer), "
+            "mean of each 1 ms grid step, smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0"
+        ),
+    },
+    "power_ic": {
+        "description": "ICRF net heating power (rf_power_net), mean of each 1 ms grid step, zero outside its record",
+    },
+    "power_lh": {
+        "description": "Lower hybrid net heating power (LH netpow), mean of each 1 ms grid step, zero outside its record",
+    },
     "power_nbi": {
         "description": "Neutral beam heating power (none on C-Mod)",
         "units": "W",
@@ -41,11 +67,6 @@ SIGNAL_ATTRS = {
         "ref": "/equilibrium/time_slice(itime)/boundary/geometric_axis/r",
     },
 }
-
-# An EFIT tree whose reconstructions sit further apart than this is slow [s].
-# Snapping its 0D signals would leave most of the 1 kHz grid NaN, so they are interpolated instead.
-# EFIT21 reconstructs every 1 ms, ANALYSIS every ~20 ms.
-SLOW_EFIT_PERIOD = 1.5e-3
 
 
 @dataclass(frozen=True)
@@ -89,7 +110,8 @@ class CModDataWorkflow(DataWorkflow):
         "power_ohm": 5.0e6,
         "power_radiated": 2.5e6,
     }
-    end_margin = 0.02
+    # One smoothing window, so the smoothed power_radiated does not carry the current quench (POWER_SMOOTHING_WINDOW)
+    end_margin = POWER_SMOOTHING_WINDOW
     shot_blacklist = []
 
     # GP fit staging knobs
@@ -152,12 +174,12 @@ class CModDataWorkflow(DataWorkflow):
         """Read one shot from MDSplus, through disruption-py, into standardized signals.
 
         Four retrievals rather than one, because their native timebases differ.
-        The fast diagnostics (Ip, B0, density, powers) are sampled at the 1 kHz grid times from their own faster native data.
-        The EFIT reconstruction and Thomson scattering (native ~20 Hz) are snapped onto the grid without interpolation,
+        The fast diagnostics (Ip, B0, density, powers) are averaged over each 1 ms grid step from their own faster native data.
+        The EFIT reconstruction and Thomson scattering are snapped onto the grid without interpolation,
         so grid times between their real samples hold NaN.
-        The EFIT 0D signals (stored energy, shaping) are snapped too from a 1 kHz tree, where the snap is an exact relabeling,
-        and interpolated from a slow one (see _get_efit0d_dataset).
-        fresh_equilibrium in the stores marks the grid times a reconstruction landed on either way.
+        The EFIT 0D signals (stored energy, shaping) are snapped too,
+        and the workflow holds them from the last usable reconstruction (hold_from_usable_reconstructions),
+        so they change exactly where fresh_equilibrium in the stores is 1.
 
         All four open the EFIT tree, at least for their timebase,
         so a shot reads everything from one tree.
@@ -207,8 +229,8 @@ class CModDataWorkflow(DataWorkflow):
     def standardize_signal_names(self, ds: xr.Dataset) -> xr.Dataset | None:
         """Rename signals to IMAS-like names, keeping freeqdsk names for EFIT signals.
 
-        All signals stay in SI units. Plasma current and toroidal field are stored
-        as magnitudes, sign conventions live in the geqdsk signals.
+        All signals stay in SI units.
+        ip and b0 keep the sign of their source, the GEQDSK signals carry the COCOS convention.
 
         Args:
             ds: Merged dataset with disruption-py signal names.
@@ -236,11 +258,6 @@ class CModDataWorkflow(DataWorkflow):
             "tritop": "triangularity_upper",
             "tribot": "triangularity_lower",
             "rout": "geometric_axis_r",
-            # thomson_scattering/channel
-            "ts_channel_ne": "ts_channel_n_e",
-            "ts_channel_ne_error": "ts_channel_n_e_error",
-            "ts_channel_te": "ts_channel_t_e",
-            "ts_channel_te_error": "ts_channel_t_e_error",
         }
 
         ds = ds.rename({k: v for k, v in imas_rename.items() if k in ds})
@@ -472,13 +489,16 @@ def _read_with_efit_tree(
 def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     """Retrieve the fast-diagnostic 0D signals on the uniform 1 kHz grid.
 
-    Only signals sampled at least as fast as the grid belong here
-    (magnetics, TCI, bolometry, RF power),
-    so sampling them at the grid times only discards resolution.
+    Only signals sampled faster than the grid belong here
+    (magnetics, TCI, bolometry, RF and LH power),
+    and each grid time takes the mean of the preceding millisecond (signal_on_grid).
     The EFIT-derived 0D signals are in _get_efit0d_dataset instead.
-    p_oh stays here because the fast loop voltage and Ip set its time resolution.
+    p_oh is disruption-py's own (get_ohmic_parameters), at the time resolution of the fast loop voltage and Ip.
     Its EFIT li inductance correction is exact at the EFIT21 slice times
     and NaN outside the EFIT time range.
+    The methods are selected by name,
+    since selected by column the disruption-py built-ins serving the same columns would run too,
+    and they interpolate.
 
     Args:
         shot: Shot number to retrieve data for.
@@ -488,22 +508,23 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         Dataset with the fast 0D signals for the given shot, or None if
         retrieval returned no data.
     """
-    fast_signals = [
-        "ip",  # Plasma current
-        "bt",  # On-axis magnetic field
-        "n_e",  # Line average electron density [m^-3]
-        # Power sources and sinks
-        "p_oh",  # Ohmic heating power
-        "p_rad",  # Bulk radiated heating power
-        "p_icrf",  # ICRF heating power
-        "p_lh",  # Lower hybrid heating power (yes this is actually lower hybrid on C-Mod, NOT the LH transition threshold like on TCV)
+    fast_methods = [
+        "get_plasma_current",  # ip
+        "get_toroidal_field",  # bt, the vacuum field at 0.66 m
+        "get_line_average_density",  # n_e [m^-3]
+        "get_radiated_power",  # p_rad
+        # p_icrf, p_lh (lower hybrid heating on C-Mod, NOT the L-H threshold power as on TCV)
+        "get_heating_powers",
+        # p_oh, with the v_loop it is built from
+        "get_ohmic_parameters",
     ]
 
     retrieval_settings = RetrievalSettings(
-        run_columns=fast_signals,
+        run_methods=fast_methods,
         time_setting=UniformTimeSetting(),
         efit_nickname_setting=efit_tree,
-        only_requested_columns=True,
+        only_requested_columns=False,
+        custom_physics_methods=[CmodPlasmaMethods, CmodPowerMethods],
     )
     result = get_shots_data(
         tokamak=Tokamak.CMOD,
@@ -515,6 +536,8 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
     )
     if _is_empty_result(result):
         return None
+    # Only p_oh is wanted from the built-in
+    result = result.drop_vars("v_loop")
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
 
@@ -524,10 +547,9 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
 
     time_setting="efit" makes params.times the EFIT tree's own timebase,
     so the final interp1 in the disruption-py methods is an identity.
-    A tree on the grid's cadence is snapped onto it like the equilibrium and Thomson.
-    A slow tree (see SLOW_EFIT_PERIOD) is interpolated linearly, as MAST's 0D equilibrium signals are,
-    so the valid filter sees a signal at every grid time.
-    Grid times outside the tree's time range hold NaN either way.
+    The tree is snapped onto the grid like the equilibrium and Thomson,
+    so its 0D and 2D sit on the same grid times, NaN between them.
+    DataWorkflow.make_unprocessed_data_files holds them from the last usable reconstruction.
 
     Args:
         shot: Shot number to retrieve data for.
@@ -566,39 +588,9 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         return None
     efit_times = result["time"].values
     timebase = make_uniform_1kHz_timebase(float(efit_times.max()))
-    slow_tree = (
-        efit_times.size > 1 and float(np.median(np.diff(efit_times))) > SLOW_EFIT_PERIOD
-    )
-    if slow_tree:
-        result = _interpolate_onto_grid(result, timebase)
-    else:
-        result = snap_to_grid(result, timebase)
+    result = snap_to_grid(result, timebase)
     result = result.set_index(idx=["shot", "time"]).unstack("idx")
     return result
-
-
-def _interpolate_onto_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
-    """Interpolate a retrieval (dim 'idx', 'time'/'shot' coords) linearly onto grid_times.
-
-    Args:
-        ds: Retrieval with dim 'idx' and 'time'/'shot' coords, 1D signals only.
-        grid_times: Uniform timebase to interpolate onto [s].
-
-    Returns:
-        The signals on grid_times, laid out like snap_to_grid's output,
-        NaN outside the retrieval's time range.
-    """
-    source_times = ds["time"].values
-    shot_id = ds["shot"].values[0]
-    data_vars = {}
-    for name, variable in ds.data_vars.items():
-        values_on_grid = interp1(source_times, variable.values, grid_times)
-        data_vars[name] = ("idx", values_on_grid, variable.attrs)
-    coords = {
-        "time": ("idx", grid_times),
-        "shot": ("idx", np.repeat(shot_id, grid_times.size)),
-    }
-    return xr.Dataset(data_vars, coords=coords, attrs=ds.attrs)
 
 
 def _get_efit_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:

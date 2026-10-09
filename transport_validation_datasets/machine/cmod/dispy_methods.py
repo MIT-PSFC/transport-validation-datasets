@@ -4,66 +4,36 @@ import numpy as np
 import xarray as xr
 from disruption_py.core.physics_method.decorator import physics_method
 from disruption_py.core.physics_method.params import PhysicsMethodParams
-from disruption_py.core.utils.math import interp1
 from disruption_py.inout.mds import mdsExceptions
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import TimeSetting, TimeSettingParams
 
 from transport_validation_datasets.machine.generic import (
     cocos_from_signs,
+    injected_power_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     orient_signal,
+    signal_on_grid,
+    smoothed_power,
     snap_to_grid,
+    ts_channel_dataset,
 )
 
-# Seconds per unit of the units string an MDSplus time node reports.
-_TIME_UNIT_SCALE = {"s": 1.0, "ms": 1e-3, "us": 1e-6}
+# Core and edge Thomson read the same laser pulses on clocks ~20 us apart,
+# so an edge sample further than this from every core time has no partner pulse [s]
+TS_PAIR_MAX_OFFSET = 1e-3
 
-
-def _time_unit_scale(params, expression: str) -> float:
-    """Resolve the seconds-per-unit factor of an EFIT tree time expression.
-
-    Args:
-        params: Anything carrying the shot's mds_conn and logger.
-        expression: MDSplus expression whose units to read.
-
-    Returns:
-        Seconds per unit, 1.0 when the tree reports units this does not know.
-    """
-    unit = params.mds_conn.get_data(f"units_of({expression})", tree_name="_efit_tree")
-    scale = _TIME_UNIT_SCALE.get(str(unit).strip().lower())
-    if scale is not None:
-        return scale
-    params.logger.verbose(
-        "EFIT tree '{tree}' reports time units '{unit}' for {expr}, assuming seconds.",
-        tree=params.mds_conn.get_tree_name_of_nickname("_efit_tree"),
-        unit=unit,
-        expr=expression,
-    )
-    return 1.0
-
-
-def efit_times_in_seconds(params, node: str) -> np.ndarray:
-    """Read an EFIT tree time node and convert it to seconds.
-
-    Every C-Mod retrieval here has to land on the same timebase, so they all
-    read their EFIT times through this. The tree reports its own units, which
-    are seconds in practice but not guaranteed to be.
-
-    Args:
-        params: Anything carrying the shot's mds_conn and logger.
-        node: EFIT tree time node, e.g. the aeqdsk analysis time.
-
-    Returns:
-        The node's times [s].
-    """
-    times = params.mds_conn.get_data(node, tree_name="_efit_tree")
-    return np.asarray(times, dtype=float) * _time_unit_scale(params, node)
+# Factor scaling the AXUV twopi_diode onto the 2pi foil bolometer, as in disruption-py get_power.
+# It was cross-calibrated in the flat-top of non-disruptive shots.
+TWOPI_DIODE_CALIBRATION = 4.5
 
 
 class UniformTimeSetting(TimeSetting):
-    """1 kHz uniform timebase up to the maximum time in the EFIT tree."""
+    """1 kHz uniform timebase up to the maximum time in the EFIT tree.
+
+    The EFIT trees read here (EFIT21, ANALYSIS) keep their times in seconds.
+    """
 
     def _get_times(self, params: TimeSettingParams) -> np.ndarray:
         """Build the shot's 1 kHz timebase from the EFIT tree's own time range.
@@ -74,10 +44,10 @@ class UniformTimeSetting(TimeSetting):
         Returns:
             Times from 0 to the last EFIT time in 1 ms steps [s].
         """
-        node = r"\efit_aeqdsk:ali"
-        (efit_time,) = params.mds_conn.get_dims(node, tree_name="_efit_tree")
-        scale = _time_unit_scale(params, f"dim_of({node})")
-        return make_uniform_1kHz_timebase(float(np.max(efit_time)) * scale)
+        (efit_time,) = params.mds_conn.get_dims(
+            r"\efit_aeqdsk:ali", tree_name="_efit_tree"
+        )
+        return make_uniform_1kHz_timebase(float(np.max(efit_time)))
 
 
 class CmodGeometryMethods:
@@ -97,7 +67,10 @@ class CmodGeometryMethods:
         Returns:
             Dict with rout [m] on the requested timebase.
         """
-        efit_time = efit_times_in_seconds(params, r"\efit_aeqdsk:time")
+        efit_time_node = params.mds_conn.get_data(
+            r"\efit_aeqdsk:time", tree_name="_efit_tree"
+        )
+        efit_time = np.asarray(efit_time_node, dtype=float)
         try:
             rout = params.mds_conn.get_data(
                 r"\efit_aeqdsk:rout/100", tree_name="_efit_tree"
@@ -108,8 +81,145 @@ class CmodGeometryMethods:
             rout = np.full(len(efit_time), np.nan)
 
         if not np.array_equal(params.times, efit_time):
-            rout = interp1(efit_time, rout, params.times)
+            rout = signal_on_grid(efit_time, rout, params.times)
         return {"rout": rout}
+
+
+class CmodPlasmaMethods:
+    """C-Mod magnetics and density retrievals that replace the disruption-py built-ins.
+
+    The built-ins interpolate onto the timebase.
+    These place each record causally (signal_on_grid), so no grid time draws on a later sample.
+    Every record here is sampled faster than the grid, so each grid time takes the mean of the preceding millisecond.
+    """
+
+    @staticmethod
+    @physics_method(columns=["ip"], tokamak=Tokamak.CMOD)
+    def get_plasma_current(params: PhysicsMethodParams):
+        r"""Plasma current, magnetics \ip, signed.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with ip [A] on the requested timebase.
+        """
+        ip, ip_time = params.mds_conn.get_data_with_dims(r"\ip", tree_name="magnetics")
+        ip_on_grid = signal_on_grid(ip_time, ip, params.times)
+        return {"ip": ip_on_grid}
+
+    @staticmethod
+    @physics_method(columns=["bt"], tokamak=Tokamak.CMOD)
+    def get_toroidal_field(params: PhysicsMethodParams):
+        r"""Vacuum toroidal field at 0.66 m, magnetics \btor, signed.
+
+        disruption-py reads it in get_n_equal_1_amplitude, which also needs the BP13 sensors.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with bt [T] on the requested timebase.
+        """
+        btor, btor_time = params.mds_conn.get_data_with_dims(
+            r"\btor", tree_name="magnetics"
+        )
+        btor_on_grid = signal_on_grid(btor_time, btor, params.times)
+        return {"bt": btor_on_grid}
+
+    @staticmethod
+    @physics_method(columns=["n_e"], tokamak=Tokamak.CMOD)
+    def get_line_average_density(params: PhysicsMethodParams):
+        """Line-averaged density, the TCI chord 4 line integral nl_04 over a 0.6 m chord, as disruption-py takes it.
+
+        nl_04 is averaged over each grid step.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with n_e [m^-3] on the requested timebase.
+        """
+        nl_04, nl_04_time = params.mds_conn.get_data_with_dims(
+            r".tci.results:nl_04", tree_name="electrons"
+        )
+        nl_04_samples = np.squeeze(nl_04)
+        nl_04_on_grid = signal_on_grid(nl_04_time, nl_04_samples, params.times)
+        return {"n_e": nl_04_on_grid / 0.6}
+
+
+def _injected_power(
+    params: PhysicsMethodParams, node: str, tree_name: str
+) -> np.ndarray:
+    """An injected heating power record on the timebase (injected_power_on_grid), in the record's units.
+
+    0 when the shot has no record, that heating system did not run.
+
+    Args:
+        params: disruption-py physics method parameters for the shot.
+        node: MDSplus node of the power record.
+        tree_name: Tree holding it.
+
+    Returns:
+        (n_t,) the power on params.times.
+    """
+    try:
+        power, power_time = params.mds_conn.get_data_with_dims(
+            node, tree_name=tree_name
+        )
+    except mdsExceptions.MdsException:
+        params.logger.debug("no {node} record, taking 0", node=node)
+        return np.zeros(len(params.times))
+    return injected_power_on_grid(power_time, power, params.times)
+
+
+class CmodPowerMethods:
+    """C-Mod power retrievals that replace the disruption-py built-ins.
+
+    Each record is placed on the grid without interpolation (signal_on_grid),
+    and power_radiated is then smoothed non-causally (smoothed_power), the DIII-D prad_tot kernel.
+    """
+
+    @staticmethod
+    @physics_method(columns=["p_rad"], tokamak=Tokamak.CMOD)
+    def get_radiated_power(params: PhysicsMethodParams):
+        r"""Radiated power, the AXUV \twopi_diode in kW scaled by TWOPI_DIODE_CALIBRATION.
+
+        Averaged over each grid step, then smoothed non-causally (smoothed_power).
+        NaN outside the record, where disruption-py fills 0 and hides a missing record.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with p_rad [W] on the requested timebase.
+        """
+        diode_kw, diode_time = params.mds_conn.get_data_with_dims(
+            r"\twopi_diode", tree_name="spectroscopy"
+        )
+        p_rad = diode_kw * 1e3 * TWOPI_DIODE_CALIBRATION
+        p_rad_on_grid = signal_on_grid(diode_time, p_rad, params.times)
+        p_rad_smoothed = smoothed_power(p_rad_on_grid)
+        return {"p_rad": p_rad_smoothed}
+
+    @staticmethod
+    @physics_method(columns=["p_icrf", "p_lh"], tokamak=Tokamak.CMOD)
+    def get_heating_powers(params: PhysicsMethodParams):
+        r"""ICRF net power (\rf_power_net, MW) and lower hybrid net power (LH \top.results:netpow, kW).
+
+        Each is 0 outside its record and on a shot without the system (_injected_power).
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+
+        Returns:
+            Dict with p_icrf and p_lh [W] on the requested timebase.
+        """
+        p_icrf_mw = _injected_power(params, r"\rf_power_net", "rf")
+        p_lh_kw = _injected_power(params, r"\top.results:netpow", "lh")
+        p_icrf = p_icrf_mw * 1e6
+        p_lh = p_lh_kw * 1e3
+        return {"p_icrf": p_icrf, "p_lh": p_lh}
 
 
 def _nan_contour_padding(
@@ -166,7 +276,10 @@ class CmodEfitMethods:
             Dataset with all geqdsk_cols signals plus grids and limiter, snapped
             onto the requested timebase without interpolation.
         """
-        efit_time = efit_times_in_seconds(params, r"\efit_a_eqdsk:atime")
+        efit_time_node = params.mds_conn.get_data(
+            r"\efit_a_eqdsk:atime", tree_name="_efit_tree"
+        )
+        efit_time = np.asarray(efit_time_node, dtype=float)
         # EFIT grid arrays are static, collapse any (T, n) layout to a single row.
         r_grid = np.atleast_2d(
             params.mds_conn.get_data(r"\efit_g_eqdsk:rgrid", tree_name="_efit_tree")
@@ -280,22 +393,22 @@ class CmodThomsonMethods:
             "units": "m",
             "ref": "/thomson_scattering/channel(i1)/position/z",
         },
-        "ts_channel_ne": {
+        "ts_channel_n_e": {
             "description": "Electron density measured by TS channels",
             "units": "m^-3",
             "ref": "/thomson_scattering/channel(i1)/n_e/data",
         },
-        "ts_channel_ne_error": {
+        "ts_channel_n_e_error": {
             "description": "Electron density measurement error of TS channels",
             "units": "m^-3",
             "ref": "/thomson_scattering/channel(i1)/n_e/data_error_upper",
         },
-        "ts_channel_te": {
+        "ts_channel_t_e": {
             "description": "Electron temperature measured by TS channels",
             "units": "eV",
             "ref": "/thomson_scattering/channel(i1)/t_e/data",
         },
-        "ts_channel_te_error": {
+        "ts_channel_t_e_error": {
             "description": "Electron temperature measurement error of TS channels",
             "units": "eV",
             "ref": "/thomson_scattering/channel(i1)/t_e/data_error_upper",
@@ -308,7 +421,7 @@ class CmodThomsonMethods:
 
         Returns:
             Dict with z (channel,), time (T,), and ne/ne_error/te/te_error as
-            (T, channel) arrays with invalid (zero) points set to nan.
+            (T, channel) arrays, 0 where a channel has no measurement.
 
         Raises:
             ValueError: If the channel count does not match the z positions, or
@@ -323,14 +436,12 @@ class CmodThomsonMethods:
             error = params.mds_conn.get_data(
                 nodes[f"{quant}_error"], tree_name="electrons"
             )
-            # Stored as (channel, time), cut pre-fire times and orient to (time, channel)
+            # Stored as (channel, time), cut pre-fire times and orient to (time, channel).
+            # 0 marks a channel with no measurement, which ts_channel_dataset drops with every non-positive reading.
             valid_time_indices = quant_time >= 0
             quant_time = quant_time[valid_time_indices]
             data = data[:, valid_time_indices].astype(np.float64).T
             error = error[:, valid_time_indices].astype(np.float64).T
-            # 0 marks channels with no measurement
-            data[data == 0] = np.nan
-            error[error == 0] = np.nan
 
             if data.shape[1] != len(region["z"]):
                 raise ValueError(
@@ -348,37 +459,101 @@ class CmodThomsonMethods:
         return region
 
     @staticmethod
+    def _align_region(
+        params: PhysicsMethodParams, region: dict, time: np.ndarray
+    ) -> dict:
+        """Place one TS system's samples onto another system's timebase.
+
+        Both the edge and the core read the same laser pulses, but their clocks differ by up to ~20 us.
+        A system can also skip a pulse, as the edge does late in shot 1160909025.
+        The per-system time >= 0 cut can split the pulse at t ~ 0 between them, as in shot 1160913007.
+        Each sample goes to the nearest time of the other system (snap_to_grid),
+        so a slip costs only the samples it touches, never the whole system.
+        A sample further than TS_PAIR_MAX_OFFSET from every time of the other system has no partner pulse and is dropped,
+        so a skipped pulse never hands its neighbour's sample to the wrong one.
+        Times with no sample come back NaN.
+
+        Args:
+            params: disruption-py physics method parameters for the shot.
+            region: One system as _get_region_channels returns it.
+            time: Timebase to place it on [s].
+
+        Returns:
+            The region on time, with the same keys.
+        """
+        quants = ["ne", "ne_error", "te", "te_error"]
+        region_times = np.asarray(region["time"], dtype=float)
+        insertion_index = np.searchsorted(time, region_times)
+        partner_index = np.clip(insertion_index, 1, time.size - 1)
+        offset_to_later = np.abs(time[partner_index] - region_times)
+        offset_to_earlier = np.abs(time[partner_index - 1] - region_times)
+        offset_to_partner = np.minimum(offset_to_later, offset_to_earlier)
+        has_partner = offset_to_partner <= TS_PAIR_MAX_OFFSET
+        n_partnered = int(has_partner.sum())
+        shot_ids = np.repeat(params.shot_id, n_partnered)
+        ds_region = xr.Dataset(
+            {
+                quant: (("idx", "ts_channel"), region[quant][has_partner])
+                for quant in quants
+            },
+            coords={
+                "time": ("idx", region_times[has_partner]),
+                "shot": ("idx", shot_ids),
+            },
+        )
+        ds_aligned = snap_to_grid(ds_region, time)
+
+        region_aligned = {"z": region["z"], "time": time}
+        for quant in quants:
+            region_aligned[quant] = ds_aligned[quant].values
+        mask_data_before = np.isfinite(region["ne"]) | np.isfinite(region["te"])
+        mask_data_after = np.isfinite(region_aligned["ne"])
+        mask_data_after |= np.isfinite(region_aligned["te"])
+        n_samples_before = int(mask_data_before.any(axis=1).sum())
+        n_samples_after = int(mask_data_after.any(axis=1).sum())
+        n_lost = n_samples_before - n_samples_after
+        if n_lost > 0:
+            params.logger.warning(
+                f"{n_lost} TS samples with data had no partner time and were dropped."
+            )
+        return region_aligned
+
+    @staticmethod
     @physics_method(
         columns=[
             "ts_channel_r",
             "ts_channel_z",
-            "ts_channel_ne",
-            "ts_channel_ne_error",
-            "ts_channel_te",
-            "ts_channel_te_error",
+            "ts_channel_n_e",
+            "ts_channel_n_e_error",
+            "ts_channel_t_e",
+            "ts_channel_t_e_error",
         ],
         tokamak=Tokamak.CMOD,
     )
     def get_thomson_channels(params: PhysicsMethodParams):
         """Get TS measurements for core and edge systems at their R and Z locations.
 
-        Both systems measure along the same vertical laser chord, so R is the
-        beam radius for every channel. For shots in legacy_core_shot_range,
-        the legacy "yag" core channels are merged in alongside "yag_new"
-        (same ts_array label "core" for both -- see legacy_core_nodes).
-        Data stays on the native TS timebase
-        (~20 Hz), not params.times.
+        Both systems measure along the same vertical laser chord, so R is the beam radius for every channel.
+        For shots in legacy_core_shot_range, the legacy "yag" core channels are merged in alongside "yag_new"
+        (same ts_array label "core" for both, see legacy_core_nodes).
+        Data stays on the native TS timebase (~20 Hz), not params.times.
+        The edge samples are placed on the core timebase sample by sample (_align_region).
+        Both systems are required, and a failed or inconsistent read of either raises.
+        Readings are kept where the value and its error are finite and positive,
+        and empty slices are dropped (ts_channel_dataset).
 
         Args:
             params: disruption-py physics method parameters for the shot.
 
         Returns:
-            Dataset with ne [m^-3] and te [eV] plus errors on (idx, ts_channel),
-            channel positions ts_channel_r and ts_channel_z [m] on (ts_channel,).
+            Dataset with ts_channel_t_e [eV] and ts_channel_n_e [m^-3] plus errors
+            and the channel positions ts_channel_r and ts_channel_z [m] on (idx, ts_channel),
+            with the ts_array coordinate naming each channel's system.
 
         Raises:
-            ValueError: If the core TS channels are inconsistent (propagated from
-                _get_region_channels). Edge TS failures are logged and skipped.
+            ValueError: If either system's channels are inconsistent (propagated from _get_region_channels).
+                A legacy core timebase that disagrees with yag_new's raises too,
+                caught here so the shot continues on the yag_new channels.
         """
         core = CmodThomsonMethods._get_region_channels(
             params, CmodThomsonMethods.core_nodes
@@ -410,22 +585,14 @@ class CmodThomsonMethods:
                 params.logger.warning(repr(e))
                 params.logger.opt(exception=True).debug(e)
 
-        edge = None
-        try:
-            edge = CmodThomsonMethods._get_region_channels(
-                params, CmodThomsonMethods.edge_nodes
-            )
-            if not np.allclose(edge["time"], core["time"], atol=1e-4):
-                raise ValueError("Edge TS timebase does not match core TS timebase")
-        except Exception as e:
-            params.logger.warning(
-                "Edge Thomson scattering data not found, continuing with core only."
-            )
-            params.logger.warning(repr(e))
-            params.logger.opt(exception=True).debug(e)
-            edge = None
+        # Edge TS is always required for a good fit.
+        # Without the edge the data ends at rho_tor_norm ~0.8
+        edge = CmodThomsonMethods._get_region_channels(
+            params, CmodThomsonMethods.edge_nodes
+        )
+        edge = CmodThomsonMethods._align_region(params, edge, core["time"])
 
-        regions = {"core": core} if edge is None else {"core": core, "edge": edge}
+        regions = {"core": core, "edge": edge}
 
         # Radius of the vertical laser beam, shared by all channels
         r_beam = float(
@@ -435,38 +602,29 @@ class CmodThomsonMethods:
         )
 
         z_pos = np.concatenate([r["z"] for r in regions.values()])
-        n_channels = len(z_pos)
         ts_array = np.concatenate(
             [np.repeat(name, len(r["z"])) for name, r in regions.items()]
         )
-
-        data_vars = {
-            "ts_channel_r": (
-                "ts_channel",
-                np.full(n_channels, r_beam, dtype=np.float32),
-            ),
-            "ts_channel_z": ("ts_channel", z_pos.astype(np.float32)),
+        ts_time = np.asarray(core["time"], dtype=float)
+        rows_shape = (ts_time.size, z_pos.size)
+        readings = {
+            quant: np.concatenate([r[quant] for r in regions.values()], axis=1)
+            for quant in ("ne", "ne_error", "te", "te_error")
         }
-        for quant in ["ne", "ne_error", "te", "te_error"]:
-            combined = np.concatenate([r[quant] for r in regions.values()], axis=1)
-            data_vars[f"ts_channel_{quant}"] = (
-                ("idx", "ts_channel"),
-                combined.astype(np.float32),
-            )
-
-        ds_thomson = xr.Dataset(
-            data_vars=data_vars,
-            coords={
-                "time": ("idx", core["time"]),
-                "shot": ("idx", np.repeat(params.shot_id, len(core["time"]))),
-                "ts_channel": np.arange(n_channels),
-                "ts_array": ("ts_channel", ts_array),
-            },
-            attrs={
-                "description": "Raw Thomson scattering measurement channels from core and edge systems at their R and Z locations",
-            },
+        r_rows = np.full(rows_shape, r_beam)
+        z_rows = np.broadcast_to(z_pos, rows_shape)
+        timebase = make_uniform_1kHz_timebase(float(ts_time.max()))
+        ds_thomson = ts_channel_dataset(
+            params.shot_id,
+            ts_time,
+            r_rows,
+            z_rows,
+            te=readings["te"],
+            te_error=readings["te_error"],
+            ne=readings["ne"],
+            ne_error=readings["ne_error"],
+            timebase=timebase,
         )
         for var, attrs in CmodThomsonMethods.channel_attrs.items():
             ds_thomson[var].attrs.update(attrs)
-
-        return ds_thomson
+        return ds_thomson.assign_coords(ts_array=("ts_channel", ts_array))
