@@ -22,10 +22,17 @@ from loguru import logger
 from scipy.constants import mu_0
 
 from transport_validation_datasets import PACKAGE_ROOT
+from transport_validation_datasets.cleaning import (
+    MAX_FIT_RHO_TOR_NORM,
+    branch_disagreement_errors,
+    drop_huge_error_readings,
+    low_side_channels,
+)
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
     POWER_SMOOTHING_WINDOW,
     absent_heating_powers,
+    channel_rows_at_times,
     cocos_from_signs,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
@@ -60,9 +67,14 @@ TS_CHANNEL_Z = 0.0
 # the real current cut is min_filter["ip"].
 SHOT_WINDOW_MIN_IP = 100e3
 
-# Channels this far outside the separatrix sit in the far SOL,
-# where mapping through a magnetics-only reconstruction is not trustworthy.
-MAX_FIT_RHO_TOR_NORM = 1.1
+# Past this rho the inboard branch departs from the outboard one systematically, not as scatter.
+# Over 100 shots the inboard read high by a median of
+# 20 percent in Te and 7 percent in ne at rho 0.8-0.85, and 42 and 18 percent at 0.85-0.9,
+# while its own point-to-point scatter stayed below the outboard's.
+# It has 3-5 times the outboard's channels there and steered the edge fit, so it is dropped.
+# Inside it the two branches inflate each other's errors where they disagree (cleaning.branch_disagreement_errors),
+# past it only the outboard branch is left, with nothing to disagree with.
+MAX_INBOARD_RHO_TOR_NORM = 0.8
 
 # efm signal -> standardized name.
 # All 0D, snapped onto the 1 kHz timebase with the GEQDSK block (_equilibrium_0d_dataset),
@@ -262,6 +274,8 @@ class MASTDataWorkflow(DataWorkflow):
 
     settings_cls = MASTSettings
     signal_attrs = SIGNAL_ATTRS
+    fit_plot_branch_position = "ts_channel_r"
+    fit_plot_branch_labels = ("inboard TS", "outboard TS")
 
     min_pulse_length = 0.2
     min_filter = {
@@ -400,12 +414,15 @@ class MASTDataWorkflow(DataWorkflow):
 
         1: Map the TS channels onto rho_tor_norm through the nearest reconstruction
         2: Convert to the fit units (Te [keV], ne [1e20 m^-3])
-        3: Drop the channels outside the fittable range
+        3: Drop every channel whose Te or ne error exceeds its value (cleaning.drop_huge_error_readings)
+        4: Drop the inboard channels past MAX_INBOARD_RHO_TOR_NORM
+        5: Inflate the errors where the inboard and outboard branches disagree (cleaning.branch_disagreement_errors)
+        6: Drop the channels outside the fittable range
 
-        BOTH sides of the chord are fit. The inboard side maps onto the same
-        rho_tor_norm through the reconstruction's interior flux, which a magnetics-only
-        reconstruction does not pin precisely, and on a spherical tokamak Te
-        is not strictly a flux function (poloidal asymmetries can be real).
+        BOTH sides of the chord are fit, the inboard side only inside MAX_INBOARD_RHO_TOR_NORM.
+        The inboard side maps onto the same rho_tor_norm through the reconstruction's interior flux,
+        which a magnetics-only reconstruction does not pin precisely,
+        and on a spherical tokamak Te is not strictly a flux function (poloidal asymmetries can be real).
 
         NOTE: The Thomson chord runs along z = TS_CHANNEL_Z while the MAST
         equilibria may put the magnetic axis 0.15-0.25 m lower, so the chord
@@ -418,7 +435,7 @@ class MASTDataWorkflow(DataWorkflow):
             ds: The shot's unprocessed dataset.
 
         Returns:
-            The fit input, or None when the shot has nothing fittable.
+            The fit input, or None when the shot has no Thomson slice to fit.
         """
         ds_shot = ds.squeeze("shot", drop=True)
         ts_times, rho_tor_norm = map_ts_channels_to_rho_tor_norm(
@@ -429,13 +446,30 @@ class MASTDataWorkflow(DataWorkflow):
             return None
 
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
+        # The read keeps only positive values with positive errors, see _thomson_dataset
+        te_y, ne_y = drop_huge_error_readings(te_y, te_err, ne_y, ne_err, shot)
+
+        r_channel = channel_rows_at_times(ds_shot["ts_channel_r"], ts_times)
+        inboard = low_side_channels(rho_tor_norm, r_channel)
+        with np.errstate(invalid="ignore"):
+            inboard_edge = inboard & (rho_tor_norm > MAX_INBOARD_RHO_TOR_NORM)
+        n_inboard_edge = int((inboard_edge & np.isfinite(te_y)).sum())
+        te_y = np.where(inboard_edge, np.nan, te_y)
+        ne_y = np.where(inboard_edge, np.nan, ne_y)
+        if n_inboard_edge:
+            logger.info(
+                f"Shot {shot}: dropped {n_inboard_edge} inboard channel readings past "
+                f"rho_tor_norm {MAX_INBOARD_RHO_TOR_NORM:g}"
+            )
+        te_err = branch_disagreement_errors(rho_tor_norm, te_y, te_err, inboard)
+        ne_err = branch_disagreement_errors(rho_tor_norm, ne_y, ne_err, inboard)
 
         with np.errstate(invalid="ignore"):
             rho_tor_norm = np.where(
                 rho_tor_norm <= MAX_FIT_RHO_TOR_NORM, rho_tor_norm, np.nan
             )
 
-        fit_input = ShotFitInput(
+        return ShotFitInput(
             x=rho_tor_norm,
             te_y=te_y,
             te_err=te_err,
@@ -443,12 +477,6 @@ class MASTDataWorkflow(DataWorkflow):
             ne_err=ne_err,
             time=ts_times,
         )
-        if not fit_input.has_fittable_points():
-            logger.warning(
-                f"Shot {shot}: no finite (rho_tor_norm, te, ne) channel data to fit"
-            )
-            return None
-        return fit_input
 
 
 def open_shot_sources(shot: int) -> ShotSources | None:

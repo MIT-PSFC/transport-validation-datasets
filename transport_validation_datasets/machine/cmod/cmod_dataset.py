@@ -9,7 +9,12 @@ from disruption_py.workflow import get_shots_data
 from loguru import logger
 
 from transport_validation_datasets import TIME_COORD
-from transport_validation_datasets.cleaning import drop_in_both
+from transport_validation_datasets.cleaning import (
+    DIP_RATIO,
+    drop_broken_channels,
+    drop_in_both,
+    relative_dips,
+)
 from transport_validation_datasets.dispy_utils import passive_log_settings, summary
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.cmod.dispy_methods import (
@@ -87,6 +92,24 @@ SIGNAL_ATTRS = {
 # and EFIT quotes bcentr at rcentr, stored as RZERO = 0.66 m.
 R0 = 0.66
 
+# C-Mod channel screens in the fit units, Te [keV] and ne [1e20 m^-3], see prepare_fit_input
+NE_ERROR_MAX = 1.0
+SOL_NE_MAX = 0.9
+READING_MIN = 0.001
+CORE_RHO_MAX = 0.4
+CORE_TE_MIN = 0.4
+TE_ERROR_FLOOR_FRACTION = 0.15
+TE_ERROR_FLOOR = 0.015
+NE_ERROR_FLOOR_FRACTION = 0.10
+NE_ERROR_FLOOR = 0.01
+
+# The core TS channel at this height [m] reads Te 1.58x the ECE at the same rho (~0.29),
+# where every other core channel reads 1.02-1.17x (26 shots with low-field-side ECE).
+# Its Te is dropped from every fit (_te_faulty_channels), its ne is kept.
+TE_FAULTY_CHANNEL_Z = 0.082
+# A channel sits at TE_FAULTY_CHANNEL_Z when its height is this close [m]
+TS_CHANNEL_Z_TOL = 1e-3
+
 
 @dataclass(frozen=True)
 class CModSettings(DeviceSettings):
@@ -148,9 +171,10 @@ class CModDataWorkflow(DataWorkflow):
 
     # GP fit staging knobs
     # Minimum valid (rho_tor_norm, value) pairs required per timestep to run the GP fit,
-    # compared against the channel count AFTER the per-shot quality screens (_drop_broken_channels).
-    # Many C-Mod shots carry exactly 10 channels, so tolerate one bad channel.
-    fit_min_points = 9
+    # compared against the channel count AFTER the per-shot quality screens (cleaning.drop_broken_channels).
+    # Many C-Mod shots carry exactly 10 core channels and the faulty one's Te is always dropped,
+    # so this tolerates one more bad channel.
+    fit_min_points = 8
     # Hyperparameter bounds for the GP fit, per variable.
     # Amplitude floor 1, the data scale since each slice is normalized to a max of 1.
     # Below it the fits fall into a low-amplitude mean regression under peaked cores, with the axis under 0.7 of the core data.
@@ -337,18 +361,19 @@ class CModDataWorkflow(DataWorkflow):
     def prepare_fit_input(self, shot: int, ds: xr.Dataset) -> ShotFitInput | None:
         """Build GP fit inputs for one shot from its unprocessed dataset.
 
-        1: Maps the TS channels onto rho_tor_norm through magnetics-only EFIT
-        2: convert to the fit units (Te [keV], ne [1e20 m^-3])
+        1: Map the TS channels onto rho_tor_norm through the magnetics-only EFIT
+        2: Convert to the fit units (Te [keV], ne [1e20 m^-3])
         3: C-Mod channel quality screens and error floors, calibrated in those units.
            A reading a screen drops in Te or ne takes the other's reading of that channel with it (cleaning.drop_in_both).
-        4: TODO: optionally correct density with interferometry
+           The Te of _te_faulty_channels is dropped before any screen, so their ne stays,
+           and cleaning.drop_broken_channels runs after, so a shot-long bias in one variable keeps the other.
 
         Args:
             shot: Shot number being staged.
             ds: The shot's unprocessed dataset.
 
         Returns:
-            The fit input, or None when the shot has nothing fittable.
+            The fit input, or None when the shot has no Thomson slice to fit.
         """
         ts_times, rho_tor_norm = map_ts_channels_to_rho_tor_norm(
             ds, self.settings.sol_extension
@@ -359,41 +384,49 @@ class CModDataWorkflow(DataWorkflow):
 
         ds_shot = ds.squeeze("shot", drop=True)
         te_y, te_err, ne_y, ne_err = ts_channel_fit_rows(ds_shot, ts_times)
+        # Before the raw validity below, so drop_in_both never takes the sound ne of a faulty Te channel
+        te_faulty = _te_faulty_channels(ds_shot)
+        te_y[:, te_faulty] = np.nan
         # What each variable offers before the screens, so what they drop can be coupled
         te_valid_raw = np.isfinite(te_y) & np.isfinite(te_err)
         ne_valid_raw = np.isfinite(ne_y) & np.isfinite(ne_err)
 
-        # Drop density channels too uncertain to constrain the fit
-        # (error > 1e20 m^-3). These are typically bad edge/SOL channels.
-        # Seen on shot 1160609014: a ne~4, err~2 channel past the separatrix
-        # (rho~1.05) drove a spike to ne~19 at rho=1.0.
-        ne_y = np.where(ne_err > 1.0, np.nan, ne_y)
-        # Drop density points past the separatrix (rho_tor_norm>1.0) reading > 0.9e20:
-        # SOL density is low out there, so such a point is a bad channel
-        ne_y = np.where((rho_tor_norm > 1.0) & (ne_y > 0.9), np.nan, ne_y)
+        # Density channels too uncertain to constrain the fit, typically bad edge or SOL channels.
+        # On 1160609014 a ne ~4, err ~2 channel past the separatrix drove a spike to ne ~19 at rho 1.0.
+        ne_y = np.where(ne_err > NE_ERROR_MAX, np.nan, ne_y)
+        # SOL density is low, so a point past the separatrix reading above SOL_NE_MAX is a bad channel
+        ne_y = np.where((rho_tor_norm > 1.0) & (ne_y > SOL_NE_MAX), np.nan, ne_y)
 
-        # If data or error bar is incredibly small, set to NaN since it is
-        # probably bad data. At this point ne is in 1e20 m^-3 and Te in keV.
-        te_y = np.where(te_y < 0.001, np.nan, te_y)
-        te_err = np.where(te_err < 0.001, np.nan, te_err)
-        ne_y = np.where(ne_y < 0.001, np.nan, ne_y)
-        ne_err = np.where(ne_err < 0.001, np.nan, ne_err)
+        # Readings or error bars under READING_MIN are analysis artifacts:
+        # Te pinned near 9 eV with a 0.02 to 0.05 eV error bar on 40 of 272,000 readings,
+        # which the error floors below would otherwise keep at 15 eV.
+        te_y = np.where(te_y < READING_MIN, np.nan, te_y)
+        te_err = np.where(te_err < READING_MIN, np.nan, te_err)
+        ne_y = np.where(ne_y < READING_MIN, np.nan, ne_y)
+        ne_err = np.where(ne_err < READING_MIN, np.nan, ne_err)
 
         # Near the magnetic axis, Te this low is not physically real
-        core_problem = (rho_tor_norm >= 0.0) & (rho_tor_norm < 0.4) & (te_y < 0.4)
+        core_problem = (rho_tor_norm < CORE_RHO_MAX) & (te_y < CORE_TE_MIN)
         te_y = np.where(core_problem, np.nan, te_y)
 
-        # Error floors.
-        # Sometimes C-Mod TS has extremely tiny error bars which I don't think are real.
-        # Te: absolute 0.1 keV
-        # ne: Floor at 10 percent of the value with a 1e18/m3 absolute floor.
-        te_err = np.where(te_err < 0.1, 0.1, te_err)
-        ne_err = np.maximum(ne_err, np.maximum(0.10 * np.abs(ne_y), 0.01))
+        # A reading far under both its rho neighbours is probably a dead channel
+        te_dips = relative_dips(rho_tor_norm, te_y)
+        ne_dips = relative_dips(rho_tor_norm, ne_y)
+        te_y = np.where(te_dips, np.nan, te_y)
+        ne_y = np.where(ne_dips, np.nan, ne_y)
+        if te_dips.any() or ne_dips.any():
+            logger.info(
+                f"Shot {shot}: dropped {int(te_dips.sum())} te and {int(ne_dips.sum())} ne readings "
+                f"under {DIP_RATIO}x both rho neighbours"
+            )
 
-        # After the floors: the persistence screen must see the same errors
-        # the fit will (its thresholds are calibrated on them).
-        te_y = _drop_broken_channels("te", rho_tor_norm, te_y, te_err)
-        ne_y = _drop_broken_channels("ne", rho_tor_norm, ne_y, ne_err)
+        # Error floors, since C-Mod TS error bars run far below the systematic errors.
+        # Hughes et al., RSI 72, 1107 (2001) quote 10-20 percent systematic errors in Te and ne,
+        # and an edge Te range starting at 15 eV.
+        te_err_floor = np.maximum(TE_ERROR_FLOOR_FRACTION * te_y, TE_ERROR_FLOOR)
+        te_err = np.maximum(te_err, te_err_floor)
+        ne_err_floor = np.maximum(NE_ERROR_FLOOR_FRACTION * ne_y, NE_ERROR_FLOOR)
+        ne_err = np.maximum(ne_err, ne_err_floor)
 
         te_valid = np.isfinite(te_y) & np.isfinite(te_err)
         ne_valid = np.isfinite(ne_y) & np.isfinite(ne_err)
@@ -406,7 +439,13 @@ class CModDataWorkflow(DataWorkflow):
                 "readings along with the other variable's drops"
             )
 
-        fit_input = ShotFitInput(
+        # After drop_in_both: a channel biased in one variable all shot is a calibration fault of that variable,
+        # like _te_faulty_channels, so its other variable stays.
+        # After the floors: the persistence screen must see the errors the fit will.
+        te_y = drop_broken_channels("te", rho_tor_norm, te_y, te_err)
+        ne_y = drop_broken_channels("ne", rho_tor_norm, ne_y, ne_err)
+
+        return ShotFitInput(
             x=rho_tor_norm,
             te_y=te_y,
             te_err=te_err,
@@ -414,18 +453,15 @@ class CModDataWorkflow(DataWorkflow):
             ne_err=ne_err,
             time=ts_times,
         )
-        if not fit_input.has_fittable_points():
-            logger.warning(
-                f"Shot {shot}: no finite (rho_tor_norm, te, ne) channel data to fit"
-            )
-            return None
-        return fit_input
 
-    def fit_plot_channel_groups(self, shot: int) -> list | None:
+    def fit_plot_channel_groups(
+        self, shot: int, fit_input: ShotFitInput
+    ) -> list | None:
         """Split the fit-plot channels into the core and edge TS systems.
 
         Args:
             shot: Shot number being plotted.
+            fit_input: The shot's staged fit input (unused, the split is fixed per channel).
 
         Returns:
             (mask, color, label) triples for the two Thomson arrays.
@@ -437,63 +473,48 @@ class CModDataWorkflow(DataWorkflow):
             (ts_array == "edge", "tab:orange", "edge TS"),
         ]
 
+    def fit_plot_dropped_readings(self, shot: int) -> tuple | None:
+        """Read the Te of _te_faulty_channels, which staging drops from every fit, for the fit plots.
 
-def _drop_broken_channels(
-    var_name: str, data_x: np.ndarray, data_y: np.ndarray, err_y: np.ndarray
-) -> np.ndarray:
-    """NaN out channels biased against their neighbors in the same way for an entire shot.
+        They map onto rho_tor_norm as in prepare_fit_input, and keep their raw errors.
 
-    Per-slice outlier removal (the fit worker's LOO pass) judges each slice in
-    isolation, so a channel that is only ~2-4 sigma off per slice can survive.
-    Persistence across the shot is what separates broken hardware from real structure.
-    A healthy channel has neighbors above and below it, a miscalibrated channel is
-    significantly biased in the same direction all shot.
-    (Note that slight biasing is expected because profiles are monatonic-ish,
-    this just looks for consitently extreme cases like [4, 1, 3], [9, 2, 7], etc.)
+        Args:
+            shot: Shot number being plotted.
 
-    Per slice, each channel with both rho_tor_norm neighbors finite gets
-    z = (y - neighbor_mean) / combined sigma, and a channel is dropped when
-    |median z| >= 3.5 with >= 90 percent of slices on the same side, over >= 10 slices.
+        Returns:
+            (times, rho_tor_norm, {"te": (y, err)}), see DataWorkflow.fit_plot_dropped_readings.
+        """
+        with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
+            ts_times, rho_tor_norm = map_ts_channels_to_rho_tor_norm(
+                ds, self.settings.sol_extension
+            )
+            ds_shot = ds.squeeze("shot", drop=True)
+            te_y, te_err, _, _ = ts_channel_fit_rows(ds_shot, ts_times)
+            te_faulty = _te_faulty_channels(ds_shot)
+        return (
+            ts_times,
+            rho_tor_norm[:, te_faulty],
+            {"te": (te_y[:, te_faulty], te_err[:, te_faulty])},
+        )
+
+
+def _te_faulty_channels(ds_shot: xr.Dataset) -> np.ndarray:
+    """Find the channels whose Te every fit drops, the core channel at TE_FAULTY_CHANNEL_Z.
+
+    Selected by position, since the channel count of the concatenated core and edge arrays varies between shots.
 
     Args:
-        var_name: Variable name for the log line.
-        data_x: (n_t, n_ch) channel rho_tor_norm positions.
-        data_y: (n_t, n_ch) channel values.
-        err_y: (n_t, n_ch) channel errors, with the fit's floors applied.
+        ds_shot: The shot's unprocessed dataset, shot dim squeezed out.
 
     Returns:
-        data_y with broken channels NaNed (a copy if any were).
-
+        (n_faulty,) channel indices along the ts_channel dim.
     """
-    n_t, n_ch = data_y.shape
-    z_sum: list[list[float]] = [[] for _ in range(n_ch)]
-    for t in range(n_t):
-        valid = np.isfinite(data_x[t]) & np.isfinite(data_y[t]) & np.isfinite(err_y[t])
-        if int(valid.sum()) < 5:
-            continue
-        idx = np.flatnonzero(valid)
-        order = idx[np.argsort(data_x[t][idx])]
-        yv, ev = data_y[t][order], err_y[t][order]
-        for k in range(1, order.size - 1):
-            nbr_mean = 0.5 * (yv[k - 1] + yv[k + 1])
-            sigma = np.sqrt(ev[k] ** 2 + 0.25 * (ev[k - 1] ** 2 + ev[k + 1] ** 2))
-            z_sum[order[k]].append(float((yv[k] - nbr_mean) / sigma))
-    broken = []
-    for c in range(n_ch):
-        z = np.asarray(z_sum[c])
-        if z.size < 10:
-            continue
-        med = float(np.median(z))
-        if abs(med) < 3.5:
-            continue
-        if float(np.mean(np.sign(z) == np.sign(med))) >= 0.9:
-            broken.append(c)
-    if not broken:
-        return data_y
-    logger.info(f"ts {var_name}: dropped persistently-biased channel(s) {broken}")
-    data_y = data_y.copy()
-    data_y[:, broken] = np.nan
-    return data_y
+    height = ds_shot["ts_channel_z"]
+    dims_to_reduce = [dim for dim in height.dims if dim != "ts_channel"]
+    channel_height = height.median(dim=dims_to_reduce, skipna=True).values
+    ts_array = ds_shot["ts_array"].values
+    at_height = np.abs(channel_height - TE_FAULTY_CHANNEL_Z) < TS_CHANNEL_Z_TOL
+    return np.flatnonzero((ts_array == "core") & at_height)
 
 
 def _is_empty_result(result: xr.Dataset) -> bool:

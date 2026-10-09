@@ -15,6 +15,7 @@ from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_validation_datasets.cleaning import (
     clean_fit_rows,
     drop_rows_without_core,
+    low_side_channels,
 )
 from transport_validation_datasets.dataset_utils import build_tensorized_dataset
 from transport_validation_datasets.filters import (
@@ -345,6 +346,11 @@ class DataWorkflow(ABC):
     # written and again at the stack stage, so the stores carry what the code says
     # now, not what the file said when it was pulled.
     signal_attrs: dict[str, dict] = {}
+
+    # The channel variable whose position along the chord splits the fit plots into its two branches
+    # (cleaning.low_side_channels), with the labels of the low and the high side. None plots one group.
+    fit_plot_branch_position: str | None = None
+    fit_plot_branch_labels: tuple[str, str] = ("low side", "high side")
 
     # The process's log file sink, replaced when a new workflow starts.
     _log_sink_id = None
@@ -1081,8 +1087,9 @@ class DataWorkflow(ABC):
             ds: The shot's unprocessed dataset (one 01_unprocessed file).
 
         Returns:
-            The fit input, or None when the shot has nothing fittable (the
-            caller records it as failed).
+            The fit input, or None when the shot has no Thomson slice to fit.
+            The caller records the shot as failed when it gets None
+            or a fit input with nothing fittable left.
         """
 
     def unprocessed_shots(self) -> list[int]:
@@ -1195,7 +1202,7 @@ class DataWorkflow(ABC):
         so an edited shotlist never quietly reuses fits made for other windows.
         Every shot's per-sample rows go through cleaning.clean_fit_rows before any window pools them,
         and its staged rows through cleaning.drop_rows_without_core after.
-        A shot whose prepare_fit_input returns None, or that cleaning leaves nothing fittable,
+        A shot whose prepare_fit_input returns None or nothing fittable, or that cleaning leaves nothing fittable,
         is recorded as failed and skipped on later runs.
         A shot with no Thomson sample inside its windows is only logged, the windows may be different next run.
 
@@ -1225,7 +1232,7 @@ class DataWorkflow(ABC):
             for shot in batch_shots:
                 with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
                     fit_input = self.prepare_fit_input(shot, ds)
-                if fit_input is None:
+                if fit_input is None or not fit_input.has_fittable_points():
                     self.record_failed_fit(shot, "No fittable Thomson channel data.")
                     continue
                 # Per sample, before any window pools the samples, see cleaning.py
@@ -1642,18 +1649,66 @@ class DataWorkflow(ABC):
 
         return xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs)
 
-    def fit_plot_channel_groups(self, shot: int) -> list | None:
+    def fit_plot_channel_groups(
+        self, shot: int, fit_input: ShotFitInput
+    ) -> list | None:
         """Get the channel grouping used to color the fit plots.
 
-        Subclasses can split channels by diagnostic
-        (e.g. C-Mod core vs edge Thomson).
-        The base implementation plots them as one group.
+        Subclasses can split channels by diagnostic (C-Mod core vs edge Thomson).
+        A device with a fit_plot_branch_position splits them into the two branches of its chord,
+        row by row at the lowest-rho channel as in its prepare_fit_input (cleaning.low_side_channels),
+        since the crossing of the axis moves slice to slice.
+        Each channel sits at its median position over the shot.
+        That keeps the channels' order along the chord, and serves pooled window rows as well,
+        whose columns repeat the channels once per pooled sample.
+        Without a fit_plot_branch_position every channel is one group.
+
+        Args:
+            shot: Shot number being plotted.
+            fit_input: The shot's staged fit input, whose rows the masks must match.
+
+        Returns:
+            (mask, color, label) triples, each mask (n_ch,) or (n_rows, n_columns), or None for a single group.
+        """
+        if self.fit_plot_branch_position is None:
+            return None
+        with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
+            position_rows = (
+                ds[self.fit_plot_branch_position]
+                .squeeze(EPISODE_DIM, drop=True)
+                .transpose("time", "ts_channel")
+                .values
+            )
+        has_position = np.isfinite(position_rows).any(axis=0)
+        position_channel = np.full(position_rows.shape[1], np.nan)
+        position_channel[has_position] = np.nanmedian(
+            position_rows[:, has_position], axis=0
+        )
+        n_rows, n_columns = fit_input.x.shape
+        n_repeats = n_columns // position_channel.size
+        position_tiled = np.tile(position_channel, (n_rows, n_repeats))
+        low_side = low_side_channels(fit_input.x, position_tiled)
+        high_side = np.isfinite(fit_input.x) & ~low_side
+        low_label, high_label = self.fit_plot_branch_labels
+        return [
+            (low_side, "tab:blue", low_label),
+            (high_side, "tab:orange", high_label),
+        ]
+
+    def fit_plot_dropped_readings(self, shot: int) -> tuple | None:
+        """Get the readings a device drops from every fit, to mark on the fit plots.
+
+        A device that drops a faulty channel from every shot returns its readings here,
+        since the staged batch no longer holds them.
+        The base implementation drops none.
 
         Args:
             shot: Shot number being plotted.
 
         Returns:
-            (mask, color, label) triples, or None for a single group.
+            (times, rho_tor_norm, {var: (y, err)}) with the (n_samples,) Thomson sample times [s]
+            and (n_samples, n_dropped) arrays in the fit units, a variable absent when it has none,
+            or None.
         """
         return None
 
@@ -1661,7 +1716,8 @@ class DataWorkflow(ABC):
         """Plot the GP fits of every fitted shot, one PDF per shot.
 
         Plots the exact (cleaned, floored) channel data the fit consumed,
-        straight from the staged batch files.
+        straight from the staged batch files,
+        and in red the readings the device drops from every fit (fit_plot_dropped_readings).
         The fits are drawn over the whole fit grid, past STORED_RHO_TOR_NORM_MAX, so the anchors show.
         Skips shots whose PDF already exists.
         A window-averaged fit gets one page per window, with every pooled point on it.
@@ -1694,6 +1750,8 @@ class DataWorkflow(ABC):
                     if batch.fit_mode == FIT_MODE_WINDOW_AVERAGE
                     else None
                 )
+                channel_groups = self.fit_plot_channel_groups(shot, si)
+                dropped_readings = self.fit_plot_dropped_readings(shot)
                 n_pages = plot_ts_fits(
                     pdf_path,
                     shot,
@@ -1705,11 +1763,10 @@ class DataWorkflow(ABC):
                     },
                     fit_output=so,
                     rho_tor_norm_fit=batch.x_star,
-                    channel_groups=_tile_channel_groups(
-                        self.fit_plot_channel_groups(shot), si.x.shape[1]
-                    ),
+                    channel_groups=_tile_channel_groups(channel_groups, si.x.shape[1]),
                     max_pages=max_pages,
                     window_bounds=window_bounds,
+                    dropped_readings=dropped_readings,
                 )
                 logger.info(f"Plotted {n_pages} fit pages for shot {shot}")
 

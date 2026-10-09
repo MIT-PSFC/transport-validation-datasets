@@ -195,6 +195,23 @@ and the fit method's own checks give each slice a fit status.
 A channel below psi_N 1 more than 5 mm outside its reconstruction's boundary contour sits in a private flux region,
 under an X-point, so it is left unmapped.
 
+Before those, each device screens its own channels in `prepare_fit_input`:
+
+- C-Mod drops the Te of the core channel at z = 0.082 m (`TE_FAULTY_CHANNEL_Z`),
+  which reads ~1.6x the low-field-side ECE at the same rho through 2016, and keeps its ne.
+  It drops readings under 0.35x both rho neighbours (`cleaning.relative_dips`)
+  and channels biased against their neighbours all shot (`cleaning.drop_broken_channels`).
+  Errors are floored at 15 percent or 15 eV in Te and 10 percent or 1e18 m^-3 in ne,
+  the systematic errors Hughes et al. quote (RSI 72, 1107, 2001).
+- MAST drops readings whose error exceeds their value (`cleaning.drop_huge_error_readings`),
+  and the inboard channels past rho_tor_norm 0.8 (`MAX_INBOARD_RHO_TOR_NORM`),
+  which read 20-40 percent high in Te there (Te not a flux function, choosing outboard side as more conventional tokamak-like).
+  Inside it, where the inboard and outboard branches disagree,
+  both get half the disagreement added to their errors (`cleaning.branch_disagreement_errors`).
+
+The fit plots color the C-Mod core and edge arrays and the MAST inboard and outboard branches,
+and mark the dropped C-Mod Te in red.
+
 Stack stage (`_internal_shot_dataset`), per shot:
 
 1. The shots excluded or rejected by the unprocessed stage checks above are left out again.
