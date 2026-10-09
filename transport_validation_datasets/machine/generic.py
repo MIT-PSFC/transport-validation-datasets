@@ -185,10 +185,41 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
     return ds
 
 
+# Width of the centered boxcar power_radiated is smoothed with, applied twice [s], see smoothed_power.
+# Unsmoothed, the bolometer noise is larger than the signal at 1 kHz.
+# The kernel is the one DIII-D's prad_tot comes smoothed with.
+POWER_SMOOTHING_WINDOW = 50e-3
+
+# Step of the uniform timebase every device is placed on [s], see make_uniform_1kHz_timebase.
+UNIFORM_TIMEBASE_DT = 1e-3
+# Decimals that pin a grid time to its step
+TIMEBASE_DECIMALS = int(round(-np.log10(UNIFORM_TIMEBASE_DT)))
+
+# A grid time carries a sample of its own when it sits this close to one [s].
+# Only absorbs float round-off, everything shares the staged 1 kHz timebase.
+SAMPLE_TIME_TOL = 1e-6
+
+# How long an equilibrium or a 0D signal slower than the grid
+# is held forward onto the 1 kHz timebase, in periods of its own sampling period.
+# Above 1 to tolerate jitter in the sampling,
+# low enough that nothing is carried across a real gap: the end of the shot, or a diagnostic dropping out.
+MAX_HOLD_PERIODS = 1.5
+
+# Longest a fitted profile slice is held forward onto the 1 kHz timebase, whatever its cadence [s].
+# Long enough to bridge dropped Thomson slices and burst-mode gaps.
+# fresh_profile marks the slices themselves.
+PROFILE_MAX_HOLD = 100e-3
+
+# Shortest an equilibrium reconstruction is held, whatever its clock [s].
+# Bridges the dropouts of single reconstructions
+# (a 1 kHz EFIT failing a few slices, one missing 5 ms MAST reconstruction)
+# that would otherwise cut every equilibrium signal.
+# fresh_equilibrium still marks only the grid times a usable reconstruction lands on.
+EQUILIBRIUM_HOLD_FLOOR = 10e-3
+
 # How far a TS slice may sit from the reconstruction it maps through,
 # in periods of the reconstruction's own sampling.
 # Above 1 to tolerate clock jitter, low enough that nothing is borrowed across a real gap.
-# The mapping counterpart of workflow.MAX_HOLD_PERIODS, separate to avoid a circular import.
 EQ_MATCH_MAX_PERIODS = 1.5
 
 # A channel below psi_N 1 this far outside its reconstruction's boundary contour is in a private flux region [m],
@@ -223,11 +254,12 @@ def make_uniform_1kHz_timebase(max_time: float) -> np.ndarray:
     Returns:
         Times from 0 to max_time in 1 ms steps [s].
     """
-    last_ms = int(np.ceil(np.round(max_time * 1000, 6)))
-    times = np.round(np.arange(last_ms + 1, dtype=np.float64) * 1e-3, 3).astype(
-        "float32"
-    )
-    return times
+    # Rounded well below one step first, so float noise never adds a step
+    steps_to_max = np.round(max_time / UNIFORM_TIMEBASE_DT, TIMEBASE_DECIMALS + 3)
+    last_step = int(np.ceil(steps_to_max))
+    step_counts = np.arange(last_step + 1, dtype=np.float64)
+    times = np.round(step_counts * UNIFORM_TIMEBASE_DT, TIMEBASE_DECIMALS)
+    return times.astype("float32")
 
 
 def make_geqdsk_dataset(
@@ -358,28 +390,27 @@ def make_geqdsk_dataset(
 
 
 def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
-    """Snap an EFIT reconstruction (dim 'idx', 'time'/'shot' coords) onto grid_times.
+    """Snap a reconstruction or a diagnostic (dim 'idx', 'time'/'shot' coords) onto grid_times.
 
-    Each EFIT slice goes to its nearest grid time, no interpolation, no fill.
-    The snap only absorbs sub-step jitter in the EFIT clock, so ties break toward
-    the later grid point: an EFIT at 9.5 ms on a 1 ms grid lands at 10 ms, never
-    feeding the 9 ms slice a future reconstruction. Slices further than half a
-    grid step outside the grid are dropped rather than piled onto the first or
-    last grid time, since a reconstruction from before or after the shot window
-    is not a measurement of either end of it. Grid times left with no slice come
-    back as NaN.
+    Each slice goes to its nearest grid time, no interpolation, no fill.
+    The snap only absorbs sub-step jitter in the source clock:
+    a slice up to half a step late lands on the earlier grid point, and a tie goes to the later one.
+    Two slices landing on one grid point keep the later.
+    Slices further than half a grid step outside the grid are dropped
+    rather than piled onto the first or last grid time,
+    since a slice from before or after the shot window is not a measurement of either end of it.
+    Grid times left with no slice come back as NaN.
 
     Args:
-        ds: EFIT reconstruction with dim 'idx' and 'time'/'shot' coords.
+        ds: Slices with dim 'idx' and 'time'/'shot' coords.
         grid_times: Uniform timebase to snap onto [s].
 
     Returns:
-        The reconstruction on grid_times, NaN at grid times with no EFIT slice.
+        The slices on grid_times, NaN at grid times with no slice.
     """
     grid_times = np.asarray(grid_times)
     step = float(np.median(np.diff(grid_times)))
-    # tol sits well below any real EFIT timing gap but far above float32
-    # round-off at the grid step
+    # Well below any real timing gap, far above float32 round-off at the grid step
     tol = 1e-4 * step
 
     shot_id = ds["shot"].values[0]
@@ -389,15 +420,15 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
     ds = ds.isel(idx=in_range)
     efit_times = ds["time"].values
 
-    # Nearest grid point per EFIT slice
+    # Nearest grid point per slice
     pos = np.searchsorted(grid_times, efit_times, side="left")
     left = np.clip(pos - 1, 0, len(grid_times) - 1)
     right = np.clip(pos, 0, len(grid_times) - 1)
     take_left = (grid_times[right] - efit_times) - (efit_times - grid_times[left]) > tol
     snapped = grid_times[np.where(take_left, left, right)]
 
-    # snapped is non-decreasing (both arrays sorted), so duplicate slots are adjacent
-    # keep the last EFIT slice that lands in each, then NaN-fill the empty grid times
+    # snapped is non-decreasing (both arrays sorted), so duplicate slots are adjacent.
+    # Keep the last slice that lands in each, then NaN-fill the empty grid times.
     keep = np.append(np.diff(snapped) != 0, True)[: snapped.size]
     ds = ds.drop_vars(["time", "shot"]).assign_coords(idx=snapped).isel(idx=keep)
     ds = ds.reindex(idx=grid_times).reset_index("idx", drop=True)
@@ -405,6 +436,336 @@ def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
         time=("idx", grid_times),
         shot=("idx", np.repeat(shot_id, len(grid_times))),
     )
+
+
+def ts_channel_dataset(
+    shot: int,
+    ts_time: np.ndarray,
+    r_rows: np.ndarray,
+    z_rows: np.ndarray,
+    te: np.ndarray,
+    te_error: np.ndarray,
+    ne: np.ndarray,
+    ne_error: np.ndarray,
+    timebase: np.ndarray,
+) -> xr.Dataset:
+    """Collect Thomson channel readings on their native timebase, ready for snap_to_grid.
+
+    A reading is kept only where the value and its error are both finite and positive, since the fit needs both.
+    Slices outside the timebase and slices left with no usable reading are dropped.
+
+    Args:
+        shot: Shot number.
+        ts_time: (n_t,) Thomson sample times [s].
+        r_rows: (n_t, n_ch) channel major radii [m].
+        z_rows: (n_t, n_ch) channel heights [m].
+        te: (n_t, n_ch) electron temperature readings [eV].
+        te_error: (n_t, n_ch) their 1-sigma errors [eV].
+        ne: (n_t, n_ch) electron density readings [m^-3].
+        ne_error: (n_t, n_ch) their 1-sigma errors [m^-3].
+        timebase: Uniform 1 kHz timebase of the shot [s].
+
+    Returns:
+        Dataset on dims ("idx", "ts_channel") with "time"/"shot" coords.
+    """
+    ts_time = np.asarray(ts_time, dtype=float)
+    in_shot = (ts_time >= timebase[0]) & (ts_time <= timebase[-1])
+    channel_data = {}
+    for name, values, errors in (
+        ("ts_channel_t_e", te, te_error),
+        ("ts_channel_n_e", ne, ne_error),
+    ):
+        values_in_shot = np.asarray(values, dtype=float)[in_shot]
+        errors_in_shot = np.asarray(errors, dtype=float)[in_shot]
+        with np.errstate(invalid="ignore"):
+            usable = (values_in_shot > 0) & (errors_in_shot > 0)
+        channel_data[name] = np.where(usable, values_in_shot, np.nan)
+        channel_data[f"{name}_error"] = np.where(usable, errors_in_shot, np.nan)
+    channel_data["ts_channel_r"] = np.asarray(r_rows, dtype=float)[in_shot]
+    channel_data["ts_channel_z"] = np.asarray(z_rows, dtype=float)[in_shot]
+
+    has_te = np.isfinite(channel_data["ts_channel_t_e"])
+    has_ne = np.isfinite(channel_data["ts_channel_n_e"])
+    keep = (has_te | has_ne).any(axis=1)
+    n_empty = int((~keep).sum())
+    if n_empty:
+        logger.debug(f"Shot {shot}: dropping {n_empty} empty Thomson slices")
+    ts_time_kept = ts_time[in_shot][keep]
+    n_channels = channel_data["ts_channel_r"].shape[1]
+    return xr.Dataset(
+        data_vars={
+            name: (("idx", "ts_channel"), values[keep])
+            for name, values in channel_data.items()
+        },
+        coords={
+            "time": ("idx", ts_time_kept),
+            "shot": ("idx", np.repeat(shot, ts_time_kept.size)),
+            "ts_channel": np.arange(n_channels),
+        },
+    )
+
+
+def hold_onto_grid(
+    grid: np.ndarray,
+    sample_times: np.ndarray,
+    period: float | None = None,
+    hold_floor: float = 0.0,
+    max_hold_time: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map every grid time onto the sample it takes its values from.
+
+    Each grid time takes the most recent sample at or before it,
+    held for at most MAX_HOLD_PERIODS sampling periods, or hold_floor when that is longer,
+    so that nothing is carried across a long gap:
+    the end of the shot, a diagnostic dropping out, or a stretch the filtering cut away.
+    max_hold_time sets the longest hold directly instead, whatever the sampling period.
+    A sample within SAMPLE_TIME_TOL after a grid time counts as at it.
+    A grid time is fresh when its sample falls in its own grid step (t - grid step, t],
+    so each sample is fresh at the first grid time that holds it, on the grid or between grid times.
+
+    Args:
+        grid: The shot's 1 kHz timebase [s].
+        sample_times: Times of the samples to place on it [s], ascending.
+        period: The sampling period to hold for [s]. None takes the median
+            spacing of sample_times, which is right when they are every
+            sample there is, and wrong when they are a windowed subset.
+        hold_floor: The hold reaches at least this far [s].
+        max_hold_time: Longest hold [s], replaces MAX_HOLD_PERIODS and hold_floor when given.
+
+    Returns:
+        (sample_index, fresh): sample_index[i] is the index of the sample
+        that grid time i draws from, -1 where it draws from none, and
+        fresh[i] marks the grid times whose sample falls in their own grid step.
+    """
+    sample_index = np.full(grid.size, -1, dtype=int)
+    fresh = np.zeros(grid.size, dtype=bool)
+    if sample_times.size == 0:
+        return sample_index, fresh
+
+    # float64, since a float32 grid time can sit just below the sample at the same millisecond
+    grid_float64 = grid.astype(np.float64)
+    sample_times_float64 = sample_times.astype(np.float64)
+    grid_steps = np.diff(grid_float64)
+    # A one-point grid has no step, so its sample is fresh wherever it lies before it
+    grid_step = float(np.median(grid_steps)) if grid_steps.size else np.inf
+    # Index of the last sample at or before each grid time
+    previous_sample = (
+        np.searchsorted(
+            sample_times_float64, grid_float64 + SAMPLE_TIME_TOL, side="right"
+        )
+        - 1
+    )
+    has_previous = previous_sample >= 0
+    previous_sample_clipped = np.clip(previous_sample, 0, None)
+    age = grid_float64 - sample_times_float64[previous_sample_clipped]
+    fresh = has_previous & (age < grid_step - SAMPLE_TIME_TOL)
+    if max_hold_time is not None:
+        max_hold = max_hold_time
+    else:
+        # One sample on its own has no period to hold for,
+        # so it only fills the grid step it sits on
+        if period is None:
+            sample_spacing = (
+                np.diff(sample_times_float64) if sample_times.size > 1 else grid_steps
+            )
+            period = float(np.median(sample_spacing))
+        max_hold = max(MAX_HOLD_PERIODS * period, hold_floor)
+    still_held = has_previous & (age <= max_hold)
+    sample_index[still_held] = previous_sample[still_held]
+    return sample_index, fresh
+
+
+def signal_on_grid(
+    source_times: np.ndarray,
+    values: np.ndarray,
+    grid: np.ndarray,
+    hold_floor: float = 0.0,
+) -> np.ndarray:
+    """Place a 0D signal on the grid causally, so no grid value draws on a later sample.
+
+    A source sampled faster than the grid is averaged over each grid step (_window_mean_on_grid).
+    A slower one is held forward from its last sample (_held_on_grid), at least hold_floor.
+    Only finite samples count.
+    The source's period is the median spacing of its finite samples,
+    so a fast clock populated only at a slower cadence is held on that cadence.
+    Fewer than two finite samples have no period, and give all NaN.
+
+    Args:
+        source_times: (n_source,) ascending sample times of the source [s].
+        values: (n_source,) the signal at those times, NaN where missing.
+        grid: The shot's 1 kHz timebase [s].
+        hold_floor: The hold of a slower source reaches at least this far [s].
+
+    Returns:
+        (n_grid,) the signal on the grid, NaN where it has no value.
+    """
+    mask_finite = np.isfinite(values)
+    if mask_finite.sum() < 2:
+        return np.full(grid.size, np.nan)
+    times_finite = source_times[mask_finite]
+    values_finite = values[mask_finite]
+    source_steps = np.diff(times_finite)
+    source_period = float(np.median(source_steps))
+    grid_float64 = grid.astype(np.float64)
+    grid_steps = np.diff(grid_float64)
+    grid_step = float(np.median(grid_steps))
+    if source_period < grid_step - SAMPLE_TIME_TOL:
+        return _window_mean_on_grid(
+            times_finite, values_finite, grid_float64, grid_step
+        )
+    return _held_on_grid(times_finite, values_finite, grid_float64, hold_floor)
+
+
+def _held_on_grid(
+    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray, hold_floor: float
+) -> np.ndarray:
+    """Each grid time takes the last sample at or before it (hold_onto_grid).
+
+    A sample is held for at most MAX_HOLD_PERIODS of the median sample spacing, or hold_floor when longer,
+    so a longer gap in the source stays NaN.
+
+    Args:
+        source_times: (n_source,) ascending finite sample times [s], at least two.
+        values: (n_source,) the samples.
+        grid: (n_grid,) the timebase [s].
+        hold_floor: The hold reaches at least this far [s].
+
+    Returns:
+        (n_grid,) the held signal, NaN where nothing is held.
+    """
+    sample_index, _ = hold_onto_grid(grid, source_times, hold_floor=hold_floor)
+    mask_held = sample_index >= 0
+    values_held = np.full(grid.size, np.nan)
+    values_held[mask_held] = values[sample_index[mask_held]]
+    return values_held
+
+
+def _window_mean_on_grid(
+    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray, grid_step: float
+) -> np.ndarray:
+    """Each grid time t takes the mean of the samples in (t - grid_step, t].
+
+    A sample within SAMPLE_TIME_TOL after a grid time counts as at it, as in hold_onto_grid.
+
+    Args:
+        source_times: (n_source,) ascending finite sample times [s].
+        values: (n_source,) the samples.
+        grid: (n_grid,) the uniform timebase [s], float64.
+        grid_step: Its step [s].
+
+    Returns:
+        (n_grid,) the window means, NaN where a window holds no sample.
+    """
+    first_window_start = grid[0] - grid_step
+    window_edges = np.concatenate([[first_window_start], grid])
+    window_index = (
+        np.searchsorted(window_edges, source_times - SAMPLE_TIME_TOL, side="left") - 1
+    )
+    mask_on_grid = (window_index >= 0) & (window_index < grid.size)
+    window_index_on_grid = window_index[mask_on_grid]
+    values_in_windows = values[mask_on_grid]
+    window_sums = np.bincount(
+        window_index_on_grid, weights=values_in_windows, minlength=grid.size
+    )
+    window_counts = np.bincount(window_index_on_grid, minlength=grid.size)
+    window_means = np.full(grid.size, np.nan)
+    mask_sampled = window_counts > 0
+    window_means[mask_sampled] = window_sums[mask_sampled] / window_counts[mask_sampled]
+    return window_means
+
+
+def injected_power_on_grid(
+    record_times: np.ndarray, power: np.ndarray, grid: np.ndarray
+) -> np.ndarray:
+    """An injected heating power record placed on the grid (signal_on_grid), 0 outside the record.
+
+    A record of fewer than two samples is taken as a heating system that did not run, 0 throughout.
+    This is a wonk edge case on some MAST / TCV discharges. Placing check here for consistency.
+
+    Args:
+        record_times: (n_record,) ascending sample times of the record [s].
+        power: (n_record,) the power, in the record's units.
+        grid: (n_grid,) the shot's 1 kHz timebase [s].
+
+    Returns:
+        (n_grid,) the power on the grid.
+    """
+    if record_times.size < 2:
+        return np.zeros(grid.size)
+    power_on_grid = signal_on_grid(record_times, power, grid)
+    mask_outside_record = (grid < record_times[0]) | (grid > record_times[-1])
+    power_on_grid[mask_outside_record] = 0.0
+    return power_on_grid
+
+
+def held_signals_on_grid(
+    source_times: np.ndarray,
+    signals: dict[str, np.ndarray],
+    grid: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Place the 0D signals of one reconstruction clock on the grid, each held for at least EQUILIBRIUM_HOLD_FLOOR.
+
+    Args:
+        source_times: (n_source,) ascending reconstruction times [s].
+        signals: {name: (n_source,) values on those times}.
+        grid: (n_grid,) the shot's 1 kHz timebase [s].
+
+    Returns:
+        {name: (n_grid,) the signal on the grid (signal_on_grid)}.
+    """
+    return {
+        name: signal_on_grid(
+            source_times, np.asarray(values, dtype=float), grid, EQUILIBRIUM_HOLD_FLOOR
+        )
+        for name, values in signals.items()
+    }
+
+
+def centered_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.ndarray:
+    """Smooth a uniformly sampled signal with a boxcar centered on each sample, along the last axis.
+
+    The boxcar spans an odd number of samples, so it stays centered on the present one.
+    NaN samples are skipped, and near the ends and around NaNs it averages over the samples present.
+
+    Args:
+        values: (..., n) the signal, uniformly sampled along its last axis.
+        window: Width of the boxcar [s].
+        dt: The sample spacing [s].
+
+    Returns:
+        (..., n) the smoothed signal, NaN only where the whole window is.
+    """
+    n_samples = max(1, round(window / dt))
+    if n_samples % 2 == 0:
+        n_samples += 1
+    signal = xr.DataArray(values)
+    last_dim = signal.dims[-1]
+    smoothed = signal.rolling({last_dim: n_samples}, center=True, min_periods=1).mean()
+    return smoothed.values
+
+
+def smoothed_power(values: np.ndarray) -> np.ndarray:
+    """Smooth a power on the uniform grid with the centered POWER_SMOOTHING_WINDOW boxcar applied twice.
+
+    The kernel is a triangle twice the window wide at its base, DIII-D's prad_tot kernel.
+    It draws on samples up to one window later, so the result is not causal.
+    A NaN sample stays NaN, so a gap in the record stays a gap for the filters.
+
+    Args:
+        values: (n,) the power on the uniform UNIFORM_TIMEBASE_DT grid.
+
+    Returns:
+        (n,) the smoothed power.
+    """
+    smoothed_once = centered_boxcar_mean(
+        values, POWER_SMOOTHING_WINDOW, UNIFORM_TIMEBASE_DT
+    )
+    smoothed_twice = centered_boxcar_mean(
+        smoothed_once, POWER_SMOOTHING_WINDOW, UNIFORM_TIMEBASE_DT
+    )
+    mask_missing = np.isnan(values)
+    smoothed_twice[mask_missing] = np.nan
+    return smoothed_twice
 
 
 def usable_reconstructions(ds: xr.Dataset) -> np.ndarray:
