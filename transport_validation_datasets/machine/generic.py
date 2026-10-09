@@ -140,6 +140,19 @@ DATASET_EQUILIBRIUM_SIGNALS = tuple(
     if name not in ("r_grid", "z_grid", "psi_idx", "boundary_idx", "limiter_idx")
 )
 
+# The 0D signals taken from the equilibrium reconstruction, on every device.
+# A device leaves them on the grid times their reconstructions land on,
+# and the unprocessed stage holds them from the last usable one (hold_from_usable_reconstructions).
+EQUILIBRIUM_0D_SIGNALS = (
+    "energy_mhd",
+    "beta_tor_norm",
+    "minor_radius",
+    "geometric_axis_r",
+    "elongation",
+    "triangularity_upper",
+    "triangularity_lower",
+)
+
 
 def imas_url(ref: str) -> str:
     """Documentation URL of an IMAS data dictionary path.
@@ -210,11 +223,12 @@ MAX_HOLD_PERIODS = 1.5
 # fresh_profile marks the slices themselves.
 PROFILE_MAX_HOLD = 100e-3
 
-# Shortest an equilibrium reconstruction is held, whatever its clock [s].
+# Shortest the GEQDSK block of a reconstruction is held in the stores, whatever its clock [s].
 # Bridges the dropouts of single reconstructions
 # (a 1 kHz EFIT failing a few slices, one missing 5 ms MAST reconstruction)
-# that would otherwise cut every equilibrium signal.
+# that would otherwise cut the block.
 # fresh_equilibrium still marks only the grid times a usable reconstruction lands on.
+# The 0D signals taken from the reconstruction hold with no limit (hold_from_usable_reconstructions).
 EQUILIBRIUM_HOLD_FLOOR = 10e-3
 
 # How far a TS slice may sit from the reconstruction it maps through,
@@ -576,15 +590,12 @@ def hold_onto_grid(
 
 
 def signal_on_grid(
-    source_times: np.ndarray,
-    values: np.ndarray,
-    grid: np.ndarray,
-    hold_floor: float = 0.0,
+    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray
 ) -> np.ndarray:
     """Place a 0D signal on the grid causally, so no grid value draws on a later sample.
 
     A source sampled faster than the grid is averaged over each grid step (_window_mean_on_grid).
-    A slower one is held forward from its last sample (_held_on_grid), at least hold_floor.
+    A slower one is held forward from its last sample (_held_on_grid).
     Only finite samples count.
     The source's period is the median spacing of its finite samples,
     so a fast clock populated only at a slower cadence is held on that cadence.
@@ -594,7 +605,6 @@ def signal_on_grid(
         source_times: (n_source,) ascending sample times of the source [s].
         values: (n_source,) the signal at those times, NaN where missing.
         grid: The shot's 1 kHz timebase [s].
-        hold_floor: The hold of a slower source reaches at least this far [s].
 
     Returns:
         (n_grid,) the signal on the grid, NaN where it has no value.
@@ -613,27 +623,26 @@ def signal_on_grid(
         return _window_mean_on_grid(
             times_finite, values_finite, grid_float64, grid_step
         )
-    return _held_on_grid(times_finite, values_finite, grid_float64, hold_floor)
+    return _held_on_grid(times_finite, values_finite, grid_float64)
 
 
 def _held_on_grid(
-    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray, hold_floor: float
+    source_times: np.ndarray, values: np.ndarray, grid: np.ndarray
 ) -> np.ndarray:
     """Each grid time takes the last sample at or before it (hold_onto_grid).
 
-    A sample is held for at most MAX_HOLD_PERIODS of the median sample spacing, or hold_floor when longer,
+    A sample is held for at most MAX_HOLD_PERIODS of the median sample spacing,
     so a longer gap in the source stays NaN.
 
     Args:
         source_times: (n_source,) ascending finite sample times [s], at least two.
         values: (n_source,) the samples.
         grid: (n_grid,) the timebase [s].
-        hold_floor: The hold reaches at least this far [s].
 
     Returns:
         (n_grid,) the held signal, NaN where nothing is held.
     """
-    sample_index, _ = hold_onto_grid(grid, source_times, hold_floor=hold_floor)
+    sample_index, _ = hold_onto_grid(grid, source_times)
     mask_held = sample_index >= 0
     values_held = np.full(grid.size, np.nan)
     values_held[mask_held] = values[sample_index[mask_held]]
@@ -696,29 +705,6 @@ def injected_power_on_grid(
     mask_outside_record = (grid < record_times[0]) | (grid > record_times[-1])
     power_on_grid[mask_outside_record] = 0.0
     return power_on_grid
-
-
-def held_signals_on_grid(
-    source_times: np.ndarray,
-    signals: dict[str, np.ndarray],
-    grid: np.ndarray,
-) -> dict[str, np.ndarray]:
-    """Place the 0D signals of one reconstruction clock on the grid, each held for at least EQUILIBRIUM_HOLD_FLOOR.
-
-    Args:
-        source_times: (n_source,) ascending reconstruction times [s].
-        signals: {name: (n_source,) values on those times}.
-        grid: (n_grid,) the shot's 1 kHz timebase [s].
-
-    Returns:
-        {name: (n_grid,) the signal on the grid (signal_on_grid)}.
-    """
-    return {
-        name: signal_on_grid(
-            source_times, np.asarray(values, dtype=float), grid, EQUILIBRIUM_HOLD_FLOOR
-        )
-        for name, values in signals.items()
-    }
 
 
 def centered_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.ndarray:
@@ -793,6 +779,45 @@ def usable_reconstructions(ds: xr.Dataset) -> np.ndarray:
     psi_n_grid = geqdsk_psi_n_grid(qpsi.shape[1])
     q_mappable = mappable_q_profiles(psi_n_grid, qpsi)
     return psi_range_usable & q_mappable & psirz_finite
+
+
+def hold_from_usable_reconstructions(ds: xr.Dataset) -> xr.Dataset:
+    """Hold the 0D signals taken from the reconstruction (EQUILIBRIUM_0D_SIGNALS) forward from the last usable one, with no limit.
+
+    Each grid time takes the signal's value at the last usable reconstruction (usable_reconstructions)
+    at or before it, however long ago,
+    so the signal changes only where a usable reconstruction lands and is NaN before the first.
+    Its values everywhere else, an unusable reconstruction's included, are dropped.
+    A dataset without a GEQDSK block passes through.
+
+    Args:
+        ds: One shot's standardized dataset on its 1 kHz grid, with the GEQDSK block. Modified in place.
+            Signals of EQUILIBRIUM_0D_SIGNALS it lacks are skipped.
+
+    Returns:
+        The same dataset.
+    """
+    if "simagx" not in ds:
+        return ds
+    grid = np.asarray(ds["time"].values, dtype=float)
+    usable = usable_reconstructions(ds)
+    reconstructed = np.flatnonzero(usable)
+    reconstruction_times = grid[reconstructed]
+    reconstruction_index, _ = hold_onto_grid(
+        grid, reconstruction_times, max_hold_time=np.inf
+    )
+    mask_held = reconstruction_index >= 0
+    # Grid index of the usable reconstruction each held grid time takes its value from
+    source_index = reconstructed[reconstruction_index[mask_held]]
+    for name in EQUILIBRIUM_0D_SIGNALS:
+        if name not in ds:
+            continue
+        signal = ds[name].transpose(..., "time")
+        values = signal.values
+        values_held = np.full(values.shape, np.nan, dtype=values.dtype)
+        values_held[..., mask_held] = values[..., source_index]
+        ds[name] = signal.copy(data=values_held)
+    return ds
 
 
 def reconstruction_clock_period(ds: xr.Dataset, grid: np.ndarray) -> float:

@@ -9,6 +9,7 @@ import xarray as xr
 
 from transport_validation_datasets.machine.generic import (
     cocos_from_signs,
+    hold_from_usable_reconstructions,
     make_uniform_1kHz_timebase,
     signal_on_grid,
     smoothed_power,
@@ -171,7 +172,7 @@ class TestCocosFromSigns:
         assert cocos_from_signs(nan, nan, nan, nan, np.full((3, 5), np.nan)) == 1
 
 
-# The two classes below hold the causality of the stored signals:
+# The three classes below hold the causality of the stored signals:
 # no grid value may draw on a later sample.
 class TestSignalOnGrid:
     def test_takes_the_last_sample_at_or_before_and_leaves_gaps_nan(self):
@@ -191,22 +192,6 @@ class TestSignalOnGrid:
         # Past 1.5 periods after 25 ms nothing is held, the 45 ms sample is not pulled back
         assert values_on_grid[32] == 6.0
         assert np.isnan(values_on_grid[33:45]).all()
-        assert values_on_grid[45] == 7.0
-
-    def test_hold_floor_bridges_a_missing_sample_and_no_more(self):
-        # The source above, held for at least 10 ms, as every equilibrium signal is
-        grid = grid_ms(60)
-        source_times = np.array([0.0, 0.005, 0.010, 0.015, 0.020, 0.025, 0.045, 0.050])
-        values = np.array([1.0, 2.0, 3.0, np.nan, 5.0, 6.0, 7.0, 8.0])
-
-        values_on_grid = signal_on_grid(source_times, values, grid, hold_floor=10e-3)
-
-        # The missing 15 ms sample is bridged by the 10 ms one
-        assert (values_on_grid[10:20] == 3.0).all()
-        assert values_on_grid[20] == 5.0
-        # The 20 ms gap after 25 ms is not, the hold ends 10 ms after it
-        assert values_on_grid[34] == 6.0
-        assert np.isnan(values_on_grid[36:45]).all()
         assert values_on_grid[45] == 7.0
 
     def test_float64_source_on_a_float32_grid_is_held_at_its_own_grid_time(self):
@@ -250,6 +235,44 @@ class TestSignalOnGrid:
         # 4 ms has no finite sample, and 5 ms averages the finite 22 to 25.
         expected = np.array([0.0, 3.0, 8.0, 13.0, np.nan, 23.5, 28.0, 33.0, 38.0, 43.0])
         np.testing.assert_array_equal(values_on_grid, expected)
+
+
+class TestHoldFromUsableReconstructions:
+    def test_held_from_the_last_usable_reconstruction_with_no_limit(self):
+        # Reconstructions at 2, 7, 12 and 40 ms, the one at 7 ms without a finite qpsi,
+        # and a stray energy_mhd sample at 20 ms with no reconstruction under it
+        grid = grid_ms(50)
+        reconstructed = [2, 7, 12, 40]
+        simagx = np.full(grid.size, np.nan)
+        psirz = np.full((grid.size, 2, 2), np.nan)
+        qpsi = np.full((grid.size, 3), np.nan)
+        energy_mhd = np.full(grid.size, np.nan)
+        for value, i_time in enumerate(reconstructed, start=1):
+            simagx[i_time] = 0.0
+            psirz[i_time] = 0.0
+            qpsi[i_time] = np.nan if i_time == 7 else 1.0
+            energy_mhd[i_time] = float(value)
+        energy_mhd[20] = 99.0
+        ds = xr.Dataset(
+            {
+                "simagx": (("shot", "time"), simagx[None]),
+                "sibdry": (("shot", "time"), simagx[None] + 1.0),
+                "qpsi": (("shot", "time", "psi_idx"), qpsi[None]),
+                "psirz": (("shot", "time", "r_grid", "z_grid"), psirz[None]),
+                "energy_mhd": (("shot", "time"), energy_mhd[None]),
+            },
+            coords={"shot": [SHOT], "time": grid},
+        )
+
+        held = hold_from_usable_reconstructions(ds)
+
+        energy_held = held["energy_mhd"].squeeze("shot").values
+        assert np.isnan(energy_held[:2]).all()
+        # The unusable 7 ms reconstruction and the stray 20 ms sample are skipped,
+        # and the 12 ms reconstruction holds across the 28 ms gap to the next usable one
+        assert (energy_held[2:12] == 1.0).all()
+        assert (energy_held[12:40] == 3.0).all()
+        assert (energy_held[40:] == 4.0).all()
 
 
 class TestSmoothedPower:
