@@ -1641,23 +1641,44 @@ def nearest_usable_reconstructions(
     """
     if "shot" in ds_shot.dims:
         ds_shot = ds_shot.squeeze("shot", drop=True)
-    sample_times = np.asarray(sample_times, dtype=float)
-    eq_index = np.full(sample_times.size, -1, dtype=int)
+    eq_index = np.full(np.size(sample_times), -1, dtype=int)
     usable = usable_reconstructions(ds_shot)
     eq_rows = np.flatnonzero(usable)
-    if eq_rows.size == 0:
-        return eq_index
     all_times = np.asarray(ds_shot["time"].values, dtype=float)
     eq_times = all_times[eq_rows]
     eq_period = reconstruction_clock_period(ds_shot, all_times)
     eq_tol = EQ_MATCH_MAX_PERIODS * eq_period
-    eq_distance = np.abs(eq_times[np.newaxis, :] - sample_times[:, np.newaxis])
-    nearest = np.argmin(eq_distance, axis=1)
-    sample_rows = np.arange(sample_times.size)
-    nearest_distance = eq_distance[sample_rows, nearest]
-    in_reach = nearest_distance <= eq_tol
+    nearest = nearest_in_reach(sample_times, eq_times, eq_tol)
+    in_reach = nearest >= 0
     eq_index[in_reach] = eq_rows[nearest[in_reach]]
     return eq_index
+
+
+def nearest_in_reach(
+    sample_times: np.ndarray, reference_times: np.ndarray, max_distance: float
+) -> np.ndarray:
+    """Find the reference time nearest each sample, if it is within reach.
+
+    Args:
+        sample_times: (n,) sample times [s].
+        reference_times: (m,) reference times [s], may be empty.
+        max_distance: Farthest a sample may sit from its reference [s].
+
+    Returns:
+        (n,) index into reference_times of each sample's nearest, -1 where it is farther than max_distance.
+    """
+    sample_times = np.asarray(sample_times, dtype=float)
+    reference_times = np.asarray(reference_times, dtype=float)
+    nearest_index = np.full(sample_times.size, -1, dtype=int)
+    if reference_times.size == 0:
+        return nearest_index
+    distance = np.abs(reference_times[np.newaxis, :] - sample_times[:, np.newaxis])
+    nearest = np.argmin(distance, axis=1)
+    sample_rows = np.arange(sample_times.size)
+    nearest_distance = distance[sample_rows, nearest]
+    in_reach = nearest_distance <= max_distance
+    nearest_index[in_reach] = nearest[in_reach]
+    return nearest_index
 
 
 def channel_rows_at_times(data: xr.DataArray, ts_times: np.ndarray) -> np.ndarray:
