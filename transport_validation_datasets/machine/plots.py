@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
+from transport_validation_datasets.machine.generic import greenwald_density
+
 BACKGROUND_COLOR = "#2F2F2F"
 FACE_COLOR = "#1A1A1A"
 TEXT_COLOR = "white"
@@ -14,14 +16,20 @@ TICK_FONTSIZE = 18
 LEGEND_FONTSIZE = 18
 
 
-def _valid_range_lines(
-    ax, valid_filter: dict[str, dict[str, float]], signal: str, scale: float, color: str
+def _threshold_lines(
+    ax,
+    min_filter: dict[str, float],
+    max_filter: dict[str, float],
+    signal: str,
+    scale: float,
+    color: str,
 ):
-    """Dashed horizontal lines at the signal's valid min/max, in plot units."""
-    bounds = valid_filter.get(signal, {})
-    for bound in ("min", "max"):
-        if bound in bounds:
-            ax.axhline(bounds[bound] * scale, color=color, linestyle="--", linewidth=1)
+    """Dashed horizontal lines at the signal's min_filter and max_filter thresholds, in plot units."""
+    for thresholds in (min_filter, max_filter):
+        if signal in thresholds:
+            ax.axhline(
+                thresholds[signal] * scale, color=color, linestyle="--", linewidth=1
+            )
 
 
 def _abs_if_negative(da: xr.DataArray) -> tuple[xr.DataArray, str]:
@@ -68,38 +76,43 @@ def plot_unprocessed_data(
     ds: xr.Dataset,
     fig_path: Path,
     title: str,
-    valid_filter: dict[str, dict[str, float]],
+    min_filter: dict[str, float],
+    max_filter: dict[str, float],
     transient_filter: dict[str, float],
-    end_margin_time: float,
-    transient_margin_time: float | None = None,
+    end_margin_time: float | None,
+    transient_spans: list[tuple[float, float]] | None = None,
     kept_spans: list[tuple[float, float]] | None = None,
     window_spans: list[tuple[float, float]] | None = None,
 ):
     """For all the 0D signals in the dataset, plot them over time and save the figure to disk.
 
+    DataWorkflow._plot_unprocessed draws it for every shot, unfiltered.
+
     One plot with several subplots, in the following groups:
 
-    1: ip (in MA) and b0 on left axis, wmhd (in MJ) on right axis
+    1: ip (in MA) and b0 on left axis, energy_mhd (in MJ) on right axis
     - Also has a vertical red line indicating the end margin time as identified by filter_and_plot
-    - And a vertical yellow line indicating the cutoff before a transient event, as identified by filter_and_plot (if provided)
-    2: n_e_line_average (in 10^20 m^-3) on left axis, beta_n (unitless) on right axis
-    - Also has green dots at the bottom for each time index where the profiles are not NaN
-    3: p_oh, p_rad, p_ic, p_lh, p_nbi (all in MW)
-    4: minor_radius and major_radius (both in m) on left axis, kappa, tritop, tribot (unitless) on right axis
+    2: n_e_line_average (in 10^20 m^-3) on left axis, beta_tor_norm on right axis
+    - Also has green dots at the bottom for each time a profile is measured
+    3: power_ohm, power_radiated, power_ic, power_lh, power_nbi, power_ec (all in MW)
+    4: minor_radius and geometric_axis_r (both in m) on left axis, elongation and the triangularities on right axis
 
-    For each signal, include dashed lines to indicate its valid range (from valid_filter)
+    For each signal, include dashed lines at its min_filter and max_filter thresholds,
+    and on the density the n_e_line_average a greenwald_fraction max_filter allows
 
     Args:
         ds: Dataset with standardized signal names for one shot.
         fig_path: Where to save the figure. Parent directories are created if needed.
         title: Figure title.
-        valid_filter: Valid ranges per signal, drawn as dashed lines.
+        min_filter: Minimum thresholds per signal, drawn as dashed lines.
+        max_filter: Maximum thresholds per signal, drawn as dashed lines.
         transient_filter: Transient thresholds per signal, drawn as dashed lines
             on the power subplot.
-        end_margin_time: Time of the end margin cutoff [s].
-        transient_margin_time: Time of the transient cutoff [s], if one was found.
-        kept_spans: (start, end) time intervals kept by filter_and_plot, shaded
-            as green vertical bars on each subplot.
+        end_margin_time: Time of the end-of-shot cut [s], None when there is none.
+        transient_spans: (start, end) time intervals filter_and_plot cut out as transients,
+            shaded as red vertical bars on each subplot.
+        kept_spans: (start, end) time intervals kept by filter_and_plot,
+            shaded as green vertical bars on each subplot.
         window_spans: (start, end) time windows the shotlist asked for, shaded
             as blue vertical bars on each subplot.
     """
@@ -116,6 +129,10 @@ def plot_unprocessed_data(
         for ax in axes:
             for span_start, span_end in kept_spans:
                 ax.axvspan(span_start, span_end, color="green", alpha=0.2, linewidth=0)
+    if transient_spans is not None:
+        for ax in axes:
+            for span_start, span_end in transient_spans:
+                ax.axvspan(span_start, span_end, color="red", alpha=0.3, linewidth=0)
     if window_spans is not None:
         for ax in axes:
             for span_start, span_end in window_spans:
@@ -123,40 +140,39 @@ def plot_unprocessed_data(
                     span_start, span_end, color="tab:blue", alpha=0.25, linewidth=0
                 )
 
-    # ip and b0 on the left y axis, wmhd on the right y axis
+    # ip and b0 on the left y axis, energy_mhd on the right y axis
     ax_ip = axes[0]
     ip, ip_label = _abs_if_negative(ds["ip"])
     ip_ma = ip / 1e6
     ax_ip.plot(time, ip_ma, label=f"{ip_label} [MA]", color="cyan")
-    _valid_range_lines(ax_ip, valid_filter, "ip", 1e-6, "cyan")
+    _threshold_lines(ax_ip, min_filter, max_filter, "ip", 1e-6, "cyan")
     left_signals = [ip_ma]
     if "b0" in ds:
         b0, b0_label = _abs_if_negative(ds["b0"])
         ax_ip.plot(time, b0, label=f"{b0_label} [T]", color="magenta")
-        _valid_range_lines(ax_ip, valid_filter, "b0", 1.0, "magenta")
+        _threshold_lines(ax_ip, min_filter, max_filter, "b0", 1.0, "magenta")
         left_signals.append(b0)
     ax_ip.set_ylabel("Ip [MA] / B0 [T]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_ip.set_ylim(_signal_ylim(left_signals))
-    ax_ip.axvline(end_margin_time, color="red")
-    if transient_margin_time is not None:
-        ax_ip.axvline(transient_margin_time, color="yellow")
+    if end_margin_time is not None:
+        ax_ip.axvline(end_margin_time, color="red")
     ax_ip.legend(
         fontsize=LEGEND_FONTSIZE,
         facecolor=BACKGROUND_COLOR,
         edgecolor=BACKGROUND_COLOR,
         loc="upper left",
     )
-    ax_wmhd = ax_ip.twinx()
-    wmhd_signals = []
+    ax_energy = ax_ip.twinx()
+    energy_signals = []
     if "energy_mhd" in ds:
-        wmhd = ds["energy_mhd"] / 1e6
-        ax_wmhd.plot(time, wmhd, label="wmhd [MJ]", color="red")
-        _valid_range_lines(ax_wmhd, valid_filter, "energy_mhd", 1e-6, "red")
-        wmhd_signals.append(wmhd)
-    ax_wmhd.set_ylabel("Wmhd [MJ]", fontsize=LABEL_FONTSIZE, color="red")
-    ax_wmhd.set_ylim(_signal_ylim(wmhd_signals))
-    ax_wmhd.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-    all_axes.append(ax_wmhd)
+        energy_mhd_MJ = ds["energy_mhd"] / 1e6
+        ax_energy.plot(time, energy_mhd_MJ, label="energy_mhd [MJ]", color="red")
+        _threshold_lines(ax_energy, min_filter, max_filter, "energy_mhd", 1e-6, "red")
+        energy_signals.append(energy_mhd_MJ)
+    ax_energy.set_ylabel("energy_mhd [MJ]", fontsize=LABEL_FONTSIZE, color="red")
+    ax_energy.set_ylim(_signal_ylim(energy_signals))
+    ax_energy.tick_params(axis="y", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
+    all_axes.append(ax_energy)
 
     # line average density on the left y axis, normalized beta on the right y axis
     ax_ne = axes[1]
@@ -164,18 +180,24 @@ def plot_unprocessed_data(
     if "n_e_line_average" in ds:
         ne20 = ds["n_e_line_average"] / 1e20
         ax_ne.plot(time, ne20, label="n_e_line_average", color="white")
-        _valid_range_lines(ax_ne, valid_filter, "n_e_line_average", 1e-20, "white")
+        _threshold_lines(
+            ax_ne, min_filter, max_filter, "n_e_line_average", 1e-20, "white"
+        )
         ne_signals.append(ne20)
+        if "greenwald_fraction" in max_filter and "minor_radius" in ds:
+            n_greenwald = greenwald_density(ds["ip"], ds["minor_radius"])
+            ne20_max = max_filter["greenwald_fraction"] * n_greenwald / 1e20
+            ax_ne.plot(time, ne20_max, color="white", linestyle="--", linewidth=1)
     ax_ne.set_ylabel("n_e [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_ne.set_ylim(_signal_ylim(ne_signals))
 
-    # Dots at 0 for time indices where the TS profiles have data
-    # No ts_channel dim means the TS retrieval failed and the column is all NaN
+    # Dots at 0 for the times a Thomson sample is measured.
+    # No ts_channel dim means the retrieval failed and the column is all NaN.
     if "ts_channel_n_e" in ds and "ts_channel" in ds["ts_channel_n_e"].dims:
-        fresh_profiles = ds["ts_channel_n_e"].notnull().any(dim="ts_channel")
+        mask_profile = ds["ts_channel_n_e"].notnull().any(dim="ts_channel")
         ax_ne.plot(
             time,
-            np.where(fresh_profiles, 0, np.nan),
+            np.where(mask_profile, 0, np.nan),
             color="green",
             marker="o",
             linestyle="None",
@@ -185,7 +207,9 @@ def plot_unprocessed_data(
     beta_signals = []
     if "beta_tor_norm" in ds:
         ax_beta.plot(time, ds["beta_tor_norm"], label="beta_tor_norm", color="magenta")
-        _valid_range_lines(ax_beta, valid_filter, "beta_tor_norm", 1.0, "magenta")
+        _threshold_lines(
+            ax_beta, min_filter, max_filter, "beta_tor_norm", 1.0, "magenta"
+        )
         beta_signals.append(ds["beta_tor_norm"])
     ax_beta.set_ylabel("Normalized Beta", fontsize=LABEL_FONTSIZE, color="magenta")
     ax_beta.set_ylim(_signal_ylim(beta_signals))
@@ -200,13 +224,14 @@ def plot_unprocessed_data(
         "power_nbi": "cyan",
         "power_lh": "yellow",
         "power_ic": "magenta",
+        "power_ec": "green",
     }
     power_signals = []
     for signal, color in power_colors.items():
         if signal in ds:
             power_mw = ds[signal] / 1e6
             ax_power.plot(time, power_mw, label=f"{signal} [MW]", color=color)
-            _valid_range_lines(ax_power, valid_filter, signal, 1e-6, color)
+            _threshold_lines(ax_power, min_filter, max_filter, signal, 1e-6, color)
             power_signals.append(power_mw)
     for signal, threshold in transient_filter.items():
         ax_power.axhline(
@@ -234,7 +259,7 @@ def plot_unprocessed_data(
     for signal, color in radius_colors.items():
         if signal in ds:
             ax_radius.plot(time, ds[signal], label=signal, color=color)
-            _valid_range_lines(ax_radius, valid_filter, signal, 1.0, color)
+            _threshold_lines(ax_radius, min_filter, max_filter, signal, 1.0, color)
             radius_signals.append(ds[signal])
     ax_radius.set_ylabel("Radius [m]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_radius.set_ylim(_signal_ylim(radius_signals, floor_zero=False))
@@ -255,7 +280,7 @@ def plot_unprocessed_data(
     for signal, color in shape_colors.items():
         if signal in ds:
             ax_shape.plot(time, ds[signal], label=signal, color=color)
-            _valid_range_lines(ax_shape, valid_filter, signal, 1.0, color)
+            _threshold_lines(ax_shape, min_filter, max_filter, signal, 1.0, color)
             shape_signals.append(ds[signal])
     ax_shape.set_ylabel("Shaping", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_shape.set_ylim(_signal_ylim(shape_signals, floor_zero=False))
