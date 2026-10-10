@@ -76,6 +76,7 @@ STORE_SIGNAL_ATTRS = {
     "fresh_profile": {"units": "1"},
     "fresh_equilibrium": {"units": "1"},
 }
+STORE_SIGNALS = tuple(STORE_SIGNAL_ATTRS)
 
 # The raw Thomson channel readings of the internal stores, their SI units and IMAS paths.
 # Each device adds its own description of the diagnostic.

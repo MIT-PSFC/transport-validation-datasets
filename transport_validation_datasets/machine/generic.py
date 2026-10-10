@@ -980,6 +980,30 @@ def normalized_beta(energy_mhd, volume, minor_radius, b0, ip):
         return 100.0 * beta_tor * minor_radius * b0_magnitude / ip_magnitude_ma
 
 
+def energy_mhd_from_normalized_beta(beta_tor_norm, volume, minor_radius, b0, ip):
+    """The stored energy that gives a normalized beta, the inverse of normalized_beta.
+
+    energy_mhd = 3/2 <p> volume with <p> = beta_tor b0^2 / (2 mu0)
+    and beta_tor = beta_tor_norm |ip|[MA] / (100 a |b0|).
+    Builtin abs, so jax arrays pass through under jit.
+
+    Args:
+        beta_tor_norm: Normalized beta [percent m T / MA].
+        volume: Plasma volume inside the boundary [m^3].
+        minor_radius: Minor radius of the boundary [m].
+        b0: Vacuum toroidal field at r0 [T], either sign.
+        ip: Plasma current [A], either sign.
+
+    Returns:
+        energy_mhd [J], shaped like the broadcast inputs.
+    """
+    b0_magnitude = abs(b0)
+    ip_magnitude_ma = abs(ip) / 1e6
+    beta_tor = beta_tor_norm * ip_magnitude_ma / (100.0 * minor_radius * b0_magnitude)
+    pressure_mean = beta_tor * b0_magnitude**2 / (2.0 * mu_0)
+    return 1.5 * pressure_mean * volume
+
+
 def greenwald_density(ip, minor_radius):
     """The Greenwald density n_GW = Ip / (pi a^2), in 1e20 m^-3, MA and m.
 

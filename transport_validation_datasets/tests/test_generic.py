@@ -11,6 +11,7 @@ from scipy.integrate import quad
 
 from transport_validation_datasets.machine.generic import (
     cocos_from_signs,
+    energy_mhd_from_normalized_beta,
     hold_from_usable_reconstructions,
     lcfs_voltage,
     make_uniform_1kHz_timebase,
@@ -391,7 +392,7 @@ class TestNormalizedBeta:
     B0 = -1.41
     IP = -2.9e5
 
-    def test_sign_invariance(self):
+    def test_sign_invariance_and_round_trip(self):
         energy_mhd = np.array([self.ENERGY_MHD])
         beta_both_negative = normalized_beta(
             energy_mhd, self.VOLUME, self.MINOR_RADIUS, self.B0, self.IP
@@ -404,6 +405,11 @@ class TestNormalizedBeta:
         )
         np.testing.assert_allclose(beta_both_positive, beta_both_negative)
         np.testing.assert_allclose(beta_mixed, beta_both_negative)
+
+        energy_back = energy_mhd_from_normalized_beta(
+            beta_both_negative, self.VOLUME, self.MINOR_RADIUS, self.B0, self.IP
+        )
+        np.testing.assert_allclose(energy_back, energy_mhd)
 
     def test_zero_current_is_not_finite(self):
         beta_tor_norm = normalized_beta(
