@@ -35,7 +35,7 @@ from transport_validation_datasets.machine.generic import (
     MIN_PSI_RANGE,
     end_of_shot_index,
     geqdsk_psi_n_grid,
-    keep_longest_segment,
+    keep_best_segment,
     kept_span,
     mappable_q_profiles,
     nearest_in_reach,
@@ -114,7 +114,7 @@ def _ip_window(summary: xr.Dataset, timebase: np.ndarray) -> np.ndarray:
     mask_before_end = np.arange(timebase.size) < end_cut_index
     with np.errstate(invalid="ignore"):
         mask_window = mask_before_end & (ip >= ip_min)
-    mask_kept, _ = keep_longest_segment(mask_window, timebase)
+    mask_kept, _ = keep_best_segment(mask_window, timebase)
     return mask_kept
 
 

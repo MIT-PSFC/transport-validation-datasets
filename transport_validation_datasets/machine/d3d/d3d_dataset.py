@@ -213,14 +213,14 @@ class D3DDataWorkflow(DataWorkflow):
         "n_e_line_average": 5e17,
     }
     max_filter = {"greenwald_fraction": 2.0}
-    # Only obvious P_oh spikes: 2 MW also cut ramp-up ohmic heating and ~1.3 s of ramp-down (173953, 173956).
-    # 5 MW still catches the 18.8 MW spike of a 300 ms reconstruction gap (171658) and disruptive terminations.
-    # The smoothed P_rad never passed 17 MW in the 2026-10 pulls, its spikes are smeared upstream (smoothed_power).
-    transient_filter = {"power_ohm": 5e6}
+    # Only obvious spikes: 2 MW of P_oh also cut ramp-up ohmic heating and ~1.3 s of ramp-down (173953, 173956).
+    # The smoothed P_rad peaks at 16 MW before the end cut in the 2026-10 pulls.
+    transient_filter = {"power_ohm": 5e6, "power_radiated": 20e6}
     # Fitted to 53 hand-labeled crashes of the 2026-10 pulls (filter_tune review):
     # every real event falls by at least 0.5 of the peak within 50 ms (impurity injections, reconnection events, one EFIT spike),
     # often stepping down over 30-50 ms, while the largest normal sawtooth crash (203540) falls 0.47.
-    energy_crash_filter = {"window": 0.05, "drop_over_peak": 0.5}
+    # The smallest labeled crash loses 0.26 MJ, so the 100 kJ floor only keeps low-energy shots' noise out.
+    energy_crash_filter = {"window": 0.05, "drop_over_peak": 0.5, "min_drop": 1e5}
     # ip reads near 0 well past the end of the plasma, so the end is the last ip above its threshold.
     # A disruption's thermal quench can land ~60 ms before that end (199122),
     # and the EFIT P_oh smooths the quench out of reach of its transient filter.

@@ -14,11 +14,11 @@ from transport_validation_datasets.machine.generic import (
     EQUILIBRIUM_HOLD_FLOOR,
     MAX_HOLD_PERIODS,
     hold_onto_grid,
-    keep_longest_segment,
+    keep_best_segment,
 )
 from transport_validation_datasets.workflow import (
     _hold_equilibrium,
-    _trim_and_keep_longest,
+    _trim_and_keep_best,
     _trim_segment_starts,
     _usable_slice_mask,
 )
@@ -34,12 +34,12 @@ def runs(*lengths: int) -> np.ndarray:
     return np.concatenate([np.full(n, i % 2 == 0) for i, n in enumerate(lengths)])
 
 
-class TestKeepLongestSegment:
-    def test_only_the_longest_run_left(self):
+class TestKeepBestSegment:
+    def test_without_profiles_only_the_longest_run_left(self):
         times = grid_ms(30)
         keep = runs(5, 2, 10, 3, 10)
 
-        kept, dropped = keep_longest_segment(keep, times)
+        kept, dropped = keep_best_segment(keep, times)
 
         # Equally long runs keep the earliest
         assert np.flatnonzero(kept).tolist() == list(range(7, 17))
@@ -47,10 +47,34 @@ class TestKeepLongestSegment:
         assert np.allclose(dropped, [0.004, 0.009])
 
     def test_empty_mask_keeps_nothing(self):
-        kept, dropped = keep_longest_segment(np.zeros(10, dtype=bool), grid_ms(10))
+        kept, dropped = keep_best_segment(np.zeros(10, dtype=bool), grid_ms(10))
 
         assert not kept.any()
         assert dropped == []
+
+    def test_most_profile_samples_beat_a_longer_run(self):
+        # A crash splits the shot, the profiles only cover the shorter run before it (DIII-D 204181)
+        times = grid_ms(30)
+        keep = runs(8, 2, 20)
+        mask_profile = np.zeros(30, dtype=bool)
+        mask_profile[[1, 4, 7, 12]] = True
+
+        kept, dropped = keep_best_segment(keep, times, mask_profile)
+
+        assert np.flatnonzero(kept).tolist() == list(range(0, 8))
+        assert np.allclose(dropped, [0.019])
+
+    def test_run_short_of_min_length_never_beats_one_that_passes(self):
+        # The 5-sample run holds more profile samples but is shorter than min_length,
+        # so the 20-sample run with fewer wins rather than getting the shot rejected
+        times = grid_ms(30)
+        keep = runs(5, 5, 20)
+        mask_profile = np.zeros(30, dtype=bool)
+        mask_profile[[0, 1, 2, 3, 15]] = True
+
+        kept, _ = keep_best_segment(keep, times, mask_profile, min_length=0.01)
+
+        assert np.flatnonzero(kept).tolist() == list(range(10, 30))
 
 
 class TestTrimSegmentStarts:
@@ -65,7 +89,7 @@ class TestTrimSegmentStarts:
         assert np.flatnonzero(trimmed).tolist() == [0, 1, 2, 6, 7]
 
 
-class TestTrimAndKeepLongest:
+class TestTrimAndKeepBest:
     def test_earlier_segment_never_starts_a_later_one(self):
         # A 5 ms clock, so a reconstruction reaches 7.5 ms.
         # The 0 ms reconstruction of the 0-2 ms segment reaches 4-7 ms, but only one segment is kept,
@@ -77,8 +101,8 @@ class TestTrimAndKeepLongest:
         reconstruction_usable = np.zeros(30, dtype=bool)
         reconstruction_usable[[0, 10, 15, 20]] = True
 
-        kept, dropped, n_trimmed = _trim_and_keep_longest(
-            keep, times, reconstruction_usable, 0.005
+        kept, dropped, n_trimmed = _trim_and_keep_best(
+            keep, times, reconstruction_usable, 0.005, np.zeros(keep.size, dtype=bool), 0.0
         )
 
         assert np.flatnonzero(kept).tolist() == list(range(10, 21))
@@ -97,8 +121,8 @@ class TestTrimAndKeepLongest:
         reconstruction_usable[0:46:5] = True
         reconstruction_usable[58:96:5] = True
 
-        kept, dropped, n_trimmed = _trim_and_keep_longest(
-            keep, times, reconstruction_usable, 0.005
+        kept, dropped, n_trimmed = _trim_and_keep_best(
+            keep, times, reconstruction_usable, 0.005, np.zeros(keep.size, dtype=bool), 0.0
         )
 
         assert np.flatnonzero(kept).tolist() == list(range(0, 46))

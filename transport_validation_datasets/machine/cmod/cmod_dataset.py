@@ -154,12 +154,16 @@ class CModDataWorkflow(DataWorkflow):
     max_filter = {
         "greenwald_fraction": 2.0,
     }
-    # Input power tops out near 6 MW, so 5.5 MW radiated is a collapse or a broken record.
-    # Over 990 shots it fires in 48 and costs 28 s of kept time, 2 percent.
+    # Only obvious spikes: in the 2026-10 pulls the smoothed P_oh peaks at 3.4 MW and P_rad at 7.5 MW over the kept data.
     transient_filter = {
-        "power_ohm": 5.0e6,
-        "power_radiated": 5.5e6,
+        "power_ohm": 6e6,
+        "power_radiated": 8e6,
     }
+    # The confinement time (~25 ms) is a sixth of DIII-D's, so W halves within 50 ms of every ICRF turn-off,
+    # and low-energy ohmic shots wander by 15 kJ, most of their peak.
+    # No hand-labeled C-Mod event was a real transient (filter_tune review),
+    # and at 0.5 of the peak within 10 ms and 60 kJ no 2026-10 shot crashes, so this only catches one far beyond them.
+    energy_crash_filter = {"window": 0.01, "drop_over_peak": 0.5, "min_drop": 6e4}
     # One smoothing window, so the smoothed powers never carry the current quench (POWER_SMOOTHING_WINDOW)
     end_margin = POWER_SMOOTHING_WINDOW
     shot_blacklist = []

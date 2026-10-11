@@ -66,12 +66,15 @@ def energy_crash_mask(
     mask_before_end: np.ndarray,
     window: float,
     drop_over_peak: float,
+    min_drop: float,
 ) -> np.ndarray:
     """The grid times a stored-energy crash follows within window, and the crash itself down to its lowest point.
 
-    A crash is energy_mhd falling by at least drop_over_peak of the shot's peak within window ahead of a grid time.
+    A crash is energy_mhd falling within window ahead of a grid time
+    by at least drop_over_peak of the shot's peak and by at least min_drop.
     The peak is the ENERGY_PEAK_PERCENTILE percentile of energy_mhd before the end cut,
     so the threshold is one absolute energy per shot and noise on the low stored energy of the ramp-up does not trip it.
+    The floor keeps the reconstruction noise of a low-energy shot from counting as a crash of most of its peak.
     Each crash runs on to the lowest energy_mhd of its window,
     since part-way down less than the threshold is left to fall and the tail would start the next segment.
 
@@ -81,6 +84,7 @@ def energy_crash_mask(
         mask_before_end: (n_t,) the grid times before the end-of-shot cut.
         window: How far ahead the drop is looked for [s].
         drop_over_peak: Smallest drop that counts, as a fraction of the peak.
+        min_drop: Smallest drop that counts, in the units of energy_mhd.
 
     Returns:
         (n_t,) True at the grid times a crash follows.
@@ -98,8 +102,9 @@ def energy_crash_mask(
     offset_min_ahead = energy_windows.argmin(axis=1)
     energy_min_ahead = energy_windows.min(axis=1)
     energy_drop = energy_mhd - energy_min_ahead
+    drop_threshold = max(drop_over_peak * energy_peak, min_drop)
     with np.errstate(invalid="ignore"):
-        mask_crash_ahead = energy_drop >= drop_over_peak * energy_peak
+        mask_crash_ahead = energy_drop >= drop_threshold
     # Each flagged time covers the grid times up to the lowest point of its window
     index_flagged = np.flatnonzero(mask_crash_ahead)
     index_bottom = index_flagged + offset_min_ahead[index_flagged]
@@ -129,7 +134,7 @@ def slice_filter_mask(
     and a stored-energy crash ahead (energy_crash_mask), the last two together the transients.
     Each grid time that fails a check before the end-of-shot cut also cuts the FAILURE_MARGIN before it,
     so a segment that ends on a failure ends that much earlier, and one that ends at the end-of-shot cut does not.
-    Keeping the longest segment of what passes is left to the caller.
+    Keeping one segment of what passes is left to the caller (keep_best_segment).
 
     Args:
         ds: One shot's signals on its time dimension alone.
@@ -137,7 +142,7 @@ def slice_filter_mask(
         min_filter: {signal: threshold}, ip among them.
         max_filter: {signal: threshold}.
         transient_filter: {signal: threshold} on the smoothed signal.
-        energy_crash_filter: energy_crash_mask's window [s] and drop_over_peak, empty for no crash check.
+        energy_crash_filter: energy_crash_mask's window [s], drop_over_peak and min_drop [J], empty for no crash check.
         end_margin: Margin cut before the end of the plasma [s].
 
     Returns:
@@ -183,6 +188,7 @@ def slice_filter_mask(
             mask_before_end,
             energy_crash_filter["window"],
             energy_crash_filter["drop_over_peak"],
+            energy_crash_filter["min_drop"],
         )
         mask_transient = mask_transient | mask_crash
     mask_pass = mask_pass & ~mask_transient

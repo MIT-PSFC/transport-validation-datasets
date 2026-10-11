@@ -13,6 +13,7 @@ from transport_validation_datasets.store_schema import INPUT_POWERS
 DT = 1e-3
 CRASH_WINDOW = 0.05
 CRASH_DROP_OVER_PEAK = 0.5
+CRASH_MIN_DROP = 0.2
 
 
 def _kept_dataset(power_ohm: np.ndarray) -> xr.Dataset:
@@ -41,7 +42,12 @@ class TestOhmicPowerSignReason:
 def _crash_mask(energy_mhd: np.ndarray) -> np.ndarray:
     mask_before_end = np.ones(energy_mhd.size, dtype=bool)
     return energy_crash_mask(
-        energy_mhd, DT, mask_before_end, CRASH_WINDOW, CRASH_DROP_OVER_PEAK
+        energy_mhd,
+        DT,
+        mask_before_end,
+        CRASH_WINDOW,
+        CRASH_DROP_OVER_PEAK,
+        CRASH_MIN_DROP,
     )
 
 
@@ -75,6 +81,15 @@ class TestEnergyCrashMask:
         assert not _crash_mask(energy_sawteeth).any()
         assert not _crash_mask(energy_decay).any()
         assert not _crash_mask(energy_ramp_up).any()
+
+    def test_floor_keeps_a_low_energy_shot_from_crashing(self):
+        # The same crash shape at a tenth of the energy falls 0.07 MJ, under the 0.2 MJ floor
+        energy_mhd = np.ones(1000)
+        energy_mhd[500:531] = np.linspace(1.0, 0.3, 31)
+        energy_mhd[531:] = 0.3
+
+        assert _crash_mask(energy_mhd).any()
+        assert not _crash_mask(0.1 * energy_mhd).any()
 
     def test_one_high_glitch_cannot_set_the_peak_of_a_crash(self):
         # A 0.6 MJ crash under a 1 MJ plateau holding a single 5 MJ reconstruction glitch

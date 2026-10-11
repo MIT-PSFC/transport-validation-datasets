@@ -1078,32 +1078,75 @@ def kept_segments(keep: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
 
 
-def keep_longest_segment(
-    keep: np.ndarray, times: np.ndarray
+def keep_best_segment(
+    keep: np.ndarray,
+    times: np.ndarray,
+    mask_profile: np.ndarray | None = None,
+    min_length: float = 0.0,
 ) -> tuple[np.ndarray, list[float]]:
-    """Clear every run of kept samples but the longest.
+    """Clear every run of kept samples but the one the store should hold.
 
+    Runs at least min_length long come first, so a short run cannot displace one that passes min_pulse_length.
+    Among those the run with the most profile samples wins, since a run without profiles fits no profile,
+    then the longest, so without profile samples this keeps the longest run.
     A run is measured from its first to its last sample, the same way kept_span measures the one left,
     so a run of n samples on the 1 kHz grid is n - 1 milliseconds long.
-    The earliest of equally long runs is kept.
+    The earliest of equally ranked runs is kept.
 
     Args:
         keep: Mask over times, True where the sample survived the filters. Not modified.
         times: The shot's timebase [s].
+        mask_profile: Mask over times, True at the profile samples (profile_sample_mask). None counts none.
+        min_length: Length [s] a run needs to rank above every shorter one.
 
     Returns:
-        The mask with only the longest run left, and the lengths [s] of the runs cleared.
+        The mask with only the best run left, and the lengths [s] of the runs cleared.
     """
     keep = np.asarray(keep, dtype=bool)
-    keep_longest = np.zeros(keep.size, dtype=bool)
+    keep_best = np.zeros(keep.size, dtype=bool)
     starts, ends = kept_segments(keep)
     if starts.size == 0:
-        return keep_longest, []
+        return keep_best, []
     run_lengths = times[ends - 1] - times[starts]
-    longest = int(np.argmax(run_lengths))
-    keep_longest[starts[longest] : ends[longest]] = True
-    dropped_lengths = np.delete(run_lengths, longest)
-    return keep_longest, dropped_lengths.tolist()
+    if mask_profile is None:
+        mask_profile = np.zeros(keep.size, dtype=bool)
+    profile_samples_so_far = np.concatenate(([0], np.cumsum(mask_profile)))
+    run_profile_samples = profile_samples_so_far[ends] - profile_samples_so_far[starts]
+    mask_long_enough = run_lengths >= min_length
+    # lexsort ranks by its last key first, and argmax takes the first of equal maxima after negating the order
+    rank_order = np.lexsort((-np.arange(starts.size), run_lengths, run_profile_samples, mask_long_enough))
+    best = int(rank_order[-1])
+    keep_best[starts[best] : ends[best]] = True
+    dropped_lengths = np.delete(run_lengths, best)
+    return keep_best, dropped_lengths.tolist()
+
+
+# The profile readings of each source and their channel dim: raw Thomson channels, or DIII-D IDA slices
+PROFILE_READINGS = (
+    (("ts_channel_t_e", "ts_channel_n_e"), "ts_channel"),
+    (("ida_t_e", "ida_n_e"), "ida_point"),
+)
+
+
+def profile_sample_mask(ds: xr.Dataset) -> np.ndarray:
+    """Mark the grid times that carry a measured profile, a Thomson sample or a DIII-D IDA slice.
+
+    A reading without its channel dim is a failed retrieval, all NaN on the 0D timebase, and marks nothing.
+
+    Args:
+        ds: One shot's dataset on its time dimension alone, with standardized names.
+
+    Returns:
+        (n_t,) True where any channel of any profile reading is finite.
+    """
+    mask_profile = np.zeros(ds.sizes[TIME_COORD], dtype=bool)
+    for readings, channel_dim in PROFILE_READINGS:
+        for reading in readings:
+            if reading not in ds or channel_dim not in ds[reading].dims:
+                continue
+            mask_reading = ds[reading].notnull().any(dim=channel_dim)
+            mask_profile |= mask_reading.transpose(TIME_COORD).values
+    return mask_profile
 
 
 def kept_span(keep: np.ndarray, times: np.ndarray) -> float:

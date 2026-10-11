@@ -70,10 +70,11 @@ from transport_validation_datasets.machine.generic import (
     SOL_EXTENSIONS,
     hold_from_usable_reconstructions,
     hold_onto_grid,
-    keep_longest_segment,
+    keep_best_segment,
     kept_segments,
     kept_span,
     ohmic_power_on_grid,
+    profile_sample_mask,
     reconstruction_clock_period,
     standardize_signal_attrs,
     usable_reconstructions,
@@ -322,7 +323,8 @@ class DataWorkflow(ABC):
     # Ceiling on the same fraction, inf for none. Above 1 more is radiated than put in.
     max_radiated_fraction = np.inf
 
-    # Stored-energy crash check of filters.energy_crash_mask, {"window": [s], "drop_over_peak": fraction}, empty for none.
+    # Stored-energy crash check of filters.energy_crash_mask,
+    # {"window": [s], "drop_over_peak": fraction of the peak, "min_drop": [J]}, empty for none.
     # The grid times a crash follows are cut as transients.
     energy_crash_filter: dict[str, float] = {}
 
@@ -856,7 +858,8 @@ class DataWorkflow(ABC):
         and a stored-energy crash ahead (energy_crash_filter).
         What survives is one contiguous segment.
         Each segment is started where a kept usable reconstruction reaches,
-        and only the longest segment is kept.
+        and only one segment is kept (keep_best_segment):
+        the one with the most profile samples among those at least min_pulse_length long.
         The shot is rejected when ip never reaches its min_filter threshold,
         when that segment is shorter than min_pulse_length,
         or when shot_rejection_reason finds a broken record in it.
@@ -901,16 +904,20 @@ class DataWorkflow(ABC):
             logger.debug(f"Shot {shot}: transients at {n_transient} grid times")
         transient_spans = mask_spans(transient_time_mask, times)
 
-        # 3: Start each segment where the store will have an equilibrium, then keep only the longest.
+        # 3: Start each segment where the store will have an equilibrium, then keep only the best one,
+        # the most profile samples among those long enough, since a segment without profiles fits no profile.
         # The store only holds the reconstructions that are kept (_hold_equilibrium),
         # so a segment's first grid times have none when the one before it is cut.
+        mask_profile = profile_sample_mask(ds_shot)
         if reconstruction_usable is not None:
             clock_period = reconstruction_clock_period(ds_input, times)
-            kept_mask, dropped_lengths, n_trimmed = _trim_and_keep_longest(
+            kept_mask, dropped_lengths, n_trimmed = _trim_and_keep_best(
                 filtered_mask,
                 times,
                 reconstruction_usable,
                 clock_period,
+                mask_profile,
+                self.min_pulse_length,
             )
             if n_trimmed:
                 logger.debug(
@@ -918,11 +925,16 @@ class DataWorkflow(ABC):
                     f"from the starts of their segments"
                 )
         else:
-            kept_mask, dropped_lengths = keep_longest_segment(filtered_mask, times)
+            kept_mask, dropped_lengths = keep_best_segment(
+                filtered_mask, times, mask_profile, self.min_pulse_length
+            )
         if dropped_lengths:
+            n_profiles_kept = int((mask_profile & kept_mask).sum())
+            n_profiles_dropped = int((mask_profile & filtered_mask & ~kept_mask).sum())
             logger.info(
-                f"Shot {shot}: kept the longest segment, dropped {len(dropped_lengths)} shorter one(s), "
-                f"the longest {1e3 * max(dropped_lengths):.0f} ms, {1e3 * sum(dropped_lengths):.0f} ms in all"
+                f"Shot {shot}: kept a {kept_span(kept_mask, times):.3f} s segment with {n_profiles_kept} profile samples, "
+                f"dropped {len(dropped_lengths)} other(s) of {1e3 * sum(dropped_lengths):.0f} ms "
+                f"and {n_profiles_dropped} profile samples in all"
             )
         valid_mask = xr.DataArray(
             kept_mask[np.newaxis, :],
@@ -940,7 +952,7 @@ class DataWorkflow(ABC):
         pulse_length = kept_span(kept_mask, times)
         if pulse_length < self.min_pulse_length:
             rejection_reason = (
-                f"longest segment {pulse_length:.3f} s after filtering, "
+                f"kept segment {pulse_length:.3f} s after filtering, "
                 f"shorter than min_pulse_length {self.min_pulse_length} s"
             )
         else:
@@ -2486,17 +2498,17 @@ class DataWorkflow(ABC):
 def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
     """Clear the samples of each run of kept samples ahead of its first sample that can start one.
 
-    A run is a stretch of consecutive kept samples on the grid, as in keep_longest_segment.
+    A run is a stretch of consecutive kept samples on the grid, as in keep_best_segment.
     Each run is cut from the front only:
     its samples before the first one marked in can_start are cleared,
     and that sample and everything after it stay, whatever can_start says further on.
     A run with no sample marked in can_start is cleared whole.
     can_start outside the runs is ignored, a marked sample just before a run does not start it.
 
-    _trim_and_keep_longest passes the grid times that a usable reconstruction of the same run reaches within the hold,
+    _trim_and_keep_best passes the grid times that a usable reconstruction of the same run reaches within the hold,
     so every kept segment starts where the store will have an equilibrium.
     Equilibrium lapses inside a segment are left for the stack stage to show as gaps.
-    It runs before keep_longest_segment, so a trimmed run is judged on what is left of it.
+    It runs before keep_best_segment, so a trimmed run is judged on what is left of it.
 
     Example, with 1 for True:
         keep      1 1 1 0 1 1 1 1 0 1 1
@@ -2519,13 +2531,15 @@ def _trim_segment_starts(keep: np.ndarray, can_start: np.ndarray) -> np.ndarray:
     return keep
 
 
-def _trim_and_keep_longest(
+def _trim_and_keep_best(
     keep: np.ndarray,
     times: np.ndarray,
     reconstruction_usable: np.ndarray,
     clock_period: float,
+    mask_profile: np.ndarray,
+    min_length: float,
 ) -> tuple[np.ndarray, list[float], int]:
-    """Start each kept segment where one of its own reconstructions reaches, and keep only the longest.
+    """Start each kept segment where one of its own reconstructions reaches, and keep only the best (keep_best_segment).
 
     A grid time has an equilibrium in the store when a kept usable reconstruction
     at or before it is within the hold of _hold_equilibrium
@@ -2533,7 +2547,7 @@ def _trim_and_keep_longest(
     Only the segment kept here reaches the store, so only its own reconstructions are kept,
     and a reconstruction in an earlier segment never starts a later one.
     _trim_segment_starts cuts each segment's leading grid times that none of its own reconstructions reaches,
-    then keep_longest_segment judges the segments on what is left.
+    then keep_best_segment judges the segments on what is left.
     Since each segment is trimmed as it would be if it alone were kept, one pass is exact.
 
     Args:
@@ -2541,10 +2555,12 @@ def _trim_and_keep_longest(
         times: The grid times [s].
         reconstruction_usable: Mask over the grid, True at the usable reconstructions (usable_reconstructions).
         clock_period: The reconstruction clock's period [s] (reconstruction_clock_period).
+        mask_profile: Mask over the grid, True at the profile samples (profile_sample_mask).
+        min_length: Length [s] a segment needs to rank above every shorter one, the min_pulse_length.
 
     Returns:
         (keep, dropped_lengths, n_trimmed): the new mask,
-        the lengths [s] of the segments dropped for a longer one,
+        the lengths [s] of the segments dropped for the best one,
         and how many grid times the trims cut.
     """
     keep = np.asarray(keep, dtype=bool)
@@ -2567,8 +2583,8 @@ def _trim_and_keep_longest(
     can_start = has_held & (held_row >= run_start)
     keep_trimmed = _trim_segment_starts(keep, can_start)
     n_trimmed = int(keep.sum() - keep_trimmed.sum())
-    keep_longest, dropped_lengths = keep_longest_segment(keep_trimmed, times)
-    return keep_longest, dropped_lengths, n_trimmed
+    keep_best, dropped_lengths = keep_best_segment(keep_trimmed, times, mask_profile, min_length)
+    return keep_best, dropped_lengths, n_trimmed
 
 
 def _usable_slice_mask(ds_fit: xr.Dataset) -> np.ndarray:

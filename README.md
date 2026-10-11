@@ -181,18 +181,25 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
    - grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold.
      The centered window only selects grid times, no stored value is smoothed by it.
    - grid times a stored-energy crash follows (`energy_crash_filter`, `energy_crash_mask`):
-     energy_mhd falls by at least `drop_over_peak` of the shot's peak within `window` ahead,
+     energy_mhd falls by at least `drop_over_peak` of the shot's peak and by at least `min_drop` within `window` ahead,
      with the peak the 99th percentile of energy_mhd before the end cut.
-     On DIII-D it is half the peak within 50 ms, fitted to hand-labeled impurity injections and reconnection events,
-     which pass it, against the largest sawtooth crashes, which do not. The other devices do not run it yet.
+     The floor keeps the reconstruction noise of a low-energy shot from reading as most of its peak.
+     On DIII-D it is half the peak within 50 ms and 100 kJ, fitted to hand-labeled impurity injections and reconnection events,
+     which pass it, against the largest sawtooth crashes, which do not.
+     On C-Mod it is half the peak within 10 ms and 60 kJ, due to shorter confinement time and lower stored energy.
+     TCV and MAST do not run it yet.
    The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`).
 6. The leading grid times of each segment are cut up to its first sample
    that a usable reconstruction of the same segment reaches within the GEQDSK block's hold,
    since the store would have no equilibrium before it.
    This is mostly the early parts of a shot, before its first usable reconstruction.
-7. Only the longest segment is kept, shaded green in the accepted-shot plots.
+7. Only one segment is kept, shaded green in the accepted-shot plots (`keep_best_segment`):
+   the one with the most profile samples, Thomson samples or DIII-D IDA slices (`profile_sample_mask`),
+   among those at least `min_pulse_length` long, then the longest.
+   A segment without profiles fits no profile, and the stack stage drops a shot without fits,
+   so after a crash the longer side would otherwise win even where the profiles stop before the crash.
    Only the kept segment's reconstructions reach the store,
-   so step 6 trims each segment as if it alone were kept, and the longest is chosen after every trim.
+   so step 6 trims each segment as if it alone were kept, and the best is chosen after every trim.
 8. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod, TCV and DIII-D 0.5 s, MAST 0.2 s).
 9. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a mean `power_radiated` below `min_radiated_fraction` of the mean input power, ohmic plus auxiliary (a dead bolometer),

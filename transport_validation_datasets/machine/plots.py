@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
-from transport_validation_datasets.machine.generic import greenwald_density
+from transport_validation_datasets.machine.generic import greenwald_density, profile_sample_mask
 from transport_validation_datasets.windows import window_membership
 
 BACKGROUND_COLOR = "#2F2F2F"
@@ -192,15 +192,9 @@ def plot_unprocessed_data(
     ax_ne.set_ylabel("n_e [10^20 m^-3]", fontsize=LABEL_FONTSIZE, color=TEXT_COLOR)
     ax_ne.set_ylim(_signal_ylim(ne_signals))
 
-    # Dots at 0 for the times a profile is measured, a Thomson sample or a DIII-D IDA slice.
-    # No channel dim means the retrieval failed and the column is all NaN.
-    for reading, channel_dim in (
-        ("ts_channel_n_e", "ts_channel"),
-        ("ida_n_e", "ida_point"),
-    ):
-        if reading not in ds or channel_dim not in ds[reading].dims:
-            continue
-        mask_profile = ds[reading].notnull().any(dim=channel_dim)
+    # Dots at 0 for the times a profile is measured, a Thomson sample or a DIII-D IDA slice
+    mask_profile = profile_sample_mask(ds)
+    if mask_profile.any():
         ax_ne.plot(
             time,
             np.where(mask_profile, 0, np.nan),
