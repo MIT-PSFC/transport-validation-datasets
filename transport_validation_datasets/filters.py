@@ -9,7 +9,6 @@ from scipy.integrate import trapezoid
 
 from transport_validation_datasets import TIME_COORD
 from transport_validation_datasets.machine.generic import (
-    POWER_SMOOTHING_WINDOW,
     centered_boxcar_mean,
     end_of_shot_index,
     greenwald_fraction,
@@ -20,15 +19,6 @@ from transport_validation_datasets.store_schema import (
     INPUT_POWERS,
     POWER_SIGNALS,
 )
-
-# Width of the centered boxcar applied before the transient thresholds are checked [s].
-# It only selects grid times, no stored value is smoothed by it.
-TRANSIENT_SMOOTHING_WINDOW = 5e-3
-
-# Margin cut before every grid time that fails a check [s], see slice_filter_mask.
-# power_ohm and power_radiated are smoothed non-causally (smoothed_power),
-# so they carry the event that ends a segment one smoothing window ahead of it.
-FAILURE_MARGIN = POWER_SMOOTHING_WINDOW
 
 # How far a shot's stored-energy rise may exceed the input energy put in before it is rejected.
 # The 5 percent covers integration error and EFIT noise, see energy_sanity_reason.
@@ -98,7 +88,9 @@ def energy_crash_mask(
     window_steps = round(window / dt)
     energy_for_min = np.where(mask_finite, energy_mhd, np.inf)
     energy_padded = np.pad(energy_for_min, (0, window_steps), constant_values=np.inf)
-    energy_windows = np.lib.stride_tricks.sliding_window_view(energy_padded, window_steps + 1)
+    energy_windows = np.lib.stride_tricks.sliding_window_view(
+        energy_padded, window_steps + 1
+    )
     offset_min_ahead = energy_windows.argmin(axis=1)
     energy_min_ahead = energy_windows.min(axis=1)
     energy_drop = energy_mhd - energy_min_ahead
@@ -120,9 +112,10 @@ def slice_filter_mask(
     times: np.ndarray,
     min_filter: dict[str, float],
     max_filter: dict[str, float],
-    transient_filter: dict[str, float],
+    transient_filter: dict[str, tuple[float, float]],
     energy_crash_filter: dict[str, float],
     end_margin: float,
+    failure_margin: float,
 ) -> tuple[np.ndarray, np.ndarray, int] | None:
     """The grid times of one shot that pass the per-time checks of the filter spec.
 
@@ -130,9 +123,9 @@ def slice_filter_mask(
     the end of the shot (end_of_shot_index on |ip| and its min_filter threshold),
     a DATASET_0D_SIGNALS signal that is not finite,
     a min_filter signal below its threshold or a max_filter signal above it, judged on filter_inputs,
-    a transient_filter signal above its threshold after a centered TRANSIENT_SMOOTHING_WINDOW boxcar,
+    a transient_filter signal above its threshold after its own centered boxcar,
     and a stored-energy crash ahead (energy_crash_mask), the last two together the transients.
-    Each grid time that fails a check before the end-of-shot cut also cuts the FAILURE_MARGIN before it,
+    Each grid time that fails a check before the end-of-shot cut also cuts the failure_margin before it,
     so a segment that ends on a failure ends that much earlier, and one that ends at the end-of-shot cut does not.
     Keeping one segment of what passes is left to the caller (keep_best_segment).
 
@@ -141,9 +134,10 @@ def slice_filter_mask(
         times: (n_t,) the shot's uniform timebase [s].
         min_filter: {signal: threshold}, ip among them.
         max_filter: {signal: threshold}.
-        transient_filter: {signal: threshold} on the smoothed signal.
+        transient_filter: {signal: (threshold, boxcar window [s])}, window 0 for the signal as stored.
         energy_crash_filter: energy_crash_mask's window [s], drop_over_peak and min_drop [J], empty for no crash check.
         end_margin: Margin cut before the end of the plasma [s].
+        failure_margin: Margin cut before every failed grid time [s].
 
     Returns:
         (mask_valid, mask_transient, end_cut_index):
@@ -172,14 +166,11 @@ def slice_filter_mask(
             mask_below = ds_filter_inputs[signal].values <= threshold
             mask_pass = mask_pass & mask_below
 
-        # Smoothed, so that sporadic noise spikes on their own do not trip it
         grid_steps = np.diff(times)
         dt = float(np.median(grid_steps))
         mask_transient = np.zeros(times.size, dtype=bool)
-        for signal, threshold in transient_filter.items():
-            smoothed = centered_boxcar_mean(
-                ds[signal].values, TRANSIENT_SMOOTHING_WINDOW, dt
-            )
+        for signal, (threshold, window) in transient_filter.items():
+            smoothed = centered_boxcar_mean(ds[signal].values, window, dt)
             mask_transient = mask_transient | (smoothed > threshold)
     if energy_crash_filter:
         mask_crash = energy_crash_mask(
@@ -193,7 +184,7 @@ def slice_filter_mask(
         mask_transient = mask_transient | mask_crash
     mask_pass = mask_pass & ~mask_transient
     mask_failed = ~mask_pass & mask_before_end
-    margin_steps = round(FAILURE_MARGIN / dt)
+    margin_steps = round(failure_margin / dt)
     mask_in_margin = _before_failures(mask_failed, margin_steps)
     mask_valid = mask_before_end & mask_pass & ~mask_in_margin
     return mask_valid, mask_transient, end_cut_index
@@ -351,7 +342,9 @@ def energy_sanity_balance(ds: xr.Dataset) -> dict[str, float] | None:
     index_peak_reached = int(np.argmax(energy_sorted >= energy_peak))
     index_start_window_end = int(np.flatnonzero(mask_start_window)[-1])
     index_peak = max(index_peak_reached, index_start_window_end)
-    energy_input = trapezoid(power_sorted[: index_peak + 1], times_sorted[: index_peak + 1])
+    energy_input = trapezoid(
+        power_sorted[: index_peak + 1], times_sorted[: index_peak + 1]
+    )
     return {
         "time_start": float(times_sorted[0]),
         "time_peak": float(times_sorted[index_peak]),

@@ -32,7 +32,6 @@ from loguru import logger
 
 from transport_validation_datasets.machine.generic import (
     EQ_MATCH_MAX_PERIODS,
-    MIN_PSI_RANGE,
     end_of_shot_index,
     geqdsk_psi_n_grid,
     keep_best_segment,
@@ -41,6 +40,7 @@ from transport_validation_datasets.machine.generic import (
     nearest_in_reach,
     rho_tor_norm_from_psi_n,
     signal_on_grid,
+    usable_psi_ranges,
 )
 from transport_validation_datasets.machine.mast.mast_dataset import (
     DEFAULT_SHOTLIST_FILE,
@@ -140,6 +140,7 @@ def _chord_rho_tor_norm_min(
     psi_axis = np.asarray(efm["psi_axis"].values, dtype=float)
     psi_boundary = np.asarray(efm["psi_boundary"].values, dtype=float)
     psi_range = psi_boundary - psi_axis
+    psi_range_usable = usable_psi_ranges(psi_axis, psi_boundary)
     psi_map = efm_flux_map(efm)
     psi_chord = psi_map.interp(z=TS_CHANNEL_Z).transpose("time", "major_radius").values
     r_grid = psi_map["major_radius"].values
@@ -156,8 +157,7 @@ def _chord_rho_tor_norm_min(
     for i in range(eq_time.size):
         if (
             not mask_on_chord.any()
-            or not np.isfinite(psi_range[i])
-            or np.abs(psi_range[i]) < MIN_PSI_RANGE
+            or not psi_range_usable[i]
             or not np.all(np.isfinite(psi_n_chord[i]))
             or not q_mappable[i]
         ):

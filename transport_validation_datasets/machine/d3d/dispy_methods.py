@@ -294,7 +294,7 @@ class D3DMethods:
         r"""Total radiated power [W] including the divertor, \bolom::prad_tot of the standard bolometer analysis.
 
         Sampled every 4 ms, from raw channels smoothed by a centered 50 ms boxcar applied twice (non-causal),
-        the kernel smoothed_power gives the other devices, so it is not smoothed further.
+        so it is not smoothed further.
         Its units label reads MW, but the values are W (they match the built-in pwrmix to a few percent).
         Replaces the built-in pwrmix,
         a causal 10 ms sum of the 48 raw channels that resolves ELMs and goes negative.

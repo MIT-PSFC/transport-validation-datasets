@@ -77,6 +77,46 @@ def test_fringe_jumps_removed_and_real_changes_kept():
     )
 
 
+def test_decaying_rise_kept_and_slips_removed():
+    """A sharp 2e19 rise that decays over 15 ms is a real density change and stays,
+    while a slip and its recovery 15 ms later are both removed, and so is a slip during a density ramp."""
+    sample_time, density_true, density_trace = _fir_trace(
+        [(0.2, -2e19), (0.215, 2e19), (0.7, -2e19)]
+    )
+    time_since_rise = sample_time - 0.5
+    mask_rise = time_since_rise >= 0
+    rise_decay = np.exp(-time_since_rise[mask_rise] / 15e-3)
+    real_rise = np.zeros(sample_time.size)
+    real_rise[mask_rise] = 2e19 * rise_decay
+    ramp_fraction = np.clip((sample_time - 0.7) / 0.05, 0.0, 1.0)
+    real_ramp = 2e19 * ramp_fraction
+    density_true = density_true + real_rise + real_ramp
+    density_trace = density_trace + real_rise + real_ramp
+
+    density_corrected, cut_time = _remove_fringe_jumps(sample_time, density_trace)
+
+    assert cut_time is None
+    mask_before_ramp = sample_time < 0.699
+    mask_off_episodes = mask_before_ramp & ~(
+        (sample_time >= 0.199) & (sample_time < 0.201)
+        | (sample_time >= 0.214) & (sample_time < 0.216)
+        | (sample_time >= 0.499) & (sample_time < 0.501)
+    )
+    np.testing.assert_allclose(
+        density_corrected[mask_off_episodes],
+        density_true[mask_off_episodes],
+        atol=1.5e18,
+    )
+    # The levels 2-10 ms either side of the slip straddle part of the ramp, so its correction falls short by that much,
+    # not by the whole 2e19 an undone correction would leave
+    mask_after_ramp_slip = sample_time >= 0.701
+    np.testing.assert_allclose(
+        density_corrected[mask_after_ramp_slip],
+        density_true[mask_after_ramp_slip],
+        atol=4e18,
+    )
+
+
 def test_fringe_burst_cuts_the_rest_of_the_record():
     """Three slips within FRINGE_BURST_WINDOW_S mean the interferometer lost count, NaN from the first on."""
     sample_time, density_true, density_trace = _fir_trace(
@@ -302,8 +342,16 @@ def test_liuqe_geqdsk_block_is_per_radian_on_the_geqdsk_grid():
     assert float(ds["fpol"][0, -1]) == pytest.approx(
         float(ds["bcentr"][0]) * float(ds["rcentr"])
     )
-    assert np.isfinite(ds["qpsi"].values[0]).all()
-    assert np.isinf(ds["qpsi"].values[2, -1])
+    # q = 1 + 2 psi_N is linear in psi_N, so its linear resampling is exact
+    q_expected = 1.0 + 2.0 * psi_n_grid
+    np.testing.assert_allclose(ds["qpsi"].values[0], q_expected)
+    # Past the last finite surface of the diverted slice (psi_N 0.81) q is infinite, with no pole before it
+    qpsi_diverted = ds["qpsi"].values[2]
+    mask_past_last_surface = psi_n_grid > 0.81
+    assert np.isinf(qpsi_diverted[mask_past_last_surface]).all()
+    np.testing.assert_allclose(
+        qpsi_diverted[~mask_past_last_surface], q_expected[~mask_past_last_surface]
+    )
     assert np.isnan(ds["psirz"].values[1]).all()
     assert np.isnan(ds["simagx"].values[1])
     assert ds.attrs["cocos"] == 7

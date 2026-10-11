@@ -4,12 +4,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 import xarray as xr
 
-from transport_validation_datasets.machine.generic import greenwald_density, profile_sample_mask
+from transport_validation_datasets.machine.generic import (
+    greenwald_density,
+    profile_sample_mask,
+)
 from transport_validation_datasets.windows import window_membership
 
 BACKGROUND_COLOR = "#2F2F2F"
 FACE_COLOR = "#1A1A1A"
 TEXT_COLOR = "white"
+# The time-trace figure of the unprocessed stage, four panels [in]
+UNPROCESSED_FIGSIZE = (22.4, 16)
+# Off-scale readings are marked this far up the panel, as a fraction of its top
+OFF_SCALE_MARKER_FRACTION = 0.97
 
 TITLE_FONTSIZE = 20
 LABEL_FONTSIZE = 20
@@ -79,7 +86,7 @@ def plot_unprocessed_data(
     title: str,
     min_filter: dict[str, float],
     max_filter: dict[str, float],
-    transient_filter: dict[str, float],
+    transient_filter: dict[str, tuple[float, float]],
     end_margin_time: float | None,
     transient_spans: list[tuple[float, float]] | None = None,
     kept_spans: list[tuple[float, float]] | None = None,
@@ -107,7 +114,7 @@ def plot_unprocessed_data(
         title: Figure title.
         min_filter: Minimum thresholds per signal, drawn as dashed lines.
         max_filter: Maximum thresholds per signal, drawn as dashed lines.
-        transient_filter: Transient thresholds per signal, drawn as dashed lines
+        transient_filter: (threshold, window) per signal, the thresholds drawn as dashed lines
             on the power subplot.
         end_margin_time: Time of the end-of-shot cut [s], None when there is none.
         transient_spans: (start, end) time intervals filter_and_plot cut out as transients,
@@ -121,7 +128,7 @@ def plot_unprocessed_data(
         ds = ds.isel(shot=0)
     time = ds["time"]
 
-    fig, axes = plt.subplots(4, 1, figsize=(22.4, 16), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=UNPROCESSED_FIGSIZE, sharex=True)
     fig.patch.set_facecolor(BACKGROUND_COLOR)
     fig.suptitle(title, fontsize=TITLE_FONTSIZE, color=TEXT_COLOR)
     all_axes = list(axes)
@@ -233,7 +240,7 @@ def plot_unprocessed_data(
             ax_power.plot(time, power_mw, label=f"{signal} [MW]", color=color)
             _threshold_lines(ax_power, min_filter, max_filter, signal, 1e-6, color)
             power_signals.append(power_mw)
-    for signal, threshold in transient_filter.items():
+    for signal, (threshold, _) in transient_filter.items():
         ax_power.axhline(
             threshold / 1e6,
             color=power_colors.get(signal, "white"),
@@ -298,11 +305,10 @@ def plot_unprocessed_data(
     for ax in all_axes:
         ax.set_facecolor(FACE_COLOR)
         ax.tick_params(axis="both", labelsize=TICK_FONTSIZE, colors=TEXT_COLOR)
-        try:
-            for text in ax.get_legend().get_texts():
+        legend = ax.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
                 text.set_color(TEXT_COLOR)
-        except AttributeError:
-            pass
 
     fig.tight_layout()
     fig_path = Path(fig_path)
@@ -373,7 +379,7 @@ def _plot_dropped_readings(
     off_scale = valid & (y > ylim_top)
     n_off_scale = int(off_scale.sum())
     if n_off_scale:
-        arrow_y = np.full(n_off_scale, 0.97 * ylim_top)
+        arrow_y = np.full(n_off_scale, OFF_SCALE_MARKER_FRACTION * ylim_top)
         ax.plot(rho[off_scale], arrow_y, "^", ms=7, color="tab:red", zorder=4)
 
 

@@ -31,13 +31,9 @@ from loguru import logger
 
 from transport_validation_datasets.gp_fitting.batch_io import ShotFitInput
 
-# An isolated channel whose error bar is many times its neighbours' poisons
-# a heteroscedastic noise model: akho's error kernel smooths error bars in rho_tor_norm,
-# so one huge-error channel inflates the effective noise of every channel near it
-# and the fit goes slack across that region.
-# The comparison is on ABSOLUTE errors: a relative-to-value rule flags low-value SOL
-# points (large relative error is normal there), while the absolute ratio
-# leaves them alone and MAST's uniform fractional errors almost never trip it
+# An isolated channel whose error bar is many times its neighbours' slackens the fit around it,
+# since akho's error kernel smooths error bars in rho_tor_norm.
+# Compared on absolute errors, so the large relative errors of low SOL readings do not trip it.
 ERR_OUTLIER_FACTOR = 5.0
 ERR_OUTLIER_HALFWIDTH = 0.1
 ERR_OUTLIER_MIN_NEIGHBORS = 3
@@ -47,17 +43,12 @@ SPIKE_SIGMA_NEIGHBOR = 2.0
 SPIKE_SIGMA_LOCAL = 3.0
 
 # A row whose innermost valid channel of a variable sits outside this has nothing to pin the core,
-# and the fit there is an extrapolation (akho reached ne 25e20 m^-3 on C-Mod 1030516024).
-# Fewer, well-constrained profiles are worth more than many extrapolated ones.
-# On a 92-shot C-Mod sample 0.15 skips ~1% of the rows.
-# On a 97-shot MAST sample it skips ~half, since the chord passes above the axis.
+# so its fit is an extrapolation (akho reached ne 25e20 m^-3 on C-Mod 1030516024).
+# It skips ~1 percent of C-Mod rows and ~half of MAST's, whose chord passes above the axis.
 CORE_COVERAGE_RHO_TOR_NORM = 0.15
 
-# A reading under DIP_RATIO times both its rho neighbours is a dead or misfired channel.
-# The spike screen misses these, because it needs the neighbours to agree with each other,
-# which a pedestal never does.
-# A near-zero C-Mod Te reading on its 15 eV error floor then outweighs its neighbours 10-50x
-# and can pull the fitted pedestal to zero.
+# A reading under DIP_RATIO times both its rho neighbours is a dead or misfired channel,
+# which the spike screen misses in a pedestal, where the neighbours disagree.
 DIP_RATIO = 0.35
 DIP_RHO_TOR_NORM_MAX = 0.97
 
@@ -76,28 +67,17 @@ MAX_RELATIVE_ERROR = 1.0
 # where mapping through a magnetics-only reconstruction is not trustworthy, so they are not fit.
 MAX_FIT_RHO_TOR_NORM = 1.1
 
-# The two branches of a chord can disagree:
-# kinetic profiles in spherical tokamaks are not necessarily flux functions,
-# and a reconstruction pins the flux surfaces away from the chord's crossing less precisely.
-# Where they do, each channel's error gets half the local disagreement added,
-# so both branches are consistent with a profile between them.
-# The disagreement at a channel is its value minus the other branch interpolated to its rho,
-# only between two channels of the other branch at most BRANCH_MAX_GAP apart.
-# Each channel takes the median |disagreement| of the channels of both branches within BRANCH_SMOOTH_HALFWIDTH
-# (at least BRANCH_MIN_CHANNELS of them), which keeps one spike from inflating its neighbours.
-# Pooling both branches inflates channels at the same rho alike,
-# where per branch the sparser one could keep its raw errors and steer the fit (MAST 24403 t=0.342).
-# Channels outside the overlap keep their raw errors.
+# Where the two branches of a chord disagree (profiles off flux surfaces, an imprecise reconstruction),
+# each channel's error gets half the local disagreement added, see branch_disagreement_errors.
+# The disagreement is against the other branch interpolated between channels at most BRANCH_MAX_GAP apart,
+# its median taken over both branches within BRANCH_SMOOTH_HALFWIDTH (at least BRANCH_MIN_CHANNELS).
 BRANCH_MAX_GAP = 0.08
 BRANCH_SMOOTH_HALFWIDTH = 0.05
 BRANCH_MIN_CHANNELS = 3
 
-# A channel whose readings sit far under their rho neighbours for most of a shot is broken for the shot,
-# a miscalibrated polychromator or a misaligned scattering volume, see persistently_low_channels.
-# Each reading is compared with the median of the other channels within PERSISTENT_HALFWIDTH, both branches pooled,
-# at rho_tor_norm under PERSISTENT_RHO_MAX, where the profile is smooth enough on that scale.
-# Calibrated on 45 TCV shots: 64529 loses six upper ne channels reading 0.06-0.57 of their neighbours in 88-100 percent of slices.
-# Only low channels are judged: a high test flags good channels whose neighbourhood a low one drags down.
+# A channel reading far under its rho neighbours for most of a shot is broken for the shot, see persistently_low_channels.
+# Calibrated on 45 TCV shots (64529 loses six upper ne channels at 0.06-0.57 of their neighbours).
+# Only low channels are judged, a high test would flag the neighbours a low channel drags down.
 PERSISTENT_HALFWIDTH = 0.05
 PERSISTENT_RHO_MAX = 0.95
 PERSISTENT_LOW_RATIO = 0.6
@@ -138,6 +118,25 @@ def clean_fit_rows(fit_input: ShotFitInput, shot: int) -> ShotFitInput:
             f"and with them {n_te_taken} te and {n_ne_taken} ne readings of the same channels"
         )
     return replace(fit_input, te_y=te_y, ne_y=ne_y)
+
+
+def floor_errors(
+    values: np.ndarray, errors: np.ndarray, fraction: float, floor: float
+) -> np.ndarray:
+    """Error bars raised to a fraction of the reading's magnitude, and to an absolute floor.
+
+    Args:
+        values: The readings.
+        errors: Their error bars.
+        fraction: Smallest error as a fraction of |reading|.
+        floor: Smallest error, in the readings' units.
+
+    Returns:
+        The floored error bars.
+    """
+    relative_floor = fraction * np.abs(values)
+    error_floor = np.maximum(relative_floor, floor)
+    return np.maximum(errors, error_floor)
 
 
 def drop_in_both(

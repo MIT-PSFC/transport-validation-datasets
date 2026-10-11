@@ -4,9 +4,15 @@ import numpy as np
 import xarray as xr
 from disruption_py.core.physics_method.params import PhysicsMethodParams
 from disruption_py.inout.mds import mdsExceptions
-from disruption_py.machine.tokamak import resolve_tokamak_from_environment
-from disruption_py.settings import LogSettings, TimeSetting, TimeSettingParams
-from disruption_py.workflow import get_database
+from disruption_py.machine.tokamak import Tokamak, resolve_tokamak_from_environment
+from disruption_py.settings import (
+    LogSettings,
+    RetrievalSettings,
+    TimeSetting,
+    TimeSettingParams,
+)
+from disruption_py.settings.output_setting import DatasetOutputSetting
+from disruption_py.workflow import get_database, get_shots_data
 from loguru import logger
 
 from transport_validation_datasets.machine.generic import (
@@ -14,9 +20,13 @@ from transport_validation_datasets.machine.generic import (
     injected_power_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
+    snap_to_grid,
 )
 
 VERBOSE_LEVEL_NO = 15
+
+# The SQL tables summary may read, so no other text reaches its query
+SUMMARY_TABLES = ("summary",)
 
 
 def _register_verbose_level():
@@ -38,12 +48,9 @@ def _register_verbose_level():
 def passive_log_settings() -> LogSettings:
     """LogSettings that leave this process's loguru sinks alone.
 
-    disruption_py's setup_logging()/reset_handlers() call logger.remove(),
-    which wipes every sink on the global loguru logger - including the
-    dataset CLI's raw_data_{pid}.log file sink, silently emptying the run
-    log. Pre-setting the setup flag and a console level skips both reset
-    paths in disruption_py's get_shots_data, so its messages flow through
-    whatever sinks the caller already configured.
+    disruption_py's setup_logging and reset_handlers call logger.remove(),
+    which would drop the workflow's log file sink (logs/<ds_name>_<time>.log).
+    The preset setup flag skips both, so disruption_py logs through the caller's sinks.
 
     Returns:
         LogSettings that leave the caller's loguru sinks in place.
@@ -60,40 +67,41 @@ def summary(
     pulse_length: float,
     min_shot: int,
     max_shot: int,
-    shots: list[int] | bool = False,
 ) -> np.ndarray:
     """Find shots with high enough current and long enough pulse length.
 
-    Performs a SELECT query on the `summary` table. Optionally selects shots from a
-    given list. Snagged from
+    Performs a SELECT query on a summary table. Snagged from
     https://github.com/MIT-PSFC/disruption-efit/blob/main/disruption_efit/sql.py
 
     Args:
-        summary_table: Name of the summary table to query.
+        summary_table: Name of the summary table to query, one of SUMMARY_TABLES.
         ipmax: Threshold that maximum plasma current must exceed [A].
         pulse_length: Threshold that pulse length must exceed [s].
         min_shot: Disregard shots below this number. Ignored if not positive.
         max_shot: Disregard shots above this number. Ignored if not positive.
-        shots: List of shots to be queried, or False to query all of them.
 
     Returns:
         Nx2 array of [shot_id, pulse_length] for the N shots which exceed the
         thresholds.
+
+    Raises:
+        ValueError: If summary_table is not one of SUMMARY_TABLES.
     """
-    # database
+    if summary_table not in SUMMARY_TABLES:
+        raise ValueError(
+            f"Unknown summary table '{summary_table}', one of {SUMMARY_TABLES}"
+        )
     db = get_database(tokamak=resolve_tokamak_from_environment())
 
-    # query
+    # db.query takes no parameters, so every number is cast before it enters the text
     query = [
-        f"select distinct(shot), pulse_length from {summary_table} ",
-        f"where ipmax > {ipmax} and pulse_length > {pulse_length}",
+        f"select distinct(shot), pulse_length from {summary_table}",
+        f"where ipmax > {float(ipmax)} and pulse_length > {float(pulse_length)}",
     ]
     if min_shot > 0:
-        query += [f"and shot >= {min_shot}"]
+        query += [f"and shot >= {int(min_shot)}"]
     if max_shot > 0:
-        query += [f"and shot <= {max_shot}"]
-    if hasattr(shots, "__iter__"):
-        query += [f"and shot in ({', '.join(str(s) for s in shots)})"]
+        query += [f"and shot <= {int(max_shot)}"]
     query += ["order by shot"]
     logger.trace("> {query}", query=" ".join(query))
 
@@ -102,6 +110,41 @@ def summary(
 
     logger.trace("= {shape}", shape=data.shape)
     return data
+
+
+def retrieve_shot(
+    tokamak: Tokamak,
+    shot: int,
+    retrieval_settings: RetrievalSettings,
+    snap: bool = False,
+) -> xr.Dataset | None:
+    """One shot through disruption-py, in this process and through the caller's log sinks.
+
+    Args:
+        tokamak: The device.
+        shot: Shot number.
+        retrieval_settings: What to retrieve.
+        snap: Snap the samples onto the uniform 1 kHz grid up to the last one (snap_to_grid),
+            for a source on its own clock.
+
+    Returns:
+        The retrieval on dims (shot, time), or None when disruption-py returned nothing.
+    """
+    result = get_shots_data(
+        tokamak=tokamak,
+        shotlist_setting=[shot],
+        retrieval_settings=retrieval_settings,
+        output_setting=DatasetOutputSetting(path=False),
+        log_settings=passive_log_settings(),
+        num_processes=1,
+    )
+    if empty_result(result):
+        return None
+    if snap:
+        last_time = float(result["time"].values.max())
+        timebase = make_uniform_1kHz_timebase(last_time)
+        result = snap_to_grid(result, timebase)
+    return result.set_index(idx=["shot", "time"]).unstack("idx")
 
 
 def empty_result(result: xr.Dataset) -> bool:

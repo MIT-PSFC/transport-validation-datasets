@@ -17,11 +17,9 @@ import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
-from disruption_py.settings.output_setting import DatasetOutputSetting
-from disruption_py.workflow import get_shots_data
 from loguru import logger
 
-from transport_validation_datasets.dispy_utils import empty_result, passive_log_settings
+from transport_validation_datasets.dispy_utils import retrieve_shot
 from transport_validation_datasets.gp_fitting.batch_io import ShotFitInput
 from transport_validation_datasets.machine.d3d.dispy_methods import (
     R0,
@@ -215,23 +213,23 @@ class D3DDataWorkflow(DataWorkflow):
     max_filter = {"greenwald_fraction": 2.0}
     # Only obvious spikes: 2 MW of P_oh also cut ramp-up ohmic heating and ~1.3 s of ramp-down (173953, 173956).
     # The smoothed P_rad peaks at 16 MW before the end cut in the 2026-10 pulls.
-    transient_filter = {"power_ohm": 5e6, "power_radiated": 20e6}
+    transient_filter = {"power_ohm": (5e6, 0.0), "power_radiated": (20e6, 0.0)}
     # Fitted to 53 hand-labeled crashes of the 2026-10 pulls (filter_tune review):
     # every real event falls by at least 0.5 of the peak within 50 ms (impurity injections, reconnection events, one EFIT spike),
     # often stepping down over 30-50 ms, while the largest normal sawtooth crash (203540) falls 0.47.
     # The smallest labeled crash loses 0.26 MJ, so the 100 kJ floor only keeps low-energy shots' noise out.
     energy_crash_filter = {"window": 0.05, "drop_over_peak": 0.5, "min_drop": 1e5}
     # ip reads near 0 well past the end of the plasma, so the end is the last ip above its threshold.
-    # A disruption's thermal quench can land ~60 ms before that end (199122),
-    # and the EFIT P_oh smooths the quench out of reach of its transient filter.
+    # A disruption's thermal quench can land ~60 ms before that end (199122).
     end_margin = 0.1
+    failure_margin = 0.1
     min_radiated_fraction = 0.025
     # More radiated than put in, the same physical ceiling as the other devices (not checked on DIII-D data)
     max_radiated_fraction = 1.0
     density_ratio_bounds = (0.7, 1.3)
     # 203549, 203551, 203554: failed shots of run 20250529 (density limit with HFS pellets).
     # The beams did not fire ("No beams" in the logbook), so they are ohmic, pellet-perturbed, and 203554 disrupts.
-    shot_blacklist = [203549, 203551, 203554]
+    shot_blacklist = (203549, 203551, 203554)
 
     @cached_property
     def ida_databases(self) -> list[IdaDatabase]:
@@ -421,17 +419,7 @@ def _retrieve(
         time_setting=Uniform1kHzTimeSetting(),
         only_requested_columns=False,
     )
-    result = get_shots_data(
-        tokamak=Tokamak.D3D,
-        shotlist_setting=[shot],
-        retrieval_settings=retrieval_settings,
-        output_setting=DatasetOutputSetting(path=False),
-        log_settings=passive_log_settings(),
-        num_processes=1,
-    )
-    if empty_result(result):
-        return None
-    return result.set_index(idx=["shot", "time"]).unstack("idx")
+    return retrieve_shot(Tokamak.D3D, shot, retrieval_settings)
 
 
 def _get_zero_d_dataset(shot: int, runtag: str) -> xr.Dataset | None:

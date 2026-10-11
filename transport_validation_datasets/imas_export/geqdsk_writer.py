@@ -15,8 +15,8 @@ the `eqdsk` package it uses for COCOS conversion reads one, so this writer
 runs once per equilibrium time before that package is handed the path.
 """
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 import numpy as np
 from freeqdsk import geqdsk

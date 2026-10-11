@@ -74,6 +74,9 @@ def fit_residual(
 
     Returns:
         The fitted residual, or None if the GP fit failed.
+
+    Raises:
+        AttributeError: If mkgp is not the pinned 3.1.5, which has _imax.
     """
     x_data = np.asarray(x, dtype=float)
     residual_data = np.asarray(residual, dtype=float)
@@ -83,6 +86,11 @@ def fit_residual(
     yerr = np.concatenate([err_data, value_anchors[:, 2]])
 
     gp = GaussianProcess()
+    # _imax is private to mkgp 3.1.5, the version pyproject and bootstrap_remote.sh pin
+    if not hasattr(gp, "_imax"):
+        raise AttributeError(
+            "mkgp has no _imax, the akho worker needs the pinned mkgp 3.1.5"
+        )
     gp._imax = _IMAX
     gp.set_kernel(
         kernel=RQ_Kernel(*_KERNEL_START), kbounds=_KERNEL_BOUNDS, regpar=_REGPAR

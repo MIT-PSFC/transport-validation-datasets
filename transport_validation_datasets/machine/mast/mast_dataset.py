@@ -30,13 +30,16 @@ from transport_validation_datasets.cleaning import (
 )
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
+    POWER_SMOOTHING_WINDOW,
     absent_heating_powers,
     channel_fit_rows,
     channel_rows_at_times,
     cocos_from_signs,
+    injected_power_on_grid,
     make_geqdsk_dataset,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
+    merge_standardized,
     normalized_beta,
     signal_on_grid,
     smoothed_power,
@@ -167,7 +170,10 @@ SIGNAL_ATTRS = {
         "description": "Line-averaged electron density, the level 2 summary line_average_n_e",
     },
     "power_radiated": {
-        "description": "Total radiated power from the poloidal bolometer array (ABM_PRAD_POL), smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0",
+        "description": (
+            "Total radiated power from the poloidal bolometer array (ABM_PRAD_POL), "
+            f"smoothed by a centered {1e3 * POWER_SMOOTHING_WINDOW:.0f} ms boxcar applied twice (non-causal), clipped at 0"
+        ),
     },
     "power_nbi": {
         "description": "Neutral beam power injected into the vessel (ANB_TOT_SUM_POWER)",
@@ -292,15 +298,16 @@ class MASTDataWorkflow(DataWorkflow):
     # Both thresholds are empirical, and both gate the radiative or ohmic collapse
     # rather than normal operation: the closest ordinary approach found while porting these was shot 29153,
     # whose ohmic power peaks at 3.9 MW right before the end of the shot.
-    # On 100 random shots read from source, 3 MW radiated fires in 5 and changes no kept time.
+    # On 100 random shots read from source, smoothed over 50 ms, 3 MW radiated fires in 5 and changes no kept time.
     transient_filter = {
-        "power_ohm": 5.0e6,
-        "power_radiated": 3.0e6,
+        "power_ohm": (5.0e6, 0.0),
+        "power_radiated": (3.0e6, 0.0),
     }
     energy_crash_filter = {"window": 0.02, "drop_over_peak": 0.55, "min_drop": 5e4}
     # MAST's ip record runs through the current quench, so a small ip cutoff still lets disruption transients in.
-    # Shots keep a median 0.29 s, so 30 ms rather than a full smoothing window (POWER_SMOOTHING_WINDOW).
+    # Shots keep a median 0.29 s, so 30 ms rather than C-Mod's 50 ms.
     end_margin = 0.03
+    failure_margin = 0.03
     # Shots radiate a median 10 percent of their heating power (from 23809 on).
     # 12 shots sit below 1 percent with MW of input, a dead bolometer, and the next lowest is at 3.75 percent.
     min_radiated_fraction = 0.025
@@ -314,7 +321,7 @@ class MASTDataWorkflow(DataWorkflow):
     # 29430: broken bolometer, the raw radiated power spans -2.2 to +40.5 MW while the input power stays below 5 MW.
     # 27430 and 28049: P_rad flat at 1.80 and 1.72 MW (min = median) over the whole shot, a stuck bolometer
     # whose radiated fraction (~0.48) passes the cuts.
-    shot_blacklist = [
+    shot_blacklist = (
         27430,
         28049,
         28938,
@@ -325,7 +332,7 @@ class MASTDataWorkflow(DataWorkflow):
         29430,
         30317,
         30318,
-    ]
+    )
 
     # GP fit staging knobs.
     # A 1/60 step puts 1.0 and 1.1 on the grid.
@@ -397,15 +404,8 @@ class MASTDataWorkflow(DataWorkflow):
         ds_equilibrium = snap_to_grid(ds_equilibrium_efit, timebase)
         ds_thomson = snap_to_grid(sources.ds_thomson, timebase)
 
-        ds = xr.merge(
-            [ds_0d, ds_equilibrium_0d, ds_equilibrium, ds_thomson],
-            compat="no_conflicts",
-            join="outer",
-        )
-        ds = ds.set_index(idx=["shot", "time"]).unstack("idx")
-        ds.attrs = dict(ds_equilibrium.attrs)
-        # Per shot like cocos, the stack stage stores it as the r0 variable
-        ds.attrs["r0"] = r0
+        datasets = [ds_0d, ds_equilibrium_0d, ds_equilibrium, ds_thomson]
+        ds = merge_standardized(datasets, ds_equilibrium.attrs, r0)
         apply_signal_attrs(ds, SIGNAL_ATTRS)
         return ds
 
@@ -424,11 +424,8 @@ class MASTDataWorkflow(DataWorkflow):
         which a magnetics-only reconstruction does not pin precisely,
         and on a spherical tokamak Te is not strictly a flux function (poloidal asymmetries can be real).
 
-        NOTE: The Thomson chord runs along z = TS_CHANNEL_Z while the MAST
-        equilibria may put the magnetic axis 0.15-0.25 m lower, so the chord
-        passes above the axis and never crosses the innermost flux surfaces.
-        This leads to extrapolation and poor fits in the core.
-        The packaged shotlist keeps only shots whose chord passes near the axis.
+        The chord at z = TS_CHANNEL_Z can pass 0.15-0.25 m above the axis, leaving the core an extrapolation,
+        so the packaged shotlist keeps only shots whose chord passes near the axis.
 
         Args:
             shot: Shot number being staged.
@@ -602,9 +599,10 @@ def _open_store_group(store_path: str, shot: int, group: str) -> xr.Dataset | No
         return xr.open_zarr(
             mapper, group=group_in_mapper, chunks=None, consolidated=True
         )
-    except Exception as e:
+    # A group missing from the metadata raises KeyError, an unreachable store OSError,
+    # unreadable metadata ValueError, anything else reaches the caller
+    except (KeyError, OSError, ValueError) as e:
         logger.warning(f"Shot {shot}: failed to open {store_path} {group}: {e}")
-        logger.opt(exception=True).debug(e)
         return None
 
 
@@ -659,9 +657,9 @@ def _zero_d_dataset(
     tf_current = np.asarray(amc["tf_current"].values, dtype=float) * 1e3  # [kA] -> [A]
     b0_tf = mu_0 * TF_TURNS * tf_current / (2.0 * np.pi * r0)
     data["b0"] = signal_on_grid(tf_time, b0_tf, timebase)
-    # Smoothed non-causally, the DIII-D prad_tot kernel
+    # Smoothed non-causally (smoothed_power)
     data["power_radiated"] = smoothed_power(data["power_radiated"])
-    data["power_nbi"] = signal_on_grid(
+    data["power_nbi"] = injected_power_on_grid(
         summary_time, summary["power_nbi"].values, timebase
     )
     # MAST has no ICRF, lower hybrid or ECH
@@ -842,16 +840,10 @@ def _thomson_dataset(
 ) -> xr.Dataset:
     """Collect the Thomson channel data on its native timebase.
 
-    The source is the level 1 ayc group, not the level 2 thomson_scattering
-    group. Level 2 is the same measurement bilinearly interpolated onto a
-    uniform 1 cm major radius grid and a uniform 5 ms timebase, and published
-    without uncertainties. That regrid is what makes it the wrong input here:
-    the laser fires every ~4.2 ms, so a level 2 sample blends two pulses, and
-    the interpolated radial points are not independent measurements even though
-    the fit would weight them as if they were. Level 1 instead gives the 131
-    real channels at the real laser times, with the spectral fit's own te and
-    ne uncertainties and the per-slice radial basis (ayc re-derives it every
-    pulse, and it moves by up to ~2 cm over a shot).
+    The source is the level 1 ayc group: the 131 real channels at the real laser times (~4.2 ms),
+    with their own te and ne uncertainties and the per-pulse radial basis.
+    Level 2 thomson_scattering is regridded to 1 cm and 5 ms without uncertainties,
+    so a sample blends two pulses and its points are not independent measurements.
 
     Only readings with a finite, positive value and error are kept,
     and slices left with no usable channel at all are dropped (ts_channel_dataset):

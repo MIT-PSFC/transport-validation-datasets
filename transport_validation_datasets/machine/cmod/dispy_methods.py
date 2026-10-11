@@ -376,6 +376,8 @@ class CmodThomsonMethods:
         "te": r".yag.results.global.profile:te_rz_t",
         "te_error": r".yag.results.global.profile:te_err_zt",
     }
+    # Largest disagreement between the legacy and the yag_new core timebases [s]
+    legacy_core_time_atol = 1e-4
 
     # Per-variable attributes, IMAS data dictionary path under "ref"
     channel_attrs = {
@@ -566,7 +568,11 @@ class CmodThomsonMethods:
                 )
                 legacy["te"] = legacy["te"] * 1000.0
                 legacy["te_error"] = legacy["te_error"] * 1000.0
-                if not np.allclose(legacy["time"], core["time"], atol=1e-4):
+                if not np.allclose(
+                    legacy["time"],
+                    core["time"],
+                    atol=CmodThomsonMethods.legacy_core_time_atol,
+                ):
                     raise ValueError(
                         "Legacy core TS timebase does not match yag_new core timebase"
                     )

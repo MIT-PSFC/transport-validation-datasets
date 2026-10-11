@@ -1,4 +1,4 @@
-import shutil
+import os
 import subprocess
 from functools import cache
 from pathlib import Path
@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from transport_validation_datasets import PACKAGE_ROOT
 from transport_validation_datasets.gp_fitting.dispatcher import ClusterFitConfig
 from transport_validation_datasets.machine.cmod.cmod_dataset import (
     CModDataWorkflow,
@@ -20,7 +19,9 @@ pytestmark = pytest.mark.skipif(
     reason="C-Mod data source not available on this system",
 )
 
-TEST_DIR = PACKAGE_ROOT / "tests" / "test_outputs" / "test_cmod_workflow"
+# Cluster scratch dir the dispatched tests fit in, its worker venv in .venv (gp_fitting/bootstrap_remote.sh).
+# Unset, the dispatched tests are skipped.
+REMOTE_TEST_DIR = os.environ.get("TVD_TEST_REMOTE_DIR")
 
 # Fit methods the local stages run under.
 # The linear interpolation method (conftest.linear_method) fits a shot in well under a second,
@@ -35,11 +36,8 @@ METHODS = [
 
 
 def cmod_workflow(
-    test_dir: Path, shotlist: list[int] | None = None, clean=True, **kwargs
+    test_dir: Path, shotlist: list[int] | None = None, **kwargs
 ) -> CModDataWorkflow:
-    # Delete the test directory if it exists to ensure a clean test environment
-    if clean and test_dir.exists():
-        shutil.rmtree(test_dir)
     test_dir.mkdir(parents=True, exist_ok=True)
 
     if shotlist:
@@ -60,11 +58,9 @@ def cmod_workflow(
 
 
 class TestMakeUnprocessedDataFiles:
-    test_dir = TEST_DIR / "test_make_unprocessed_data_files"
-
-    def test_basic(self):
+    def test_basic(self, tmp_path):
         # Basic check that unprocessed data files are created for each shot in the shotlist
-        test_dir = self.test_dir / "test_basic"
+        test_dir = tmp_path
         max_num_shots = 2
         workflow = cmod_workflow(test_dir, max_num_shots=max_num_shots)
 
@@ -76,9 +72,9 @@ class TestMakeUnprocessedDataFiles:
             f"Expected {max_num_shots} unprocessed data files, got {len(shots)}: {shots}"
         )
 
-    def test_graceful_skip(self):
+    def test_graceful_skip(self, tmp_path):
         # Check that shots with known problems are handled gracefully
-        test_dir = self.test_dir / "test_graceful_skip"
+        test_dir = tmp_path
 
         shotlist_missing = [
             1160503006,  # Missing TS data
@@ -105,11 +101,11 @@ class TestMakeUnprocessedDataFiles:
                 f"Unprocessed data file for shot {shot} should not exist"
             )
 
-    def test_efit_tree_fallback(self):
+    def test_efit_tree_fallback(self, tmp_path):
         # A missing first tree falls through to ANALYSIS, which reconstructs every ~20 ms.
         # Its EFIT 0D signals are held onto the grid, so the shot still passes the filter,
         # while the reconstruction itself stays on its own grid times.
-        test_dir = self.test_dir / "test_efit_tree_fallback"
+        test_dir = tmp_path
         shot = 1160712015
         settings = CModSettings(efit_trees=["NOTATREE", "ANALYSIS"])
         workflow = cmod_workflow(test_dir, shotlist=[shot], settings=settings)
@@ -122,11 +118,11 @@ class TestMakeUnprocessedDataFiles:
             n_reconstructions = int(ds["simagx"].notnull().sum())
         assert n_energy > 10 * n_reconstructions
 
-    def test_edge_ts_aligned(self):
+    def test_edge_ts_aligned(self, tmp_path):
         # Edge TS whose timebase disagrees with the core's is placed on it sample by sample, never dropped whole.
         # 1160913007: the per-system time >= 0 cut splits the pulse at t ~ 0, leaving the edge one sample longer.
         # 1160909025: the edge clock skips a pulse at 1.67 s, after the plasma.
-        test_dir = self.test_dir / "test_edge_ts_aligned"
+        test_dir = tmp_path
         shotlist = [1160913007, 1160909025]
         workflow = cmod_workflow(test_dir, shotlist=shotlist)
 
@@ -155,13 +151,11 @@ class TestMakeUnprocessedDataFiles:
 
 
 class TestPrepareFitInput:
-    test_dir = TEST_DIR / "test_prepare_fit_input"
-
-    def test_faulty_te_channel_dropped_ne_kept(self):
+    def test_faulty_te_channel_dropped_ne_kept(self, tmp_path):
         # A faulty channel's Te leaves the fit and reaches the plots through the dropped-reading hook,
         # while its sound ne stays in the fit, not taken along by cleaning.drop_in_both.
         shot = 1160503008
-        workflow = cmod_workflow(self.test_dir, shotlist=[shot])
+        workflow = cmod_workflow(tmp_path, shotlist=[shot])
         workflow.make_unprocessed_data_files()
 
         with xr.open_dataset(workflow.unprocessed_data_dir / f"{shot}.nc") as ds:
@@ -222,12 +216,10 @@ def ssh_host_reachable(alias: str) -> bool:
 
 
 class TestGPFit:
-    test_dir = TEST_DIR / "test_gp_fit"
-
     @pytest.mark.parametrize("method", METHODS)
-    def test_serial(self, method: str):
+    def test_serial(self, tmp_path, method: str):
         # Basic check that GP fitting can be performed on unprocessed data files
-        test_dir = self.test_dir / "test_serial" / method
+        test_dir = tmp_path / method
         max_num_shots = 1
         workflow = cmod_workflow(
             test_dir, max_num_shots=max_num_shots, fit_method=method
@@ -250,21 +242,22 @@ class TestGPFit:
             with xr.open_dataset(shot_path) as ds_fit:
                 assert ds_fit.attrs["fit_method"] == method
 
+    @pytest.mark.slow
     @pytest.mark.skipif(
-        not ssh_host_reachable("orcd-login"),
-        reason="no authenticated ssh session to orcd-login",
+        REMOTE_TEST_DIR is None or not ssh_host_reachable("orcd-login"),
+        reason="no TVD_TEST_REMOTE_DIR or no authenticated ssh session to orcd-login",
     )
     @pytest.mark.parametrize("method", ["akho", "zk"])
-    def test_dispatched(self, method: str):
+    def test_dispatched(self, tmp_path, method: str):
         # check that GP fitting can be done via the dispatcher on a cluster (requires ssh config set up)
-        test_dir = self.test_dir / "test_dispatched" / method
+        test_dir = tmp_path / method
         max_num_shots = 1
         cluster_config = ClusterFitConfig(
             ssh_host="orcd-login",
             partitions="sched_mit_psfc_r8@8:00:00",
             job_name_prefix="test_gpfit",
-            remote_workdir="/home/zkeith/orcd/scratch/tests/transport_validation_datasets/test_dispatched",
-            venv_path="/home/zkeith/orcd/scratch/tests/transport_validation_datasets/.venv",
+            remote_workdir=f"{REMOTE_TEST_DIR}/test_dispatched",
+            venv_path=f"{REMOTE_TEST_DIR}/.venv",
             shots_per_batch=1,
         )
 
@@ -306,20 +299,20 @@ class TestGPFit:
 
     @pytest.mark.slow
     @pytest.mark.skipif(
-        not ssh_host_reachable("orcd-login"),
-        reason="no authenticated ssh session to orcd-login",
+        REMOTE_TEST_DIR is None or not ssh_host_reachable("orcd-login"),
+        reason="no TVD_TEST_REMOTE_DIR or no authenticated ssh session to orcd-login",
     )
     @pytest.mark.parametrize("method", ["akho", "zk"])
-    def test_dispatched_20(self, method: str):
+    def test_dispatched_20(self, tmp_path, method: str):
         # check that GP fitting can be done via the dispatcher on a cluster for many full shots
-        test_dir = self.test_dir / "test_dispatched_20" / method
+        test_dir = tmp_path / method
         max_num_shots = 20
         cluster_config = ClusterFitConfig(
             ssh_host="orcd-login",
             partitions="sched_mit_psfc_r8@8:00:00",
             job_name_prefix="test_gpfit",
-            remote_workdir="/home/zkeith/orcd/scratch/tests/transport_validation_datasets/test_dispatched_20",
-            venv_path="/home/zkeith/orcd/scratch/tests/transport_validation_datasets/.venv",
+            remote_workdir=f"{REMOTE_TEST_DIR}/test_dispatched_20",
+            venv_path=f"{REMOTE_TEST_DIR}/.venv",
             shots_per_batch=4,
         )
 
@@ -357,21 +350,14 @@ class TestGPFit:
 
 
 class TestFinalAssembly:
-    test_dir = TEST_DIR / "test_final_assembly"
-
     @pytest.mark.parametrize("method", METHODS)
-    def test_basic(self, method: str):
+    def test_basic(self, tmp_path, method: str):
         # Basic check that the final assembly can be performed on GP fit results
-        test_dir = self.test_dir / "test_basic" / method
+        test_dir = tmp_path / method
         max_num_shots = 6
         workflow = cmod_workflow(
-            test_dir, clean=False, max_num_shots=max_num_shots, fit_method=method
+            test_dir, max_num_shots=max_num_shots, fit_method=method
         )
-        if workflow.stores_dir.exists():
-            shutil.rmtree(workflow.stores_dir)
-        # The kept unprocessed files spare the C-Mod read.
-        # The fits are redone, since the run refuses batches staged under other fit settings.
-        workflow.clean_fit_state()
 
         workflow.make_unprocessed_data_files()
         for shot in workflow.unprocessed_shots():

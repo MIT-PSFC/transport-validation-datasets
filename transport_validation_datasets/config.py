@@ -1,33 +1,8 @@
-"""Run configuration from TOML files: the cluster and the device settings.
+"""Run configuration from TOML files: the cluster and the device settings, see the README (Configuration).
 
-The CLI takes the files through --config, one or more comma separated. They
-are layered: the tables are merged key by key and a later file overrides an
-earlier one, so a shared file (configs/orcd.toml) carries the cluster and the
-device settings, and a per-user file (configs/<user>.user.toml, gitignored)
-carries the user-specific paths. The tables:
-
-    [cluster]   SLURM dispatch of the fit stage, fields of gp_fitting.dispatcher.ClusterFitConfig.
-                If this section is absent, the fits run locally.
-    [<device>]  Settings of a device's workflow ([cmod], [mast], [tcv], [d3d]),
-                to modify the fields of the workflow's settings_cls.
-                If this section is absent, the device's workflow uses its defaults.
-                One file may hold the tables of several devices,
-                only the table of the device being built is read.
-
-Keys are the dataclass field names, so those dataclasses are the reference
-for what each table takes and what the defaults are.
-A key the dataclass has no field for, a required key that is missing,
-or an unexpected table raises an error, so a typo cannot silently fall back to a default.
-
-    [cluster]
-    ssh_host = "orcd-login"
-    partitions = "sched_mit_psfc_r8@11:00:00"
-    remote_workdir = "/path/on/cluster"
-    venv_path = "/path/on/cluster/.venv"
-
-    # Opt in to C-Mod's ANALYSIS fallback, the default reads EFIT21 only
-    [cmod]
-    efit_trees = ["EFIT21", "ANALYSIS"]
+The --config files are layered, a later file overriding an earlier one key by key.
+[cluster] takes the fields of gp_fitting.dispatcher.ClusterFitConfig and [<device>] those of the workflow's settings_cls.
+An unknown key or table, or a missing required key, raises, so a typo cannot fall back to a default.
 """
 
 import dataclasses

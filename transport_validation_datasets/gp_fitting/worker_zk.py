@@ -88,28 +88,20 @@ def _no_fit(status: int) -> VariableFit:
 
 
 def _attempt_fit(
-    x,
-    y,
-    err,
+    cleaned,
     x_star,
     min_points,
-    scale_per_slice,
     bounds,
-    anchors,
     pedestal_rho,
     seed_salt=0,
 ):
-    """Clean, fit, and rescale one variable of one slice, once.
+    """Fit and rescale one variable of one slice from its cleaned channels, once.
 
     Args:
-        x: Channel rho positions.
-        y: Channel values, NaN where invalid.
-        err: Channel errors.
+        cleaned: clean_channels' result under these bounds, None when cleaning left nothing.
         x_star: Target rho grid.
         min_points: Minimum channels left after cleaning to fit.
-        scale_per_slice: Normalize by the cleaned slice max before fitting.
         bounds: The variable's staged bound knobs.
-        anchors: The variable's anchors, in the data's own units.
         pedestal_rho: The kernel's length-scale transition center.
         seed_salt: Restart seed offset for a reseeded retry (see run_gp).
 
@@ -120,7 +112,6 @@ def _attempt_fit(
         Negative slopes are physical and kept.
         The gradient is 0 only where the fit is clipped at 0 (see fit_profile).
     """
-    cleaned = clean_channels(x, y, err, bounds, anchors, pedestal_rho, scale_per_slice)
     if cleaned is None:
         return None
     cx, cy, cerr, scale, scaled_anchors = cleaned
@@ -228,16 +219,18 @@ def _fit_variable(
         attempts.append((1, replace(bounds, var_min=AMPLITUDE_RESCUE_VAR_MIN)))
 
     last_flagged = None
+    # Cleaning reads the bounds but not the seed, so each distinct bounds is cleaned once
+    cleaned_by_bounds = {}
     for n_attempt, (seed_salt, attempt_bounds) in enumerate(attempts):
+        if attempt_bounds not in cleaned_by_bounds:
+            cleaned_by_bounds[attempt_bounds] = clean_channels(
+                x, y, err, attempt_bounds, anchors, pedestal_rho, scale_per_slice
+            )
         result = _attempt_fit(
-            x,
-            y,
-            err,
+            cleaned_by_bounds[attempt_bounds],
             x_star,
             min_points,
-            scale_per_slice,
             attempt_bounds,
-            anchors,
             pedestal_rho,
             seed_salt=seed_salt,
         )
@@ -263,9 +256,8 @@ def _fit_variable(
     still_valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(err)
     if int(still_valid.sum()) < min_points:
         return _no_fit(STATUS_CULLED)
-    result = _attempt_fit(
-        x, y, err, x_star, min_points, scale_per_slice, bounds, anchors, pedestal_rho
-    )
+    cleaned = clean_channels(x, y, err, bounds, anchors, pedestal_rho, scale_per_slice)
+    result = _attempt_fit(cleaned, x_star, min_points, bounds, pedestal_rho)
     if result is None:
         return _no_fit(STATUS_CULLED)
     peak, biased = _fit_problems(result[0], x_star, x, y, err)

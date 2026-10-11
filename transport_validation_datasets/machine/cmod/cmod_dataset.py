@@ -4,8 +4,6 @@ import numpy as np
 import xarray as xr
 from disruption_py.machine.tokamak import Tokamak
 from disruption_py.settings import RetrievalSettings
-from disruption_py.settings.output_setting import DatasetOutputSetting
-from disruption_py.workflow import get_shots_data
 from loguru import logger
 
 from transport_validation_datasets import TIME_COORD
@@ -13,13 +11,10 @@ from transport_validation_datasets.cleaning import (
     DIP_RATIO,
     drop_broken_channels,
     drop_in_both,
+    floor_errors,
     relative_dips,
 )
-from transport_validation_datasets.dispy_utils import (
-    empty_result,
-    passive_log_settings,
-    summary,
-)
+from transport_validation_datasets.dispy_utils import retrieve_shot, summary
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.cmod.dispy_methods import (
     CmodAeqdskMethods,
@@ -33,9 +28,7 @@ from transport_validation_datasets.machine.generic import (
     POWER_SMOOTHING_WINDOW,
     absent_heating_powers,
     channel_fit_rows,
-    make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
-    snap_to_grid,
     values_held_from_usable,
 )
 from transport_validation_datasets.store_schema import apply_signal_attrs
@@ -58,7 +51,8 @@ SIGNAL_ATTRS = {
     "power_radiated": {
         "description": (
             "Total radiated power, AXUV twopi_diode x 4.5 (cross-calibrated to the 2pi foil bolometer), "
-            "mean of each 1 ms grid step, smoothed by a centered 50 ms boxcar applied twice (non-causal), clipped at 0"
+            f"mean of each 1 ms grid step, smoothed by a centered {1e3 * POWER_SMOOTHING_WINDOW:.0f} ms boxcar applied twice (non-causal), "
+            "clipped at 0"
         ),
     },
     "power_ic": {
@@ -102,10 +96,6 @@ SOL_NE_MAX = 0.9
 READING_MIN = 0.001
 CORE_RHO_MAX = 0.4
 CORE_TE_MIN = 0.4
-TE_ERROR_FLOOR_FRACTION = 0.15
-TE_ERROR_FLOOR = 0.015
-NE_ERROR_FLOOR_FRACTION = 0.10
-NE_ERROR_FLOOR = 0.01
 
 # The core TS channel at this height [m] reads Te 1.58x the ECE at the same rho (~0.29),
 # where every other core channel reads 1.02-1.17x (26 shots with low-field-side ECE).
@@ -154,17 +144,18 @@ class CModDataWorkflow(DataWorkflow):
     max_filter = {
         "greenwald_fraction": 2.0,
     }
-    # Only obvious spikes: in the 2026-10 pulls the smoothed P_oh peaks at 3.4 MW and P_rad at 7.5 MW over the kept data.
+    # Only obvious spikes: in the 2026-10 pulls, smoothed over 50 ms, P_oh peaks at 3.4 MW and P_rad at 7.5 MW over the kept data.
     transient_filter = {
-        "power_ohm": 6e6,
-        "power_radiated": 8e6,
+        "power_ohm": (6e6, 0.0),
+        "power_radiated": (8e6, 0.0),
     }
     # The confinement time (~25 ms) is a sixth of DIII-D's, so W halves within 50 ms of every ICRF turn-off,
     # and low-energy ohmic shots wander by 15 kJ, most of their peak.
     energy_crash_filter = {"window": 0.01, "drop_over_peak": 0.5, "min_drop": 2.5e4}
-    # One smoothing window, so the smoothed powers never carry the current quench (POWER_SMOOTHING_WINDOW)
-    end_margin = POWER_SMOOTHING_WINDOW
-    shot_blacklist = []
+    # Keeps the thermal and current quench out of the kept data
+    end_margin = 0.05
+    failure_margin = 0.05
+    shot_blacklist = ()
     # Shots radiate a median 25 percent of their heating power.
     # The lowest live bolometer record, 1160928005, sits at 1.9 percent.
     # The two shots with no record at all are caught by the all-finite check of slice_filter_mask.
@@ -181,6 +172,10 @@ class CModDataWorkflow(DataWorkflow):
     # Many C-Mod shots carry exactly 10 core channels and the faulty one's Te is always dropped,
     # so this tolerates one more bad channel.
     fit_min_points = 8
+    # C-Mod TS error bars run far below the systematic errors.
+    # Hughes et al., RSI 72, 1107 (2001) quote 10-20 percent systematic errors in Te and ne,
+    # and an edge Te range starting at 15 eV.
+    error_floors = {"te": (0.15, 0.015), "ne": (0.10, 0.01)}
     # Hyperparameter bounds for the GP fit, per variable.
     # Amplitude floor 1, the data scale since each slice is normalized to a max of 1.
     # Below it the fits fall into a low-amplitude mean regression under peaked cores, with the axis under 0.7 of the core data.
@@ -203,7 +198,6 @@ class CModDataWorkflow(DataWorkflow):
             pulse_length=self.min_pulse_length,
             min_shot=1160500000,
             max_shot=1160932000,
-            shots=False,
         )
         shotlist = data[:, 0].astype(int).tolist()
 
@@ -400,7 +394,8 @@ class CModDataWorkflow(DataWorkflow):
         # Density channels too uncertain to constrain the fit, typically bad edge or SOL channels.
         # On 1160609014 a ne ~4, err ~2 channel past the separatrix drove a spike to ne ~19 at rho 1.0.
         ne_y = np.where(ne_err > NE_ERROR_MAX, np.nan, ne_y)
-        # SOL density is low, so a point past the separatrix reading above SOL_NE_MAX is a bad channel
+        # SOL density is low, so a point past the separatrix reading above SOL_NE_MAX is a bad channel.
+        # These screens stand in for the MAX_FIT_RHO_TOR_NORM cut of MAST and TCV, so C-Mod keeps its far-SOL channels.
         ne_y = np.where((rho_tor_norm > 1.0) & (ne_y > SOL_NE_MAX), np.nan, ne_y)
 
         # Readings or error bars under READING_MIN are analysis artifacts:
@@ -426,13 +421,8 @@ class CModDataWorkflow(DataWorkflow):
                 f"under {DIP_RATIO}x both rho neighbours"
             )
 
-        # Error floors, since C-Mod TS error bars run far below the systematic errors.
-        # Hughes et al., RSI 72, 1107 (2001) quote 10-20 percent systematic errors in Te and ne,
-        # and an edge Te range starting at 15 eV.
-        te_err_floor = np.maximum(TE_ERROR_FLOOR_FRACTION * te_y, TE_ERROR_FLOOR)
-        te_err = np.maximum(te_err, te_err_floor)
-        ne_err_floor = np.maximum(NE_ERROR_FLOOR_FRACTION * ne_y, NE_ERROR_FLOOR)
-        ne_err = np.maximum(ne_err, ne_err_floor)
+        te_err = floor_errors(te_y, te_err, *self.error_floors["te"])
+        ne_err = floor_errors(ne_y, ne_err, *self.error_floors["ne"])
 
         te_valid = np.isfinite(te_y) & np.isfinite(te_err)
         ne_valid = np.isfinite(ne_y) & np.isfinite(ne_err)
@@ -589,18 +579,7 @@ def _get_fast_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         only_requested_columns=False,
         custom_physics_methods=[CmodPlasmaMethods, CmodPowerMethods],
     )
-    result = get_shots_data(
-        tokamak=Tokamak.CMOD,
-        shotlist_setting=shot,
-        retrieval_settings=retrieval_settings,
-        output_setting=DatasetOutputSetting(path=False),
-        log_settings=passive_log_settings(),
-        num_processes=1,
-    )
-    if empty_result(result):
-        return None
-    result = result.set_index(idx=["shot", "time"]).unstack("idx")
-    return result
+    return retrieve_shot(Tokamak.CMOD, shot, retrieval_settings)
 
 
 def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
@@ -638,21 +617,7 @@ def _get_efit0d_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         only_requested_columns=True,
         custom_physics_methods=[CmodAeqdskMethods],
     )
-    result = get_shots_data(
-        tokamak=Tokamak.CMOD,
-        shotlist_setting=shot,
-        retrieval_settings=retrieval_settings,
-        output_setting=DatasetOutputSetting(path=False),
-        log_settings=passive_log_settings(),
-        num_processes=1,
-    )
-    if empty_result(result):
-        return None
-    efit_times = result["time"].values
-    timebase = make_uniform_1kHz_timebase(float(efit_times.max()))
-    result = snap_to_grid(result, timebase)
-    result = result.set_index(idx=["shot", "time"]).unstack("idx")
-    return result
+    return retrieve_shot(Tokamak.CMOD, shot, retrieval_settings, snap=True)
 
 
 def _get_efit_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
@@ -666,24 +631,13 @@ def _get_efit_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         Dataset with GEQDSK signals for the given shot,
         or None if retrieval returned no data.
     """
-    settings = RetrievalSettings(
+    retrieval_settings = RetrievalSettings(
         run_methods=["get_geqdsk_parameters"],
         efit_nickname_setting=efit_tree,
         time_setting=UniformTimeSetting(),
         custom_physics_methods=[CmodEfitMethods.get_geqdsk_parameters],
     )
-    result = get_shots_data(
-        tokamak=Tokamak.CMOD,
-        shotlist_setting=shot,
-        retrieval_settings=settings,
-        output_setting=DatasetOutputSetting(path=False),
-        log_settings=passive_log_settings(),
-        num_processes=1,
-    )
-    if empty_result(result):
-        return None
-    result = result.set_index(idx=["shot", "time"]).unstack("idx")
-    return result
+    return retrieve_shot(Tokamak.CMOD, shot, retrieval_settings)
 
 
 def _get_thomson_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
@@ -703,19 +657,6 @@ def _get_thomson_dataset(shot: int, efit_tree: str) -> xr.Dataset | None:
         only_requested_columns=False,
         custom_physics_methods=[CmodThomsonMethods.get_thomson_channels],
     )
-    result = get_shots_data(
-        tokamak=Tokamak.CMOD,
-        shotlist_setting=[shot],
-        retrieval_settings=retrieval_settings,
-        output_setting=DatasetOutputSetting(path=False),
-        log_settings=passive_log_settings(),
-        num_processes=1,
-    )
-    if empty_result(result):
-        return None
-    # Snap native ~20 Hz TS slices onto the uniform 1 kHz grid, no interpolation.
+    # The native ~20 Hz TS slices are snapped onto the uniform 1 kHz grid, no interpolation.
     # Grid times with no TS slice come back as NaN.
-    timebase = make_uniform_1kHz_timebase(float(result["time"].values.max()))
-    result = snap_to_grid(result, timebase)
-    result = result.set_index(idx=["shot", "time"]).unstack("idx")
-    return result
+    return retrieve_shot(Tokamak.CMOD, shot, retrieval_settings, snap=True)

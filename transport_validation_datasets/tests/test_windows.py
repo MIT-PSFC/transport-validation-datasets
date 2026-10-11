@@ -60,7 +60,7 @@ class TestReadShotlist:
             # A byte order mark hides the shot column of an otherwise windowed header
             (
                 chr(0xFEFF) + "shot,t_start,t_end\n5,0.1,0.2\n",
-                "needs a shot or pulse_no column",
+                "needs a shot column",
             ),
             ("# only a comment\n\n", "no shot"),
         ],
@@ -86,15 +86,6 @@ class TestReadShotlist:
 
         assert shots == [5, 7]  # first appearance order, once each
         assert windows == {5: [(0.6, 0.9), (1.0, 1.2), (1.25, 1.5)], 7: [(0.65, 0.78)]}
-
-    def test_shot_column_may_be_called_pulse_no(self, tmp_path):
-        path = tmp_path / "shots.csv"
-        path.write_text("pulse_no,t_start,t_end\n9,0.1,0.2\n")
-
-        shots, windows = read_shotlist(path)
-
-        assert shots == [9]
-        assert windows == {9: [(0.1, 0.2)]}
 
     def test_accepts_str_path(self, tmp_path):
         path = tmp_path / "shots.txt"
@@ -151,7 +142,7 @@ class TestReadShotlist:
         path = tmp_path / "shots.csv"
         path.write_text("shotno,t_start,t_end\n5,1.0,1.5\n")
 
-        with pytest.raises(ValueError, match="shot or pulse_no"):
+        with pytest.raises(ValueError, match="needs a shot column"):
             read_shotlist(path)
 
     def test_unparsable_bound_identifies_line(self, tmp_path):

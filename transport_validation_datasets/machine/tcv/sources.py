@@ -374,6 +374,42 @@ def _profiles_on_psi_n_grid(
     return values_grid
 
 
+def _q_on_psi_n_grid(
+    inverse_q_surfaces: np.ndarray, psi_n_surfaces: np.ndarray, psi_n_grid: np.ndarray
+) -> np.ndarray:
+    """Resample q onto a psi_N grid, linearly in q over the surfaces where it is finite, infinite past them.
+
+    LIUQE gives 1/q, 0 where q diverges at the LCFS of a diverted plasma.
+    Linear in 1/q, the grid points between the last finite surface and the LCFS
+    would carry a 1/(1 - psi_N) pole that phi_n_map's log tail is not built for.
+
+    Args:
+        inverse_q_surfaces: (n_q, n_t) 1/q on the LIUQE surfaces.
+        psi_n_surfaces: (n_q,) increasing psi_N of the surfaces.
+        psi_n_grid: (n_psi,) psi_N grid inside the surfaces' span.
+
+    Returns:
+        (n_t, n_psi) q on the grid, NaN at a time without a finite surface.
+    """
+    with np.errstate(divide="ignore"):
+        q_surfaces = 1.0 / inverse_q_surfaces
+    n_t = q_surfaces.shape[1]
+    q_grid = np.full((n_t, psi_n_grid.size), np.inf)
+    for i_time in range(n_t):
+        mask_finite = np.isfinite(q_surfaces[:, i_time])
+        if not mask_finite.any():
+            q_grid[i_time] = np.nan
+            continue
+        last_finite = int(np.flatnonzero(mask_finite)[-1])
+        psi_n_finite = psi_n_surfaces[: last_finite + 1]
+        q_finite = q_surfaces[: last_finite + 1, i_time]
+        mask_inside = psi_n_grid <= psi_n_finite[-1]
+        q_grid[i_time, mask_inside] = np.interp(
+            psi_n_grid[mask_inside], psi_n_finite, q_finite
+        )
+    return q_grid
+
+
 def _liuqe_time_first(values: np.ndarray, mask_time_missing: np.ndarray) -> np.ndarray:
     """A LIUQE array with its time axis moved first, NaN at the missing times.
 
@@ -396,8 +432,8 @@ def liuqe_geqdsk_dataset(liuqe: dict[str, np.ndarray], shot: int) -> xr.Dataset:
     so psi is scaled by LIUQE_FLUX_PER_RADIAN and the d/dpsi profiles FF' and p' by its inverse.
     Its flux-function profiles live on 41 surfaces evenly spaced in rho_pol = sqrt(psi_N),
     and are resampled linearly onto the GEQDSK psi_N grid of one point per R grid column, the format's convention.
-    q is resampled as LIUQE's 1/q, which is 0 where q diverges at the LCFS of a diverted plasma,
-    so q is infinite there, which phi_n_map handles.
+    q is resampled linearly in q and is infinite past the last surface where it is finite,
+    the LCFS of a diverted plasma (_q_on_psi_n_grid), which phi_n_map handles.
     A reconstruction LIUQE found no boundary for (lB 0) is NaN, so usable_reconstructions drops it.
     The flux map is float32, it dominates the block's size.
 
@@ -423,16 +459,14 @@ def liuqe_geqdsk_dataset(liuqe: dict[str, np.ndarray], shot: int) -> xr.Dataset:
         ("pres", "PQ"),
         ("ffprime", "TTpQ"),
         ("pprime", "PpQ"),
-        ("inverse_q", "iqQ"),
     ):
         values_grid = _profiles_on_psi_n_grid(liuqe[source], psi_n_surfaces, psi_n_grid)
         values_grid[mask_no_boundary] = np.nan
         profiles[name] = values_grid
     profiles["ffprime"] = profiles["ffprime"] / flux_scale
     profiles["pprime"] = profiles["pprime"] / flux_scale
-    inverse_q = profiles.pop("inverse_q")
-    with np.errstate(divide="ignore"):
-        qpsi = 1.0 / inverse_q
+    qpsi = _q_on_psi_n_grid(liuqe["iqQ"], psi_n_surfaces, psi_n_grid)
+    qpsi[mask_no_boundary] = np.nan
 
     # Fx is (z, r, t), the block takes (t, r, z)
     flux_r_z = np.transpose(liuqe["Fx"], (1, 0, 2))

@@ -12,6 +12,7 @@ Ships to the cluster with the worker, must adhere to import rules in gp_fitting/
 
 import json
 import os
+import tempfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -153,6 +154,8 @@ class FitBatch:
         sol_extension: How the staged positions continue outside the LCFS (machine.generic.SOL_EXTENSIONS).
             Workers never read it, it only keeps a resumed run from mixing extensions.
         fit_mode: One of the FIT_MODE_* values, how the rows were built.
+        error_floors: Per-variable (fraction, floor) the staged error bars were raised to (cleaning.floor_errors),
+            empty for none. Workers never read it, it only keeps a resumed run from mixing floors.
     """
 
     shot_inputs: dict[int, ShotFitInput]
@@ -164,6 +167,7 @@ class FitBatch:
     pedestal_rho_tor_norm: float
     sol_extension: str
     fit_mode: str = FIT_MODE_SAMPLE
+    error_floors: dict[str, tuple[float, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -235,6 +239,7 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         "pedestal_rho_tor_norm": np.float64(batch.pedestal_rho_tor_norm),
         "fit_mode": np.str_(batch.fit_mode),
         "sol_extension": np.str_(batch.sol_extension),
+        "error_floors": np.str_(_error_floors_json(batch.error_floors)),
     }
     for var in FIT_VARIABLES:
         for f in fields(FitBounds):
@@ -311,7 +316,23 @@ def _unpack_batch(data, shot_inputs: dict[int, ShotFitInput]) -> FitBatch:
         pedestal_rho_tor_norm=float(data["pedestal_rho_tor_norm"]),
         sol_extension=str(data["sol_extension"].item()),
         fit_mode=str(data["fit_mode"].item()),
+        error_floors=json.loads(str(data["error_floors"].item())),
     )
+
+
+def _error_floors_json(error_floors: dict[str, tuple[float, float]]) -> str:
+    """The error floors as JSON, each (fraction, floor) a list of floats, so a tuple and a list compare equal.
+
+    Args:
+        error_floors: Per-variable (fraction, floor).
+
+    Returns:
+        The JSON text, keys sorted.
+    """
+    floors = {
+        var: [float(bound) for bound in pair] for var, pair in error_floors.items()
+    }
+    return json.dumps(floors, sort_keys=True)
 
 
 def _unpack_anchors(data) -> dict[str, FitAnchors]:
@@ -408,6 +429,7 @@ def fit_batch_settings(batch: FitBatch) -> dict[str, str]:
         "x_star": json.dumps(x_star),
         "min_points": str(int(batch.min_points)),
         "scale_per_slice": str(bool(batch.scale_per_slice)),
+        "error_floors": _error_floors_json(batch.error_floors),
     }
 
 
@@ -484,8 +506,8 @@ def atomic_write(path: Path | str, write: Callable[[Path], object]):
     """Write a file through a temporary neighbour and rename it into place.
 
     No reader ever sees a partial file.
-    The temporary is the destination's name plus ".tmp" in the same directory,
-    so the rename stays on one filesystem.
+    The temporary has a unique name in the same directory,
+    so the rename stays on one filesystem and two writers of one file never share it.
 
     Args:
         path: Destination path.
@@ -493,9 +515,16 @@ def atomic_write(path: Path | str, write: Callable[[Path], object]):
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + ".tmp")
-    write(tmp_path)
-    os.replace(tmp_path, path)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp"
+    )
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
+    try:
+        write(tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _savez(path: Path, arrays: dict):

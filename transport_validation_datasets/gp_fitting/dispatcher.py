@@ -242,12 +242,9 @@ def plan_batches(
     pending = set(pending_shots)
     batches: dict[str, list[int]] = {}
 
+    # Every staged file was read whole by the staged-batch check before planning
     for batch_path in staged_batch_paths(batches_dir):
-        try:
-            batch_shots = read_batch_shots(batch_path)
-        except Exception as e:
-            logger.warning(f"Could not read existing batch file {batch_path}: {e}")
-            continue
+        batch_shots = read_batch_shots(batch_path)
         batch_id = batch_path.stem.removeprefix("batch_")
         claimed = [s for s in batch_shots if s in pending]
         if claimed:

@@ -208,21 +208,12 @@ def _remove_loo_outliers(
 ):
     """Drop uncorroborated LOO outliers, worst first, one at a time.
 
-    Judging each point by its LOO residual (_loo_standardized_residuals) is
-    what makes this robust: a bad channel cannot pull the reference toward
-    itself to hide. But one bad point also inflates its neighbors' residuals,
-    so flagging everything over sigma in one pass over-drops. Dropping only
-    the single worst point and recomputing lets the swamped neighbors fall
-    back below sigma.
-
-    The LOO reference is a single smooth kernel, so a genuinely steep, high
-    core reads as a run of large residuals and the plain rule culls the whole
-    core. The corroboration gate (_locally_corroborated) fixes that: the worst
-    over-sigma point is dropped only if it also disagrees with both immediate
-    rho-neighbors, so consistently-high core points protect each other while
-    an isolated spike is still removed. When the worst point is corroborated
-    the next-worst uncorroborated one is taken instead.
-    If every remaining over-sigma point is corroborated, it stops.
+    Each point is judged by its leave-one-out residual (_loo_standardized_residuals),
+    so a bad channel cannot pull the reference toward itself.
+    Only the worst point is dropped per pass, since one bad point inflates its neighbours' residuals too.
+    A point is dropped only if it also disagrees with both rho neighbours (_locally_corroborated),
+    so a steep, high core protects itself while an isolated spike goes.
+    It stops when every remaining point over sigma is corroborated.
 
     Args:
         x: Channel rho positions.
@@ -230,17 +221,11 @@ def _remove_loo_outliers(
         err: Channel errors.
         value_anchors: (n_a, 3) value anchor rows (normalized).
         pedestal_rho: The kernel's length-scale transition center.
-        sigma: LOO residual threshold. 3.0 (rather than a stricter 2.0)
-            tolerates reference/data mismatch on genuinely steep slices.
+        sigma: LOO residual threshold, loose enough for genuinely steep slices.
         sigma_corr: Combined-sigma window for neighbor corroboration.
-        max_drop_frac: Stop after dropping this fraction of the points (and
-            never below 3): a slice needing more than that is either genuinely
-            bad or a real pedestal the fixed length scale cannot follow, and
-            gutting it further only produces worse fits.
-        ref_hyperparams: LOO kernel hyperparameters (the slice's own
-            rough-optimized shape), the generic start values if None.
-            Held fixed across iterations, refitting each pass would cost
-            an optimizer run per dropped point.
+        max_drop_frac: Stop after dropping this fraction of the points (and never below 3 points).
+        ref_hyperparams: LOO kernel hyperparameters held fixed across passes,
+            the generic start values if None.
 
     Returns:
         (x, y, err) with the outliers removed.

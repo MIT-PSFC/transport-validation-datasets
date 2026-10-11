@@ -199,9 +199,9 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
 
 
 # Width of the centered boxcar power_ohm and power_radiated are smoothed with, applied twice [s], see smoothed_power.
-# Unsmoothed, the inductive swings of P_oh and the bolometer noise of P_rad are larger than the signals at 1 kHz.
-# The kernel is the one DIII-D's prad_tot comes smoothed with.
-POWER_SMOOTHING_WINDOW = 50e-3
+# It takes the sample-to-sample noise off the 1 kHz grid and keeps events a few milliseconds long.
+# DIII-D's prad_tot arrives smoothed upstream with a 50 ms boxcar applied twice and is kept as it is.
+POWER_SMOOTHING_WINDOW = 5e-3
 
 # Step of the uniform timebase every device is placed on [s], see make_uniform_1kHz_timebase.
 UNIFORM_TIMEBASE_DT = 1e-3
@@ -401,6 +401,27 @@ def make_geqdsk_dataset(
             ds_geqdsk[name].attrs.update(GEQDSK_SIGNAL_ATTRS[name])
 
     return ds_geqdsk
+
+
+def merge_standardized(
+    datasets: list[xr.Dataset], equilibrium_attrs: dict, r0: float
+) -> xr.Dataset:
+    """Merge one shot's datasets on dim "idx" into its standardized dataset on (shot, time).
+
+    Args:
+        datasets: The shot's datasets, each on dim "idx" with "shot" and "time" coords.
+        equilibrium_attrs: The GEQDSK block's attributes, its COCOS among them.
+        r0: The radius b0 is given at [m].
+
+    Returns:
+        The merged dataset, with the block's attributes and r0,
+        per shot like cocos, which the stack stage stores as the r0 variable.
+    """
+    ds_merged = xr.merge(datasets, compat="no_conflicts", join="outer")
+    ds = ds_merged.set_index(idx=["shot", "time"]).unstack("idx")
+    ds.attrs = dict(equilibrium_attrs)
+    ds.attrs["r0"] = r0
+    return ds
 
 
 def snap_to_grid(ds: xr.Dataset, grid_times: np.ndarray) -> xr.Dataset:
@@ -679,9 +700,23 @@ def _held_on_grid(
         (n_grid,) the held signal, NaN where nothing is held.
     """
     sample_index, _ = hold_onto_grid(grid, source_times, hold_floor=hold_floor)
-    mask_held = sample_index >= 0
-    values_held = np.full(grid.size, np.nan)
-    values_held[mask_held] = values[sample_index[mask_held]]
+    return _take_held(values, sample_index)
+
+
+def _take_held(values: np.ndarray, held_index: np.ndarray) -> np.ndarray:
+    """The samples each grid time holds, along the last axis.
+
+    Args:
+        values: (..., n_source) the samples.
+        held_index: (n_grid,) the sample each grid time holds, -1 for none (hold_onto_grid).
+
+    Returns:
+        (..., n_grid) the held values, NaN where nothing is held.
+    """
+    mask_held = held_index >= 0
+    held_shape = (*values.shape[:-1], held_index.size)
+    values_held = np.full(held_shape, np.nan)
+    values_held[..., mask_held] = values[..., held_index[mask_held]]
     return values_held
 
 
@@ -724,8 +759,7 @@ def injected_power_on_grid(
 ) -> np.ndarray:
     """An injected heating power record placed on the grid (signal_on_grid), 0 outside the record.
 
-    A record of fewer than two samples is taken as a heating system that did not run, 0 throughout.
-    This is a wonk edge case on some MAST / TCV discharges. Placing check here for consistency.
+    A record of fewer than two samples, as some MAST and TCV shots carry, is a system that did not run, 0 throughout.
 
     Args:
         record_times: (n_record,) ascending sample times of the record [s].
@@ -769,7 +803,7 @@ def centered_boxcar_mean(values: np.ndarray, window: float, dt: float) -> np.nda
 def smoothed_power(values: np.ndarray) -> np.ndarray:
     """Smooth a power on the uniform grid with the centered POWER_SMOOTHING_WINDOW boxcar applied twice.
 
-    The kernel is a triangle twice the window wide at its base, DIII-D's prad_tot kernel.
+    The kernel is a triangle twice the window wide at its base.
     It draws on samples up to one window later, so the result is not causal.
     A NaN sample stays NaN, so a gap in the record stays a gap for the filters.
 
@@ -957,10 +991,8 @@ def normalized_beta(energy_mhd, volume, minor_radius, b0, ip):
     beta_tor = 2 mu0 <p> / b0^2 with the volume-averaged pressure <p> = 2 energy_mhd / (3 volume),
     since energy_mhd = 3/2 int p dV.
     beta_tor_norm = 100 beta_tor a |b0| / |ip|[MA].
-    b0 is the vacuum toroidal field at the fixed r0, NOT AT THE GEOMETRIC AXIS.
-    Note this is different from the definition which is often used in EFIT and other codes,
-    where what's used is the geometric axis vacuum field. Different by R_geo / R0.
-    HUGE difference on MAST, not so much on other devices.
+    b0 is the vacuum field at the fixed r0, not at the geometric axis as EFIT's betan takes it,
+    a factor R_geo / r0 apart, large on MAST and small on the other devices.
 
     Args:
         energy_mhd: Stored energy, 3/2 the volume integral of the pressure [J].
@@ -1114,7 +1146,9 @@ def keep_best_segment(
     run_profile_samples = profile_samples_so_far[ends] - profile_samples_so_far[starts]
     mask_long_enough = run_lengths >= min_length
     # lexsort ranks by its last key first, and argmax takes the first of equal maxima after negating the order
-    rank_order = np.lexsort((-np.arange(starts.size), run_lengths, run_profile_samples, mask_long_enough))
+    rank_order = np.lexsort(
+        (-np.arange(starts.size), run_lengths, run_profile_samples, mask_long_enough)
+    )
     best = int(rank_order[-1])
     keep_best[starts[best] : ends[best]] = True
     dropped_lengths = np.delete(run_lengths, best)
@@ -1131,8 +1165,6 @@ PROFILE_READINGS = (
 def profile_sample_mask(ds: xr.Dataset) -> np.ndarray:
     """Mark the grid times that carry a measured profile, a Thomson sample or a DIII-D IDA slice.
 
-    A reading without its channel dim is a failed retrieval, all NaN on the 0D timebase, and marks nothing.
-
     Args:
         ds: One shot's dataset on its time dimension alone, with standardized names.
 
@@ -1142,7 +1174,7 @@ def profile_sample_mask(ds: xr.Dataset) -> np.ndarray:
     mask_profile = np.zeros(ds.sizes[TIME_COORD], dtype=bool)
     for readings, channel_dim in PROFILE_READINGS:
         for reading in readings:
-            if reading not in ds or channel_dim not in ds[reading].dims:
+            if reading not in ds:
                 continue
             mask_reading = ds[reading].notnull().any(dim=channel_dim)
             mask_profile |= mask_reading.transpose(TIME_COORD).values
@@ -1179,6 +1211,20 @@ def absent_heating_powers(ip, names: tuple[str, ...]) -> dict:
     return {name: ip * 0.0 for name in names}
 
 
+def usable_psi_ranges(simagx: np.ndarray, sibdry: np.ndarray) -> np.ndarray:
+    """Whether each reconstruction's axis and boundary psi are finite and more than MIN_PSI_RANGE apart.
+
+    Args:
+        simagx: (n,) psi at the magnetic axis.
+        sibdry: (n,) psi at the boundary.
+
+    Returns:
+        (n,) True where the psi range can normalize psi.
+    """
+    psi_range = sibdry - simagx
+    return np.isfinite(psi_range) & (np.abs(psi_range) > MIN_PSI_RANGE)
+
+
 def usable_reconstructions(ds: xr.Dataset) -> np.ndarray:
     """Mark the times that carry a reconstruction the Thomson mapping and the stores can use.
 
@@ -1195,8 +1241,7 @@ def usable_reconstructions(ds: xr.Dataset) -> np.ndarray:
         ds = ds.squeeze("shot", drop=True)
     simagx = ds["simagx"].transpose("time").values
     sibdry = ds["sibdry"].transpose("time").values
-    psi_range = sibdry - simagx
-    psi_range_usable = np.isfinite(psi_range) & (np.abs(psi_range) > MIN_PSI_RANGE)
+    psi_range_usable = usable_psi_ranges(simagx, sibdry)
     qpsi = ds["qpsi"].transpose("time", "psi_idx").values
     psirz_finite = (
         np.isfinite(ds["psirz"]).all(("r_grid", "z_grid")).transpose("time").values
@@ -1228,12 +1273,8 @@ def values_held_from_usable(
     reconstruction_index, _ = hold_onto_grid(
         grid, reconstruction_times, max_hold_time=np.inf
     )
-    mask_held = reconstruction_index >= 0
-    # Grid index of the usable reconstruction each held grid time takes its values from
-    source_index = reconstructed[reconstruction_index[mask_held]]
-    values_held = np.full(values.shape, np.nan)
-    values_held[..., mask_held] = values[..., source_index]
-    return values_held
+    values_at_reconstructions = values[..., reconstructed]
+    return _take_held(values_at_reconstructions, reconstruction_index)
 
 
 def hold_from_usable_reconstructions(ds: xr.Dataset, usable: np.ndarray) -> xr.Dataset:
@@ -1697,7 +1738,9 @@ def _distance_to_contour(points: np.ndarray, contour: np.ndarray) -> np.ndarray:
     segment_start = contour
     segment_end = np.roll(contour, -1, axis=0)
     segment = segment_end - segment_start
-    segment_length_squared = np.maximum(np.sum(segment**2, axis=1), 1e-30)
+    segment_length_squared = np.sum(segment**2, axis=1)
+    # A zero-length segment (a repeated vertex) projects every point onto its start
+    segment_length_squared = np.maximum(segment_length_squared, np.finfo(float).tiny)
     offset = points[:, np.newaxis, :] - segment_start[np.newaxis, :, :]
     projection = np.sum(offset * segment[np.newaxis, :, :], axis=2)
     fraction = np.clip(projection / segment_length_squared, 0.0, 1.0)

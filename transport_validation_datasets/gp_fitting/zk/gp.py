@@ -189,6 +189,9 @@ def _fit_from_start(
 
     Returns:
         The fitted GaussianProcess, or None if mkgp raised.
+
+    Raises:
+        AttributeError: If mkgp is not the pinned 3.1.5, which has _imax.
     """
     xdata, ydata, yerr, grad_bc, x_eval = data
     gp = GaussianProcess()
@@ -211,6 +214,11 @@ def _fit_from_start(
     )
     if not optimize:
         # The public maxiter clamps to >=50, so poke _imax=0 to skip the gradient-ascent loop entirely.
+        # _imax is private to mkgp 3.1.5, the version pyproject and bootstrap_remote.sh pin.
+        if not hasattr(gp, "_imax"):
+            raise AttributeError(
+                "mkgp has no _imax, the zk worker needs the pinned mkgp 3.1.5"
+            )
         gp._imax = 0
     x_eval_array = np.asarray(x_eval, dtype=float)
     try:
@@ -317,18 +325,14 @@ def fit_profile(
             break
         gp = gp_mono
 
-    # Te/ne are physical (positive) quantities but the GP posterior is
-    # Gaussian with unbounded support, so the mean can dip slightly negative
-    # past the separatrix where the value anchors pull it to zero.
-    # Clip the mean at 0 (downstream should read the band as truncated at 0 likewise)
+    # The Gaussian posterior mean can dip below 0 past the separatrix, where the anchors pull it to zero,
+    # so it is clipped at 0 (the band reads as truncated there too)
     mean = np.asarray(gp.get_gp_mean(), dtype=float).ravel()[:n_out]
     fit = np.maximum(mean, 0.0)
-    # Predictive std, the latent std and the channel errors in quadrature.
-    # Under few, high-error core channels the latent band alone is misleadingly tight.
-    # The errors are interpolated in rho and held flat past the first and last channel,
-    # so the band tracks the local error bars.
-    # mkgp's own noise term is one RMS over every error, 3-10x the edge errors on C-Mod Te.
-    # The derivative std stays latent, since the gradient is never directly observed.
+    # Predictive std: the latent std and the channel errors (interpolated in rho, flat past the ends) in quadrature,
+    # since the latent band alone is too tight under few, high-error channels,
+    # and mkgp's own noise term is one RMS over every error (3-10x the C-Mod edge Te errors).
+    # The derivative std stays latent, the gradient is never observed.
     order = np.argsort(data_X)
     noise = np.interp(x_out, data_X[order], err_y[order])
     latent_std_eval = gp.get_gp_std(noise_flag=False)

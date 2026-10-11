@@ -99,6 +99,7 @@ include = ["transport_validation_datasets"]
 
 [tool.hatch.build.targets.wheel]
 include = ["transport_validation_datasets"]
+exclude = ["transport_validation_datasets/tests"]
 
 [build-system]
 build-backend = "hatchling.build"

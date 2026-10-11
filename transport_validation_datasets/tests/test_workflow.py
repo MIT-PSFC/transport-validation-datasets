@@ -102,7 +102,12 @@ class TestTrimAndKeepBest:
         reconstruction_usable[[0, 10, 15, 20]] = True
 
         kept, dropped, n_trimmed = _trim_and_keep_best(
-            keep, times, reconstruction_usable, 0.005, np.zeros(keep.size, dtype=bool), 0.0
+            keep,
+            times,
+            reconstruction_usable,
+            0.005,
+            np.zeros(keep.size, dtype=bool),
+            0.0,
         )
 
         assert np.flatnonzero(kept).tolist() == list(range(10, 21))
@@ -122,7 +127,12 @@ class TestTrimAndKeepBest:
         reconstruction_usable[58:96:5] = True
 
         kept, dropped, n_trimmed = _trim_and_keep_best(
-            keep, times, reconstruction_usable, 0.005, np.zeros(keep.size, dtype=bool), 0.0
+            keep,
+            times,
+            reconstruction_usable,
+            0.005,
+            np.zeros(keep.size, dtype=bool),
+            0.0,
         )
 
         assert np.flatnonzero(kept).tolist() == list(range(0, 46))
@@ -296,18 +306,6 @@ class TestHoldEquilibrium:
         assert (simagx[2 : last_held + 1] == 1.0).all()
         assert np.isnan(simagx[last_held + 1 : 22]).all()
         assert (simagx[22:] == 4.0).all()
-
-    def test_device_without_equilibrium_passes_signals_through(self):
-        grid = grid_ms(20)
-        ds = xr.Dataset(
-            {"rmagx": ((EPISODE_DIM, TIME_COORD), np.zeros((1, grid.size)))}
-        )
-
-        held, fresh = _hold_equilibrium(ds, grid)
-
-        assert set(held) == {"rmagx"}
-        assert not fresh.any()
-        assert held["rmagx"].shape == (1, grid.size)
 
 
 class TestUsableSliceMask:

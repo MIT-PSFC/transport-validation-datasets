@@ -20,6 +20,7 @@ from transport_validation_datasets.cleaning import (
     MAX_FIT_RHO_TOR_NORM,
     branch_disagreement_errors,
     drop_huge_error_readings,
+    floor_errors,
     low_side_channels,
     persistently_low_channels,
 )
@@ -31,6 +32,7 @@ from transport_validation_datasets.machine.generic import (
     injected_power_on_grid,
     make_uniform_1kHz_timebase,
     map_ts_channels_to_rho_tor_norm,
+    merge_standardized,
     normalized_beta,
     signal_on_grid,
     snap_signals_to_grid,
@@ -85,7 +87,7 @@ HEATING_SOURCES_MW = {
 # PradTot follows the Thomson cadence (~17 ms) but often skips one or two samples (33-50 ms steps),
 # or comes in bursts 50 ms apart (61056).
 # The 1.5-step hold left gaps that cut ~10 percent of the kept time, and 60 ms bridges both.
-# A causal zero-order hold, not the 50 ms triangle of smoothed_power, since PradTot already reads smooth.
+# A causal zero-order hold, not smoothed_power, since PradTot already reads smooth.
 PRAD_TOT_HOLD_FLOOR_S = 60e-3
 
 # Every DEFUSE 0D signal a shot needs
@@ -118,13 +120,13 @@ FRINGE_LEVEL_WINDOW_S = 10e-3
 # means the interferometer has lost count, and the rest of the record is cut
 FRINGE_BURST_EPISODES = 3
 FRINGE_BURST_WINDOW_S = 0.05
-
-# Thomson error floors of prepare_fit_input in the fit units (Te [keV], ne [1e20 m^-3]),
-# fractional with an absolute floor, the TCV Thomson calibration is good to a few percent.
-TE_ERROR_FLOOR_FRACTION = 0.05
-TE_ERROR_FLOOR_KEV = 0.01
-NE_ERROR_FLOOR_FRACTION = 0.05
-NE_ERROR_FLOOR_1E20 = 0.01
+# An isolated upward jump must leave the corrected trace this long after its episode back level with the one before it [s],
+# within FRINGE_PERSIST_TOLERANCE of the shift, else it was a real rise that decays (a pellet, 78656) and stays.
+# A sharp drop is always a fringe jump, no density falls 1e19 within a millisecond.
+# A jump with another corrected within the window's end is part of a fringe sequence and stands too:
+# a slip and its recovery, a dropout (78927) or two fringes in a row, which a density ramp would make fail the check.
+FRINGE_PERSIST_WINDOW_S = (0.02, 0.05)
+FRINGE_PERSIST_TOLERANCE = 0.5
 
 # Per-variable attributes. The store signals take their units and refs from STORE_SIGNAL_ATTRS.
 SIGNAL_ATTRS = {
@@ -244,9 +246,10 @@ class TCVDataWorkflow(DataWorkflow):
         "greenwald_fraction": 2.0,
     }
     # P_oh as on DIII-D. In 246 shots only 75026 has a 5 ms P_rad peak above 3 MW (12 MW).
-    transient_filter = {"power_ohm": 2e6, "power_radiated": 5e6}
+    transient_filter = {"power_ohm": (2e6, 0.0), "power_radiated": (5e6, 0.0)}
     energy_crash_filter = {"window": 0.01, "drop_over_peak": 0.65, "min_drop": 1e3}
     end_margin = 0.03
+    failure_margin = 0.05
     # TCV bolometry reads a few percent of the input power or more, a dead bolometer far less
     min_radiated_fraction = 0.025
     # 5 of 246 shots radiate more than is put in, two by far (75026 4.1x with a 12 MW PradTot spike, 78926 1.7x),
@@ -254,10 +257,12 @@ class TCVDataWorkflow(DataWorkflow):
     max_radiated_fraction = 1.0
     # Thomson n_e is calibrated to the FIR, so this only catches a broken calibration of either
     density_ratio_bounds = (0.7, 1.3)
-    shot_blacklist = []
+    shot_blacklist = ()
 
     # GP fit staging knobs, C-Mod's to start with, each slice normalized to a max of 1
     fit_min_points = 10
+    # The TCV Thomson calibration is good to a few percent
+    error_floors = {"te": (0.05, 0.01), "ne": (0.05, 0.01)}
     fit_bounds = {
         "te": FitBounds(l1_min=0.35, var_min=1.0),
         "ne": FitBounds(l1_min=0.55, l1_max=1.0, var_min=1.0),
@@ -340,15 +345,8 @@ class TCVDataWorkflow(DataWorkflow):
         ds_thomson = snap_to_grid(ds_thomson_native, timebase)
         ds_0d = _zero_d_dataset(shot, signals, timebase)
 
-        ds = xr.merge(
-            [ds_0d, ds_equilibrium_0d, ds_equilibrium, ds_thomson],
-            compat="no_conflicts",
-            join="outer",
-        )
-        ds = ds.set_index(idx=["shot", "time"]).unstack("idx")
-        ds.attrs = dict(ds_equilibrium.attrs)
-        # Per shot like cocos, the stack stage stores it as the r0 variable
-        ds.attrs["r0"] = r0
+        datasets = [ds_0d, ds_equilibrium_0d, ds_equilibrium, ds_thomson]
+        ds = merge_standardized(datasets, ds_equilibrium.attrs, r0)
         apply_signal_attrs(ds, SIGNAL_ATTRS)
         return ds
 
@@ -359,7 +357,7 @@ class TCVDataWorkflow(DataWorkflow):
         2: Convert to the fit units (Te [keV], ne [1e20 m^-3])
         3: Drop every channel whose Te or ne error exceeds its value (cleaning.drop_huge_error_readings)
         4: Drop, for the whole shot, the channels of each variable reading far under their neighbours (cleaning.persistently_low_channels)
-        5: Floor the errors (TE_ and NE_ERROR_FLOOR_*)
+        5: Floor the errors (error_floors, cleaning.floor_errors)
         6: Inflate the errors where the branches below and above the axis disagree (cleaning.branch_disagreement_errors)
         7: Drop the channels past cleaning.MAX_FIT_RHO_TOR_NORM
 
@@ -397,14 +395,8 @@ class TCVDataWorkflow(DataWorkflow):
                 f"and ne channels {np.flatnonzero(ne_low).tolist()}"
             )
 
-        te_floor = np.maximum(
-            TE_ERROR_FLOOR_FRACTION * np.abs(te_y), TE_ERROR_FLOOR_KEV
-        )
-        ne_floor = np.maximum(
-            NE_ERROR_FLOOR_FRACTION * np.abs(ne_y), NE_ERROR_FLOOR_1E20
-        )
-        te_err = np.maximum(te_err, te_floor)
-        ne_err = np.maximum(ne_err, ne_floor)
+        te_err = floor_errors(te_y, te_err, *self.error_floors["te"])
+        ne_err = floor_errors(ne_y, ne_err, *self.error_floors["ne"])
 
         z_channel = channel_rows_at_times(ds_shot["ts_channel_z"], ts_times)
         below_axis = low_side_channels(rho_tor_norm, z_channel)
@@ -547,16 +539,24 @@ def _zero_d_dataset(
         data[store_name] = signal_on_grid(
             signal.time, signal.values, timebase, hold_floor
         )
-    # Each record is 0 outside its span and NaN in its gaps (injected_power_on_grid), a system a shot lacks is 0
+    # Each record is 0 outside its span and NaN in its gaps (injected_power_on_grid), a system a shot lacks is 0.
+    # A gap in one record leaves the others' sum, like the ECRH rows, a time in every record's gap stays NaN.
     for store_name, raw_names in HEATING_SOURCES_MW.items():
-        power_MW = np.zeros(timebase.size)
+        records_on_grid = []
         for raw_name in raw_names:
             if raw_name in signals:
                 record = signals[raw_name]
                 record_on_grid = injected_power_on_grid(
                     record.time, record.values, timebase
                 )
-                power_MW = power_MW + record_on_grid
+                records_on_grid.append(record_on_grid)
+        if not records_on_grid:
+            data[store_name] = np.zeros(timebase.size)
+            continue
+        records_stacked = np.stack(records_on_grid)
+        mask_any_finite = np.isfinite(records_stacked).any(axis=0)
+        power_summed_MW = np.nansum(records_stacked, axis=0)
+        power_MW = np.where(mask_any_finite, power_summed_MW, np.nan)
         data[store_name] = power_MW * 1e6
     # TCV has no ICRF or lower hybrid
     data.update(absent_heating_powers(data["ip"], ("power_ic", "power_lh")))
@@ -635,6 +635,72 @@ def _level_samples(
     return idx_adjacent
 
 
+@dataclass
+class _FringeCorrection:
+    """One episode _remove_fringe_jumps corrected, kept to judge and undo the correction."""
+
+    first: int
+    last: int
+    level_before: float
+    shift: float
+    idx_adjacent_before: np.ndarray
+    idx_adjacent_after: np.ndarray
+
+
+def _line_across_episode(
+    sample_time: np.ndarray,
+    density: np.ndarray,
+    first: int,
+    last: int,
+    idx_adjacent_before: np.ndarray,
+    idx_adjacent_after: np.ndarray,
+):
+    """Replace an episode's samples, in place, by a straight line between the medians of the samples next to it.
+
+    Args:
+        sample_time: (n,) sample times [s].
+        density: (n,) NEavg [m^-3], modified in place.
+        first: First sample of the episode.
+        last: Last sample of the episode.
+        idx_adjacent_before: The samples next to it before.
+        idx_adjacent_after: The samples next to it after.
+    """
+    edge_before = np.nanmedian(density[idx_adjacent_before])
+    edge_after = np.nanmedian(density[idx_adjacent_after])
+    edge_times = [sample_time[first - 1], sample_time[last + 1]]
+    span_times = sample_time[first : last + 1]
+    density[first : last + 1] = np.interp(
+        span_times, edge_times, [edge_before, edge_after]
+    )
+
+
+def _correction_persists(
+    sample_time: np.ndarray,
+    density_corrected: np.ndarray,
+    correction: _FringeCorrection,
+) -> bool:
+    """Whether the corrected trace FRINGE_PERSIST_WINDOW_S after an episode is back level with the one before it.
+
+    Args:
+        sample_time: (n,) sample times [s].
+        density_corrected: (n,) NEavg with every correction made so far [m^-3].
+        correction: The episode's correction.
+
+    Returns:
+        True within FRINGE_PERSIST_TOLERANCE of the shift, and when no finite sample lies in the window.
+    """
+    time_last = sample_time[correction.last]
+    window_start = time_last + FRINGE_PERSIST_WINDOW_S[0]
+    window_end = time_last + FRINGE_PERSIST_WINDOW_S[1]
+    mask_window = (sample_time > window_start) & (sample_time <= window_end)
+    density_window = density_corrected[mask_window]
+    if not np.isfinite(density_window).any():
+        return True
+    level_late = np.nanmedian(density_window)
+    level_offset = abs(level_late - correction.level_before)
+    return level_offset <= FRINGE_PERSIST_TOLERANCE * abs(correction.shift)
+
+
 def _remove_fringe_jumps(
     sample_time: np.ndarray, density: np.ndarray
 ) -> tuple[np.ndarray, float | None]:
@@ -649,6 +715,8 @@ def _remove_fringe_jumps(
     So a spike that decays back, or a dropout that recovers, only loses its inside.
     An episode longer than FRINGE_BURST_WINDOW_S, or FRINGE_BURST_EPISODES corrections within it,
     means the interferometer has lost count, and every sample from the start of the first such episode on is NaN.
+    Before that, an isolated upward correction that leaves the trace off level FRINGE_PERSIST_WINDOW_S later is undone
+    (_correction_persists), the last first, so no undo moves the levels of one still to be judged.
 
     Args:
         sample_time: (n,) sorted, unique sample times [s].
@@ -658,6 +726,9 @@ def _remove_fringe_jumps(
         (n,) the corrected samples, and the time the record is cut from, None when it is not.
     """
     density_corrected = density.copy()
+    # No sample step to size the windows with
+    if density.size < 2:
+        return density_corrected, None
     sample_steps = np.diff(sample_time)
     sample_step = float(np.median(sample_steps))
     n_sharp_window = round(FRINGE_SHARP_WINDOW_S / sample_step)
@@ -670,7 +741,7 @@ def _remove_fringe_jumps(
     span_first, span_last = _fringe_episode_spans(sample_time, idx_sharp, n_sharp)
 
     idx_samples = np.arange(density.size)
-    corrected_episode_times = []
+    corrections = []
     lost_count_time = np.inf
     for i_episode in range(span_first.size):
         first = span_first[i_episode]
@@ -710,18 +781,28 @@ def _remove_fringe_jumps(
         level_shift = level_after - level_before
         if np.abs(level_shift) >= FRINGE_JUMP_MIN_M3:
             density_corrected[last + 1 :] -= level_shift
-            corrected_episode_times.append(time_first)
-
-        # A straight line across the episode, between the samples next to it
-        edge_before = np.nanmedian(density_corrected[idx_adjacent_before])
-        edge_after = np.nanmedian(density_corrected[idx_adjacent_after])
-        edge_times = [sample_time[first - 1], sample_time[last + 1]]
-        span_times = sample_time[first : last + 1]
-        density_corrected[first : last + 1] = np.interp(
-            span_times, edge_times, [edge_before, edge_after]
+            correction = _FringeCorrection(
+                first,
+                last,
+                level_before,
+                level_shift,
+                idx_adjacent_before,
+                idx_adjacent_after,
+            )
+            corrections.append(correction)
+        _line_across_episode(
+            sample_time,
+            density_corrected,
+            first,
+            last,
+            idx_adjacent_before,
+            idx_adjacent_after,
         )
 
-    episode_times = np.asarray(corrected_episode_times)
+    # Judged on every correction, since inside a burst the trace never settles for the persistence check
+    episode_times = np.array(
+        [sample_time[correction.first] for correction in corrections]
+    )
     for episode_time in episode_times:
         mask_burst = (episode_times >= episode_time) & (
             episode_times <= episode_time + FRINGE_BURST_WINDOW_S
@@ -729,7 +810,28 @@ def _remove_fringe_jumps(
         if mask_burst.sum() >= FRINGE_BURST_EPISODES:
             lost_count_time = min(lost_count_time, episode_time)
             break
+    density_corrected[sample_time >= lost_count_time] = np.nan
+
+    # Last first: undoing a correction shifts only what follows it, so the level before each one stays as measured
+    for correction in reversed(corrections):
+        correction_time = sample_time[correction.first]
+        if correction_time >= lost_count_time or correction.shift < 0:
+            continue
+        time_to_others = np.abs(episode_times - correction_time)
+        n_neighbours = int((time_to_others <= FRINGE_PERSIST_WINDOW_S[1]).sum()) - 1
+        if n_neighbours > 0:
+            continue
+        if _correction_persists(sample_time, density_corrected, correction):
+            continue
+        density_corrected[correction.last + 1 :] += correction.shift
+        _line_across_episode(
+            sample_time,
+            density_corrected,
+            correction.first,
+            correction.last,
+            correction.idx_adjacent_before,
+            correction.idx_adjacent_after,
+        )
     if not np.isfinite(lost_count_time):
         return density_corrected, None
-    density_corrected[sample_time >= lost_count_time] = np.nan
     return density_corrected, float(lost_count_time)

@@ -35,9 +35,7 @@ WINDOW_TIME_TOL = 1e-6
 MIN_CENTER_SEPARATION = 1e-3
 
 WINDOW_COLUMNS = ("t_start", "t_end")
-# The shot column, by preference: shot, else pulse_no (what scenario tables
-# exported from other tools tend to call it)
-SHOT_COLUMNS = ("shot", "pulse_no")
+SHOT_COLUMN = "shot"
 
 
 def read_shotlist(
@@ -50,7 +48,6 @@ def read_shotlist(
     or a CSV with a shot column and no window columns, other columns ignored.
     Windowed: a CSV whose header holds shot, t_start and t_end [s], other columns ignored.
     A shot appears on one row per window.
-    The shot column may also be called pulse_no.
     The header is read as plain comma-separated names,
     so a quoted header, a byte order mark or another separator leaves the file plain,
     where its lines are not shot numbers and the error names the first one.
@@ -78,31 +75,30 @@ def read_shotlist(
     with open(path, newline="") as f:
         header = [column.strip() for column in f.readline().split(",")]
         f.seek(0)
-        shot_column = next((c for c in SHOT_COLUMNS if c in header), None)
+        has_shot_column = SHOT_COLUMN in header
         if not all(column in header for column in WINDOW_COLUMNS):
-            if shot_column is None:
+            if not has_shot_column:
                 plain = _read_plain_shot_lines(f, path)
             else:
                 plain = []
                 for line_number, row in enumerate(csv.DictReader(f), start=2):
                     try:
-                        plain.append(int(row[shot_column]))
+                        plain.append(int(row[SHOT_COLUMN]))
                     except (TypeError, ValueError) as e:
                         raise ValueError(f"{path} line {line_number}: {e}") from e
             if not plain:
                 raise ValueError(f"{path}: no shot in the shotlist")
             return list(dict.fromkeys(plain)), None
 
-        if shot_column is None:
+        if not has_shot_column:
             raise ValueError(
-                f"{path}: a windowed shotlist needs a {' or '.join(SHOT_COLUMNS)} "
-                f"column, the header is {header}"
+                f"{path}: a windowed shotlist needs a {SHOT_COLUMN} column, the header is {header}"
             )
         shots: list[int] = []
         windows: dict[int, list[tuple[float, float]]] = {}
         for line_number, row in enumerate(csv.DictReader(f), start=2):
             try:
-                shot = int(row[shot_column])
+                shot = int(row[SHOT_COLUMN])
                 t_start = float(row["t_start"])
                 t_end = float(row["t_end"])
             except (TypeError, ValueError) as e:
@@ -154,7 +150,7 @@ def _read_plain_shot_lines(lines, path: Path) -> list[int]:
             raise ValueError(
                 f"{path} line {line_number}: {text!r} is not a shot number. "
                 "A shotlist is one shot number per line, or a CSV with a shot "
-                "(or pulse_no) column and optional t_start and t_end columns."
+                "column and optional t_start and t_end columns."
             ) from e
     return shots
 

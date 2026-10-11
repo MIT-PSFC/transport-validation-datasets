@@ -1,6 +1,6 @@
 """Assemble per-episode datasets into one tensorized Zarr store, one episode at a time.
 
-Based on popsim/data/dataset_utils.py
+Forked from popsim/data/dataset_utils.py and diverged since.
 """
 
 import os
@@ -28,8 +28,8 @@ def build_tensorized_dataset(
 
     process_fn turns one identifier at a time into that episode's dataset, or None to skip it.
     Each episode is appended to the Zarr store as it comes, so peak memory is one episode.
-    An episode whose process_fn raises is logged with its traceback and skipped,
-    so a single unreadable shot does not lose the rest of the run.
+    An episode whose process_fn raises is logged with its traceback and the rest still run,
+    then the build raises naming every one of them, so a store never silently lacks a shot.
 
     Args:
         process_fn: Turns one identifier into that episode's dataset, or None to skip the episode.
@@ -40,7 +40,6 @@ def build_tensorized_dataset(
         dim_sizes: Upper bound per non-episode dimension.
             Every episode is padded to these sizes before it is written,
             so the store is never extended, which would rewrite every chunk already in it.
-            The rechunking pass trims the slack.
         mb_per_chunk: Target size of each variable's chunks.
             Each variable gets its own episodes per chunk from its own size per episode,
             so a 0D signal packs many more episodes into a chunk than a 2D map.
@@ -51,7 +50,7 @@ def build_tensorized_dataset(
 
     Raises:
         ValueError: If zarr_path does not end in .zarr or already exists.
-        RuntimeError: If no episode was written.
+        RuntimeError: If any episode raised, or none was written.
     """
     zarr_path = Path(zarr_path)
     if zarr_path.suffix != ".zarr":
@@ -61,15 +60,13 @@ def build_tensorized_dataset(
     zarr_path.parent.mkdir(parents=True, exist_ok=True)
 
     n_written = 0
-    n_skipped = 0
+    failures = {}
     for identifier in identifiers:
         try:
             ds_episode = process_fn(identifier)
-        except Exception:
-            logger.opt(exception=True).warning(
-                f"Error processing {identifier}, skipping it"
-            )
-            n_skipped += 1
+        except Exception as error:
+            logger.opt(exception=True).error(f"Error processing {identifier}")
+            failures[identifier] = f"{type(error).__name__}: {error}"
             continue
         if ds_episode is None:
             continue
@@ -78,8 +75,13 @@ def build_tensorized_dataset(
         # Released before the next episode is built
         del ds_episode
 
-    if n_skipped:
-        logger.warning(f"Skipped {n_skipped} episodes that raised while processing")
+    if failures:
+        failure_lines = "\n".join(
+            f"  {identifier}: {reason}" for identifier, reason in failures.items()
+        )
+        raise RuntimeError(
+            f"{len(failures)} episodes raised while processing:\n{failure_lines}"
+        )
     if n_written == 0:
         raise RuntimeError(f"No episodes were written to {zarr_path}")
 
@@ -88,10 +90,6 @@ def build_tensorized_dataset(
     if mb_per_chunk is None:
         return ds_store
 
-    # The rechunking pass rewrites the store anyway, so it drops the padding slack of dim_sizes
-    for dim in dim_sizes:
-        if dim in ds_store.dims and dim != episode_dim:
-            ds_store = trim_trailing_nan_slices(ds_store, dim)
     chunk_specs = episode_chunk_specs(ds_store, episode_dim, mb_per_chunk)
 
     # Written beside the old store and swapped in, so a crash mid-rewrite leaves the original intact
@@ -162,7 +160,7 @@ def add_to_zarr_store(
         dim_sizes: Upper bound per non-episode dimension, see build_tensorized_dataset.
 
     Raises:
-        ValueError: If ds holds more than one episode,
+        ValueError: If ds holds more than one episode or an integer data variable,
             exceeds a dim_sizes bound or the store's size of a dimension,
             carries a dimension the store does not have,
             does not carry exactly the store's variables,
@@ -180,10 +178,17 @@ def add_to_zarr_store(
     # so the next episode would no longer match the store.
     for variable in ds.variables.values():
         variable.encoding = {}
-    ds = _set_integer_fill_values(ds)
 
     if episode_dim not in ds.dims:
         ds = ds.set_coords(episode_dim).expand_dims(episode_dim)
+    # The NaN padding would be encoded back into an integer variable as a valid value
+    integer_vars = [
+        name for name in ds.data_vars if np.issubdtype(ds[name].dtype, np.integer)
+    ]
+    if integer_vars:
+        raise ValueError(
+            f"Integer variables {integer_vars} cannot hold the NaN padding, cast them to float first."
+        )
     if ds.sizes[episode_dim] > 1:
         raise ValueError(
             f"Dataset holds {ds.sizes[episode_dim]} episodes, expected exactly one."
@@ -277,30 +282,6 @@ def _check_coordinates_match(
                 f"Coordinate {name} of the episode differs from the store's at {zarr_path}. "
                 "Every episode must sit on the store's grids."
             )
-
-
-def _set_integer_fill_values(ds: xr.Dataset) -> xr.Dataset:
-    """Give integer variables a _FillValue so NaN padding survives the round trip.
-
-    Padding promotes an integer variable to float64 with NaN in the new slots.
-    Appended to a store that holds it as an integer, the NaN is encoded back to that integer type,
-    and without a _FillValue it lands as garbage: an int8 status pads as 0, which reads as a clean fit.
-    The fill value is the type's extreme value, which decodes back to NaN on read,
-    so no real value may take it.
-
-    Args:
-        ds: One episode's dataset.
-
-    Returns:
-        The dataset, with a _FillValue in the encoding of every integer variable.
-    """
-    for name in ds.data_vars:
-        dtype = ds[name].dtype
-        if np.issubdtype(dtype, np.integer):
-            info = np.iinfo(dtype)
-            fill = info.min if np.issubdtype(dtype, np.signedinteger) else info.max
-            ds[name].encoding.setdefault("_FillValue", fill)
-    return ds
 
 
 def _pad(ds: xr.Dataset, pad_widths: dict[str, tuple[int, int]]) -> xr.Dataset:

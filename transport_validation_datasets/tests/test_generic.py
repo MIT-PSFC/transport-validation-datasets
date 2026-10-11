@@ -10,6 +10,8 @@ from scipy.constants import mu_0
 from scipy.integrate import quad
 
 from transport_validation_datasets.machine.generic import (
+    POWER_SMOOTHING_WINDOW,
+    UNIFORM_TIMEBASE_DT,
     cocos_from_signs,
     energy_mhd_from_normalized_beta,
     hold_from_usable_reconstructions,
@@ -293,9 +295,9 @@ class TestSmoothedPower:
 
         smoothed = smoothed_power(values)
 
-        # A 50 ms window is 51 samples, so two passes give a triangle 101 samples wide
-        # with its peak 1 / 51 on the impulse, the same before it as after it
-        n_window = 51
+        # A window of n_window samples (odd), so two passes give a triangle 2 n_window - 1 samples wide
+        # with its peak 1 / n_window on the impulse, the same before it as after it
+        n_window = round(POWER_SMOOTHING_WINDOW / UNIFORM_TIMEBASE_DT) // 2 * 2 + 1
         offsets = np.arange(-100, 101)
         triangle = np.clip(n_window - np.abs(offsets), 0, None) / n_window**2
         np.testing.assert_allclose(smoothed[100:301], triangle, atol=1e-12)

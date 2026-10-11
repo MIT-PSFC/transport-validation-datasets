@@ -17,7 +17,6 @@ import xarray as xr
 
 import transport_validation_datasets.workflow as workflow_module
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
-from transport_validation_datasets.filters import FAILURE_MARGIN
 from transport_validation_datasets.gp_fitting.batch_io import (
     FIT_MODE_SAMPLE,
     FIT_MODE_WINDOW_AVERAGE,
@@ -30,6 +29,7 @@ from transport_validation_datasets.machine.generic import (
     channel_fit_rows,
     channel_rows_at_times,
     make_uniform_1kHz_timebase,
+    usable_reconstructions,
 )
 from transport_validation_datasets.workflow import DataWorkflow
 
@@ -131,8 +131,19 @@ def make_source_dataset(
         return ((EPISODE_DIM, TIME_COORD, "ts_channel"), values[None])
 
     zero_d = {**DEFAULT_ZERO_D, **(extra_signals or {})}
+    # A usable reconstruction at every grid time, the GEQDSK variables usable_reconstructions reads
+    equilibrium = {
+        "simagx": ((EPISODE_DIM, TIME_COORD), np.zeros((1, n_t))),
+        "sibdry": ((EPISODE_DIM, TIME_COORD), np.ones((1, n_t))),
+        "qpsi": ((EPISODE_DIM, TIME_COORD, "psi_idx"), np.ones((1, n_t, 3))),
+        "psirz": (
+            (EPISODE_DIM, TIME_COORD, "r_grid", "z_grid"),
+            np.zeros((1, n_t, 2, 2)),
+        ),
+    }
     return xr.Dataset(
         {
+            **equilibrium,
             **{
                 name: (
                     (EPISODE_DIM, TIME_COORD),
@@ -159,9 +170,10 @@ class DummyWorkflow(DataWorkflow):
     max_filter = {}
     transient_filter = {}
     end_margin = 0.01
+    failure_margin = 0.01
     min_pulse_length = 0.1
-    shot_blacklist = [BLACKLISTED_SHOT]
-    fit_rho_tor_norm = np.linspace(0.0, 1.4, 29)
+    shot_blacklist = (BLACKLISTED_SHOT,)
+    fit_rho_tor_norm = np.linspace(0.0, 1.6, 33)
     fit_min_points = 3
 
     def __init__(self, *args, **kwargs):
@@ -179,7 +191,7 @@ class DummyWorkflow(DataWorkflow):
     def add_equilibrium_signals(
         self, ds_standardized: xr.Dataset, reconstruction_usable: np.ndarray | None
     ) -> xr.Dataset:
-        # The synthetic source has no GEQDSK block, it carries its own 0D signals and power_ohm
+        # The synthetic source carries its own 0D signals and power_ohm
         return ds_standardized
 
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
@@ -362,15 +374,17 @@ class TestMakeUnprocessedDataFiles:
 class TestTransientGaps:
     grid = make_uniform_1kHz_timebase(DURATION).astype(float)
 
-    def kept_times(self, tmp_path, spike_time: float) -> np.ndarray:
-        # A 20 MW ohmic spike 5 ms wide, above the 5 MW threshold for 7 ms after smoothing
+    def kept_times(
+        self, tmp_path, spike_time: float, window: float = 5e-3
+    ) -> np.ndarray:
+        # A 20 MW ohmic spike 5 ms wide, above the 5 MW threshold for 7 ms after a 5 ms boxcar
         workflow = make_workflow(tmp_path)
-        workflow.transient_filter = {"power_ohm": 5e6}
+        workflow.transient_filter = {"power_ohm": (5e6, window)}
         power_ohm = np.where(np.abs(self.grid - spike_time) <= 2.5e-3, 2e7, 1e5)
         ds = make_source_dataset(
             1, parabola, DURATION, None, False, extra_signals={"power_ohm": power_ohm}
         )
-        ds_filtered = workflow.filter_and_plot(ds, None)
+        ds_filtered = workflow.filter_and_plot(ds, usable_reconstructions(ds))
         return ds_filtered[TIME_COORD].values
 
     def test_early_spike_cut_out_and_the_longer_stretch_after_kept(self, tmp_path):
@@ -382,9 +396,15 @@ class TestTransientGaps:
     def test_late_spike_keeps_the_longer_stretch_before(self, tmp_path):
         times = self.kept_times(tmp_path, 0.22)
 
-        # The transient starts at 0.217 s, and FAILURE_MARGIN cuts the 20 ms before it
+        # The transient starts at 0.217 s, and the failure margin is cut before it
         assert times.min() < 1e-3
-        assert times.max() == pytest.approx(0.217 - 1e-3 - FAILURE_MARGIN)
+        assert times.max() == pytest.approx(0.217 - 1e-3 - DummyWorkflow.failure_margin)
+
+    def test_unsmoothed_threshold_cuts_only_the_spike(self, tmp_path):
+        times = self.kept_times(tmp_path, 0.22, window=0.0)
+
+        # Without a boxcar the transient starts on the spike's first grid time, 0.218 s
+        assert times.max() == pytest.approx(0.218 - 1e-3 - DummyWorkflow.failure_margin)
 
 
 class TestSliceFilters:
@@ -394,7 +414,7 @@ class TestSliceFilters:
         ds = make_source_dataset(
             1, parabola, DURATION, None, False, extra_signals=signals
         )
-        ds_filtered = workflow.filter_and_plot(ds, None)
+        ds_filtered = workflow.filter_and_plot(ds, usable_reconstructions(ds))
         return ds_filtered[TIME_COORD].values
 
     def test_min_max_and_nan_failures_are_gaps_around_the_longest_segment(
@@ -622,7 +642,7 @@ class TestRunGpFitting:
 
         for shot in (1, 2):
             with xr.open_dataset(workflow.fit_shots_dir / f"{shot}.nc") as ds:
-                # The fit grid runs to 1.4 and is cut at 1.1 when written
+                # The fit grid runs to 1.6 and is cut at 1.1 when written
                 assert ds.sizes == {EPISODE_DIM: 1, TIME_DIM: 15, "rho_tor_norm": 23}
                 assert np.isclose(ds["rho_tor_norm"].values[-1], 1.1)
                 assert (ds["t_e_fit_status"].values == STATUS_OK).all()
@@ -708,7 +728,9 @@ class TestStackInternalDataset:
                 expected_te(shot, rho_tor_norm[inside]),
                 atol=0.01 * TE_AXIS,
             )
-        assert (store["fresh_equilibrium"].values == 0).all()
+            # The synthetic source reconstructs at every grid time
+            fresh_equilibrium = store["fresh_equilibrium"].values[i, : times.size]
+            assert (fresh_equilibrium == 1).all()
 
     def test_windowed_store_holds_stop_at_edges(self, tmp_path):
         windows = {1: [(0.1, 0.2), (0.24, 0.289)], 2: [(0.05, 0.1)]}
@@ -792,7 +814,7 @@ class TestStackInternalDataset:
         workflow.run_gp_fitting()
 
         workflow.first_shot = 2
-        workflow.shot_blacklist = [3]
+        workflow.shot_blacklist = (3,)
         store = xr.open_zarr(workflow.stack_internal_dataset(), consolidated=True)
 
         assert store[EPISODE_DIM].values.tolist() == [2]
@@ -823,6 +845,9 @@ class TestStackInternalDataset:
         assert "ts_channel" not in published.dims
         assert "t_e" in published
         assert published.attrs["stripped_signals"].startswith("ts_channel")
+        # Both stores were built as partial stores and renamed into place
+        store_names = sorted(path.name for path in workflow.stores_dir.iterdir())
+        assert store_names == ["dummy_internal.zarr", "dummy_published.zarr"]
 
     def test_internal_only_device_refuses_publish_and_export(
         self, tmp_path, monkeypatch

@@ -121,7 +121,6 @@ class TestThomsonDataset:
         assert np.allclose(ds["ts_channel_r"].values, radius)
 
 
-@pytest.mark.slow  # reads the public S3 stores, ~60-90 s per shot
 def circular_efm(times, axis_z, psi_axis, psi_boundary, axis_r=0.9, minor_radius=0.5):
     # Stand-in for the level 1 efm group: circular flux surfaces, psi quadratic in the distance to the axis,
     # and a flat q, so rho_tor_norm is the distance over minor_radius.
@@ -176,6 +175,7 @@ class TestShotlist:
         assert near_axis_fraction == 0.5
 
 
+@pytest.mark.slow  # reads the public S3 stores, ~60-90 s per shot
 class TestMakeUnprocessedDataFiles:
     def test_one_shot(self, tmp_path):
         skip_without_store()

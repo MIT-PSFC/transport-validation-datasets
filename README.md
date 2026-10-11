@@ -15,7 +15,7 @@ and the GEQDSK block's attributes in `machine/generic.py` (`GEQDSK_SIGNAL_ATTRS`
 The stack stage brings every variable onto that convention.
 Each unprocessed file records the COCOS index of its GEQDSK signals in a root
 attribute `cocos`. The final dataset carries it as the per-shot variable `cocos`.
-It is identified per shot from the signs of the reconstruction's own Ip, B0, psi and q (`cocos_from_signs`),
+It is identified per shot from the signs of the reconstruction's own Ip, B0, psi and q (`cocos_from_signs`).
 The psi signals are per radian on every device (C-Mod, MAST and DIII-D from EFIT,
 TCV from LIUQE, whose flux per 2 pi radians is rescaled),
 while the IMAS nodes their `ref` points at hold the total flux in Wb, in COCOS 17.
@@ -57,7 +57,9 @@ Two Zarr stores per device, under `<data_assembly_dir>/<ds_name>/04_datasets/`:
 
 Shots are stacked along `shot` and NaN padded along every other dimension, so
 shots of different lengths line up. Only one shot is ever held in memory while
-the internal store is built, and the published store is streamed from it.
+the internal store is built, and the published store is written from it one chunk at a time.
+Both are built beside the old store (`<name>.partial.zarr`) and replace it only once complete,
+and a shot that raises while stacking fails the stack, naming it.
 
 The timebase is the unprocessed data's uniform 1 kHz grid.
 `time_idx` is the grid dimension, so shots of different lengths pad to a common size,
@@ -99,11 +101,11 @@ The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since so
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
 
 Every stored value is causal, no grid time draws on a later sample, with these exceptions:
-power_ohm and power_radiated are smoothed by a centered 50 ms boxcar applied twice (`smoothed_power`),
-the kernel of DIII-D's bolometer postprocessing.
-DIII-D's `\bolom::prad_tot` is smoothed that way at the source,
+power_ohm and power_radiated are smoothed by a centered 5 ms boxcar applied twice (`smoothed_power`, `POWER_SMOOTHING_WINDOW`).
+DIII-D's `\bolom::prad_tot` instead comes smoothed at the source by a 50 ms boxcar applied twice and is kept as it is,
 and TCV's `PradTot` reads smooth at its ~17 ms cadence, so it is only held causally, for at least 60 ms over skipped samples.
-TCV's n_e_line_average has the FIR fringe jumps removed from its raw samples, which looks across each jump.
+TCV's n_e_line_average has the FIR fringe jumps removed from its raw samples, which looks across each jump
+and up to 50 ms past it, keeping an isolated rise that decays back (a pellet, 78656) rather than reading it as a jump.
 The EFIT and Thomson slices are snapped to the nearest grid time (`snap_to_grid`), up to 0.5 ms early,
 and a Thomson slice can map through a reconstruction up to `EQ_MATCH_MAX_PERIODS` later than it (see [Filtering](#filtering)).
 
@@ -119,7 +121,8 @@ mu0 24 I_TF / (2 pi r0) from the toroidal field coil current `amc/tf_current` on
 which is the field EFIT's bvac_val gives (just at a faster timebase),
 LIUQE's rBt / r0 at 0.88 m on TCV (DEFUSE BZERO),
 and mu0 144 bcoil / (2 pi r0) at 1.6955 m on DIII-D (PTDATA bcoil, EFIT's bcentr formula).
-ip and b0 keep their source sign, the cocos variable records the convention.
+ip and b0 keep their source sign.
+The cocos variable is the GEQDSK block's convention, identified from the block's own current and field, which ip and b0 need not share.
 beta_tor_norm is normalized as IMAS defines it, 100 beta_tor a |b0| / |Ip|[MA] with beta_tor = 2 mu0 <p> / b0^2 and b0 at r0.
 Every device builds it the same way (`generic.normalized_beta`),
 from the reconstruction's own stored energy and volume, <p> = 2 W / (3 V), with its own a, b0 and Ip:
@@ -165,21 +168,23 @@ The reach and the hold both run on the reconstruction clock (`reconstruction_clo
 Unprocessed stage (`make_unprocessed_data_files`, `filter_and_plot`), per shot.
 Steps 3 to 5 and 9 are the filter spec every device store shares (`filters.py`).
 Every check from 3 to 5 cuts the grid times it fails out as a gap (`slice_filter_mask`).
-A failed grid time before the end-of-shot cut also cuts the 50 ms before it (`FAILURE_MARGIN`, one `POWER_SMOOTHING_WINDOW`),
-since the smoothed power_ohm and power_radiated carry the event that ends a segment one smoothing window ahead of it:
+A failed grid time before the end-of-shot cut also cuts the `failure_margin` before it
+(30 ms on MAST, 50 ms on C-Mod and TCV, 100 ms on DIII-D), so a segment that ends on a failure leaves out its lead-up:
 
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
 2. The reconstruction's 0D signals are held and power_ohm is derived (`add_equilibrium_signals`).
 3. End of shot (`end_of_shot_index`): the plasma ends at the last grid time with |ip| at or above its `min_filter` threshold,
-   and everything after `end_margin` (30 ms on TCV, 50 ms on C-Mod and MAST, 100 ms on DIII-D) before that is cut.
+   and everything after `end_margin` (30 ms on TCV and MAST, 50 ms on C-Mod, 100 ms on DIII-D) before that is cut.
    A shot whose |ip| never reaches the threshold is rejected.
 4. Every 0D signal must be finite, every `min_filter` signal at or above its threshold
    (ip compared as |ip|), and every `max_filter` signal at or below it, on the raw samples.
    The max filters take `greenwald_fraction` = n_e_line_average / n_GW with n_GW = Ip / (pi a^2),
    derived for the filter and not stored.
 5. Transients:
-   - grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold.
-     The centered window only selects grid times, no stored value is smoothed by it.
+   - grid times where a `transient_filter` signal is above its threshold after a centered boxcar of its own window,
+     each entry `(threshold, window)`.
+     Every device reads the stored power_ohm and power_radiated as they are (window 0), since they are smoothed already.
+     The window only selects grid times, no stored value is smoothed by it.
    - grid times a stored-energy crash follows (`energy_crash_filter`, `energy_crash_mask`):
      energy_mhd falls by at least `drop_over_peak` of the shot's peak and by at least `min_drop` within `window` ahead,
      with the peak the 99th percentile of energy_mhd before the end cut.
@@ -188,7 +193,9 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
      which pass it, against the largest sawtooth crashes, which do not.
      On C-Mod it is half the peak within 10 ms and 25 kJ, due to shorter confinement time and lower stored energy.
      On TCV it is 0.65 of the peak within 10 ms and 1 kJ, which separates its largest crash train and a reconstruction spike
-     from its ECH turn-offs and sawteeth. MAST does not run it yet.
+     from its ECH turn-offs and sawteeth.
+     On MAST it is 0.55 of the peak within 20 ms and 50 kJ, which separates its hand-labeled reconnection events and collapses
+     from its NBI turn-offs and ordinary crashes.
    The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`).
 6. The leading grid times of each segment are cut up to its first sample
    that a usable reconstruction of the same segment reaches within the GEQDSK block's hold,
@@ -224,6 +231,9 @@ A shot that is accepted loses its note, so the notes count only the current reje
 Fit stage: the Thomson channels map through the nearest usable reconstruction in reach,
 the Thomson screens in `cleaning.py` run on every sample before fitting,
 and the fit method's own checks give each slice a fit status.
+Each device raises its error bars to its `error_floors` (`cleaning.floor_errors`), recorded in the fit settings:
+on C-Mod 15 percent and 15 eV for Te and 10 percent and 1e18 m^-3 for ne, on TCV 5 percent and 10 eV and 1e18 m^-3, none on MAST.
+MAST and TCV drop the channels past rho_tor_norm 1.1 (`MAX_FIT_RHO_TOR_NORM`), C-Mod screens its far SOL with `SOL_NE_MAX` instead.
 A channel below psi_N 1 more than 5 mm outside its reconstruction's boundary contour sits in a private flux region,
 under an X-point, so it is left unmapped (TCV's vertical chord reaches below the lower X-point, where such channels read a few eV).
 DIII-D's IDA points map through the DISPY q profile instead,
@@ -283,9 +293,6 @@ indicating a large change in the Thomson density calibration.
 
 - **Thomson against interferometer.** Inside the density bounds the two still differ shot to shot.
   The kept shots sit at 0.76-1.16 on C-Mod and 0.75-1.10 on MAST.
-- **MAST transients inside the kept windows.** Reconnection events and Ip spikes that stay under the transient thresholds remain,
-  e.g. 28203 at 0.343 s, where core Te drops from 0.55 to 0.12 keV, Ip spikes from 0.53 to 0.68 MA and P_rad reaches 2.8 MW.
-  The transient filter needs P_rad above 3 MW after smoothing.
 - **MAST EFIT vertical glitches.** Single reconstructions jump zmagx and zbdry by 5-10 cm and come back at the next one,
   e.g. 24623 at 0.29-0.33 s (39 reconstructions in 26 shots out of ~1000).
 - **Equilibrium gaps.** The 10 ms hold floor bridges a missing reconstruction in the GEQDSK block,
@@ -294,7 +301,7 @@ indicating a large change in the Thomson density calibration.
   A Thomson slice inside a bridged gap maps through no reconstruction (it reaches only `EQ_MATCH_MAX_PERIODS`),
   so the profile before it is held there.
 - **power_ohm is the reconstruction's.** Its loop voltage is the boundary flux derivative of the equilibrium, not a flux loop,
-  so it carries the reconstruction's flux noise (smoothed over 50 ms).
+  so it carries the reconstruction's flux noise (smoothed over 5 ms). Chosen as a reasonable tradeoff for a consistent definition.
 - **MAST summary signals.** The level 2 summary group is FAIR-MAST's own 1 kHz resampling of ip, n_e_line_average, power_radiated and power_nbi,
   whose causality this package does not verify.
 - **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
@@ -358,6 +365,7 @@ The fit stage plots every shot's fits to a PDF, about a minute per shot.
 `--skip_fit_plots` leaves them out, and a later fit stage without it plots the shots that have no PDF yet.
 `--max_fit_pages` caps the pages of each PDF.
 A cluster fit pulls each job's SLURM log back into `<ds_name>/logs/fit_jobs/`.
+A shot's fit file is rewritten when its batch was refit or this package changed (its `fit_stamp`).
 
 # Configuration
 
@@ -404,12 +412,12 @@ Every device table takes the fit anchors, the virtual observations every GP fit 
 Each is a list of `[rho_tor_norm, value, error]` rows in the fit units, Te in keV and ne in 1e20 m^-3, gradients per unit rho_tor_norm.
 The defaults pin each profile to zero value and gradient at rho_tor_norm 1.3 to 1.6, and zero gradient at the axis.
 They sit past the SOL channels, which rho_tor_norm stretches out to ~1.25.
-Moving an anchor past 1.6 needs a device fit grid that reaches it.
+An anchor outside the device's fit grid is refused, so moving one past 1.6 needs a grid that reaches it.
 
 ```toml
 [mast]
 te_value_anchors = [[1.3, 0.0, 0.01], [1.4, 0.0, 0.01], [1.5, 0.0, 0.01], [1.6, 0.0, 0.01]]
-te_grad_anchors = [[0.0, 0.0, 0.1], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1], [1.5, 0.0, 0.1], [1.6, 0.0, 0.1]]
+te_grad_anchors = [[0.0, 0.0, 0.0], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1], [1.5, 0.0, 0.1], [1.6, 0.0, 0.1]]
 # ne_value_anchors, ne_grad_anchors likewise
 ```
 
@@ -485,7 +493,7 @@ ida_databases = [
 
 - plain: one shot number per line, blank lines and lines starting with `#` skipped
 - windowed: 
-  a CSV whose header holds `shot` (or `pulse_no`), `t_start` and `t_end` [s],
+  a CSV whose header holds `shot`, `t_start` and `t_end` [s],
   one row per window and a shot on as many rows as it has windows.
   Other columns are ignored.
   Windows of one shot may overlap, but no two may share a center (closer than 1 ms),
