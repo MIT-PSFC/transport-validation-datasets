@@ -200,7 +200,7 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
    so after a crash the longer side would otherwise win even where the profiles stop before the crash.
    Only the kept segment's reconstructions reach the store,
    so step 6 trims each segment as if it alone were kept, and the best is chosen after every trim.
-8. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod, TCV and DIII-D 0.5 s, MAST 0.2 s).
+8. The shot is rejected when the kept segment is shorter than `min_pulse_length` (C-Mod and TCV 0.3 s, DIII-D 0.5 s, MAST 0.2 s).
 9. The shot is rejected when `shot_rejection_reason` finds a broken record in what is kept:
    - a mean `power_radiated` below `min_radiated_fraction` of the mean input power, ohmic plus auxiliary (a dead bolometer),
      or above `max_radiated_fraction` of it, since more cannot be radiated than is put in (`radiated_fraction_reason`)

@@ -143,7 +143,7 @@ class CModDataWorkflow(DataWorkflow):
     settings_cls = CModSettings
     signal_attrs = SIGNAL_ATTRS
 
-    min_pulse_length = 0.5
+    min_pulse_length = 0.3
     min_filter = {
         "ip": 100e3,
         # 2.7 kJ keeps the ramp-ups, 3 s of kept time over 990 shots more than 3 kJ would

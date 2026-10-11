@@ -231,7 +231,7 @@ class TCVDataWorkflow(DataWorkflow):
     fit_plot_branch_position = "ts_channel_z"
     fit_plot_branch_labels = ("TS below axis", "TS above axis")
 
-    min_pulse_length = 0.5
+    min_pulse_length = 0.3
     min_filter = {
         "ip": 5e4,
         "energy_mhd": 1e3,
