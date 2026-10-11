@@ -186,8 +186,9 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
      The floor keeps the reconstruction noise of a low-energy shot from reading as most of its peak.
      On DIII-D it is half the peak within 50 ms and 100 kJ, fitted to hand-labeled impurity injections and reconnection events,
      which pass it, against the largest sawtooth crashes, which do not.
-     On C-Mod it is half the peak within 10 ms and 20 kJ, due to shorter confinement time and lower stored energy.
-     TCV and MAST do not run it yet.
+     On C-Mod it is half the peak within 10 ms and 25 kJ, due to shorter confinement time and lower stored energy.
+     On TCV it is 0.65 of the peak within 10 ms and 1 kJ, which separates its largest crash train and a reconstruction spike
+     from its ECH turn-offs and sawteeth. MAST does not run it yet.
    The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`).
 6. The leading grid times of each segment are cut up to its first sample
    that a usable reconstruction of the same segment reaches within the GEQDSK block's hold,

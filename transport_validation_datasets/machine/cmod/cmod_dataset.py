@@ -161,10 +161,7 @@ class CModDataWorkflow(DataWorkflow):
     }
     # The confinement time (~25 ms) is a sixth of DIII-D's, so W halves within 50 ms of every ICRF turn-off,
     # and low-energy ohmic shots wander by 15 kJ, most of their peak.
-    # One hand-labeled C-Mod event is a real transient (1160915018 at 0.85 s, about 40 kJ of a 65 kJ peak, filter_tune review).
-    # At 0.5 of the peak within 10 ms and 20 kJ it is the only mid-shot crash of the 2026-10 pulls,
-    # the other two flagged sit at the end of the kept data, while every ICRF turn-off and ohmic wander stays under it.
-    energy_crash_filter = {"window": 0.01, "drop_over_peak": 0.5, "min_drop": 2e4}
+    energy_crash_filter = {"window": 0.01, "drop_over_peak": 0.5, "min_drop": 2.5e4}
     # One smoothing window, so the smoothed powers never carry the current quench (POWER_SMOOTHING_WINDOW)
     end_margin = POWER_SMOOTHING_WINDOW
     shot_blacklist = []

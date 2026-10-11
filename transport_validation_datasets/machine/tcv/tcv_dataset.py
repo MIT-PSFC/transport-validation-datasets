@@ -245,6 +245,7 @@ class TCVDataWorkflow(DataWorkflow):
     }
     # P_oh as on DIII-D. In 246 shots only 75026 has a 5 ms P_rad peak above 3 MW (12 MW).
     transient_filter = {"power_ohm": 2e6, "power_radiated": 5e6}
+    energy_crash_filter = {"window": 0.01, "drop_over_peak": 0.65, "min_drop": 1e3}
     end_margin = 0.03
     # TCV bolometry reads a few percent of the input power or more, a dead bolometer far less
     min_radiated_fraction = 0.025

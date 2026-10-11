@@ -297,6 +297,7 @@ class MASTDataWorkflow(DataWorkflow):
         "power_ohm": 5.0e6,
         "power_radiated": 3.0e6,
     }
+    energy_crash_filter = {"window": 0.02, "drop_over_peak": 0.55, "min_drop": 5e4}
     # MAST's ip record runs through the current quench, so a small ip cutoff still lets disruption transients in.
     # Shots keep a median 0.29 s, so 30 ms rather than a full smoothing window (POWER_SMOOTHING_WINDOW).
     end_margin = 0.03
