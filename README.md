@@ -171,7 +171,7 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
 1. A shot in `shot_blacklist` or numbered below `first_shot` is skipped before its source is read (`excluded_shot_reason`).
 2. The reconstruction's 0D signals are held and power_ohm is derived (`add_equilibrium_signals`).
 3. End of shot (`end_of_shot_index`): the plasma ends at the last grid time with |ip| at or above its `min_filter` threshold,
-   and everything after `end_margin` (50 ms on C-Mod, MAST and TCV, one smoothing window, 100 ms on DIII-D) before that is cut.
+   and everything after `end_margin` (30 ms on TCV, 50 ms on C-Mod and MAST, 100 ms on DIII-D) before that is cut.
    A shot whose |ip| never reaches the threshold is rejected.
 4. Every 0D signal must be finite, every `min_filter` signal at or above its threshold
    (ip compared as |ip|), and every `max_filter` signal at or below it, on the raw samples.
@@ -186,7 +186,7 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
      The floor keeps the reconstruction noise of a low-energy shot from reading as most of its peak.
      On DIII-D it is half the peak within 50 ms and 100 kJ, fitted to hand-labeled impurity injections and reconnection events,
      which pass it, against the largest sawtooth crashes, which do not.
-     On C-Mod it is half the peak within 10 ms and 60 kJ, due to shorter confinement time and lower stored energy.
+     On C-Mod it is half the peak within 10 ms and 20 kJ, due to shorter confinement time and lower stored energy.
      TCV and MAST do not run it yet.
    The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`).
 6. The leading grid times of each segment are cut up to its first sample

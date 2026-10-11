@@ -30,7 +30,6 @@ from transport_validation_datasets.cleaning import (
 )
 from transport_validation_datasets.gp_fitting.batch_io import FitBounds, ShotFitInput
 from transport_validation_datasets.machine.generic import (
-    POWER_SMOOTHING_WINDOW,
     absent_heating_powers,
     channel_fit_rows,
     channel_rows_at_times,
@@ -299,8 +298,8 @@ class MASTDataWorkflow(DataWorkflow):
         "power_radiated": 3.0e6,
     }
     # MAST's ip record runs through the current quench, so a small ip cutoff still lets disruption transients in.
-    # One smoothing window, so the smoothed powers never carry the quench (POWER_SMOOTHING_WINDOW).
-    end_margin = POWER_SMOOTHING_WINDOW
+    # Shots keep a median 0.29 s, so 30 ms rather than a full smoothing window (POWER_SMOOTHING_WINDOW).
+    end_margin = 0.03
     # Shots radiate a median 10 percent of their heating power (from 23809 on).
     # 12 shots sit below 1 percent with MW of input, a dead bolometer, and the next lowest is at 3.75 percent.
     min_radiated_fraction = 0.025
