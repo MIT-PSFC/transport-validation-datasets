@@ -486,7 +486,7 @@ class TestShotRejectionReason:
         assert "energy_mhd" in workflow.shot_rejection_reason(unheated)
         assert workflow.shot_rejection_reason(heated) is None
 
-    def test_rise_from_first_kept_time_against_input_up_to_peak(self, tmp_path):
+    def test_rise_from_start_level_against_input_up_to_peak(self, tmp_path):
         workflow = make_workflow(tmp_path)
         # 0.3 MW puts in 30 kJ by the peak at 0.1 s and 90 kJ over the shot.
         # Both shots start at 200 kJ, so judging the peak itself would reject both,

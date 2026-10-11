@@ -177,8 +177,14 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
    (ip compared as |ip|), and every `max_filter` signal at or below it, on the raw samples.
    The max filters take `greenwald_fraction` = n_e_line_average / n_GW with n_GW = Ip / (pi a^2),
    derived for the filter and not stored.
-5. Grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold.
-   The centered window only selects grid times, no stored value is smoothed by it.
+5. Transients:
+   - grid times where a `transient_filter` signal, smoothed by a centered 5 ms boxcar, is above its threshold.
+     The centered window only selects grid times, no stored value is smoothed by it.
+   - grid times a stored-energy crash follows (`energy_crash_filter`, `energy_crash_mask`):
+     energy_mhd falls by at least `drop_over_peak` of the shot's peak within `window` ahead,
+     with the peak the 99th percentile of energy_mhd before the end cut.
+     On DIII-D it is half the peak within 50 ms, fitted to hand-labeled impurity injections and reconnection events,
+     which pass it, against the largest sawtooth crashes, which do not. The other devices do not run it yet.
    The unprocessed plots shade the transients red (`machine/plots.plot_unprocessed_data`).
 6. The leading grid times of each segment are cut up to its first sample
    that a usable reconstruction of the same segment reaches within the GEQDSK block's hold,
@@ -192,7 +198,9 @@ since the smoothed power_ohm and power_radiated carry the event that ends a segm
    - a mean `power_radiated` below `min_radiated_fraction` of the mean input power, ohmic plus auxiliary (a dead bolometer),
      or above `max_radiated_fraction` of it, since more cannot be radiated than is put in (`radiated_fraction_reason`)
    - a negative median `power_ohm`, the reconstruction's current and boundary flux disagreeing in sign (`ohmic_power_sign_reason`)
-   - an `energy_mhd` rise from the first kept time to its peak greater than all the input power integrated to that time (`energy_sanity_reason`)
+   - an `energy_mhd` rise greater than all the input power integrated to its peak (`energy_sanity_reason`),
+     from the median over the first 20 ms of the kept times to the 99th percentile,
+     with the input integrated at least over those 20 ms, so a reconstruction spike or held step at the start sets neither end
 
 The standardized source pull of every shot is kept unfiltered in `01_unprocessed/source/`.
 A rerun filters from it without touching the source.

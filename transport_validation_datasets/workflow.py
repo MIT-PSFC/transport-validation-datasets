@@ -19,7 +19,9 @@ from transport_validation_datasets.cleaning import (
 )
 from transport_validation_datasets.dataset_utils import build_tensorized_dataset
 from transport_validation_datasets.filters import (
+    ENERGY_PEAK_PERCENTILE,
     ENERGY_SANITY_LEEWAY,
+    ENERGY_SANITY_START_WINDOW,
     FAILURE_MARGIN,
     TRANSIENT_SMOOTHING_WINDOW,
     clip_powers,
@@ -320,6 +322,10 @@ class DataWorkflow(ABC):
     # Ceiling on the same fraction, inf for none. Above 1 more is radiated than put in.
     max_radiated_fraction = np.inf
 
+    # Stored-energy crash check of filters.energy_crash_mask, {"window": [s], "drop_over_peak": fraction}, empty for none.
+    # The grid times a crash follows are cut as transients.
+    energy_crash_filter: dict[str, float] = {}
+
     # Shots numbered below this are left out like blacklisted ones, 0 for none.
     first_shot = 0
 
@@ -547,20 +553,23 @@ class DataWorkflow(ABC):
         A filter rejection's failure note is stamped with these (filter_rejection_note).
 
         Returns:
-            The min, max and transient filters, the transient smoothing window, the failure and end margins,
-            the minimum pulse length, and the thresholds of the whole-shot checks.
+            The min, max and transient filters, the transient smoothing window, the energy crash filter and its peak percentile,
+            the failure and end margins, the minimum pulse length, and the thresholds of the whole-shot checks.
         """
         return {
             "min_filter": self.min_filter,
             "max_filter": self.max_filter,
             "transient_filter": self.transient_filter,
             "transient_smoothing_window": TRANSIENT_SMOOTHING_WINDOW,
+            "energy_crash_filter": self.energy_crash_filter,
+            "energy_peak_percentile": ENERGY_PEAK_PERCENTILE,
             "failure_margin": FAILURE_MARGIN,
             "end_margin": self.end_margin,
             "min_pulse_length": self.min_pulse_length,
             "min_radiated_fraction": self.min_radiated_fraction,
             "max_radiated_fraction": self.max_radiated_fraction,
             "energy_sanity_leeway": ENERGY_SANITY_LEEWAY,
+            "energy_sanity_start_window": ENERGY_SANITY_START_WINDOW,
         }
 
     def filter_rejection_note(self) -> str:
@@ -843,7 +852,8 @@ class DataWorkflow(ABC):
         the end of the shot (end_of_shot_index),
         a 0D signal of DATASET_0D_SIGNALS that is not finite,
         a min_filter signal below its threshold or a max_filter signal above it,
-        and a transient_filter signal above its threshold after smoothing.
+        a transient_filter signal above its threshold after smoothing,
+        and a stored-energy crash ahead (energy_crash_filter).
         What survives is one contiguous segment.
         Each segment is started where a kept usable reconstruction reaches,
         and only the longest segment is kept.
@@ -875,6 +885,7 @@ class DataWorkflow(ABC):
             self.min_filter,
             self.max_filter,
             self.transient_filter,
+            self.energy_crash_filter,
             self.end_margin,
         )
         if slice_filter is None:
