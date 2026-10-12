@@ -295,12 +295,11 @@ class MASTDataWorkflow(DataWorkflow):
     # No power_radiated minimum or maximum.
     # The smoothed bolometer record can dip below 0, and clip_powers writes those times as 0 after filtering.
     max_filter = {"greenwald_fraction": 2.0}
-    # Both thresholds are empirical, and both gate the radiative or ohmic collapse
-    # rather than normal operation: the closest ordinary approach found while porting these was shot 29153,
-    # whose ohmic power peaks at 3.9 MW right before the end of the shot.
-    # On 100 random shots read from source, smoothed over 50 ms, 3 MW radiated fires in 5 and changes no kept time.
+    # Both gate the radiative or ohmic collapse rather than normal operation (filter_tune review of the 2026-10 pulls).
+    # On the 5 ms powers 5 MW of P_oh fires in 27 shots' kept data and 6 MW in 18,
+    # while 3 MW of P_rad fires in 51, mostly single-sample spikes of a broken bolometer record.
     transient_filter = {
-        "power_ohm": (5.0e6, 0.0),
+        "power_ohm": (6.0e6, 0.0),
         "power_radiated": (3.0e6, 0.0),
     }
     energy_crash_filter = {"window": 0.02, "drop_over_peak": 0.55, "min_drop": 5e4}

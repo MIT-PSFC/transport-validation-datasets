@@ -10,6 +10,7 @@ from scipy.constants import mu_0
 from scipy.integrate import quad
 
 from transport_validation_datasets.machine.generic import (
+    POLOIDAL_ENERGY_RATE_WINDOW,
     POWER_SMOOTHING_WINDOW,
     UNIFORM_TIMEBASE_DT,
     cocos_from_signs,
@@ -18,7 +19,7 @@ from transport_validation_datasets.machine.generic import (
     lcfs_voltage,
     make_uniform_1kHz_timebase,
     normalized_beta,
-    ohmic_power,
+    poloidal_energy_rate_on_grid,
     poloidal_field_energy,
     signal_on_grid,
     smoothed_power,
@@ -305,20 +306,40 @@ class TestSmoothedPower:
 
 
 class TestOhmicPower:
-    def test_quadratic_w_pol_matches_the_backward_difference_closed_form(self):
-        # W_pol = k t^2, so its backward difference over one step is k (t_n + t_n-1)
-        times = np.arange(10) * 1e-3
-        current = 5e5 + 2e6 * times
-        v_loop = np.full(times.size, 1.5)
+    def test_quadratic_w_pol_keeps_its_backward_difference_rate(self):
+        # W_pol = k t^2 at every grid time, its backward difference k (2 t - dt) is linear in t,
+        # so the centered boxcar leaves it unchanged away from the ends
+        grid = make_uniform_1kHz_timebase(0.06).astype(float)
+        usable = np.ones(grid.size, dtype=bool)
         w_pol_rate = 3e7
-        w_pol = w_pol_rate * times**2
+        w_pol = w_pol_rate * grid**2
 
-        p_ohm = ohmic_power(times, current, v_loop, w_pol)
+        dw_pol_dt = poloidal_energy_rate_on_grid(w_pol, usable, grid)
 
-        dw_pol_dt = w_pol_rate * (times[1:] + times[:-1])
-        expected = current[1:] * v_loop[1:] - dw_pol_dt
-        assert np.isnan(p_ohm[0])
-        np.testing.assert_allclose(p_ohm[1:], expected, rtol=1e-12)
+        assert np.isnan(dw_pol_dt[0])
+        n_half_window = (
+            round(POLOIDAL_ENERGY_RATE_WINDOW / UNIFORM_TIMEBASE_DT) // 2 + 1
+        )
+        interior = slice(n_half_window + 1, grid.size - n_half_window)
+        expected = w_pol_rate * (2 * grid - UNIFORM_TIMEBASE_DT)
+        # The float32 grid times leave ~1e-7 of round-off
+        np.testing.assert_allclose(dw_pol_dt[interior], expected[interior], rtol=1e-6)
+
+    def test_a_step_in_w_pol_keeps_its_energy_spread_over_the_window(self):
+        # Reconstructions every 5 ms, W_pol drops by 1 kJ at 0.05 s:
+        # the rate integrates to the drop and peaks no higher than the drop over the window
+        grid = make_uniform_1kHz_timebase(0.1).astype(float)
+        usable = np.zeros(grid.size, dtype=bool)
+        usable[::5] = True
+        energy_drop = 1e3
+        w_pol = np.where(grid < 0.0495, 2e4, 2e4 - energy_drop)
+        w_pol = np.where(usable, w_pol, np.nan)
+
+        dw_pol_dt = poloidal_energy_rate_on_grid(w_pol, usable, grid)
+
+        energy_released = np.nansum(dw_pol_dt) * UNIFORM_TIMEBASE_DT
+        assert energy_released == pytest.approx(-energy_drop, rel=1e-6)
+        assert np.nanmin(dw_pol_dt) >= -energy_drop / POLOIDAL_ENERGY_RATE_WINDOW
 
     def test_lcfs_voltage_follows_the_cocos_sign_of_psi(self):
         # psi_boundary falling 1 mWb/rad per ms is 2 pi V through the boundary,

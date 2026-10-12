@@ -66,6 +66,7 @@ from transport_validation_datasets.machine.generic import (
     DATASET_EQUILIBRIUM_SIGNALS,
     EQUILIBRIUM_HOLD_FLOOR,
     MAX_HOLD_PERIODS,
+    POLOIDAL_ENERGY_RATE_WINDOW,
     POWER_OHM_DESCRIPTION,
     POWER_SMOOTHING_WINDOW,
     PROFILE_MAX_HOLD,
@@ -574,7 +575,8 @@ class DataWorkflow(ABC):
         A filter rejection's failure note is stamped with these (filter_rejection_note).
 
         Returns:
-            The min, max and transient filters, the power smoothing window, the energy crash filter and its peak percentile,
+            The min, max and transient filters, the power and dW_pol/dt smoothing windows,
+            the energy crash filter and its peak percentile,
             the failure and end margins, the minimum pulse length, and the thresholds of the whole-shot checks.
         """
         return {
@@ -582,6 +584,7 @@ class DataWorkflow(ABC):
             "max_filter": self.max_filter,
             "transient_filter": self.transient_filter,
             "power_smoothing_window": POWER_SMOOTHING_WINDOW,
+            "poloidal_energy_rate_window": POLOIDAL_ENERGY_RATE_WINDOW,
             "energy_crash_filter": self.energy_crash_filter,
             "energy_peak_percentile": ENERGY_PEAK_PERCENTILE,
             "failure_margin": self.failure_margin,
@@ -2468,6 +2471,7 @@ class DataWorkflow(ABC):
                     "profile_max_hold": PROFILE_MAX_HOLD,
                     "equilibrium_hold_floor": EQUILIBRIUM_HOLD_FLOOR,
                     "power_smoothing_window": POWER_SMOOTHING_WINDOW,
+                    "poloidal_energy_rate_window": POLOIDAL_ENERGY_RATE_WINDOW,
                 }
             ),
         }

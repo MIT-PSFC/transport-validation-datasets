@@ -211,9 +211,8 @@ class D3DDataWorkflow(DataWorkflow):
         "n_e_line_average": 5e17,
     }
     max_filter = {"greenwald_fraction": 2.0}
-    # Only obvious spikes: 2 MW of P_oh also cut ramp-up ohmic heating and ~1.3 s of ramp-down (173953, 173956).
-    # The smoothed P_rad peaks at 16 MW before the end cut in the 2026-10 pulls.
-    transient_filter = {"power_ohm": (5e6, 0.0), "power_radiated": (20e6, 0.0)}
+    # Only obvious spikes, these signals tend to be noisy on DIII-D
+    transient_filter = {"power_ohm": (10e6, 0.0), "power_radiated": (15e6, 0.0)}
     # Fitted to 53 hand-labeled crashes of the 2026-10 pulls (filter_tune review):
     # every real event falls by at least 0.5 of the peak within 50 ms (impurity injections, reconnection events, one EFIT spike),
     # often stepping down over 30-50 ms, while the largest normal sawtooth crash (203540) falls 0.47.

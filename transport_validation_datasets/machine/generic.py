@@ -202,6 +202,9 @@ def standardize_signal_attrs(ds: xr.Dataset) -> xr.Dataset:
 # It takes the sample-to-sample noise off the 1 kHz grid and keeps events a few milliseconds long.
 # DIII-D's prad_tot arrives smoothed upstream with a 50 ms boxcar applied twice and is kept as it is.
 POWER_SMOOTHING_WINDOW = 5e-3
+# Width of the centered boxcar dW_pol/dt is averaged over before it enters power_ohm [s], the same on every device.
+# Differenced between reconstructions 1 ms apart, the reconstruction jitter of W_pol is the largest noise of P_oh (DIII-D).
+POLOIDAL_ENERGY_RATE_WINDOW = 10e-3
 
 # Step of the uniform timebase every device is placed on [s], see make_uniform_1kHz_timebase.
 UNIFORM_TIMEBASE_DT = 1e-3
@@ -902,31 +905,36 @@ def lcfs_voltage(times: np.ndarray, sibdry: np.ndarray, cocos: int) -> np.ndarra
     return sigma_bp(cocos) * 2.0 * np.pi * dpsi / dt
 
 
-def ohmic_power(
-    times: np.ndarray,
-    current: np.ndarray,
-    v_loop: np.ndarray,
-    w_pol: np.ndarray,
+def poloidal_energy_rate_on_grid(
+    w_pol_at_reconstructions: np.ndarray, usable: np.ndarray, grid: np.ndarray
 ) -> np.ndarray:
-    """Ohmic power P_oh = Ip V_loop - dW_pol/dt on the reconstruction times.
+    """dW_pol/dt on the grid, averaged over a centered POLOIDAL_ENERGY_RATE_WINDOW boxcar.
 
-    dW_pol/dt is a backward difference, so no sample draws on a later one, and the first sample is NaN.
-    current and v_loop share the reconstruction's sign convention (lcfs_voltage),
-    so their product is positive while the plasma is driven.
+    The backward difference between consecutive usable reconstructions is held until the next one
+    (values_held_from_usable), then averaged, so a step in W_pol is spread over the window rather than one interval.
+    NaN before the second usable reconstruction.
 
     Args:
-        times: (n,) ascending reconstruction times [s].
-        current: (n,) the reconstructed plasma current [A].
-        v_loop: (n,) the loop voltage at the LCFS [V].
-        w_pol: (n,) the poloidal field energy inside the plasma [J].
+        w_pol_at_reconstructions: (n_t,) the poloidal field energy at the usable reconstructions [J], NaN elsewhere.
+        usable: (n_t,) True at the usable reconstructions (usable_reconstructions).
+        grid: (n_t,) the shot's 1 kHz timebase [s].
 
     Returns:
-        (n,) ohmic power [W].
+        (n_t,) dW_pol/dt [W].
     """
-    dw_pol = np.diff(np.asarray(w_pol, dtype=float), prepend=np.nan)
-    dt = np.diff(np.asarray(times, dtype=float), prepend=np.nan)
-    dw_pol_dt = dw_pol / dt
-    return current * v_loop - dw_pol_dt
+    reconstructed = np.flatnonzero(usable)
+    reconstruction_times = grid[reconstructed]
+    w_pol = w_pol_at_reconstructions[reconstructed]
+    dw_pol = np.diff(w_pol, prepend=np.nan)
+    dt = np.diff(reconstruction_times, prepend=np.nan)
+    rate_at_reconstructions = np.full(grid.size, np.nan)
+    rate_at_reconstructions[reconstructed] = dw_pol / dt
+    rate_held = values_held_from_usable(rate_at_reconstructions, usable, grid)
+    rate_averaged = centered_boxcar_mean(
+        rate_held, POLOIDAL_ENERGY_RATE_WINDOW, UNIFORM_TIMEBASE_DT
+    )
+    rate_averaged[np.isnan(rate_held)] = np.nan
+    return rate_averaged
 
 
 POWER_OHM_DESCRIPTION = (
@@ -934,6 +942,7 @@ POWER_OHM_DESCRIPTION = (
     "V_loop = sigma_Bp 2 pi dpsi_boundary/dt at the LCFS, W_pol the poloidal field energy inside the boundary "
     "integrated from psirz, Ip the reconstructed current, backward differences between consecutive usable reconstructions, "
     "held from the last usable reconstruction until the next, "
+    f"dW_pol/dt averaged over a centered {1e3 * POLOIDAL_ENERGY_RATE_WINDOW:.0f} ms boxcar, "
     f"then smoothed by a centered {1e3 * POWER_SMOOTHING_WINDOW:.0f} ms boxcar applied twice (non-causal), clipped at 0"
 )
 
@@ -941,10 +950,11 @@ POWER_OHM_DESCRIPTION = (
 def ohmic_power_on_grid(ds_shot: xr.Dataset, usable: np.ndarray) -> np.ndarray:
     """P_oh on one shot's 1 kHz grid from its GEQDSK block alone, the same way on every device.
 
-    Computed on the usable reconstructions from the block's own
-    psirz, sibdry and current (poloidal_field_energy, lcfs_voltage, ohmic_power),
-    held from the last usable reconstruction until the next like every equilibrium signal (values_held_from_usable),
-    then smoothed non-causally (smoothed_power), as power_radiated is.
+    Ip V_loop and dW_pol/dt come from the usable reconstructions of the block's own psirz, sibdry and current
+    (lcfs_voltage, poloidal_field_energy), each held from the last usable reconstruction until the next
+    like every equilibrium signal (values_held_from_usable).
+    dW_pol/dt is averaged over POLOIDAL_ENERGY_RATE_WINDOW first (poloidal_energy_rate_on_grid),
+    and their difference is smoothed non-causally (smoothed_power), as power_radiated is.
     NaN before the second usable reconstruction, the first a backward difference can be taken at.
 
     Args:
@@ -976,12 +986,17 @@ def ohmic_power_on_grid(ds_shot: xr.Dataset, usable: np.ndarray) -> np.ndarray:
     )
     reconstruction_times = times[reconstructed]
     v_loop = lcfs_voltage(reconstruction_times, sibdry, ds_shot.attrs["cocos"])
-    p_ohm_raw = ohmic_power(
-        reconstruction_times, block["current"].values, v_loop, w_pol
+    # current and v_loop share the reconstruction's sign convention, so their product is positive while driven
+    power_ip_v_loop = block["current"].values * v_loop
+    power_ip_v_loop_at_reconstructions = np.full(times.size, np.nan)
+    power_ip_v_loop_at_reconstructions[reconstructed] = power_ip_v_loop
+    power_ip_v_loop_held = values_held_from_usable(
+        power_ip_v_loop_at_reconstructions, usable, times
     )
-    p_ohm_at_reconstructions = np.full(times.size, np.nan)
-    p_ohm_at_reconstructions[reconstructed] = p_ohm_raw
-    p_ohm_held = values_held_from_usable(p_ohm_at_reconstructions, usable, times)
+    w_pol_at_reconstructions = np.full(times.size, np.nan)
+    w_pol_at_reconstructions[reconstructed] = w_pol
+    dw_pol_dt = poloidal_energy_rate_on_grid(w_pol_at_reconstructions, usable, times)
+    p_ohm_held = power_ip_v_loop_held - dw_pol_dt
     return smoothed_power(p_ohm_held)
 
 

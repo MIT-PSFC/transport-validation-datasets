@@ -101,7 +101,8 @@ The power signals (power_ohm/radiated/nbi/ic/lh/ec) are clipped at zero since so
 (bolometer baseline drift, channel pickup), and no heating or radiated power is physically negative.
 
 Every stored value is causal, no grid time draws on a later sample, with these exceptions:
-power_ohm and power_radiated are smoothed by a centered 5 ms boxcar applied twice (`smoothed_power`, `POWER_SMOOTHING_WINDOW`).
+power_ohm and power_radiated are smoothed by a centered 5 ms boxcar applied twice (`smoothed_power`, `POWER_SMOOTHING_WINDOW`),
+and the dW_pol/dt of power_ohm is first averaged over a centered 10 ms boxcar (`POLOIDAL_ENERGY_RATE_WINDOW`).
 DIII-D's `\bolom::prad_tot` instead comes smoothed at the source by a 50 ms boxcar applied twice and is kept as it is,
 and TCV's `PradTot` reads smooth at its ~17 ms cadence, so it is only held causally, for at least 60 ms over skipped samples.
 TCV's n_e_line_average has the FIR fringe jumps removed from its raw samples, which looks across each jump
@@ -140,8 +141,10 @@ V_loop = sigma_Bp 2 pi dpsi_boundary/dt is the loop voltage at the LCFS from the
 W_pol = (pi / mu0) int |grad psi|^2 / R dR dZ is the poloidal field energy inside the boundary from `psirz`
 (`poloidal_field_energy`, LIUQE's own Wp to 0.1 percent over a TCV shot),
 and Ip is the block's `current`, so the sign convention is the reconstruction's own.
-Both derivatives are backward differences between consecutive usable reconstructions,
-and the result is held like every signal taken from the reconstruction, then smoothed.
+Both derivatives are backward differences between consecutive usable reconstructions, each held like every signal taken from the reconstruction.
+dW_pol/dt is then averaged over a centered 10 ms boxcar on every device (`poloidal_energy_rate_on_grid`),
+since the reconstruction jitter of W_pol, differenced 1 ms apart on DIII-D, is the largest noise of power_ohm,
+and the difference is smoothed like power_radiated.
 No measured loop voltage enters,
 the wall flux loops (C-Mod `mflux:v0`, DIII-D `vloopb`) read 35-55 percent off the LCFS voltage at flattop on some shots.
 n_e_line_average is the IMAS line average, the interferometer line integral over the chord length inside the plasma:
@@ -301,7 +304,8 @@ indicating a large change in the Thomson density calibration.
   A Thomson slice inside a bridged gap maps through no reconstruction (it reaches only `EQ_MATCH_MAX_PERIODS`),
   so the profile before it is held there.
 - **power_ohm is the reconstruction's.** Its loop voltage is the boundary flux derivative of the equilibrium, not a flux loop,
-  so it carries the reconstruction's flux noise (smoothed over 5 ms). Chosen as a reasonable tradeoff for a consistent definition.
+  so it carries the reconstruction's flux noise (dW_pol/dt averaged over 10 ms, the result smoothed over 5 ms).
+  Chosen as a reasonable tradeoff for a consistent definition.
 - **MAST summary signals.** The level 2 summary group is FAIR-MAST's own 1 kHz resampling of ip, n_e_line_average, power_radiated and power_nbi,
   whose causality this package does not verify.
 - **EFIT `pres` goes slightly negative near the edge**, in 60 percent of C-Mod slices, down to ~2 percent of the core pressure.
