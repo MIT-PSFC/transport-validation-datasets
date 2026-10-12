@@ -144,10 +144,11 @@ class CModDataWorkflow(DataWorkflow):
     max_filter = {
         "greenwald_fraction": 2.0,
     }
-    # Only obvious spikes: in the 2026-10 pulls, smoothed over 50 ms, P_oh peaks at 3.4 MW and P_rad at 7.5 MW over the kept data.
+    # Only obvious spikes: in the 2026-10 pulls, smoothed over 5 ms, P_oh peaks at 4.7 MW over the kept data,
+    # and P_rad at 7.8 MW but for 1160930042 (8.8 MW).
     transient_filter = {
         "power_ohm": (6e6, 0.0),
-        "power_radiated": (8e6, 0.0),
+        "power_radiated": (9e6, 0.0),
     }
     # The confinement time (~25 ms) is a sixth of DIII-D's, so W halves within 50 ms of every ICRF turn-off,
     # and low-energy ohmic shots wander by 15 kJ, most of their peak.
