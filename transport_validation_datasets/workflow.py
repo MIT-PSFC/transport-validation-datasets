@@ -69,7 +69,6 @@ from transport_validation_datasets.machine.generic import (
     POLOIDAL_ENERGY_RATE_WINDOW,
     POWER_OHM_DESCRIPTION,
     POWER_SMOOTHING_WINDOW,
-    PROFILE_MAX_HOLD,
     SOL_EXTENSIONS,
     hold_from_usable_reconstructions,
     hold_onto_grid,
@@ -166,6 +165,9 @@ class DeviceSettings:
         te_grad_anchors: Rows of [rho_tor_norm, dTe/drho_tor_norm, error].
         ne_value_anchors: Rows of [rho_tor_norm, ne, error].
         ne_grad_anchors: Rows of [rho_tor_norm, dne/drho_tor_norm, error].
+        profile_max_hold: Longest a fitted profile slice is held forward onto the 1 kHz grid [s].
+            None holds each slice until the next one or the end of the shot,
+            since fresh_profile already separates a fresh profile from a held one.
     """
 
     sol_extension: str = "secant"
@@ -204,11 +206,16 @@ class DeviceSettings:
             [1.6, 0.0, 0.1],
         ]
     )
+    profile_max_hold: float | None = None
 
     def __post_init__(self):
         if self.sol_extension not in SOL_EXTENSIONS:
             raise ValueError(
                 f"sol_extension must be one of {SOL_EXTENSIONS}, got {self.sol_extension!r}"
+            )
+        if self.profile_max_hold is not None and not self.profile_max_hold > 0:
+            raise ValueError(
+                f"profile_max_hold must be positive or None, got {self.profile_max_hold!r}"
             )
         for name in (
             "te_value_anchors",
@@ -1876,7 +1883,7 @@ class DataWorkflow(ABC):
         The store is built beside an existing one and replaces it only once complete.
         TIME_DIM is the ordinal of the unprocessed 1 kHz grid, the TIME_COORD variable carries the times.
         Profiles (one per Thomson sample) and equilibria (on the reconstruction clock) are held forward onto the grid,
-        a profile for at most PROFILE_MAX_HOLD,
+        a profile until the next one (or for at most the device's profile_max_hold),
         the GEQDSK block for at most MAX_HOLD_PERIODS of its clock and at least EQUILIBRIUM_HOLD_FLOOR,
         with fresh_profile and fresh_equilibrium marking the grid times that carry a sample of their own.
         A windowed shotlist keeps only the grid times inside the windows,
@@ -2232,7 +2239,8 @@ class DataWorkflow(ABC):
         The fitted profiles are sampled far more slowly (one per Thomson sample),
         and on some devices the equilibria are too, so both are held forward
         onto the grid and the fresh flags mark which grid times carry a sample of their own.
-        A profile is held for at most PROFILE_MAX_HOLD, the equilibria as _hold_equilibrium holds them.
+        A profile is held until the next one (or for at most the device's profile_max_hold),
+        the equilibria as _hold_equilibrium holds them.
 
         A shot fit with time windows is placed on its full grid first, then
         cut down to the grid times inside the windows, so an equilibrium from
@@ -2291,8 +2299,11 @@ class DataWorkflow(ABC):
                     f"unprocessed file are out of step, refit the shot."
                 )
         else:
+            profile_max_hold = self.settings.profile_max_hold
+            # hold_onto_grid reads None as a hold on the sample clock, so no limit is passed as inf
+            max_hold_time = np.inf if profile_max_hold is None else profile_max_hold
             slice_index, fresh_profile = hold_onto_grid(
-                grid, slice_times, max_hold_time=PROFILE_MAX_HOLD
+                grid, slice_times, max_hold_time=max_hold_time
             )
             if not fresh_profile.any():
                 raise ValueError(
@@ -2468,7 +2479,6 @@ class DataWorkflow(ABC):
                     "bounds": self.fit_bounds,
                     "error_floors": self.error_floors,
                     "max_hold_periods": MAX_HOLD_PERIODS,
-                    "profile_max_hold": PROFILE_MAX_HOLD,
                     "equilibrium_hold_floor": EQUILIBRIUM_HOLD_FLOOR,
                     "power_smoothing_window": POWER_SMOOTHING_WINDOW,
                     "poloidal_energy_rate_window": POLOIDAL_ENERGY_RATE_WINDOW,

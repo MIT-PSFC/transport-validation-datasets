@@ -216,7 +216,7 @@ class TestHoldOntoGrid:
         assert (index[8:13] == 1).all()
 
     def test_max_hold_time_caps_the_hold_whatever_the_period(self):
-        # The profile hold on a 5 ms clock: the 48 ms gap after 12 ms is bridged,
+        # A 100 ms cap on a 5 ms clock: the 48 ms gap after 12 ms is bridged,
         # the 190 ms gap after 60 ms is held 100 ms into, and the last sample holds 100 ms
         grid = grid_ms(400)
         samples = np.array([0.002, 0.007, 0.012, 0.060, 0.250])

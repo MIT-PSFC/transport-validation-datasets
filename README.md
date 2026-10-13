@@ -69,8 +69,10 @@ Profiles are from Thomson scattering and equilibria from a reconstruction,
 both of which can be slower than 1 kHz or missing for certain timesteps,
 so they are held forward over the grid times that follow them
 and `fresh_profile` / `fresh_equilibrium` mark the grid times that carry a sample of their own.
-A profile is held for at most `PROFILE_MAX_HOLD` (100 ms) on every device, whatever its Thomson cadence,
-so dropped slices are bridged and `fresh_profile` tells a fresh profile from a held one.
+A profile is held until the next one or the end of the shot on every device, whatever its Thomson cadence,
+so dropped slices are bridged, no profile is NaN after a shot's first fitted slice,
+and `fresh_profile` alone separates a fresh profile from a held one.
+A device's `profile_max_hold` setting caps the hold instead.
 The GEQDSK block of a reconstruction
 is held for at most `MAX_HOLD_PERIODS` (1.5) periods of the reconstruction clock, or `EQUILIBRIUM_HOLD_FLOOR` (10 ms) when that is longer,
 so a few missing reconstructions do not cut the shot,
@@ -436,6 +438,16 @@ One value for both Te and ne. It is staged and checked like the anchors.
 ```toml
 [mast]
 pedestal_rho_tor_norm = 1.0
+```
+
+Every device table also takes `profile_max_hold`, the longest a fitted profile is held forward onto the 1 kHz grid in seconds.
+Left out, each profile is held until the next one or the end of the shot.
+It only acts at the stack stage, so changing it needs a restack, not a refit,
+and the stores record it in their `device_settings` attribute.
+
+```toml
+[tcv]
+profile_max_hold = 0.1
 ```
 
 Every device table also takes `sol_extension`, how the Thomson channels outside the LCFS are placed in rho_tor_norm.

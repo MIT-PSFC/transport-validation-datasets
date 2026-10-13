@@ -221,11 +221,6 @@ SAMPLE_TIME_TOL = 1e-6
 # low enough that nothing is carried across a real gap: the end of the shot, or a diagnostic dropping out.
 MAX_HOLD_PERIODS = 1.5
 
-# Longest a fitted profile slice is held forward onto the 1 kHz timebase, whatever its cadence [s].
-# Long enough to bridge dropped Thomson slices and burst-mode gaps.
-# fresh_profile marks the slices themselves.
-PROFILE_MAX_HOLD = 100e-3
-
 # Shortest the GEQDSK block of a reconstruction is held in the stores, whatever its clock [s].
 # Bridges the dropouts of single reconstructions
 # (a 1 kHz EFIT failing a few slices, one missing 5 ms MAST reconstruction)
