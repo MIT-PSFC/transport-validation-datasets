@@ -268,7 +268,7 @@ Before those, each device screens its TS channels in `prepare_fit_input`:
 The fit plots color the C-Mod core and edge arrays, the MAST inboard and outboard branches
 and the TCV branches below and above the axis, and mark the dropped C-Mod Te in red.
 
-Stack stage (`_internal_shot_dataset`), per shot:
+Stack stage (`internal_shot_dataset`), per shot:
 
 1. The shots excluded or rejected by the unprocessed stage checks above are left out again.
 2. A slice is dropped (`_usable_slice_mask`) when

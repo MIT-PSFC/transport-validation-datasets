@@ -1901,7 +1901,7 @@ class DataWorkflow(ABC):
             ValueError: If no shot has both an unprocessed data file and a fit
                 result file.
         """
-        shots = self._internal_dataset_shots()
+        shots = self.internal_dataset_shots()
         if not shots:
             raise ValueError(
                 f"No shots have both an unprocessed data file in {self.unprocessed_data_dir} "
@@ -1911,7 +1911,7 @@ class DataWorkflow(ABC):
 
         # Bound every non-episode dimension up front so that no shot ever has to
         # extend the store, which would rewrite the chunks of every shot in it.
-        dim_sizes = self._internal_dataset_dim_sizes(shots)
+        dim_sizes = self.internal_dataset_dim_sizes(shots)
         logger.info(f"Internal dataset dimension bounds: {dim_sizes}")
 
         zarr_path = self.stores_dir / f"{self.ds_name}_internal.zarr"
@@ -1921,7 +1921,7 @@ class DataWorkflow(ABC):
             shutil.rmtree(partial_path)
 
         ds = build_tensorized_dataset(
-            process_fn=self._internal_shot_dataset,
+            process_fn=self.internal_shot_dataset,
             identifiers=shots,
             zarr_path=partial_path,
             time_dim=TIME_DIM,
@@ -1930,7 +1930,7 @@ class DataWorkflow(ABC):
             mb_per_chunk=mb_per_chunk,
         )
         ds.close()
-        self._write_store_provenance(partial_path)
+        self.write_store_provenance(partial_path)
         if zarr_path.exists():
             logger.warning(f"Replacing the existing internal dataset at {zarr_path}")
             shutil.rmtree(zarr_path)
@@ -2022,7 +2022,7 @@ class DataWorkflow(ABC):
                 f"its datasets stop at the internal store, so {stage} is refused"
             )
 
-    def _internal_dataset_shots(self) -> list[int]:
+    def internal_dataset_shots(self) -> list[int]:
         """List the shots that can go into the internal dataset.
 
         Returns:
@@ -2073,7 +2073,7 @@ class DataWorkflow(ABC):
             write_ids,
         )
 
-        shots = self._internal_dataset_shots()
+        shots = self.internal_dataset_shots()
         if not shots:
             logger.warning(
                 "No shots have both unprocessed data and fit results, nothing to export to IMAS"
@@ -2117,7 +2117,7 @@ class DataWorkflow(ABC):
             f"{len(shots) - n_written - n_rejected} already up to date or failed"
         )
 
-    def _internal_dataset_dim_sizes(self, shots: list[int]) -> dict[str, int]:
+    def internal_dataset_dim_sizes(self, shots: list[int]) -> dict[str, int]:
         """Find the largest size of every non-episode dimension over the shots.
 
         Reads only the headers of the files (and the time coordinate of a windowed shot),
@@ -2232,7 +2232,7 @@ class DataWorkflow(ABC):
             return None
         return ds_fit
 
-    def _internal_shot_dataset(self, shot: int) -> xr.Dataset | None:
+    def internal_shot_dataset(self, shot: int) -> xr.Dataset | None:
         """Build one shot's contribution to the internal dataset.
 
         The internal dataset is on the unprocessed dataset's 1 kHz timebase.
@@ -2420,10 +2420,10 @@ class DataWorkflow(ABC):
         }
         return ds_stacked
 
-    def _write_store_provenance(self, zarr_path: Path):
+    def write_store_provenance(self, zarr_path: Path):
         """Add the run's provenance to the root attributes of a finished store.
 
-        Three layers on top of the run attributes _internal_shot_dataset set:
+        Three layers on top of the run attributes internal_shot_dataset set:
         the shots' own provenance (the source package and version that pulled
         each unprocessed file, this package's commit when it did), merged over
         every shot in the store so a key the shots disagree on is recorded as
@@ -2432,7 +2432,7 @@ class DataWorkflow(ABC):
         (build_stamp, build_provenance), and the run configuration (_run_config_attrs).
 
         Args:
-            zarr_path: The internal store, complete and consolidated.
+            zarr_path: A store of the unprocessed shots, the internal store or a device's own, complete and consolidated.
         """
         with xr.open_zarr(zarr_path, consolidated=True) as ds_store:
             shots = [int(shot) for shot in ds_store[EPISODE_DIM].values]
