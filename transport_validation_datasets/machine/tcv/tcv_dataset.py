@@ -102,7 +102,7 @@ DEFUSE_SIGNALS = (
     *(raw_name for raw_names in HEATING_SOURCES_MW.values() for raw_name in raw_names),
 )
 
-# Fringe jumps of the FIR interferometer, removed from the raw NEavg samples (_remove_fringe_jumps).
+# Fringe jumps of the FIR interferometer, removed from the raw NEavg samples (remove_fringe_jumps).
 # Smallest level shift read as a fringe jump [m^-3]. The clean jumps in 185 shots are 1.1-2.5e19.
 FRINGE_JUMP_MIN_M3 = 1e19
 # A fringe jump completes within a few raw samples, and no real density change is that fast.
@@ -506,7 +506,7 @@ def _zero_d_dataset(
 
     Every signal is placed causally (signal_on_grid), never interpolated, so no grid time draws on a later sample,
     PradTot held for at least PRAD_TOT_HOLD_FLOOR_S.
-    The fringe jumps of NEavg are removed from its raw samples first (_remove_fringe_jumps, non-causal).
+    The fringe jumps of NEavg are removed from its raw samples first (remove_fringe_jumps, non-causal).
     The 0D signals of the reconstruction are in _equilibrium_0d_dataset,
     and power_ohm comes from the LIUQE block (DataWorkflow.add_equilibrium_signals).
     Plasma current and toroidal field keep their source sign.
@@ -520,7 +520,7 @@ def _zero_d_dataset(
         Dataset of 0D signals on dim "idx", with "time" and "shot" coords.
     """
     density = signals[ZERO_D_SOURCES["n_e_line_average"]]
-    density_corrected, cut_time = _remove_fringe_jumps(density.time, density.values)
+    density_corrected, cut_time = remove_fringe_jumps(density.time, density.values)
     if cut_time is not None:
         logger.info(
             f"Shot {shot}: the FIR interferometer lost count, NEavg cut from {cut_time:.3f} s"
@@ -637,7 +637,7 @@ def _level_samples(
 
 @dataclass
 class _FringeCorrection:
-    """One episode _remove_fringe_jumps corrected, kept to judge and undo the correction."""
+    """One episode remove_fringe_jumps corrected, kept to judge and undo the correction."""
 
     first: int
     last: int
@@ -701,7 +701,7 @@ def _correction_persists(
     return level_offset <= FRINGE_PERSIST_TOLERANCE * abs(correction.shift)
 
 
-def _remove_fringe_jumps(
+def remove_fringe_jumps(
     sample_time: np.ndarray, density: np.ndarray
 ) -> tuple[np.ndarray, float | None]:
     """The raw NEavg samples with the interferometer fringe jumps removed, non-causally.
