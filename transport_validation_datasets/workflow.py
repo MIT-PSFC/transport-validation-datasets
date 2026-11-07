@@ -13,6 +13,7 @@ from loguru import logger
 
 from transport_validation_datasets import EPISODE_DIM, TIME_COORD, TIME_DIM
 from transport_validation_datasets.cleaning import (
+    CORE_COVERAGE_RHO_TOR_NORM,
     clean_fit_rows,
     drop_rows_without_core,
     low_side_channels,
@@ -388,6 +389,7 @@ class DataWorkflow(ABC):
     # GP fit staging knobs
     fit_rho_tor_norm = np.linspace(0.0, 1.6, 81)
     fit_min_points = 10
+    fit_core_coverage_rho_tor_norm = CORE_COVERAGE_RHO_TOR_NORM
     fit_scale_per_slice = True
     fit_bounds = default_fit_bounds()
     # Per fit variable (fraction, floor) the device raises its Thomson error bars to, in the fit units,
@@ -1307,7 +1309,9 @@ class DataWorkflow(ABC):
                 fit_input = self._apply_windows(shot, fit_input)
                 if fit_input is None:
                     continue
-                shot_inputs[shot] = drop_rows_without_core(fit_input, shot)
+                shot_inputs[shot] = drop_rows_without_core(
+                    fit_input, shot, self.fit_core_coverage_rho_tor_norm
+                )
             if not shot_inputs:
                 continue
             pack_fit_batch(in_path, self._fit_batch(shot_inputs))

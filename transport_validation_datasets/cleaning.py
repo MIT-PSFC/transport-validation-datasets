@@ -400,14 +400,17 @@ def drop_huge_error_readings(
     return te_y, ne_y
 
 
-def drop_rows_without_core(fit_input: ShotFitInput, shot: int) -> ShotFitInput:
-    """Empty every row of a variable whose valid channels all sit outside CORE_COVERAGE_RHO_TOR_NORM.
+def drop_rows_without_core(
+    fit_input: ShotFitInput, shot: int, core_coverage_rho_tor_norm: float
+) -> ShotFitInput:
+    """Empty every row of a variable whose valid channels all sit outside core_coverage_rho_tor_norm.
 
     The worker then skips that variable of that row for too few points.
 
     Args:
         fit_input: The shot's fit input as it is staged, after the windows.
         shot: Shot number, for the log line.
+        core_coverage_rho_tor_norm: Largest rho_tor_norm of a row's innermost channel.
 
     Returns:
         The fit input with those rows NaN in te_y or ne_y.
@@ -421,13 +424,13 @@ def drop_rows_without_core(fit_input: ShotFitInput, shot: int) -> ShotFitInput:
         x_valid = np.where(valid, fit_input.x, np.inf)
         innermost = x_valid.min(axis=1)
         # A row with no valid channel at all is left for the worker's own skip
-        uncovered = valid.any(axis=1) & (innermost > CORE_COVERAGE_RHO_TOR_NORM)
+        uncovered = valid.any(axis=1) & (innermost > core_coverage_rho_tor_norm)
         y_rows[uncovered] = np.nan
         emptied[f"{var}_y"] = y_rows
         counts[var] = int(uncovered.sum())
     if any(counts.values()):
         logger.info(
-            f"Shot {shot}: no channel inside rho_tor_norm {CORE_COVERAGE_RHO_TOR_NORM} "
+            f"Shot {shot}: no channel inside rho_tor_norm {core_coverage_rho_tor_norm} "
             f"in {counts['te']} te and {counts['ne']} ne rows, not fitting them"
         )
     return replace(fit_input, **emptied)
