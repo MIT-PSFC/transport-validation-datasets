@@ -210,6 +210,24 @@ SIGNAL_ATTRS = {
 
 
 @dataclass(frozen=True)
+class TCVSources:
+    """What one TCV shot is built from, in the layouts of the DEFUSE and MEQ readers.
+
+    A workflow reading TCV from another source fills these and overrides TCVDataWorkflow.read_sources,
+    so the grid placement, the GEQDSK block and the merge stay get_source_dataset's.
+
+    Attributes:
+        signals: The 0D signals by DEFUSE name (read_defuse_signals), SI, the heating powers in MW.
+        thomson: The raw Thomson channels, ne calibrated to the FIR interferometer (read_defuse_thomson).
+        liuqe: The LIUQE reconstructions, the fields read_liuqe returns.
+    """
+
+    signals: dict[str, DefuseSignal]
+    thomson: DefuseThomson
+    liuqe: dict[str, np.ndarray]
+
+
+@dataclass(frozen=True)
 class TCVSettings(DeviceSettings):
     """TCV settings, the [tcv] table of the config file.
 
@@ -284,8 +302,32 @@ class TCVDataWorkflow(DataWorkflow):
             )
         return shots
 
+    def read_sources(self, shot: int) -> TCVSources | None:
+        """Read one shot's DEFUSE export and MEQ database, what get_source_dataset builds the shot from.
+
+        A workflow reading TCV from another source overrides this alone.
+
+        Args:
+            shot: Shot number to read.
+
+        Returns:
+            The sources, or None when the shot cannot be read, recorded with record_failed_shot.
+        """
+        defuse_file = defuse_path(self.settings.defuse_dir, shot)
+        meqdb_file = meqdb_path(self.settings.meqdb_dir, shot)
+        if not (defuse_file.exists() and meqdb_file.exists()):
+            self.record_failed_shot(shot, "No DEFUSE export or no MEQ database.")
+            return None
+        signals = read_defuse_signals(defuse_file, DEFUSE_SIGNALS)
+        thomson = read_defuse_thomson(defuse_file)
+        if thomson is None:
+            self.record_failed_shot(shot, "No raw Thomson Te and ne in DEFUSE.")
+            return None
+        liuqe = read_liuqe(meqdb_file)
+        return TCVSources(signals=signals, thomson=thomson, liuqe=liuqe)
+
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
-        """Read one shot from its DEFUSE export and MEQ database into standardized signals.
+        """Read one shot's sources (read_sources) into standardized signals.
 
         The measured 0D signals are placed causally (signal_on_grid, _zero_d_dataset),
         while the LIUQE reconstructions, the 0D signals taken from them (_equilibrium_0d_dataset),
@@ -299,13 +341,10 @@ class TCVDataWorkflow(DataWorkflow):
         Returns:
             The standardized dataset, or None when the shot cannot be built.
         """
-        defuse_file = defuse_path(self.settings.defuse_dir, shot)
-        meqdb_file = meqdb_path(self.settings.meqdb_dir, shot)
-        if not (defuse_file.exists() and meqdb_file.exists()):
-            self.record_failed_shot(shot, "No DEFUSE export or no MEQ database.")
+        sources = self.read_sources(shot)
+        if sources is None:
             return None
-
-        signals = read_defuse_signals(defuse_file, DEFUSE_SIGNALS)
+        signals = sources.signals
         missing = [name for name in REQUIRED_DEFUSE_SIGNALS if name not in signals]
         if missing:
             self.record_failed_shot(shot, f"Missing DEFUSE signals {missing}.")
@@ -320,11 +359,7 @@ class TCVDataWorkflow(DataWorkflow):
         ip_end_time = float(ip.time[mask_ip_valid].max())
         timebase = make_uniform_1kHz_timebase(ip_end_time)
 
-        thomson = read_defuse_thomson(defuse_file)
-        if thomson is None:
-            self.record_failed_shot(shot, "No raw Thomson Te and ne in DEFUSE.")
-            return None
-        ds_thomson_native = _thomson_dataset(shot, thomson, timebase)
+        ds_thomson_native = _thomson_dataset(shot, sources.thomson, timebase)
         has_te = np.isfinite(ds_thomson_native["ts_channel_t_e"].values).any()
         has_ne = np.isfinite(ds_thomson_native["ts_channel_n_e"].values).any()
         if not (has_te and has_ne):
@@ -333,11 +368,9 @@ class TCVDataWorkflow(DataWorkflow):
             )
             return None
 
-        liuqe = read_liuqe(meqdb_file)
+        liuqe = sources.liuqe
         r0 = liuqe["r0"]
         ds_equilibrium_liuqe = liuqe_geqdsk_dataset(liuqe, shot)
-        # The full struct is ~250 MB, only the block is kept
-        del liuqe
         ds_equilibrium = snap_to_grid(ds_equilibrium_liuqe, timebase)
         ds_equilibrium_0d = _equilibrium_0d_dataset(
             shot, signals, ds_equilibrium, timebase

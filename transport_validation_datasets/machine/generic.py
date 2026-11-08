@@ -1287,21 +1287,26 @@ def values_held_from_usable(
     return _take_held(values_at_reconstructions, reconstruction_index)
 
 
-def hold_from_usable_reconstructions(ds: xr.Dataset, usable: np.ndarray) -> xr.Dataset:
-    """Hold the 0D signals taken from the reconstruction (EQUILIBRIUM_0D_SIGNALS) from the last usable one, with no limit.
+def hold_from_usable_reconstructions(
+    ds: xr.Dataset,
+    usable: np.ndarray,
+    names: tuple[str, ...] = EQUILIBRIUM_0D_SIGNALS,
+) -> xr.Dataset:
+    """Hold signals taken from the reconstruction from the last usable one, with no limit.
 
     See values_held_from_usable.
 
     Args:
         ds: One shot's standardized dataset on its 1 kHz grid. Modified in place.
-            Signals of EQUILIBRIUM_0D_SIGNALS it lacks are skipped.
         usable: (n_t,) True at the usable reconstructions (usable_reconstructions).
+        names: The signals to hold, EQUILIBRIUM_0D_SIGNALS unless a device holds more.
+            Signals ds lacks are skipped.
 
     Returns:
         The same dataset.
     """
     grid = np.asarray(ds[TIME_COORD].values, dtype=float)
-    for name in EQUILIBRIUM_0D_SIGNALS:
+    for name in names:
         if name not in ds:
             continue
         signal = ds[name].transpose(..., TIME_COORD)

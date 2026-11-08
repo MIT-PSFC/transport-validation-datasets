@@ -136,7 +136,7 @@ def _is_placeholder(dataset: h5py.Dataset) -> bool:
     return is_empty or not is_floating
 
 
-def _unique_finite_times(time: np.ndarray) -> np.ndarray:
+def unique_finite_times(time: np.ndarray) -> np.ndarray:
     """Indices that sort the finite times and drop repeats, since placing onto the timebase needs increasing times.
 
     Args:
@@ -187,7 +187,7 @@ def _read_signal(group: h5py.Group, name: str) -> DefuseSignal | None:
     mask_any_finite = np.isfinite(values_rows).any(axis=0)
     values_summed = np.nansum(values_rows, axis=0)
     values = np.where(mask_any_finite, values_summed, np.nan)
-    idx_keep = _unique_finite_times(time)
+    idx_keep = unique_finite_times(time)
     return DefuseSignal(time=time[idx_keep], values=values[idx_keep])
 
 
@@ -286,7 +286,7 @@ def read_defuse_thomson(path: Path) -> DefuseThomson | None:
     if not same_layout:
         logger.warning(f"{path.name}: Te and ne raw Thomson disagree on their layout")
         return None
-    idx_keep = _unique_finite_times(te_time)
+    idx_keep = unique_finite_times(te_time)
     return DefuseThomson(
         time=te_time[idx_keep],
         r_channel=te_r,
