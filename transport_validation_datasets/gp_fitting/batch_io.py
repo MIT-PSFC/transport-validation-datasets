@@ -12,7 +12,7 @@ Ships to the cluster with the worker, must adhere to import rules in gp_fitting/
 
 import json
 import os
-import tempfile
+import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -515,11 +515,9 @@ def atomic_write(path: Path | str, write: Callable[[Path], object]):
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp"
-    )
+    tmp_path = path.parent / f"{path.name}.{uuid.uuid4().hex}.tmp"
+    tmp_fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     os.close(tmp_fd)
-    tmp_path = Path(tmp_name)
     try:
         write(tmp_path)
         os.replace(tmp_path, path)

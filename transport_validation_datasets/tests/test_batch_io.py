@@ -1,4 +1,6 @@
-"""The fit settings a staged batch is compared on."""
+"""The fit settings a staged batch is compared on, and the mode of an atomic write."""
+
+import os
 
 import numpy as np
 
@@ -7,6 +9,7 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     FitBatch,
     FitBounds,
     ShotFitInput,
+    atomic_write,
     batch_settings,
     fit_batch_settings,
     pack_fit_batch,
@@ -57,3 +60,17 @@ def test_staged_settings_match_the_batch_and_a_changed_knob_does_not(tmp_path):
     changed_settings = fit_batch_settings(changed)
     differing = [key for key in settings if changed_settings[key] != settings[key]]
     assert differing == ["bounds"]
+
+
+def test_atomic_write_mode_matches_plain_write(tmp_path):
+    # Under umask 022 a plain write gives 0o644, mkstemp's temporary would leave 0o600
+    umask_before = os.umask(0o022)
+    try:
+        plain_path = tmp_path / "plain.txt"
+        plain_path.write_text("x")
+        atomic_path = tmp_path / "atomic.txt"
+        atomic_write(atomic_path, lambda tmp_file: tmp_file.write_text("x"))
+    finally:
+        os.umask(umask_before)
+    assert atomic_path.stat().st_mode == plain_path.stat().st_mode
+    assert list(tmp_path.glob("*.tmp")) == []
