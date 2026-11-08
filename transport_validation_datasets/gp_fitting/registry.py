@@ -54,10 +54,16 @@ def load_worker(method: str) -> ModuleType:
     return importlib.import_module(worker_module(method))
 
 
-def run_batch_file(method: str, input_path: Path | str, output_path: Path | str):
-    """Fit one staged batch file in this process, one slice at a time, writing its result file.
+def run_batch_file(
+    method: str,
+    input_path: Path | str,
+    output_path: Path | str,
+    num_workers: int = 1,
+):
+    """Fit one staged batch file from this process, writing its result file.
 
-    Serial and in-process, so a breakpoint in a worker stops there.
+    With one worker the slices are fit serially in this process, so a breakpoint in a worker stops there.
+    More workers fit them across worker processes, as a cluster job does.
     It reads the same staged npz a cluster job would,
     so the fits match a cluster run's as far as the numpy and scipy builds agree
     (bootstrap_remote.sh pins the cluster's versions).
@@ -69,10 +75,11 @@ def run_batch_file(method: str, input_path: Path | str, output_path: Path | str)
         method: Fitting method name.
         input_path: Batch input npz.
         output_path: Batch result npz to write.
+        num_workers: Slice-level worker processes, 1 fits serially in this process.
     """
     from transport_validation_datasets.gp_fitting import batch_io
 
     worker = load_worker(method)
     batch = batch_io.unpack_fit_batch(input_path)
-    outputs = worker.fit_batch(batch, num_workers=1)
+    outputs = worker.fit_batch(batch, num_workers=num_workers)
     batch_io.pack_fit_results(output_path, outputs, batch.x_star)

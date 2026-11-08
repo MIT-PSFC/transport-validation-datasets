@@ -169,6 +169,8 @@ class DeviceSettings:
         profile_max_hold: Longest a fitted profile slice is held forward onto the 1 kHz grid [s].
             None holds each slice until the next one or the end of the shot,
             since fresh_profile already separates a fresh profile from a held one.
+        local_fit_workers: Worker processes a local fit spreads each batch's slices over,
+            1 fits them serially in this process. Cluster fits use ClusterFitConfig instead.
     """
 
     sol_extension: str = "secant"
@@ -208,6 +210,7 @@ class DeviceSettings:
         ]
     )
     profile_max_hold: float | None = None
+    local_fit_workers: int = 1
 
     def __post_init__(self):
         if self.sol_extension not in SOL_EXTENSIONS:
@@ -217,6 +220,10 @@ class DeviceSettings:
         if self.profile_max_hold is not None and not self.profile_max_hold > 0:
             raise ValueError(
                 f"profile_max_hold must be positive or None, got {self.profile_max_hold!r}"
+            )
+        if self.local_fit_workers < 1:
+            raise ValueError(
+                f"local_fit_workers must be at least 1, got {self.local_fit_workers!r}"
             )
         for name in (
             "te_value_anchors",
@@ -440,7 +447,7 @@ class DataWorkflow(ABC):
                 None takes the first of fit_methods.
             cluster_config: If provided, GP profile fitting is dispatched to a SLURM
                 cluster (see gp_fitting/dispatcher.py).
-                If None, fitting runs serially in this process (registry.run_batch_file).
+                If None, fitting runs from this process on the settings' local_fit_workers (registry.run_batch_file).
             prepare_workers: Threads used to stage source data. None takes the
                 device's default_prepare_workers.
             settings: The device's settings, an instance of its settings_cls
@@ -1480,7 +1487,7 @@ class DataWorkflow(ABC):
         return self.fit_batches_dir / f"batch_{batch_id}_out_{self.fit_method}.npz"
 
     def _fit_batches_local(self, batches: dict[str, list[int]]):
-        """Fit staged batches serially in this process, one at a time.
+        """Fit staged batches from this process, one batch at a time, on the settings' local_fit_workers.
 
         A worker error stops the run where it was raised, so a debugger lands on it.
 
@@ -1496,7 +1503,12 @@ class DataWorkflow(ABC):
                 f"({i + 1}/{len(batches)})"
             )
             in_path = self._batch_in_path(batch_id)
-            registry.run_batch_file(self.fit_method, in_path, out_path)
+            registry.run_batch_file(
+                self.fit_method,
+                in_path,
+                out_path,
+                num_workers=self.settings.local_fit_workers,
+            )
 
     def write_fit_results(self):
         """Write every batch's fit results out as one netCDF per shot.
