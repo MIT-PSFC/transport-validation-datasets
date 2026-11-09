@@ -47,13 +47,16 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     FitBatch,
     ShotFitInput,
     ShotFitOutput,
+    UnprocessedStamp,
     atomic_write,
     batch_settings,
     default_fit_bounds,
     fit_batch_settings,
     pack_fit_batch,
     read_batch_shots,
+    read_batch_unprocessed_stamps,
     read_batch_windows,
+    rewrite_batch_unprocessed_stamps,
     staged_batch_paths,
     unpack_fit_batch,
     unpack_fit_results,
@@ -90,6 +93,7 @@ from transport_validation_datasets.provenance import (
     SOURCE_VOLATILE_KEYS,
     build_provenance,
     build_stamp,
+    file_digest,
     merge_shot_attrs,
     pull_provenance,
     source_provenance,
@@ -123,6 +127,8 @@ RHO_TOR_NORM_DEFINITION = (
 # The fit grid runs past this so every anchor is fit and plotted.
 # The fit files, the stores and the IMAS export keep only the grid up to here.
 STORED_RHO_TOR_NORM_MAX = 1.1
+# Second radial dim of a fit's error correlation matrix, the same points as rho_tor_norm
+CORRELATION_RHO_DIM = "rho_tor_norm_correlated"
 
 # How _check_batch names the batch_io.fit_batch_settings keys in its messages, the rest go by their key
 FIT_SETTING_NAMES = {
@@ -1225,6 +1231,8 @@ class DataWorkflow(ABC):
             f"in fit mode '{self.fit_mode}'"
         )
 
+        # A shot whose unprocessed file changed since staging is staged again, before any batch is checked or planned
+        self._restage_changed_shots()
         # Checked before any fitting, so a stale dataset fails before it costs anything
         self._check_staged_batches()
 
@@ -1313,7 +1321,9 @@ class DataWorkflow(ABC):
                 batches[batch_id] = batch_shots
                 continue
             shot_inputs = {}
+            unprocessed_stamps = {}
             for shot in batch_shots:
+                unprocessed_stamps[shot] = self._unprocessed_stamp(shot)
                 with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds:
                     fit_input = self.prepare_fit_input(shot, ds)
                 if fit_input is None or not fit_input.has_fittable_points():
@@ -1335,10 +1345,123 @@ class DataWorkflow(ABC):
                 )
             if not shot_inputs:
                 continue
-            pack_fit_batch(in_path, self._fit_batch(shot_inputs))
+            pack_fit_batch(in_path, self._fit_batch(shot_inputs), unprocessed_stamps)
             batches[batch_id] = sorted(shot_inputs)
             logger.info(f"Staged batch {batch_id} with {len(shot_inputs)} shots")
         return batches
+
+    def _unprocessed_stamp(self, shot: int) -> UnprocessedStamp:
+        """The data digest and modification time of a shot's unprocessed file.
+
+        Args:
+            shot: Shot number, with an unprocessed file.
+
+        Returns:
+            Its stamp.
+        """
+        unprocessed_path = self.unprocessed_data_dir / f"{shot}.nc"
+        mtime_ns = unprocessed_path.stat().st_mtime_ns
+        digest = file_digest(unprocessed_path)
+        return UnprocessedStamp(digest=digest, mtime_ns=mtime_ns)
+
+    def _unprocessed_changed(self, shot: int, stamp: UnprocessedStamp) -> bool:
+        """Whether a shot's unprocessed file holds other data than the stamp it was staged from.
+
+        A file with the stamp's modification time is taken as unchanged without reading it.
+        A shot whose file is gone is left alone until it is written again.
+
+        Args:
+            shot: Shot number.
+            stamp: What the shot was staged from.
+
+        Returns:
+            True when the file's data digest differs from the stamp's.
+        """
+        unprocessed_path = self.unprocessed_data_dir / f"{shot}.nc"
+        if not unprocessed_path.exists():
+            return False
+        if unprocessed_path.stat().st_mtime_ns == stamp.mtime_ns:
+            return False
+        digest = file_digest(unprocessed_path)
+        return digest != stamp.digest
+
+    def _restage_changed_shots(self):
+        """Drop the staged fits of the shots whose unprocessed file changed since staging, so this run stages and fits them again.
+
+        A batch with a changed shot loses its input, its result, and the fit files and fit plots of all its shots,
+        so the batch is planned again and nothing of the old fit is written or kept.
+        A local batch is one shot (LOCAL_SHOTS_PER_BATCH), so only that shot refits.
+        A shot rewritten with the same data, as when only attributes change, refits nothing:
+        its batch gets the new modification time, so the next run does not read the file again.
+        A note of a failed staging older than its shot's unprocessed file goes too, so the shot is tried again.
+
+        Raises:
+            ValueError: If a cluster batch holds a changed shot, since its old result may still sit on the cluster.
+        """
+        for in_path in staged_batch_paths(self.fit_batches_dir):
+            batch_id = in_path.stem.removeprefix("batch_")
+            unprocessed_stamps = read_batch_unprocessed_stamps(in_path)
+            shots_changed = [
+                shot
+                for shot, stamp in unprocessed_stamps.items()
+                if self._unprocessed_changed(shot, stamp)
+            ]
+            if not shots_changed:
+                self._refresh_unprocessed_mtimes(in_path, unprocessed_stamps)
+                continue
+            if self.cluster_config is not None:
+                raise ValueError(
+                    f"Batch {batch_id}: the unprocessed files of shots {shots_changed} changed since staging, "
+                    "and its old result may still be on the cluster. Rerun with --clean_fit_state."
+                )
+            logger.info(
+                f"Batch {batch_id}: the unprocessed files of shots {shots_changed} changed since staging, "
+                "staging and fitting it again"
+            )
+            out_path = self._batch_out_path(batch_id)
+            in_path.unlink()
+            out_path.unlink(missing_ok=True)
+            for shot in unprocessed_stamps:
+                (self.fit_shots_dir / f"{shot}.nc").unlink(missing_ok=True)
+                (self.fit_plots_dir / f"{shot}.pdf").unlink(missing_ok=True)
+        if not self.failed_fits_dir.exists():
+            return
+        for note_path in sorted(self.failed_fits_dir.glob("*.txt")):
+            unprocessed_path = self.unprocessed_data_dir / f"{note_path.stem}.nc"
+            if not unprocessed_path.exists():
+                continue
+            unprocessed_mtime_ns = unprocessed_path.stat().st_mtime_ns
+            if unprocessed_mtime_ns > note_path.stat().st_mtime_ns:
+                logger.info(
+                    f"Shot {note_path.stem}: its unprocessed file is newer than its failed staging, staging it again"
+                )
+                note_path.unlink()
+
+    def _refresh_unprocessed_mtimes(
+        self, in_path: Path, unprocessed_stamps: dict[int, UnprocessedStamp]
+    ):
+        """Record the present modification times of a batch's unchanged unprocessed files, so later runs skip their digest.
+
+        Left out on a cluster run, whose dispatcher owns the batch inputs.
+
+        Args:
+            in_path: The batch input npz.
+            unprocessed_stamps: Per shot the stamp it was staged from, its data unchanged.
+        """
+        if self.cluster_config is not None:
+            return
+        stamps_now = {}
+        for shot, stamp in unprocessed_stamps.items():
+            unprocessed_path = self.unprocessed_data_dir / f"{shot}.nc"
+            if not unprocessed_path.exists():
+                continue
+            mtime_ns = unprocessed_path.stat().st_mtime_ns
+            if mtime_ns != stamp.mtime_ns:
+                stamps_now[shot] = UnprocessedStamp(
+                    digest=stamp.digest, mtime_ns=mtime_ns
+                )
+        if stamps_now:
+            rewrite_batch_unprocessed_stamps(in_path, stamps_now)
 
     def _batch_plan_name(self) -> str:
         """Name the batch ids are hashed from.
@@ -1694,6 +1817,7 @@ class DataWorkflow(ABC):
         )
         data_vars = {}
         has_hyps = False
+        has_correlation = False
         for var, si_factor, name, unit, desc in (
             ("te", 1.0e3, "t_e", "eV", "electron temperature"),
             ("ne", 1.0e20, "n_e", "m^-3", "electron density"),
@@ -1731,6 +1855,31 @@ class DataWorkflow(ABC):
                 np.asarray(getattr(so, f"{var}_status"), dtype=np.int8)[None],
                 status_attrs,
             )
+            cov = getattr(so, f"{var}_cov")
+            if cov is not None:
+                has_correlation = True
+                latent_error, error_correlation = _latent_error_and_correlation(
+                    cov[:, stored][:, :, stored]
+                )
+                latent_error_si = latent_error * si_factor
+                data_vars[f"{name}_latent_error"] = (
+                    ("shot", TIME_DIM, "rho_tor_norm"),
+                    latent_error_si[None].astype(np.float32),
+                    {
+                        "description": f"1-sigma latent uncertainty of the GP-fitted {desc} profile ({fit_description}), "
+                        "the channel errors left out",
+                        "units": unit,
+                    },
+                )
+                data_vars[f"{name}_error_correlation"] = (
+                    ("shot", TIME_DIM, "rho_tor_norm", CORRELATION_RHO_DIM),
+                    error_correlation[None].astype(np.float32),
+                    {
+                        "description": f"Correlation between two radii of the latent errors of the GP-fitted {desc} profile, "
+                        f"the covariance being this times {name}_latent_error at both radii",
+                        "units": "1",
+                    },
+                )
             hyps = getattr(so, f"{var}_hyps")
             if hyps is not None:
                 has_hyps = True
@@ -1762,6 +1911,14 @@ class DataWorkflow(ABC):
         }
         if has_hyps and hyp_names is not None:
             coords["hyperparameter"] = list(hyp_names)
+        if has_correlation:
+            coords[CORRELATION_RHO_DIM] = (
+                CORRELATION_RHO_DIM,
+                x_star[stored],
+                {
+                    "description": "rho_tor_norm of the second index of an error correlation"
+                },
+            )
         attrs = {
             "fit_method": self.fit_method,
             "fit_mode": self.fit_mode,
@@ -2186,7 +2343,13 @@ class DataWorkflow(ABC):
                 shot_sizes = {
                     dim: size
                     for dim, size in ds_fit.sizes.items()
-                    if dim not in (EPISODE_DIM, TIME_DIM, "hyperparameter")
+                    if dim
+                    not in (
+                        EPISODE_DIM,
+                        TIME_DIM,
+                        "hyperparameter",
+                        CORRELATION_RHO_DIM,
+                    )
                 }
             with xr.open_dataset(self.unprocessed_data_dir / f"{shot}.nc") as ds_shot:
                 shot_sizes.update(
@@ -2262,7 +2425,9 @@ class DataWorkflow(ABC):
             return None
         return ds_fit
 
-    def internal_shot_dataset(self, shot: int) -> xr.Dataset | None:
+    def internal_shot_dataset(
+        self, shot: int, with_error_correlation: bool = False
+    ) -> xr.Dataset | None:
         """Build one shot's contribution to the internal dataset.
 
         The internal dataset is on the unprocessed dataset's 1 kHz timebase.
@@ -2277,9 +2442,12 @@ class DataWorkflow(ABC):
         just before a window still fills its first milliseconds.
         Per-sample fits are never held across a window boundary.
         A window-averaged profile fills its whole window, fresh at the window center.
+        A fit's error correlation (n_x x n_x per slice) is held with its profile only when asked for,
+        it would dominate the store.
 
         Args:
             shot: Shot number.
+            with_error_correlation: Keep the fits' <name>_error_correlation on (time, rho_tor_norm, CORRELATION_RHO_DIM).
 
         Returns:
             The shot's dataset, or None when _usable_shot_fit rejects it.
@@ -2303,6 +2471,8 @@ class DataWorkflow(ABC):
         # the store, where it would be the only string-labelled dimension
         if "hyperparameter" in ds_fit.dims:
             ds_fit = ds_fit.drop_dims("hyperparameter", errors="ignore")
+        if not with_error_correlation and CORRELATION_RHO_DIM in ds_fit.dims:
+            ds_fit = ds_fit.drop_dims(CORRELATION_RHO_DIM)
         slice_times = np.asarray(
             ds_fit[TIME_COORD].squeeze(EPISODE_DIM, drop=True).values, dtype=float
         )
@@ -2709,6 +2879,32 @@ def _usable_slice_mask(ds_fit: xr.Dataset) -> np.ndarray:
             f"fitted slices unusable, per check {rejected_counts}"
         )
     return ~unusable_any
+
+
+def _latent_error_and_correlation(
+    cov: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """A fit's latent covariance as its std and its correlation matrix.
+
+    The two keep float32 in range, where a density covariance in m^-6 would not.
+    A point of zero variance (an anchored one) correlates with nothing but itself.
+
+    Args:
+        cov: (n_t, n_x, n_x) latent covariances, NaN for a slice that was not fit.
+
+    Returns:
+        ((n_t, n_x) std, (n_t, n_x, n_x) correlation).
+    """
+    variance = np.diagonal(cov, axis1=1, axis2=2)
+    std = np.sqrt(np.clip(variance, 0.0, None))
+    std_outer = std[:, :, np.newaxis] * std[:, np.newaxis, :]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        correlation = cov / std_outer
+    identity = np.eye(cov.shape[1], dtype=bool)
+    mask_degenerate = std_outer <= 0.0
+    correlation = np.where(mask_degenerate & ~identity, 0.0, correlation)
+    correlation = np.where(mask_degenerate & identity, 1.0, correlation)
+    return std, correlation
 
 
 def _hold_fits_onto_grid(ds_fit: xr.Dataset, slice_index: np.ndarray) -> xr.Dataset:

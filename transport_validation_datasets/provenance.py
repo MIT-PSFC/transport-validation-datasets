@@ -8,9 +8,12 @@ source_* attributes with the parts that cannot be trusted replaced (see
 SOURCE_ATTR_KEYS). Every value is a string or a JSON string, so the same
 attributes land in netCDF and Zarr alike, and merge_shot_attrs combines the
 attributes of many shots into one set that says where they disagree.
+dataset_digest fingerprints a file's data, its attributes left out,
+so a stage can tell a changed input from one only rewritten.
 """
 
 import dataclasses
+import hashlib
 import importlib.metadata
 import json
 import platform
@@ -21,6 +24,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+import xarray as xr
 from loguru import logger
 
 PACKAGE = "transport_validation_datasets"
@@ -316,3 +320,45 @@ def merge_shot_attrs(
             )
             merged[key] = to_json(values)
     return merged
+
+
+def dataset_digest(ds: xr.Dataset) -> str:
+    """SHA-256 over the names, dims, dtypes and values of a dataset's variables and coordinates.
+
+    Attributes are left out, so a rewrite that only changes provenance keeps the digest.
+
+    Args:
+        ds: The dataset.
+
+    Returns:
+        The digest, as hex.
+    """
+    digest = hashlib.sha256()
+    for name in sorted(ds.variables):
+        variable = ds.variables[name]
+        values = variable.values
+        header = f"{name}\0{variable.dims}\0{values.dtype}\0"
+        header_bytes = header.encode()
+        digest.update(header_bytes)
+        # Strings are objects in memory, their bytes would be pointers
+        if values.dtype.kind in "OSU":
+            values_text = "\0".join(str(value) for value in values.ravel())
+            values_bytes = values_text.encode()
+        else:
+            values_contiguous = np.ascontiguousarray(values)
+            values_bytes = values_contiguous.tobytes()
+        digest.update(values_bytes)
+    return digest.hexdigest()
+
+
+def file_digest(path: Path) -> str:
+    """dataset_digest of a netCDF file.
+
+    Args:
+        path: The file.
+
+    Returns:
+        The digest, as hex.
+    """
+    with xr.open_dataset(path) as ds_file:
+        return dataset_digest(ds_file)

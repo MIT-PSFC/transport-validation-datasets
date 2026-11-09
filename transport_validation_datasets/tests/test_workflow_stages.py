@@ -9,6 +9,7 @@ so every stage runs in well under a second and the fitted profiles are predictab
 """
 
 import json
+import os
 from collections.abc import Callable
 
 import numpy as np
@@ -23,6 +24,8 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     FIT_MODE_WINDOW_SAMPLE,
     STATUS_OK,
     ShotFitInput,
+    read_batch_unprocessed_stamps,
+    staged_batch_paths,
     unpack_fit_batch,
 )
 from transport_validation_datasets.machine.generic import (
@@ -258,6 +261,19 @@ def make_workflow(tmp_path, shots=None, windows=None, **kwargs) -> DummyWorkflow
         fit_method="linear",
         **kwargs,
     )
+
+
+def _rewrite_unprocessed(workflow: DummyWorkflow, shot: int, te_factor: float) -> int:
+    # The shot's unprocessed file written again with its Te scaled and a new attribute, a second later
+    unprocessed_path = workflow.unprocessed_data_dir / f"{shot}.nc"
+    mtime_ns_before = unprocessed_path.stat().st_mtime_ns
+    ds_unprocessed = xr.load_dataset(unprocessed_path)
+    ds_unprocessed["ts_channel_t_e"] = ds_unprocessed["ts_channel_t_e"] * te_factor
+    ds_unprocessed.attrs["rewritten"] = "yes"
+    ds_unprocessed.to_netcdf(unprocessed_path)
+    mtime_ns_after = mtime_ns_before + 1_000_000_000
+    os.utime(unprocessed_path, ns=(mtime_ns_after, mtime_ns_after))
+    return mtime_ns_after
 
 
 def run_all(workflow: DummyWorkflow) -> xr.Dataset:
@@ -691,6 +707,41 @@ class TestRunGpFitting:
 
         assert [p.stat().st_mtime_ns for p in outputs + fits] == before
 
+    def test_shot_with_changed_unprocessed_data_refit(self, tmp_path):
+        # Only the changed shot refits, a local batch is one shot
+        workflow = make_workflow(tmp_path)
+        workflow.make_unprocessed_data_files()
+        workflow.run_gp_fitting()
+        fit_path_unchanged = workflow.fit_shots_dir / "2.nc"
+        mtime_unchanged = fit_path_unchanged.stat().st_mtime_ns
+        with xr.open_dataset(workflow.fit_shots_dir / "1.nc") as ds_fit:
+            te_before = ds_fit["t_e"].values
+        _rewrite_unprocessed(workflow, 1, te_factor=2.0)
+
+        workflow.run_gp_fitting()
+
+        with xr.open_dataset(workflow.fit_shots_dir / "1.nc") as ds_fit:
+            te_after = ds_fit["t_e"].values
+        mask_fitted = np.isfinite(te_before) & (te_before > 0.0)
+        assert np.allclose(te_after[mask_fitted], 2.0 * te_before[mask_fitted])
+        assert fit_path_unchanged.stat().st_mtime_ns == mtime_unchanged
+
+    def test_shot_rewritten_with_same_data_not_refit(self, tmp_path):
+        # A new attribute changes the file but not its data, so the batch only takes the new time
+        workflow = make_workflow(tmp_path, shots=[1])
+        workflow.make_unprocessed_data_files()
+        workflow.run_gp_fitting()
+        out_paths = sorted(workflow.fit_batches_dir.glob("*_out_linear.npz"))
+        mtime_out = out_paths[0].stat().st_mtime_ns
+        unprocessed_mtime_ns = _rewrite_unprocessed(workflow, 1, te_factor=1.0)
+
+        workflow.run_gp_fitting()
+
+        assert out_paths[0].stat().st_mtime_ns == mtime_out
+        in_paths = staged_batch_paths(workflow.fit_batches_dir)
+        stamps = read_batch_unprocessed_stamps(in_paths[0])
+        assert stamps[1].mtime_ns == unprocessed_mtime_ns
+
     def test_clean_fit_state_removes_batches_and_results(self, tmp_path):
         workflow = make_workflow(tmp_path)
         workflow.make_unprocessed_data_files()
@@ -898,3 +949,23 @@ class TestStackInternalDataset:
             edited.run_gp_fitting()
         with pytest.raises(ValueError, match="other time windows"):
             edited.stack_internal_dataset()
+
+
+def test_latent_error_and_correlation_rebuild_covariance():
+    # One slice of a smooth covariance with an anchored, zero-variance point at the end, one slice not fit
+    from transport_validation_datasets.workflow import _latent_error_and_correlation
+
+    x = np.linspace(0.0, 1.0, 6)
+    std_true = 0.1 + 0.2 * x
+    std_true[-1] = 0.0
+    distance = x[:, np.newaxis] - x[np.newaxis, :]
+    correlation_true = np.exp(-0.5 * (distance / 0.4) ** 2)
+    cov_fit = std_true[:, np.newaxis] * std_true[np.newaxis, :] * correlation_true
+    cov_not_fit = np.full_like(cov_fit, np.nan)
+    cov = np.stack([cov_fit, cov_not_fit])
+    std, correlation = _latent_error_and_correlation(cov)
+    rebuilt = std[0][:, np.newaxis] * std[0][np.newaxis, :] * correlation[0]
+    np.testing.assert_allclose(rebuilt, cov_fit, atol=1e-15)
+    np.testing.assert_allclose(np.diagonal(correlation[0]), 1.0)
+    np.testing.assert_array_equal(correlation[0][-1, :-1], 0.0)
+    assert np.isnan(std[1]).all()

@@ -170,6 +170,21 @@ class FitBatch:
     error_floors: dict[str, tuple[float, float]] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class UnprocessedStamp:
+    """The unprocessed file a shot was staged from, so a changed file restages the shot.
+
+    Workers never read it.
+
+    Attributes:
+        digest: The file's data digest, its attributes left out (provenance.file_digest), hex.
+        mtime_ns: The file's modification time [ns], which spares the digest while it holds.
+    """
+
+    digest: str
+    mtime_ns: int
+
+
 @dataclass
 class ShotFitOutput:
     """GP-fitted profiles for one shot.
@@ -181,6 +196,8 @@ class ShotFitOutput:
     The status arrays are (n_t,) int8 STATUS_* codes.
     The hyps arrays are optional method diagnostics ((n_t, n_hyp), NaN where a slice
     was not fit at optimized hyperparameters) workers that have none leave them as None.
+    The cov arrays are the optional (n_t, n_x, n_x) latent posterior covariances of the profiles,
+    NaN for a slice that was not fit, None from a method that gives none.
     """
 
     te_fit: np.ndarray
@@ -196,6 +213,8 @@ class ShotFitOutput:
     time: np.ndarray
     te_hyps: np.ndarray | None = None
     ne_hyps: np.ndarray | None = None
+    te_cov: np.ndarray | None = None
+    ne_cov: np.ndarray | None = None
 
     @classmethod
     def empty(cls, n_t: int, n_x: int, time: np.ndarray) -> "ShotFitOutput":
@@ -224,12 +243,17 @@ class ShotFitOutput:
         )
 
 
-def pack_fit_batch(path: Path | str, batch: FitBatch):
+def pack_fit_batch(
+    path: Path | str,
+    batch: FitBatch,
+    unprocessed_stamps: dict[int, UnprocessedStamp],
+):
     """Write a batch of shot fit inputs to a single npz file (atomically).
 
     Args:
         path: Destination npz path.
         batch: Batch to write.
+        unprocessed_stamps: Per shot of the batch, the unprocessed file it was staged from.
     """
     arrays = {
         "shots": np.array(sorted(batch.shot_inputs), dtype=np.int64),
@@ -261,6 +285,9 @@ def pack_fit_batch(path: Path | str, batch: FitBatch):
         arrays[f"{shot}:ne_err"] = np.asarray(si.ne_err, dtype=np.float32)
         arrays[f"{shot}:windows"] = np.asarray(si.windows, dtype=np.float64)
         arrays[f"{shot}:window_index"] = np.asarray(si.window_index, dtype=np.int64)
+        stamp = unprocessed_stamps[shot]
+        arrays[f"{shot}:unprocessed_digest"] = np.str_(stamp.digest)
+        arrays[f"{shot}:unprocessed_mtime_ns"] = np.int64(stamp.mtime_ns)
     atomic_write(path, lambda tmp_path: _savez(tmp_path, arrays))
 
 
@@ -397,6 +424,42 @@ def read_batch_windows(path: Path | str) -> dict[int, np.ndarray]:
         return {shot: data[f"{shot}:windows"] for shot in data["shots"].tolist()}
 
 
+def read_batch_unprocessed_stamps(path: Path | str) -> dict[int, UnprocessedStamp]:
+    """Read only the unprocessed file each shot of a batch input npz was staged from (cheap).
+
+    Args:
+        path: Batch input npz path.
+
+    Returns:
+        Per shot its UnprocessedStamp.
+    """
+    with np.load(path) as data:
+        return {
+            shot: UnprocessedStamp(
+                digest=str(data[f"{shot}:unprocessed_digest"]),
+                mtime_ns=int(data[f"{shot}:unprocessed_mtime_ns"]),
+            )
+            for shot in data["shots"].tolist()
+        }
+
+
+def rewrite_batch_unprocessed_stamps(
+    path: Path | str, unprocessed_stamps: dict[int, UnprocessedStamp]
+):
+    """Replace the unprocessed stamps of a batch input npz, its channel data and settings kept (atomically).
+
+    Args:
+        path: Batch input npz path.
+        unprocessed_stamps: Per shot of the batch, the stamp to record.
+    """
+    with np.load(path) as data:
+        arrays = {key: data[key] for key in data.files}
+    for shot, stamp in unprocessed_stamps.items():
+        arrays[f"{shot}:unprocessed_digest"] = np.str_(stamp.digest)
+        arrays[f"{shot}:unprocessed_mtime_ns"] = np.int64(stamp.mtime_ns)
+    atomic_write(path, lambda tmp_path: _savez(tmp_path, arrays))
+
+
 def fit_batch_settings(batch: FitBatch) -> dict[str, str]:
     """Every fit setting of a batch as a comparable string.
 
@@ -471,9 +534,12 @@ def pack_fit_results(
             arrays[f"{shot}:{var}_status"] = np.asarray(
                 getattr(so, f"{var}_status"), dtype=np.int8
             )
-            hyps = getattr(so, f"{var}_hyps")
-            if hyps is not None:
-                arrays[f"{shot}:{var}_hyps"] = np.asarray(hyps, dtype=np.float32)
+            for extra in ("hyps", "cov"):
+                values = getattr(so, f"{var}_{extra}")
+                if values is not None:
+                    arrays[f"{shot}:{var}_{extra}"] = np.asarray(
+                        values, dtype=np.float32
+                    )
     atomic_write(path, lambda tmp_path: _savez(tmp_path, arrays))
 
 
@@ -485,7 +551,7 @@ def unpack_fit_results(path: Path | str) -> dict[int, ShotFitOutput]:
 
     Returns:
         Per-shot fit outputs, keyed by shot number.
-        Absent hyps keys read back as None.
+        Absent hyps and cov keys read back as None.
     """
     with np.load(path) as data:
         outputs = {}
@@ -494,10 +560,11 @@ def unpack_fit_results(path: Path | str) -> dict[int, ShotFitOutput]:
             for var in FIT_VARIABLES:
                 for name in ("fit", "std", "grad", "grad_std", "status"):
                     kwargs[f"{var}_{name}"] = data[f"{shot}:{var}_{name}"]
-                hyps_key = f"{shot}:{var}_hyps"
-                kwargs[f"{var}_hyps"] = (
-                    data[hyps_key] if hyps_key in data.files else None
-                )
+                for extra in ("hyps", "cov"):
+                    extra_key = f"{shot}:{var}_{extra}"
+                    kwargs[f"{var}_{extra}"] = (
+                        data[extra_key] if extra_key in data.files else None
+                    )
             outputs[shot] = ShotFitOutput(**kwargs)
         return outputs
 

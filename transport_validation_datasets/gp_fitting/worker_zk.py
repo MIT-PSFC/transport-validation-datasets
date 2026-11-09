@@ -106,7 +106,7 @@ def _attempt_fit(
         seed_salt: Restart seed offset for a reseeded retry (see run_gp).
 
     Returns:
-        (fit, std, grad, grad_std, hyps) in the data's own units, or None when
+        (fit, std, grad, grad_std, hyps, cov) in the data's own units, or None when
         cleaning left fewer than min_points channels, the GP fit failed,
         or any of its arrays holds a non-finite value.
         Negative slopes are physical and kept.
@@ -123,15 +123,39 @@ def _attempt_fit(
     )
     if pf is None:
         return None
-    arrays = (pf.fit, pf.std, pf.grad, pf.grad_std)
+    arrays = (pf.fit, pf.std, pf.grad, pf.grad_std, pf.cov)
     if not all(np.isfinite(array).all() for array in arrays):
         return None
+    scale_squared = scale**2
     return (
         pf.fit * scale,
         pf.std * scale,
         pf.grad * scale,
         pf.grad_std * scale,
         pf.hyps,
+        pf.cov * scale_squared,
+    )
+
+
+def _variable_fit(result: tuple, status: int) -> VariableFit:
+    """The VariableFit of one _attempt_fit result.
+
+    Args:
+        result: _attempt_fit's (fit, std, grad, grad_std, hyps, cov).
+        status: STATUS_* code of the slice.
+
+    Returns:
+        The VariableFit.
+    """
+    fit, std, grad, grad_std, hyps, cov = result
+    return VariableFit(
+        fit=fit,
+        std=std,
+        grad=grad,
+        grad_std=grad_std,
+        hyps=hyps,
+        status=status,
+        cov=cov,
     )
 
 
@@ -239,7 +263,7 @@ def _fit_variable(
         peak, biased = _fit_problems(result[0], x_star, x, y, err)
         if peak is None and not biased:
             status = STATUS_OK if n_attempt == 0 else STATUS_REPAIRED
-            return VariableFit(*result, status=status)
+            return _variable_fit(result, status)
         last_flagged = (peak, biased)
 
     if last_flagged is None:
@@ -263,7 +287,7 @@ def _fit_variable(
     peak, biased = _fit_problems(result[0], x_star, x, y, err)
     if peak is not None or biased:
         return _no_fit(STATUS_CULLED)
-    return VariableFit(*result, status=STATUS_REPAIRED)
+    return _variable_fit(result, STATUS_REPAIRED)
 
 
 def _fit_slice(task: SliceTask, guarded: bool) -> SliceResult:

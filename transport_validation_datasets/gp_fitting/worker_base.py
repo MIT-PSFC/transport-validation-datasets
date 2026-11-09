@@ -74,6 +74,7 @@ class VariableFit:
         grad_std: (n_x,) latent derivative std.
         hyps: Method-specific hyperparameter diagnostics, or None.
         status: STATUS_* code for this slice.
+        cov: (n_x, n_x) latent posterior covariance of the profile, or None when the method gives none.
     """
 
     fit: np.ndarray | None
@@ -82,6 +83,7 @@ class VariableFit:
     grad_std: np.ndarray | None
     hyps: np.ndarray | None
     status: int
+    cov: np.ndarray | None = None
 
 
 @dataclass
@@ -159,6 +161,15 @@ def map_slices(
                         np.full((so.te_fit.shape[0], vf.hyps.size), np.nan),
                     )
                 getattr(so, f"{var}_hyps")[result.i_time, :] = vf.hyps
+            if vf.cov is not None:
+                if getattr(so, f"{var}_cov") is None:
+                    n_x = so.te_fit.shape[1]
+                    setattr(
+                        so,
+                        f"{var}_cov",
+                        np.full((so.te_fit.shape[0], n_x, n_x), np.nan),
+                    )
+                getattr(so, f"{var}_cov")[result.i_time, :, :] = vf.cov
 
     n_total = len(tasks)
     n_done = 0

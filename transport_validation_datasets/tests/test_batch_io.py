@@ -9,6 +9,7 @@ from transport_validation_datasets.gp_fitting.batch_io import (
     FitBatch,
     FitBounds,
     ShotFitInput,
+    UnprocessedStamp,
     atomic_write,
     batch_settings,
     fit_batch_settings,
@@ -50,7 +51,8 @@ def _batch() -> FitBatch:
 def test_staged_settings_match_the_batch_and_a_changed_knob_does_not(tmp_path):
     path = tmp_path / "batch_abc.npz"
     batch = _batch()
-    pack_fit_batch(path, batch)
+    unprocessed_stamps = {7: UnprocessedStamp(digest="0" * 64, mtime_ns=0)}
+    pack_fit_batch(path, batch, unprocessed_stamps)
 
     settings = batch_settings(path)
 

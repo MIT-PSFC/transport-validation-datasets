@@ -76,6 +76,7 @@ def _healthy_fit() -> ProfileFit:
         grad=-2.0 * X_STAR,
         grad_std=np.full_like(profile, 0.1),
         hyps=np.array([2.0, 0.5, 0.3, 0.1]),
+        cov=np.diag(np.full_like(profile, 0.05**2)),
     )
 
 

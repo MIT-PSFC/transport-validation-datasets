@@ -62,6 +62,7 @@ class ProfileFit:
         grad: (n_x,) posterior derivative d/drho, 0 where fit is clipped.
         grad_std: (n_x,) latent derivative std.
         hyps: Fitted [var, l1, l2, lw].
+        cov: (n_x, n_x) latent posterior covariance of the profile, the channel errors left out.
     """
 
     fit: np.ndarray
@@ -69,6 +70,7 @@ class ProfileFit:
     grad: np.ndarray
     grad_std: np.ndarray
     hyps: np.ndarray
+    cov: np.ndarray
 
 
 def run_gp(
@@ -346,4 +348,9 @@ def fit_profile(
     grad_std = np.asarray(gp.get_gp_drv_std(noise_flag=False), dtype=float).ravel()[
         :n_out
     ]
-    return ProfileFit(fit=fit, std=std, grad=grad, grad_std=grad_std, hyps=hyps_out)
+    # The latent covariance on x_eval, the target grid first
+    latent_cov_eval = np.asarray(gp.get_gp_variance(noise_flag=False), dtype=float)
+    cov = latent_cov_eval[:n_out, :n_out]
+    return ProfileFit(
+        fit=fit, std=std, grad=grad, grad_std=grad_std, hyps=hyps_out, cov=cov
+    )
