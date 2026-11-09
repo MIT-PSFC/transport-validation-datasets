@@ -183,6 +183,8 @@ class DummyWorkflow(DataWorkflow):
         self.bad_readings = False
         # 0D signals a shot's source carries beyond ip, a value or an array on the grid
         self.extra_signals: dict[int, dict[str, float | np.ndarray]] = {}
+        # Errors a shot's source read raises
+        self.read_errors: dict[int, Exception] = {}
         super().__init__(*args, **kwargs)
 
     def get_shotlist_from_source(self) -> list[int]:
@@ -196,6 +198,8 @@ class DummyWorkflow(DataWorkflow):
 
     def get_source_dataset(self, shot: int) -> xr.Dataset | None:
         self.source_reads.append(shot)
+        if shot in self.read_errors:
+            raise self.read_errors[shot]
         if shot == UNREADABLE_SHOT:
             return None
         duration = 0.05 if shot == SHORT_SHOT else DURATION
@@ -343,6 +347,19 @@ class TestMakeUnprocessedDataFiles:
         assert not workflow.shot_already_failed(UNREADABLE_SHOT)
         workflow.make_unprocessed_data_files()
         assert workflow.source_reads.count(UNREADABLE_SHOT) == 2
+
+    def test_read_error_recorded_unless_transient(self, tmp_path):
+        # A bug is recorded and skipped next run, a lost connection is retried
+        workflow = make_workflow(tmp_path, shots=[1, 2])
+        workflow.transient_read_errors = (OSError,)
+        workflow.read_errors = {1: ValueError("bug"), 2: OSError("lost connection")}
+
+        workflow.make_unprocessed_data_files()
+        workflow.make_unprocessed_data_files()
+
+        assert workflow.shot_already_failed(1)
+        assert not workflow.shot_already_failed(2)
+        assert workflow.source_reads == [1, 2, 2]
 
     def test_rejected_shot_recorded_and_skipped_next_run(self, tmp_path):
         workflow = make_workflow(tmp_path, shots=[SHORT_SHOT])

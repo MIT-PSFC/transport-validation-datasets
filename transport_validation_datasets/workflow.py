@@ -385,6 +385,11 @@ class DataWorkflow(ABC):
     # now, not what the file said when it was pulled.
     signal_attrs: dict[str, dict] = {}
 
+    # Errors of a source read worth retrying on the next run, such as a lost connection, only logged.
+    # Any other error is recorded as a failed shot, so a bug drops a shot with its reason.
+    # Every error by default, a device narrows it to the errors its source raises.
+    transient_read_errors: tuple[type[Exception], ...] = (Exception,)
+
     # The channel variable whose position along the chord splits the fit plots into its two branches
     # (cleaning.low_side_channels), with the labels of the low and the high side. None plots one group.
     fit_plot_branch_position: str | None = None
@@ -810,6 +815,9 @@ class DataWorkflow(ABC):
         def read(shot: int) -> xr.Dataset | None:
             """Read one shot, keeping a failure from killing the whole run.
 
+            An error in transient_read_errors is only logged, so the next run retries the shot.
+            Any other error is recorded as a failed shot (record_failed_shot), so later runs skip it.
+
             Args:
                 shot: Shot number to read.
 
@@ -818,10 +826,16 @@ class DataWorkflow(ABC):
             """
             try:
                 return self.get_source_dataset(shot)
-            except Exception as e:
+            except self.transient_read_errors as e:
                 logger.opt(exception=True).warning(
-                    f"Shot {shot}: failed to read source data: {e}"
+                    f"Shot {shot}: failed to read source data, the next run retries it: {e}"
                 )
+                return None
+            except Exception as e:
+                logger.opt(exception=True).error(
+                    f"Shot {shot}: reading the source data raised, recorded as failed: {e!r}"
+                )
+                self.record_failed_shot(shot, f"Reading the source data raised {e!r}.")
                 return None
 
         if len(shots_to_read) <= 1 or workers == 1:
