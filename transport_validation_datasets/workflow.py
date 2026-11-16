@@ -441,9 +441,10 @@ class DataWorkflow(ABC):
         """Set up the dataset directories and resolve the shotlist.
 
         Args:
-            ds_name: Name of the dataset.
-            data_assembly_dir: Directory where data files are stored and the
-                datasets will be saved.
+            ds_name: Name of the dataset. Names its stores, its logs, and its cluster jobs.
+            data_assembly_dir: Directory the stage directories and the stores are written to.
+                Datasets built in the same directory share its stage files,
+                so a shot already staged or fit there is not done again for another ds_name.
             shotlist_file: Path to file containing list of shots to process,
                 one shot per line, or a CSV with time windows per shot.
                 If None, will call get_shotlist_from_source() to retrieve shotlist from
@@ -478,7 +479,7 @@ class DataWorkflow(ABC):
                 f"not '{fit_method}'"
             )
         self.ds_name = ds_name
-        self.data_assembly_dir = self.stage_root_dir(data_assembly_dir)
+        self.data_assembly_dir = data_assembly_dir
 
         self.max_num_shots = max_num_shots
         if max_num_shots is None:
@@ -525,7 +526,8 @@ class DataWorkflow(ABC):
         # One file sink per process: a later workflow in the same process
         # (tests, back-to-back builds) replaces the sink instead of adding a
         # second one, which would write both datasets' logs into both files.
-        self.logs_dir = self.data_assembly_dir / "logs"
+        # Per dataset, since datasets built in the same data_assembly_dir share every other directory
+        self.logs_dir = self.data_assembly_dir / "logs" / self.ds_name
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         # The cluster fit jobs' SLURM logs, pulled back by the dispatcher
         self.fit_job_logs_dir = self.logs_dir / "fit_jobs"
@@ -571,18 +573,6 @@ class DataWorkflow(ABC):
         else:
             self.fit_mode = FIT_MODE_WINDOW_SAMPLE
         logger.info(f"Fit mode: {self.fit_mode}")
-
-    def stage_root_dir(self, data_assembly_dir: Path) -> Path:
-        """Directory that holds the stage directories of the dataset.
-
-        Args:
-            data_assembly_dir: The directory the workflow was given.
-
-        Returns:
-            data_assembly_dir/<ds_name>, so every dataset keeps its stage results apart.
-            A device whose datasets share their stage results returns data_assembly_dir itself.
-        """
-        return data_assembly_dir / self.ds_name
 
     def record_failed_shot(self, shot: int, reason: str):
         """Record that a shot failed to produce an unprocessed file.
@@ -1506,7 +1496,7 @@ class DataWorkflow(ABC):
             raise ValueError(
                 f"{where} was built with {name} {found}, this run has {expected}. "
                 "Rerun with --clean_fit_state to rebuild it, "
-                "or build the dataset under another ds_name."
+                "or build the dataset in another data_assembly_dir."
             )
 
     def _fit_batch(self, shot_inputs: dict[int, ShotFitInput]) -> FitBatch:
@@ -1594,7 +1584,7 @@ class DataWorkflow(ABC):
         raise ValueError(
             f"Shot {shot} in {where} was built with other time windows: {problem}. "
             f"Rerun with --clean_fit_state to restage everything, or build the "
-            f"dataset under another ds_name."
+            f"dataset in another data_assembly_dir."
         )
 
     def _apply_windows(self, shot: int, fit_input: ShotFitInput) -> ShotFitInput | None:

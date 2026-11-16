@@ -47,7 +47,7 @@ TCV and DIII-D data has no release permission (yet), so those datasets stop at s
 
 # Datasets
 
-Two Zarr stores per device, under `<data_assembly_dir>/<ds_name>/04_datasets/`:
+Two Zarr stores per dataset, under `<data_assembly_dir>/04_datasets/`:
 
 - `<ds_name>_internal.zarr`, the store for internal use, carrying every signal
   below. Built by `DataWorkflow.stack_internal_dataset` (the stack stage).
@@ -370,7 +370,8 @@ Stack and publish are the exceptions, each always rebuilds its store.
 The fit stage plots every shot's fits to a PDF, about a minute per shot.
 `--skip_fit_plots` leaves them out, and a later fit stage without it plots the shots that have no PDF yet.
 `--max_fit_pages` caps the pages of each PDF.
-A cluster fit pulls each job's SLURM log back into `<ds_name>/logs/fit_jobs/`.
+The stage directories sit in `data_assembly_dir` itself, so datasets built there under different `--ds_name` share their unprocessed files and fits.
+Each run logs to `logs/<ds_name>/`, and a cluster fit pulls each job's SLURM log back into `logs/<ds_name>/fit_jobs/`.
 A shot's fit file is rewritten when its batch was refit or this package changed (its `fit_stamp`).
 
 # Configuration
@@ -428,7 +429,7 @@ te_grad_anchors = [[0.0, 0.0, 0.0], [1.3, 0.0, 0.1], [1.4, 0.0, 0.1], [1.5, 0.0,
 ```
 
 The anchors are staged into the fit batches,
-so changing them needs `--clean_fit_state` or a new `--ds_name`.
+so changing them needs `--clean_fit_state` or another `data_assembly_dir`.
 The fit stage refuses batches staged under any other fit setting, the device's fit bounds and fit grid included.
 
 Every device table also takes `pedestal_rho_tor_norm`, the pedestal location every fit uses, 1.0 by default.
@@ -540,21 +541,21 @@ Windows act on the fit and stack stages, in one of two modes:
 
 `--average_windows` with a plain shotlist is an error. Every staged batch and
 every fit result records the mode and the windows it was built with, and the
-fit and stack stages compare them with the shotlist before doing anything. A
-shot whose windows changed, a shot the shotlist no longer lists, or a mode
-switch stops the run with an error, so an edited shotlist can never quietly
-ship profiles fit for other windows. `--clean_fit_state` restages everything
-(or build under a new `--ds_name`). The window list of each shot and the
-window of each fitted row are kept in the `03_fit_results` files for debugging (`windows`
-attribute, `window_index` coordinate), not in the final stores.
+fit and stack stages compare them with the shotlist before doing anything.
+A shot whose windows changed, a shot the shotlist no longer lists,
+or a mode switch stops the run with an error,
+so an edited shotlist can never quietly ship profiles fit for other windows.
+`--clean_fit_state` restages everything (or build in another `data_assembly_dir`).
+The window list of each shot and the window of each fitted row are
+kept in the `03_fit_results` files for debugging (`windows` attribute, `window_index` coordinate).
 
 ```bash
 # C-Mod scenarios, one fit per Thomson sample inside each window
-uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_dir \
+uv run python -m transport_validation_datasets.cli cmod /path/to/scenarios_dir \
     --ds_name cmod_scenarios --shotlist_file scenarios.csv
 
-# The same windows, one pooled fit per window
-uv run python -m transport_validation_datasets.cli cmod /path/to/data_assembly_dir \
+# The same windows, one pooled fit per window, in a directory of its own since the fit mode differs
+uv run python -m transport_validation_datasets.cli cmod /path/to/scenarios_avg_dir \
     --ds_name cmod_scenarios_avg --shotlist_file scenarios.csv --average_windows
 ```
 

@@ -67,7 +67,9 @@ def main(
     Args:
         device: The device, one of DEVICES.
         data_assembly_dir: Directory holding the intermediate files, plots, logs, and datasets.
-        ds_name: Dataset name, used in paths and cluster job names. None takes the device name.
+            Datasets built in the same directory share its intermediate files.
+        ds_name: Dataset name, used in the store names, the log directory, and cluster job names.
+            None takes the device name.
         shotlist_file: File with one shot number per line, or a CSV with
             shot, t_start and t_end columns for time windows.
             None takes the device's own shotlist (get_shotlist_from_source).

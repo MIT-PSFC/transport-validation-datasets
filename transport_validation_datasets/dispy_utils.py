@@ -49,7 +49,7 @@ def passive_log_settings() -> LogSettings:
     """LogSettings that leave this process's loguru sinks alone.
 
     disruption_py's setup_logging and reset_handlers call logger.remove(),
-    which would drop the workflow's log file sink (logs/<ds_name>_<time>.log).
+    which would drop the workflow's log file sink (logs/<ds_name>/<ds_name>_<time>.log).
     The preset setup flag skips both, so disruption_py logs through the caller's sinks.
 
     Returns:
