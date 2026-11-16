@@ -478,7 +478,7 @@ class DataWorkflow(ABC):
                 f"not '{fit_method}'"
             )
         self.ds_name = ds_name
-        self.data_assembly_dir = data_assembly_dir / self.ds_name
+        self.data_assembly_dir = self.stage_root_dir(data_assembly_dir)
 
         self.max_num_shots = max_num_shots
         if max_num_shots is None:
@@ -571,6 +571,18 @@ class DataWorkflow(ABC):
         else:
             self.fit_mode = FIT_MODE_WINDOW_SAMPLE
         logger.info(f"Fit mode: {self.fit_mode}")
+
+    def stage_root_dir(self, data_assembly_dir: Path) -> Path:
+        """Directory that holds the stage directories of the dataset.
+
+        Args:
+            data_assembly_dir: The directory the workflow was given.
+
+        Returns:
+            data_assembly_dir/<ds_name>, so every dataset keeps its stage results apart.
+            A device whose datasets share their stage results returns data_assembly_dir itself.
+        """
+        return data_assembly_dir / self.ds_name
 
     def record_failed_shot(self, shot: int, reason: str):
         """Record that a shot failed to produce an unprocessed file.
